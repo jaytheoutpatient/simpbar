@@ -6,6 +6,17 @@ set -e
 
 echo "Setting up your desktop..."
 
+if ! command -v pacman >/dev/null; then
+    echo "This script is Arch-only (pacman not found). Aborting."
+    exit 1
+fi
+
+# Ensure required tools are present
+if ! command -v unzip >/dev/null; then
+    echo "unzip not found — installing..."
+    sudo pacman -S --noconfirm --needed unzip curl
+fi
+
 # Create config dir
 mkdir -p ~/.config
 
@@ -21,41 +32,15 @@ echo "Waybar config placed in ~/.config/waybar"
 # Install dependencies
 echo "Installing gnome-calendar, wlogout, swaybg, waypaper & JetBrainsMono Nerd Font..."
 
-if command -v pacman >/dev/null; then
-    echo "Arch Linux detected — installing official packages..."
-    sudo pacman -S --noconfirm --needed gnome-calendar wlogout swaybg ttf-jetbrains-mono-nerd
+sudo pacman -S --noconfirm --needed gnome-calendar wlogout swaybg ttf-jetbrains-mono-nerd
 
-    # waypaper is in AUR — use yay (most common). Fall back to paru if present
-    if command -v yay >/dev/null; then
-        yay -S --noconfirm --needed waypaper
-    elif command -v paru >/dev/null; then
-        paru -S --noconfirm --needed waypaper
-    else
-        echo "No AUR helper (yay/paru) found. Install waypaper manually with: yay -S waypaper"
-    fi
-
-elif command -v apt >/dev/null; then
-    sudo apt update
-    sudo apt install -y gnome-calendar wlogout
-    # swaybg & waypaper via other means (or manual)
-    echo "Debian/Ubuntu: swaybg and waypaper may need manual install or backports."
-    # Nerd font
-    mkdir -p ~/.local/share/fonts
-    curl -L -o /tmp/JetBrainsMono.zip https://github.com/ryanoasis/nerd-fonts/releases/download/v3.2.1/JetBrainsMono.zip
-    unzip -o /tmp/JetBrainsMono.zip -d ~/.local/share/fonts/
-    rm /tmp/JetBrainsMono.zip
-    fc-cache -fv
-
-elif command -v dnf >/dev/null; then
-    sudo dnf install -y gnome-calendar wlogout
-    # Similar for others...
-    mkdir -p ~/.local/share/fonts
-    curl -L -o /tmp/JetBrainsMono.zip https://github.com/ryanoasis/nerd-fonts/releases/download/v3.2.1/JetBrainsMono.zip
-    unzip -o /tmp/JetBrainsMono.zip -d ~/.local/share/fonts/
-    rm /tmp/JetBrainsMono.zip
-    fc-cache -fv
+# waypaper is in AUR — use yay (most common). Fall back to paru if present
+if command -v yay >/dev/null; then
+    yay -S --noconfirm --needed waypaper
+elif command -v paru >/dev/null; then
+    paru -S --noconfirm --needed waypaper
 else
-    echo "Unknown distro. Install manually: gnome-calendar, wlogout, swaybg, waypaper, and JetBrainsMono Nerd Font."
+    echo "No AUR helper (yay/paru) found. Install waypaper manually with: yay -S waypaper"
 fi
 
 echo "Setup complete. Restart your session or run:"
