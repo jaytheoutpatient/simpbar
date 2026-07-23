@@ -1,17 +1,24 @@
 # simpbar
-A Waybar theme thats simple looks nice and not distracting!
 
-<b>Dependencies</b> <br>
-Waybar | You will need to have waybar for this to work, installed search up your linux distribution on how to install it <br>
-Gnome Calendar | The clock has a on click function where it will open the calendar <br>
-Wlogout | Your power menu <br>
-<b>Thats it!</b> <br>
+This is my waybar configuration for simplicity,<br>
+it has the weather, time and the day. Its got a power button to allow you <br> 
+to shutdown or reboot the pc. You might have to set the waybars resolution <br>
+as it is set to my monitor 1920x1080 with the scale 1 as I was using hyprland making <br>
+this waybar configuration. You got a picture logo where you can click to change wallpaper <br>
+just make sure to add `waypaper --restore` in your desired window manager configuration. <br>
 
-And you can use it however you want this is just made
-for my minimalistic vibe! <br>
+There is a install script below do know this only works for archlinux atm <br>
+but will try make it work for other Linux distributions! <br>
 
-Once downloaded just extract the file & just drap drop it into your ~/.config file! <br>
+It will install the dependencies such as: <br>
+1. Gnome Calendar
+2. wlogout
+3. swaybg
+4. waypaper
+
 
 <img width="1922" height="38" alt="image" src="https://github.com/user-attachments/assets/1b78b96e-1085-426a-aa79-bb118cb98278" /></img>
+Copy and paste this line below paste it into your terminal: <br>
+`curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash` <br>
 
-`curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash`
+The install script is all thanks to @Ryzendew aka Mattscreative
