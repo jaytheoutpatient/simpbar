@@ -152,7 +152,7 @@ ok "Config placed in ~/.config/waybar"
 # ── Step 3: install packages ───────────────────────────────────────
 step "Installing packages"
 
-PACMAN_PKGS=(waybar gnome-calendar swaybg ttf-jetbrains-mono-nerd)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd)
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
@@ -160,17 +160,29 @@ run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${P
 AUR_PKGS=(wlogout waypaper)
 
 if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
-    printf '  %s?%s No AUR helper found. Install which one? [%syay%s/%sparu%s/%sskip%s]: ' \
-        "$C_YELLOW" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
-    read -r AUR_CHOICE
+    printf '\n  %sNo AUR helper found. Install which one?%s\n' "$C_YELLOW" "$C_RESET"
+    printf '    %s1)%s yay\n'  "$C_CYAN" "$C_RESET"
+    printf '    %s2)%s paru\n' "$C_CYAN" "$C_RESET"
+    printf '    %s3)%s skip\n' "$C_CYAN" "$C_RESET"
+    printf '  %sChoice [1]: %s' "$C_BOLD" "$C_RESET"
+    if [ -r /dev/tty ]; then
+        read -r AUR_CHOICE < /dev/tty
+    else
+        warn "No interactive terminal available — defaulting to yay"
+        AUR_CHOICE=1
+    fi
     case "$AUR_CHOICE" in
-        paru|Paru|PARU)
+        2)
             install_paru || warn "Could not install paru automatically — install manually: ${AUR_PKGS[*]}"
             ;;
-        skip|Skip|SKIP|n|N|no|No)
+        3)
             warn "Skipping AUR helper install — install manually: ${AUR_PKGS[*]}"
             ;;
+        1|"")
+            install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}"
+            ;;
         *)
+            warn "Unrecognized choice — defaulting to yay"
             install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}"
             ;;
     esac
@@ -188,7 +200,7 @@ fi
 
 # ── Step 4: done ────────────────────────────────────────────────────
 step "Done"
-ok "waybar, gnome-calendar, swaybg, JetBrainsMono Nerd Font installed (pacman)"
+ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font installed (pacman)"
 ok "wlogout, waypaper installed via AUR helper (if available)"
 ok "waybar config in ~/.config/waybar"
 
@@ -197,3 +209,4 @@ printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %swaybar &%s\n' "$C_CYAN" "$C_RESET"
 printf '  %sswaybg -i /path/to/your/wallpaper.jpg -m fill &%s   # example\n' "$C_CYAN" "$C_RESET"
 printf '  %swaypaper%s                                          # pick a wallpaper\n' "$C_CYAN" "$C_RESET"
+printf '  %s/usr/lib/mate-polkit/polkit-mate-authentication-agent-1 &%s   # needed for GUI auth prompts\n' "$C_CYAN" "$C_RESET"
