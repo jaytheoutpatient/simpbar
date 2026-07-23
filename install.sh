@@ -152,9 +152,6 @@ ok "Config placed in ~/.config/waybar"
 # ── Step 3: install packages ───────────────────────────────────────
 step "Installing packages"
 
-# ── Step 3: install packages ───────────────────────────────────────
-step "Installing packages"
-
 PACMAN_PKGS=(waybar gnome-calendar swaybg ttf-jetbrains-mono-nerd)
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
