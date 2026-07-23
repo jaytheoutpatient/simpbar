@@ -18,8 +18,9 @@ It will install the dependencies such as: <br>
 5. Gnome Calendar <br>
 <b>That's it!</b>
 
-<img width="1922" height="38" alt="image" src="https://github.com/user-attachments/assets/1b78b96e-1085-426a-aa79-bb118cb98278" /></img>
 Copy and paste this line below paste it into your terminal: <br>
 `curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash` <br>
 
-The install script is all thanks to @Ryzendew aka Mattscreative
+The install script is all thanks to @Ryzendew aka Mattscreative <br>
+
+<img width="1920" height="40" alt="image" src="https://github.com/user-attachments/assets/169b48f9-fba9-405d-9096-d8f5a4223bc9" />
