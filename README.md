@@ -15,7 +15,7 @@ It will install the dependencies such as: <br>
 2. Wlogout
 3. Swaybg
 4. Waypaper
-5. Gnome Calendar
+5. Gnome Calendar <br>
 <b>That's it!</b>
 
 <img width="1922" height="38" alt="image" src="https://github.com/user-attachments/assets/1b78b96e-1085-426a-aa79-bb118cb98278" /></img>
