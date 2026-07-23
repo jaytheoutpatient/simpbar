@@ -37,6 +37,7 @@
         //"battery",
         //"pulseaudio",
        // "custom/screenshot_t",
+         "custom/waypaper",
          "tray",
          "custom/power"
     ],
@@ -55,8 +56,10 @@
         "tooltip": false
     },
     
-
-
+    "custom/waypaper": {
+	    "format": "🖾 ",
+	    "on-click": "waypaper"
+    },
 
     "custom/rofi": {
         "format": "",
