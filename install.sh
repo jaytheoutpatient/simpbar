@@ -152,41 +152,47 @@ ok "Config placed in ~/.config/waybar"
 # ── Step 3: install packages ───────────────────────────────────────
 step "Installing packages"
 
-PACMAN_PKGS=(waybar gnome-calendar wlogout swaybg ttf-jetbrains-mono-nerd)
+# ── Step 3: install packages ───────────────────────────────────────
+step "Installing packages"
+
+PACMAN_PKGS=(waybar gnome-calendar swaybg ttf-jetbrains-mono-nerd)
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
-# waypaper is AUR-only — needs an AUR helper
+# wlogout & waypaper are AUR-only — need an AUR helper
+AUR_PKGS=(wlogout waypaper)
+
 if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
     printf '  %s?%s No AUR helper found. Install which one? [%syay%s/%sparu%s/%sskip%s]: ' \
         "$C_YELLOW" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
     read -r AUR_CHOICE
     case "$AUR_CHOICE" in
         paru|Paru|PARU)
-            install_paru || warn "Could not install paru automatically — install waypaper manually: paru -S waypaper"
+            install_paru || warn "Could not install paru automatically — install manually: ${AUR_PKGS[*]}"
             ;;
         skip|Skip|SKIP|n|N|no|No)
-            warn "Skipping AUR helper install — install waypaper manually: yay -S waypaper"
+            warn "Skipping AUR helper install — install manually: ${AUR_PKGS[*]}"
             ;;
         *)
-            install_yay || warn "Could not install yay automatically — install waypaper manually: yay -S waypaper"
+            install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}"
             ;;
     esac
 fi
 
 if command -v yay >/dev/null; then
-    run_spinner "yay: waypaper (AUR)" yay -S --noconfirm --needed waypaper \
-        || warn "waypaper install failed via yay — install manually: yay -S waypaper"
+    run_spinner "yay: ${AUR_PKGS[*]} (AUR)" yay -S --noconfirm --needed "${AUR_PKGS[@]}" \
+        || warn "Some AUR packages failed via yay — install manually: yay -S ${AUR_PKGS[*]}"
 elif command -v paru >/dev/null; then
-    run_spinner "paru: waypaper (AUR)" paru -S --noconfirm --needed waypaper \
-        || warn "waypaper install failed via paru — install manually: paru -S waypaper"
+    run_spinner "paru: ${AUR_PKGS[*]} (AUR)" paru -S --noconfirm --needed "${AUR_PKGS[@]}" \
+        || warn "Some AUR packages failed via paru — install manually: paru -S ${AUR_PKGS[*]}"
 else
-    warn "No AUR helper available — install waypaper manually: yay -S waypaper"
+    warn "No AUR helper available — install manually: yay -S ${AUR_PKGS[*]}"
 fi
 
 # ── Step 4: done ────────────────────────────────────────────────────
 step "Done"
-ok "waybar, gnome-calendar, wlogout, swaybg, JetBrainsMono Nerd Font installed"
+ok "waybar, gnome-calendar, swaybg, JetBrainsMono Nerd Font installed (pacman)"
+ok "wlogout, waypaper installed via AUR helper (if available)"
 ok "waybar config in ~/.config/waybar"
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
