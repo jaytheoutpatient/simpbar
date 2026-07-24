@@ -157,6 +157,15 @@ banner
 # ── Step 0: platform check ─────────────────────────────────────────
 command -v pacman >/dev/null || die "This script is Arch-only (pacman not found)."
 
+# Authenticate sudo up front so the password prompt never lands in the
+# middle of a spinner later on. Keep it alive in the background for the
+# rest of the script, and make sure that background loop dies with us.
+printf '\n%sThis installer needs sudo access.%s\n' "$C_BOLD" "$C_RESET"
+sudo -v || die "Could not authenticate with sudo."
+( while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) &
+SUDO_KEEPALIVE_PID=$!
+trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null' EXIT
+
 # ── Step 1: prerequisites ──────────────────────────────────────────
 step "Checking prerequisites"
 MISSING_PREREQS=()
