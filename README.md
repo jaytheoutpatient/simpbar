@@ -15,7 +15,15 @@ It will install the dependencies such as: <br>
 2. Wlogout
 3. Swaybg
 4. Waypaper
-5. Gnome Calendar <br>
+5. Neovim with (Lazyvim)
+6. Steam
+7. ProtonPlus
+8. Nautilus
+9. Hyprland
+10. Mate-polkit
+11. Fastfetch because ya gotta flex
+12. Foot (Terminal)
+13. Gnome Calendar <br>
 <b>That's it!</b>
 
 Copy and paste this line below paste it into your terminal: <br>
