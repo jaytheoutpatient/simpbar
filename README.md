@@ -6,6 +6,7 @@ to shutdown or reboot the pc. You might have to set the waybars resolution <br>
 as it is set to my monitor 1920x1080 with the scale 1 as I was using hyprland making <br>
 this waybar configuration. You got a picture logo where you can click to change wallpaper <br>
 just make sure to add `waypaper --restore` in your desired window managers autostart configuration. <br>
+Originally this about just a waybar configuration till I noticed this is becoming a hyprland setup to <br>
 
 There is a install script below do know this only works for archlinux atm <br>
 but will try make it work for other Linux distributions! <br>
@@ -18,12 +19,15 @@ It will install the dependencies such as: <br>
 5. Neovim with (Lazyvim)
 6. Steam
 7. ProtonPlus
-8. Nautilus
-9. Hyprland
-10. Mate-polkit
-11. Fastfetch because ya gotta flex
-12. Foot (Terminal)
-13. Gnome Calendar <br>
+8. Flatpak
+9. Bazaar
+10. Ly (login manager)
+11. Nautilus
+12. Hyprland
+13. Mate-polkit
+14. Fastfetch because ya gotta flex
+15. Foot (Terminal)
+16. Gnome Calendar <br>
 <b>That's it!</b>
 
 Copy and paste this line below paste it into your terminal: <br>
