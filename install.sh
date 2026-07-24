@@ -210,6 +210,27 @@ case "$LAUNCHER_CHOICE" in
     4|""|*) ;;
 esac
 
+printf '\n  %sWhich Discord client would you like to install?%s\n' "$C_YELLOW" "$C_RESET"
+printf '    %s1)%s Discord\n' "$C_CYAN" "$C_RESET"
+printf '    %s2)%s Vesktop\n' "$C_CYAN" "$C_RESET"
+printf '    %s3)%s Equibop\n' "$C_CYAN" "$C_RESET"
+printf '    %s4)%s Skip — don'"'"'t install a Discord client\n' "$C_CYAN" "$C_RESET"
+printf '  %sChoice [4]: %s' "$C_BOLD" "$C_RESET"
+if [ -r /dev/tty ]; then
+    read -r DISCORD_CHOICE < /dev/tty
+else
+    warn "No interactive terminal available — skipping Discord client"
+    DISCORD_CHOICE=4
+fi
+
+DISCORD_AUR_PKG=""
+case "$DISCORD_CHOICE" in
+    1) DISCORD_NAME="Discord"; PACMAN_PKGS+=(discord) ;;
+    2) DISCORD_NAME="Vesktop"; DISCORD_AUR_PKG="vesktop-bin" ;;
+    3) DISCORD_NAME="Equibop"; DISCORD_AUR_PKG="equibop-bin" ;;
+    4|""|*) DISCORD_NAME="" ;;
+esac
+
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
@@ -251,6 +272,7 @@ fi
 # wlogout, waypaper & protonplus are AUR-only — need an AUR helper
 AUR_PKGS=(wlogout waypaper protonplus)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
+[ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 
 if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
     printf '\n  %sNo AUR helper found. Install which one?%s\n' "$C_YELLOW" "$C_RESET"
@@ -397,6 +419,11 @@ if pacman -Qq lutris >/dev/null 2>&1; then
 fi
 if pacman -Qq heroic-games-launcher-bin >/dev/null 2>&1; then
     ok "Heroic Games Launcher installed via AUR helper (if available)"
+fi
+if [ -n "$DISCORD_NAME" ]; then
+    ok "$DISCORD_NAME installed"
+else
+    ok "Discord client install skipped, as requested"
 fi
 ok "Flathub remote added for flatpak/bazaar"
 ok "nwg-look set to prefer dark theme"
