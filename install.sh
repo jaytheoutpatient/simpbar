@@ -239,8 +239,8 @@ for dm in "${OTHER_DMS[@]}"; do
     fi
 done
 
-run_spinner "Enabling ly" sudo systemctl enable ly.service \
-    || die "Failed to enable ly.service — is the ly package installed?"
+run_spinner "Enabling ly" sudo systemctl enable ly@tty2.service \
+    || die "Failed to enable ly@tty2.service — is the ly package installed?"
 
 ok "Ly set as the login manager (takes effect on next reboot)"
 
