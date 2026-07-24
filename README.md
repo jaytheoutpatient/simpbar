@@ -21,7 +21,6 @@ It will install the dependencies such as: <br>
 7. ProtonPlus
 8. Flatpak
 9. Bazaar
-10. Ly (login manager)
 11. Nautilus
 12. Hyprland
 13. Mate-polkit
