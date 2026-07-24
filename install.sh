@@ -85,6 +85,11 @@ install_paru() {
 # Run a command quietly, showing a spinner, then a check/cross line.
 run_spinner() {
     local msg="$1"; shift
+    # Refresh (or acquire) the sudo timestamp synchronously first. If a
+    # password prompt is actually needed, it happens here on its own
+    # line — before any spinner output starts — instead of colliding
+    # with the spinner's carriage-return line mid-command.
+    sudo -v 2>/dev/null
     local logfile
     logfile=$(mktemp)
     ( "$@" >"$logfile" 2>&1 ) &
