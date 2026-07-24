@@ -168,9 +168,13 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd hyprland foot fastfetch neovim steam ly swaync rofi)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd hyprland foot fastfetch neovim steam ly swaync rofi flatpak bazaar)
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
+
+run_spinner "Adding Flathub remote" \
+    flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo \
+    || warn "Could not add Flathub remote — add it manually: flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo"
 
 # wlogout, waypaper & protonplus are AUR-only — need an AUR helper
 AUR_PKGS=(wlogout waypaper protonplus)
@@ -256,7 +260,8 @@ fi
 
 # ── Step 6: done ────────────────────────────────────────────────────
 step "Done"
-ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, hyprland, foot, fastfetch, neovim, steam, ly, swaync, rofi installed (pacman)"
+ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, hyprland, foot, fastfetch, neovim, steam, ly, swaync, rofi, flatpak, bazaar installed (pacman)"
+ok "Flathub remote added for flatpak/bazaar"
 ok "wlogout, waypaper, protonplus installed via AUR helper (if available)"
 ok "waybar config in ~/.config/waybar"
 ok "hypr config in ~/.config/hypr"
