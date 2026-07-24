@@ -169,6 +169,47 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
 fi
 
 PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber)
+
+printf '\n  %sWill you be using OBS Studio for recording/streaming?%s\n' "$C_YELLOW" "$C_RESET"
+printf '    %s1)%s Yes\n' "$C_CYAN" "$C_RESET"
+printf '    %s2)%s No\n'  "$C_CYAN" "$C_RESET"
+printf '  %sChoice [2]: %s' "$C_BOLD" "$C_RESET"
+if [ -r /dev/tty ]; then
+    read -r OBS_CHOICE < /dev/tty
+else
+    warn "No interactive terminal available — skipping OBS Studio"
+    OBS_CHOICE=2
+fi
+
+case "$OBS_CHOICE" in
+    1)
+        PACMAN_PKGS+=(obs-studio)
+        ;;
+    2|""|*)
+        ;;
+esac
+
+printf '\n  %sWould you like to install any game launchers?%s\n' "$C_YELLOW" "$C_RESET"
+printf '    %s1)%s Lutris\n'  "$C_CYAN" "$C_RESET"
+printf '    %s2)%s Heroic\n'  "$C_CYAN" "$C_RESET"
+printf '    %s3)%s Both\n'    "$C_CYAN" "$C_RESET"
+printf '    %s4)%s Neither\n' "$C_CYAN" "$C_RESET"
+printf '  %sChoice [4]: %s' "$C_BOLD" "$C_RESET"
+if [ -r /dev/tty ]; then
+    read -r LAUNCHER_CHOICE < /dev/tty
+else
+    warn "No interactive terminal available — skipping game launchers"
+    LAUNCHER_CHOICE=4
+fi
+
+INSTALL_HEROIC=0
+case "$LAUNCHER_CHOICE" in
+    1) PACMAN_PKGS+=(lutris) ;;
+    2) INSTALL_HEROIC=1 ;;
+    3) PACMAN_PKGS+=(lutris); INSTALL_HEROIC=1 ;;
+    4|""|*) ;;
+esac
+
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
@@ -209,6 +250,7 @@ fi
 
 # wlogout, waypaper & protonplus are AUR-only — need an AUR helper
 AUR_PKGS=(wlogout waypaper protonplus)
+[ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 
 if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
     printf '\n  %sNo AUR helper found. Install which one?%s\n' "$C_YELLOW" "$C_RESET"
@@ -266,20 +308,24 @@ printf '\n  %sWhich browser would you like to install?%s\n' "$C_YELLOW" "$C_RESE
 printf '    %s1)%s Brave\n' "$C_CYAN" "$C_RESET"
 printf '    %s2)%s Zen Browser\n' "$C_CYAN" "$C_RESET"
 printf '    %s3)%s Vivaldi\n' "$C_CYAN" "$C_RESET"
-printf '    %s4)%s Skip — don'"'"'t install a browser\n' "$C_CYAN" "$C_RESET"
-printf '  %sChoice [4]: %s' "$C_BOLD" "$C_RESET"
+printf '    %s4)%s Microsoft Edge\n' "$C_CYAN" "$C_RESET"
+printf '    %s5)%s LibreWolf\n' "$C_CYAN" "$C_RESET"
+printf '    %s6)%s Skip — don'"'"'t install a browser\n' "$C_CYAN" "$C_RESET"
+printf '  %sChoice [6]: %s' "$C_BOLD" "$C_RESET"
 if [ -r /dev/tty ]; then
     read -r BROWSER_CHOICE < /dev/tty
 else
     warn "No interactive terminal available — skipping browser install"
-    BROWSER_CHOICE=4
+    BROWSER_CHOICE=6
 fi
 
 case "$BROWSER_CHOICE" in
-    1) BROWSER_NAME="Brave";       BROWSER_PKG="brave-bin" ;;
-    2) BROWSER_NAME="Zen Browser"; BROWSER_PKG="zen-browser-bin" ;;
-    3) BROWSER_NAME="Vivaldi";     BROWSER_PKG="vivaldi" ;;
-    4|""|*) BROWSER_NAME=""; BROWSER_PKG="" ;;
+    1) BROWSER_NAME="Brave";          BROWSER_PKG="brave-bin" ;;
+    2) BROWSER_NAME="Zen Browser";    BROWSER_PKG="zen-browser-bin" ;;
+    3) BROWSER_NAME="Vivaldi";        BROWSER_PKG="vivaldi" ;;
+    4) BROWSER_NAME="Microsoft Edge"; BROWSER_PKG="microsoft-edge-stable-bin" ;;
+    5) BROWSER_NAME="LibreWolf";      BROWSER_PKG="librewolf-bin" ;;
+    6|""|*) BROWSER_NAME=""; BROWSER_PKG="" ;;
 esac
 
 if [ -z "$BROWSER_NAME" ]; then
@@ -343,6 +389,15 @@ fi
 step "Done"
 ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire installed (pacman)"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
+if pacman -Qq obs-studio >/dev/null 2>&1; then
+    ok "OBS Studio installed"
+fi
+if pacman -Qq lutris >/dev/null 2>&1; then
+    ok "Lutris installed"
+fi
+if pacman -Qq heroic-games-launcher-bin >/dev/null 2>&1; then
+    ok "Heroic Games Launcher installed via AUR helper (if available)"
+fi
 ok "Flathub remote added for flatpak/bazaar"
 ok "nwg-look set to prefer dark theme"
 ok "wlogout, waypaper, protonplus installed via AUR helper (if available)"
