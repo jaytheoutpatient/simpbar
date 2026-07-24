@@ -58,6 +58,7 @@ local menu        = "rofi -show drun"
      hl.exec_cmd("gnome-calendar -silent")
      hl.exec_cmd("waypaper --restore")
      hl.exec_cmd("/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1")
+	 hl.exec_cmd("/usr/libexec/polkit-mate-authentication-agent-1")	
  end)
 
 
