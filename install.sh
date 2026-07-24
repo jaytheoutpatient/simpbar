@@ -168,7 +168,7 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility)
 
 printf '\n  %sWill you be using OBS Studio for recording/streaming?%s\n' "$C_YELLOW" "$C_RESET"
 printf '    %s1)%s Yes\n' "$C_CYAN" "$C_RESET"
@@ -387,7 +387,7 @@ fi
 
 # ── Step 6: done ────────────────────────────────────────────────────
 step "Done"
-ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire installed (pacman)"
+ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility installed (pacman)"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 if pacman -Qq obs-studio >/dev/null 2>&1; then
     ok "OBS Studio installed"
