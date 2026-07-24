@@ -231,18 +231,28 @@ fi
 # ── Step 5: switch login manager to Ly ──────────────────────────────
 step "Switching login manager to Ly"
 
-OTHER_DMS=(gdm gdm3 sddm lightdm lxdm xdm slim entrance greetd)
-for dm in "${OTHER_DMS[@]}"; do
-    if systemctl is-enabled --quiet "$dm.service" 2>/dev/null; then
-        run_spinner "Disabling $dm" sudo systemctl disable --now "$dm.service" \
-            || warn "Could not disable $dm — you may need to do this manually"
+if ! pacman -Qq ly >/dev/null 2>&1; then
+    warn "ly package not found installed — skipping login manager switch"
+elif [ ! -e /usr/lib/systemd/system/ly@.service ] && [ ! -e /etc/systemd/system/ly@.service ]; then
+    warn "ly is installed but its systemd unit (ly@.service) wasn't found — skipping login manager switch"
+else
+    OTHER_DMS=(gdm gdm3 sddm lightdm lxdm xdm slim entrance greetd)
+    for dm in "${OTHER_DMS[@]}"; do
+        if systemctl is-enabled --quiet "$dm.service" 2>/dev/null; then
+            run_spinner "Disabling $dm" sudo systemctl disable --now "$dm.service" \
+                || warn "Could not disable $dm — you may need to do this manually"
+        fi
+    done
+
+    if systemctl is-enabled --quiet getty@tty1.service 2>/dev/null; then
+        run_spinner "Disabling getty@tty1" sudo systemctl disable --now getty@tty1.service \
+            || warn "Could not disable getty@tty1 — it may keep competing with ly@tty2 for the console"
     fi
-done
 
-run_spinner "Enabling ly" sudo systemctl enable ly@tty2.service \
-    || die "Failed to enable ly@tty2.service — is the ly package installed?"
-
-ok "Ly set as the login manager (takes effect on next reboot)"
+    run_spinner "Enabling ly" sudo systemctl enable ly@tty2.service \
+        && ok "Ly set as the login manager (takes effect on next reboot)" \
+        || warn "Failed to enable ly@tty2.service — enable it manually with: sudo systemctl enable ly@tty2.service"
+fi
 
 # ── Step 6: done ────────────────────────────────────────────────────
 step "Done"
@@ -252,7 +262,6 @@ ok "waybar config in ~/.config/waybar"
 ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
-ok "Ly enabled as login manager (other display managers disabled)"
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
