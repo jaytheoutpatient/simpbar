@@ -140,14 +140,19 @@ run_spinner "Extracting archive" \
     unzip -o /tmp/simpbar.zip -d /tmp/simpbar-temp \
     || die "Could not extract simpbar archive."
 
-if [ ! -d /tmp/simpbar-temp/simpbar-main/waybar ]; then
-    rm -rf /tmp/simpbar-temp /tmp/simpbar.zip
-    die "Downloaded archive did not contain a waybar/ directory — layout may have changed upstream."
-fi
+CONFIG_DIRS=(waybar hypr swaync)
+for d in "${CONFIG_DIRS[@]}"; do
+    if [ ! -d "/tmp/simpbar-temp/simpbar-main/$d" ]; then
+        rm -rf /tmp/simpbar-temp /tmp/simpbar.zip
+        die "Downloaded archive did not contain a $d/ directory — layout may have changed upstream."
+    fi
+done
 
-cp -r /tmp/simpbar-temp/simpbar-main/waybar ~/.config/
+for d in "${CONFIG_DIRS[@]}"; do
+    cp -r "/tmp/simpbar-temp/simpbar-main/$d" ~/.config/
+done
 rm -rf /tmp/simpbar-temp /tmp/simpbar.zip
-ok "Config placed in ~/.config/waybar"
+ok "Configs placed in ~/.config/{${CONFIG_DIRS[*]// /,}}"
 
 # ── Step 3: install packages ───────────────────────────────────────
 step "Installing packages"
@@ -163,7 +168,7 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd hyprland foot fastfetch neovim steam ly)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd hyprland foot fastfetch neovim steam ly swaync)
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
@@ -225,9 +230,11 @@ fi
 
 # ── Step 5: done ────────────────────────────────────────────────────
 step "Done"
-ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, hyprland, foot, fastfetch, neovim, steam, ly installed (pacman)"
+ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, hyprland, foot, fastfetch, neovim, steam, ly, swaync installed (pacman)"
 ok "wlogout, waypaper, protonplus installed via AUR helper (if available)"
 ok "waybar config in ~/.config/waybar"
+ok "hypr config in ~/.config/hypr"
+ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
