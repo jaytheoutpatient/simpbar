@@ -110,6 +110,48 @@ run_spinner() {
     fi
 }
 
+# Print a numbered menu, read one choice from /dev/tty, and fall back to
+# a default when input isn't available or left blank.
+#   prompt_choice RESULT_VAR DEFAULT "Question?" "Option 1" "Option 2" ...
+# RESULT_VAR is set to the chosen number (as a string), or DEFAULT.
+prompt_choice() {
+    local result_var="$1" default="$2" question="$3"; shift 3
+    local n=1 opt choice
+
+    printf '\n  %s%s%s\n' "$C_YELLOW" "$question" "$C_RESET"
+    for opt in "$@"; do
+        printf '    %s%d)%s %s\n' "$C_CYAN" "$n" "$C_RESET" "$opt"
+        n=$((n + 1))
+    done
+    printf '  %sChoice [%s]: %s' "$C_BOLD" "$default" "$C_RESET"
+
+    if [ -r /dev/tty ]; then
+        read -r choice < /dev/tty
+    else
+        warn "No interactive terminal available — defaulting to option $default"
+        choice="$default"
+    fi
+    [ -z "$choice" ] && choice="$default"
+
+    printf -v "$result_var" '%s' "$choice"
+}
+
+# Try installing an AUR package with whichever helper is available.
+# install_aur_pkg <display name> <package>
+install_aur_pkg() {
+    local name="$1" pkg="$2"
+    if command -v yay >/dev/null; then
+        run_spinner "yay: $pkg (AUR)" yay -S --noconfirm --needed "$pkg" \
+            || { warn "Could not install $name via yay — install manually: yay -S $pkg"; return 1; }
+    elif command -v paru >/dev/null; then
+        run_spinner "paru: $pkg (AUR)" paru -S --noconfirm --needed "$pkg" \
+            || { warn "Could not install $name via paru — install manually: paru -S $pkg"; return 1; }
+    else
+        warn "No AUR helper available — install $name manually: yay -S $pkg"
+        return 1
+    fi
+}
+
 banner
 
 # ── Step 0: platform check ─────────────────────────────────────────
@@ -170,65 +212,29 @@ fi
 
 PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility)
 
-printf '\n  %sWill you be using OBS Studio for recording/streaming?%s\n' "$C_YELLOW" "$C_RESET"
-printf '    %s1)%s Yes\n' "$C_CYAN" "$C_RESET"
-printf '    %s2)%s No\n'  "$C_CYAN" "$C_RESET"
-printf '  %sChoice [2]: %s' "$C_BOLD" "$C_RESET"
-if [ -r /dev/tty ]; then
-    read -r OBS_CHOICE < /dev/tty
-else
-    warn "No interactive terminal available — skipping OBS Studio"
-    OBS_CHOICE=2
-fi
+prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
+[ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
 
-case "$OBS_CHOICE" in
-    1)
-        PACMAN_PKGS+=(obs-studio)
-        ;;
-    2|""|*)
-        ;;
-esac
-
-printf '\n  %sWould you like to install any game launchers?%s\n' "$C_YELLOW" "$C_RESET"
-printf '    %s1)%s Lutris\n'  "$C_CYAN" "$C_RESET"
-printf '    %s2)%s Heroic\n'  "$C_CYAN" "$C_RESET"
-printf '    %s3)%s Both\n'    "$C_CYAN" "$C_RESET"
-printf '    %s4)%s Neither\n' "$C_CYAN" "$C_RESET"
-printf '  %sChoice [4]: %s' "$C_BOLD" "$C_RESET"
-if [ -r /dev/tty ]; then
-    read -r LAUNCHER_CHOICE < /dev/tty
-else
-    warn "No interactive terminal available — skipping game launchers"
-    LAUNCHER_CHOICE=4
-fi
+prompt_choice LAUNCHER_CHOICE 4 "Would you like to install any game launchers?" \
+    "Lutris" "Heroic" "Both" "Neither"
 
 INSTALL_HEROIC=0
 case "$LAUNCHER_CHOICE" in
     1) PACMAN_PKGS+=(lutris) ;;
     2) INSTALL_HEROIC=1 ;;
     3) PACMAN_PKGS+=(lutris); INSTALL_HEROIC=1 ;;
-    4|""|*) ;;
+    *) ;;
 esac
 
-printf '\n  %sWhich Discord client would you like to install?%s\n' "$C_YELLOW" "$C_RESET"
-printf '    %s1)%s Discord\n' "$C_CYAN" "$C_RESET"
-printf '    %s2)%s Vesktop\n' "$C_CYAN" "$C_RESET"
-printf '    %s3)%s Equibop\n' "$C_CYAN" "$C_RESET"
-printf '    %s4)%s Skip — don'"'"'t install a Discord client\n' "$C_CYAN" "$C_RESET"
-printf '  %sChoice [4]: %s' "$C_BOLD" "$C_RESET"
-if [ -r /dev/tty ]; then
-    read -r DISCORD_CHOICE < /dev/tty
-else
-    warn "No interactive terminal available — skipping Discord client"
-    DISCORD_CHOICE=4
-fi
+prompt_choice DISCORD_CHOICE 4 "Which Discord client would you like to install?" \
+    "Discord" "Vesktop" "Equibop" "Skip — don't install a Discord client"
 
 DISCORD_AUR_PKG=""
 case "$DISCORD_CHOICE" in
     1) DISCORD_NAME="Discord"; PACMAN_PKGS+=(discord) ;;
     2) DISCORD_NAME="Vesktop"; DISCORD_AUR_PKG="vesktop-bin" ;;
     3) DISCORD_NAME="Equibop"; DISCORD_AUR_PKG="equibop-bin" ;;
-    4|""|*) DISCORD_NAME="" ;;
+    *) DISCORD_NAME="" ;;
 esac
 
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
@@ -275,27 +281,11 @@ AUR_PKGS=(wlogout waypaper protonplus)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 
 if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
-    printf '\n  %sNo AUR helper found. Install which one?%s\n' "$C_YELLOW" "$C_RESET"
-    printf '    %s1)%s yay\n'  "$C_CYAN" "$C_RESET"
-    printf '    %s2)%s paru\n' "$C_CYAN" "$C_RESET"
-    printf '    %s3)%s skip\n' "$C_CYAN" "$C_RESET"
-    printf '  %sChoice [1]: %s' "$C_BOLD" "$C_RESET"
-    if [ -r /dev/tty ]; then
-        read -r AUR_CHOICE < /dev/tty
-    else
-        warn "No interactive terminal available — defaulting to yay"
-        AUR_CHOICE=1
-    fi
+    prompt_choice AUR_CHOICE 1 "No AUR helper found. Install which one?" "yay" "paru" "skip"
     case "$AUR_CHOICE" in
-        2)
-            install_paru || warn "Could not install paru automatically — install manually: ${AUR_PKGS[*]}"
-            ;;
-        3)
-            warn "Skipping AUR helper install — install manually: ${AUR_PKGS[*]}"
-            ;;
-        1|"")
-            install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}"
-            ;;
+        2) install_paru || warn "Could not install paru automatically — install manually: ${AUR_PKGS[*]}" ;;
+        3) warn "Skipping AUR helper install — install manually: ${AUR_PKGS[*]}" ;;
+        1) install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}" ;;
         *)
             warn "Unrecognized choice — defaulting to yay"
             install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}"
@@ -326,20 +316,8 @@ fi
 # ── Step 4: choose a browser ─────────────────────────────────────────
 step "Choosing a browser"
 
-printf '\n  %sWhich browser would you like to install?%s\n' "$C_YELLOW" "$C_RESET"
-printf '    %s1)%s Brave\n' "$C_CYAN" "$C_RESET"
-printf '    %s2)%s Zen Browser\n' "$C_CYAN" "$C_RESET"
-printf '    %s3)%s Vivaldi\n' "$C_CYAN" "$C_RESET"
-printf '    %s4)%s Microsoft Edge\n' "$C_CYAN" "$C_RESET"
-printf '    %s5)%s LibreWolf\n' "$C_CYAN" "$C_RESET"
-printf '    %s6)%s Skip — don'"'"'t install a browser\n' "$C_CYAN" "$C_RESET"
-printf '  %sChoice [6]: %s' "$C_BOLD" "$C_RESET"
-if [ -r /dev/tty ]; then
-    read -r BROWSER_CHOICE < /dev/tty
-else
-    warn "No interactive terminal available — skipping browser install"
-    BROWSER_CHOICE=6
-fi
+prompt_choice BROWSER_CHOICE 6 "Which browser would you like to install?" \
+    "Brave" "Zen Browser" "Vivaldi" "Microsoft Edge" "LibreWolf" "Skip — don't install a browser"
 
 case "$BROWSER_CHOICE" in
     1) BROWSER_NAME="Brave";          BROWSER_PKG="brave-bin" ;;
@@ -347,19 +325,13 @@ case "$BROWSER_CHOICE" in
     3) BROWSER_NAME="Vivaldi";        BROWSER_PKG="vivaldi" ;;
     4) BROWSER_NAME="Microsoft Edge"; BROWSER_PKG="microsoft-edge-stable-bin" ;;
     5) BROWSER_NAME="LibreWolf";      BROWSER_PKG="librewolf-bin" ;;
-    6|""|*) BROWSER_NAME=""; BROWSER_PKG="" ;;
+    *) BROWSER_NAME=""; BROWSER_PKG="" ;;
 esac
 
 if [ -z "$BROWSER_NAME" ]; then
     warn "Skipping browser install, as requested"
-elif command -v yay >/dev/null; then
-    run_spinner "yay: $BROWSER_PKG (AUR)" yay -S --noconfirm --needed "$BROWSER_PKG" \
-        || warn "Could not install $BROWSER_NAME via yay — install manually: yay -S $BROWSER_PKG"
-elif command -v paru >/dev/null; then
-    run_spinner "paru: $BROWSER_PKG (AUR)" paru -S --noconfirm --needed "$BROWSER_PKG" \
-        || warn "Could not install $BROWSER_NAME via paru — install manually: paru -S $BROWSER_PKG"
 else
-    warn "No AUR helper available — install $BROWSER_NAME manually: yay -S $BROWSER_PKG"
+    install_aur_pkg "$BROWSER_NAME" "$BROWSER_PKG"
 fi
 
 if [ -n "$BROWSER_PKG" ] && pacman -Qq "$BROWSER_PKG" >/dev/null 2>&1; then
@@ -368,28 +340,15 @@ fi
 
 # Firefox often ships preinstalled — ask before touching it.
 if pacman -Qq firefox >/dev/null 2>&1; then
-    printf '\n  %sFirefox is currently installed. Keep it or remove it?%s\n' "$C_YELLOW" "$C_RESET"
-    printf '    %s1)%s Keep Firefox\n'   "$C_CYAN" "$C_RESET"
-    printf '    %s2)%s Remove Firefox\n' "$C_CYAN" "$C_RESET"
-    printf '  %sChoice [1]: %s' "$C_BOLD" "$C_RESET"
-    if [ -r /dev/tty ]; then
-        read -r FIREFOX_CHOICE < /dev/tty
-    else
-        warn "No interactive terminal available — keeping Firefox"
-        FIREFOX_CHOICE=1
-    fi
-
+    prompt_choice FIREFOX_CHOICE 1 "Firefox is currently installed. Keep it or remove it?" \
+        "Keep Firefox" "Remove Firefox"
     case "$FIREFOX_CHOICE" in
         2)
             run_spinner "Removing Firefox" sudo pacman -Rns --noconfirm firefox \
                 || warn "Could not remove Firefox — remove it manually: sudo pacman -Rns firefox"
             ;;
-        1|"")
-            ok "Keeping Firefox"
-            ;;
-        *)
-            warn "Unrecognized choice — keeping Firefox"
-            ;;
+        1) ok "Keeping Firefox" ;;
+        *) warn "Unrecognized choice — keeping Firefox" ;;
     esac
 fi
 
