@@ -13,7 +13,7 @@ else
     C_RESET=""; C_BOLD=""; C_BLUE=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_CYAN=""
 fi
 
-TOTAL_STEPS=5
+TOTAL_STEPS=6
 STEP=0
 
 banner() {
@@ -228,7 +228,23 @@ else
         || warn "Could not clone LazyVim starter — install manually: https://www.lazyvim.org/installation"
 fi
 
-# ── Step 5: done ────────────────────────────────────────────────────
+# ── Step 5: switch login manager to Ly ──────────────────────────────
+step "Switching login manager to Ly"
+
+OTHER_DMS=(gdm gdm3 sddm lightdm lxdm xdm slim entrance greetd)
+for dm in "${OTHER_DMS[@]}"; do
+    if systemctl is-enabled --quiet "$dm.service" 2>/dev/null; then
+        run_spinner "Disabling $dm" sudo systemctl disable --now "$dm.service" \
+            || warn "Could not disable $dm — you may need to do this manually"
+    fi
+done
+
+run_spinner "Enabling ly" sudo systemctl enable ly.service \
+    || die "Failed to enable ly.service — is the ly package installed?"
+
+ok "Ly set as the login manager (takes effect on next reboot)"
+
+# ── Step 6: done ────────────────────────────────────────────────────
 step "Done"
 ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, hyprland, foot, fastfetch, neovim, steam, ly, swaync, rofi installed (pacman)"
 ok "wlogout, waypaper, protonplus installed via AUR helper (if available)"
@@ -236,6 +252,7 @@ ok "waybar config in ~/.config/waybar"
 ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
+ok "Ly enabled as login manager (other display managers disabled)"
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
