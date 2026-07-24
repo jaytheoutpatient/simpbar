@@ -10,6 +10,14 @@ Originally this about just a waybar configuration till I noticed this is becomin
 
 There is a install script below do know this only works for archlinux atm <br>
 but will try make it work for other Linux distributions! <br>
+The install script is going to ask some questions like ask if you are going <br>
+to use obs-studio, what browser would you like to use, it will detect that you are using <br>
+Firefox and ask if you want to remove or keep it, And what discord client you want <br>
+such as discord, vesktop or equibop. It's going to give you also flatpak and bazaar <br>
+
+<b> Just a warning </b> <br>
+It is going to be jank this is still a wip but I can gurantee it's not going to <br>
+mess your system up! 
 
 It will install the dependencies such as: <br>
 1. Waybar
