@@ -13,7 +13,7 @@ else
     C_RESET=""; C_BOLD=""; C_BLUE=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_CYAN=""
 fi
 
-TOTAL_STEPS=5
+TOTAL_STEPS=6
 STEP=0
 
 banner() {
@@ -168,7 +168,7 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber)
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
@@ -181,6 +181,17 @@ if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
 else
     ok "Verified all pacman packages are installed"
 fi
+
+run_spinner "Refreshing font cache" fc-cache -f \
+    || warn "Could not refresh the font cache — run 'fc-cache -f' manually if icons look missing"
+
+# Enable the pipewire audio stack as user services so pavucontrol has
+# something to control without needing a reboot/relogin first.
+PIPEWIRE_UNITS=(pipewire.socket pipewire-pulse.socket wireplumber.service)
+for unit in "${PIPEWIRE_UNITS[@]}"; do
+    run_spinner "Enabling $unit" systemctl --user enable --now "$unit" \
+        || warn "Could not enable $unit — enable it manually: systemctl --user enable --now $unit"
+done
 
 run_spinner "Adding Flathub remote" \
     flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo \
@@ -248,7 +259,73 @@ else
     ok "Verified all AUR packages are installed"
 fi
 
-# ── Step 4: LazyVim ─────────────────────────────────────────────────
+# ── Step 4: choose a browser ─────────────────────────────────────────
+step "Choosing a browser"
+
+printf '\n  %sWhich browser would you like to install?%s\n' "$C_YELLOW" "$C_RESET"
+printf '    %s1)%s Brave\n' "$C_CYAN" "$C_RESET"
+printf '    %s2)%s Zen Browser\n' "$C_CYAN" "$C_RESET"
+printf '    %s3)%s Vivaldi\n' "$C_CYAN" "$C_RESET"
+printf '    %s4)%s Skip — don'"'"'t install a browser\n' "$C_CYAN" "$C_RESET"
+printf '  %sChoice [4]: %s' "$C_BOLD" "$C_RESET"
+if [ -r /dev/tty ]; then
+    read -r BROWSER_CHOICE < /dev/tty
+else
+    warn "No interactive terminal available — skipping browser install"
+    BROWSER_CHOICE=4
+fi
+
+case "$BROWSER_CHOICE" in
+    1) BROWSER_NAME="Brave";       BROWSER_PKG="brave-bin" ;;
+    2) BROWSER_NAME="Zen Browser"; BROWSER_PKG="zen-browser-bin" ;;
+    3) BROWSER_NAME="Vivaldi";     BROWSER_PKG="vivaldi" ;;
+    4|""|*) BROWSER_NAME=""; BROWSER_PKG="" ;;
+esac
+
+if [ -z "$BROWSER_NAME" ]; then
+    warn "Skipping browser install, as requested"
+elif command -v yay >/dev/null; then
+    run_spinner "yay: $BROWSER_PKG (AUR)" yay -S --noconfirm --needed "$BROWSER_PKG" \
+        || warn "Could not install $BROWSER_NAME via yay — install manually: yay -S $BROWSER_PKG"
+elif command -v paru >/dev/null; then
+    run_spinner "paru: $BROWSER_PKG (AUR)" paru -S --noconfirm --needed "$BROWSER_PKG" \
+        || warn "Could not install $BROWSER_NAME via paru — install manually: paru -S $BROWSER_PKG"
+else
+    warn "No AUR helper available — install $BROWSER_NAME manually: yay -S $BROWSER_PKG"
+fi
+
+if [ -n "$BROWSER_PKG" ] && pacman -Qq "$BROWSER_PKG" >/dev/null 2>&1; then
+    ok "$BROWSER_NAME installed"
+fi
+
+# Firefox often ships preinstalled — ask before touching it.
+if pacman -Qq firefox >/dev/null 2>&1; then
+    printf '\n  %sFirefox is currently installed. Keep it or remove it?%s\n' "$C_YELLOW" "$C_RESET"
+    printf '    %s1)%s Keep Firefox\n'   "$C_CYAN" "$C_RESET"
+    printf '    %s2)%s Remove Firefox\n' "$C_CYAN" "$C_RESET"
+    printf '  %sChoice [1]: %s' "$C_BOLD" "$C_RESET"
+    if [ -r /dev/tty ]; then
+        read -r FIREFOX_CHOICE < /dev/tty
+    else
+        warn "No interactive terminal available — keeping Firefox"
+        FIREFOX_CHOICE=1
+    fi
+
+    case "$FIREFOX_CHOICE" in
+        2)
+            run_spinner "Removing Firefox" sudo pacman -Rns --noconfirm firefox \
+                || warn "Could not remove Firefox — remove it manually: sudo pacman -Rns firefox"
+            ;;
+        1|"")
+            ok "Keeping Firefox"
+            ;;
+        *)
+            warn "Unrecognized choice — keeping Firefox"
+            ;;
+    esac
+fi
+
+# ── Step 5: LazyVim ─────────────────────────────────────────────────
 step "Setting up LazyVim"
 
 if [ -e ~/.config/nvim ]; then
@@ -262,12 +339,18 @@ else
         || warn "Could not clone LazyVim starter — install manually: https://www.lazyvim.org/installation"
 fi
 
-# ── Step 5: done ────────────────────────────────────────────────────
+# ── Step 6: done ────────────────────────────────────────────────────
 step "Done"
-ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look installed (pacman)"
+ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire installed (pacman)"
+ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 ok "Flathub remote added for flatpak/bazaar"
 ok "nwg-look set to prefer dark theme"
 ok "wlogout, waypaper, protonplus installed via AUR helper (if available)"
+if [ -n "$BROWSER_NAME" ]; then
+    ok "$BROWSER_NAME installed via AUR helper (if available)"
+else
+    ok "Browser install skipped, as requested"
+fi
 ok "waybar config in ~/.config/waybar"
 ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
