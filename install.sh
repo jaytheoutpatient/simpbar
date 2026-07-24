@@ -13,7 +13,7 @@ else
     C_RESET=""; C_BOLD=""; C_BLUE=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_CYAN=""
 fi
 
-TOTAL_STEPS=6
+TOTAL_STEPS=5
 STEP=0
 
 banner() {
@@ -168,7 +168,7 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look)
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
@@ -185,6 +185,16 @@ fi
 run_spinner "Adding Flathub remote" \
     flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo \
     || warn "Could not add Flathub remote — add it manually: flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo"
+
+# nwg-look reads/writes gsettings directly (no private config file), so setting
+# these keys ourselves has the same effect as toggling "Prefer dark" in its GUI.
+if command -v gsettings >/dev/null; then
+    run_spinner "Setting nwg-look theme to prefer dark" \
+        gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' \
+        || warn "Could not set dark theme preference — toggle 'Prefer dark' manually in nwg-look"
+else
+    warn "gsettings not found — open nwg-look and toggle 'Prefer dark' manually"
+fi
 
 # wlogout, waypaper & protonplus are AUR-only — need an AUR helper
 AUR_PKGS=(wlogout waypaper protonplus)
@@ -252,76 +262,12 @@ else
         || warn "Could not clone LazyVim starter — install manually: https://www.lazyvim.org/installation"
 fi
 
-# ── Step 5: choose & switch login manager ───────────────────────────
-step "Choosing a login manager"
-
-printf '\n  %sWhich login manager would you like to use?%s\n' "$C_YELLOW" "$C_RESET"
-printf '    %s1)%s Ly (lightweight TUI)\n' "$C_CYAN" "$C_RESET"
-printf '    %s2)%s SDDM\n' "$C_CYAN" "$C_RESET"
-printf '    %s3)%s GDM\n' "$C_CYAN" "$C_RESET"
-printf '    %s4)%s LightDM\n' "$C_CYAN" "$C_RESET"
-printf '    %s5)%s Skip — don'"'"'t touch my login manager\n' "$C_CYAN" "$C_RESET"
-printf '  %sChoice [1]: %s' "$C_BOLD" "$C_RESET"
-if [ -r /dev/tty ]; then
-    read -r LM_CHOICE < /dev/tty
-else
-    warn "No interactive terminal available — defaulting to Ly"
-    LM_CHOICE=1
-fi
-
-case "$LM_CHOICE" in
-    2) LM_NAME="SDDM";    LM_PKGS=(sddm);                     LM_SERVICE="sddm.service" ;;
-    3) LM_NAME="GDM";     LM_PKGS=(gdm);                      LM_SERVICE="gdm.service" ;;
-    4) LM_NAME="LightDM"; LM_PKGS=(lightdm lightdm-gtk-greeter); LM_SERVICE="lightdm.service" ;;
-    5) LM_NAME="";        LM_PKGS=();                         LM_SERVICE="" ;;
-    1|"") LM_NAME="Ly";   LM_PKGS=(ly);                       LM_SERVICE="ly@tty2.service" ;;
-    *) warn "Unrecognized choice — defaulting to Ly"
-       LM_NAME="Ly"; LM_PKGS=(ly); LM_SERVICE="ly@tty2.service" ;;
-esac
-
-if [ -z "$LM_NAME" ]; then
-    warn "Skipping login manager setup, as requested"
-else
-    run_spinner "pacman: ${LM_PKGS[*]}" sudo pacman -S --noconfirm --needed "${LM_PKGS[@]}" \
-        || die "Failed to install $LM_NAME (${LM_PKGS[*]})"
-
-    LM_MISSING=()
-    for pkg in "${LM_PKGS[@]}"; do
-        pacman -Qq "$pkg" >/dev/null 2>&1 || LM_MISSING+=("$pkg")
-    done
-
-    if [ "${#LM_MISSING[@]}" -gt 0 ]; then
-        warn "$LM_NAME package(s) not actually installed (${LM_MISSING[*]}) — skipping the switch"
-    else
-        OTHER_DMS=(gdm gdm3 sddm lightdm lxdm xdm slim entrance greetd ly)
-        for dm in "${OTHER_DMS[@]}"; do
-            [ "$dm" = "${LM_PKGS[0]}" ] && continue
-            if systemctl is-enabled --quiet "$dm.service" 2>/dev/null; then
-                run_spinner "Disabling $dm" sudo systemctl disable --now "$dm.service" \
-                    || warn "Could not disable $dm — you may need to do this manually"
-            fi
-        done
-        if [ "$LM_NAME" = "Ly" ] && systemctl is-enabled --quiet getty@tty1.service 2>/dev/null; then
-            run_spinner "Disabling getty@tty1" sudo systemctl disable --now getty@tty1.service \
-                || warn "Could not disable getty@tty1 — it may keep competing with ly@tty2 for the console"
-        fi
-
-        run_spinner "Enabling $LM_NAME" sudo systemctl enable "$LM_SERVICE" \
-            && ok "$LM_NAME set as the login manager (takes effect on next reboot)" \
-            || warn "Failed to enable $LM_SERVICE — enable it manually with: sudo systemctl enable $LM_SERVICE"
-    fi
-fi
-
-# ── Step 6: done ────────────────────────────────────────────────────
+# ── Step 5: done ────────────────────────────────────────────────────
 step "Done"
-ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar installed (pacman)"
+ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look installed (pacman)"
 ok "Flathub remote added for flatpak/bazaar"
+ok "nwg-look set to prefer dark theme"
 ok "wlogout, waypaper, protonplus installed via AUR helper (if available)"
-if [ -n "$LM_NAME" ]; then
-    ok "$LM_NAME installed and set as login manager"
-else
-    ok "Login manager setup skipped, as requested"
-fi
 ok "waybar config in ~/.config/waybar"
 ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
