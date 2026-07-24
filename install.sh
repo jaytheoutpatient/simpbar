@@ -168,7 +168,7 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd hyprland foot fastfetch neovim steam ly swaync)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd hyprland foot fastfetch neovim steam ly swaync rofi)
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
@@ -230,7 +230,7 @@ fi
 
 # ── Step 5: done ────────────────────────────────────────────────────
 step "Done"
-ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, hyprland, foot, fastfetch, neovim, steam, ly, swaync installed (pacman)"
+ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, hyprland, foot, fastfetch, neovim, steam, ly, swaync, rofi installed (pacman)"
 ok "wlogout, waypaper, protonplus installed via AUR helper (if available)"
 ok "waybar config in ~/.config/waybar"
 ok "hypr config in ~/.config/hypr"
