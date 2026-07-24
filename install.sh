@@ -13,7 +13,7 @@ else
     C_RESET=""; C_BOLD=""; C_BLUE=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_CYAN=""
 fi
 
-TOTAL_STEPS=4
+TOTAL_STEPS=5
 STEP=0
 
 banner() {
@@ -152,12 +152,23 @@ ok "Config placed in ~/.config/waybar"
 # ── Step 3: install packages ───────────────────────────────────────
 step "Installing packages"
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd)
+# Steam lives in the multilib repo, which isn't enabled by default.
+if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
+    warn "multilib repo not enabled — enabling it for Steam"
+    sudo sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /etc/pacman.conf
+    if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
+        printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
+    fi
+    run_spinner "Syncing package databases" sudo pacman -Sy \
+        || die "Failed to sync package databases after enabling multilib."
+fi
+
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd hyprland foot fastfetch neovim steam ly)
 run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
-# wlogout & waypaper are AUR-only — need an AUR helper
-AUR_PKGS=(wlogout waypaper)
+# wlogout, waypaper & protonplus are AUR-only — need an AUR helper
+AUR_PKGS=(wlogout waypaper protonplus)
 
 if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
     printf '\n  %sNo AUR helper found. Install which one?%s\n' "$C_YELLOW" "$C_RESET"
@@ -198,11 +209,26 @@ else
     warn "No AUR helper available — install manually: yay -S ${AUR_PKGS[*]}"
 fi
 
-# ── Step 4: done ────────────────────────────────────────────────────
+# ── Step 4: LazyVim ─────────────────────────────────────────────────
+step "Setting up LazyVim"
+
+if [ -e ~/.config/nvim ]; then
+    warn "~/.config/nvim already exists — skipping LazyVim install (back it up and re-run to install fresh)"
+else
+    for d in ~/.local/share/nvim ~/.local/state/nvim ~/.cache/nvim; do
+        [ -e "$d" ] && mv "$d" "$d.bak.$(date +%s)"
+    done
+    run_spinner "Cloning LazyVim starter" git clone --quiet https://github.com/LazyVim/starter ~/.config/nvim \
+        && rm -rf ~/.config/nvim/.git \
+        || warn "Could not clone LazyVim starter — install manually: https://www.lazyvim.org/installation"
+fi
+
+# ── Step 5: done ────────────────────────────────────────────────────
 step "Done"
-ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font installed (pacman)"
-ok "wlogout, waypaper installed via AUR helper (if available)"
+ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, hyprland, foot, fastfetch, neovim, steam, ly installed (pacman)"
+ok "wlogout, waypaper, protonplus installed via AUR helper (if available)"
 ok "waybar config in ~/.config/waybar"
+ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
