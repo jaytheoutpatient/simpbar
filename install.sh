@@ -229,6 +229,26 @@ PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mon
 prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
 [ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
 
+VIDEO_EDITOR_AUR_PKG=""
+prompt_choice VIDEO_EDITOR_YN 2 "Would you like to install a video editor?" "Yes" "No"
+if [ "$VIDEO_EDITOR_YN" = 1 ]; then
+    prompt_choice VIDEO_EDITOR_CHOICE 1 "Which video editor would you like to install?" \
+        "Kdenlive" "Shotcut" "Flowblade" "DaVinci Resolve"
+    case "$VIDEO_EDITOR_CHOICE" in
+        1) VIDEO_EDITOR_NAME="Kdenlive";       PACMAN_PKGS+=(kdenlive) ;;
+        2) VIDEO_EDITOR_NAME="Shotcut";        PACMAN_PKGS+=(shotcut) ;;
+        3) VIDEO_EDITOR_NAME="Flowblade";      PACMAN_PKGS+=(flowblade) ;;
+        4)
+            VIDEO_EDITOR_NAME="DaVinci Resolve"
+            VIDEO_EDITOR_AUR_PKG="davinci-resolve"
+            warn "DaVinci Resolve's AUR package sometimes needs Blackmagic's installer downloaded manually first (EULA) — if the AUR install below fails, see: https://aur.archlinux.org/packages/davinci-resolve"
+            ;;
+        *) VIDEO_EDITOR_NAME="" ;;
+    esac
+else
+    VIDEO_EDITOR_NAME=""
+fi
+
 prompt_choice LAUNCHER_CHOICE 4 "Would you like to install any game launchers?" \
     "Lutris" "Heroic" "Both" "Neither"
 
@@ -293,6 +313,7 @@ fi
 AUR_PKGS=(wlogout waypaper protonplus)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
+[ -n "$VIDEO_EDITOR_AUR_PKG" ] && AUR_PKGS+=("$VIDEO_EDITOR_AUR_PKG")
 
 if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
     prompt_choice AUR_CHOICE 1 "No AUR helper found. Install which one?" "yay" "paru" "skip"
@@ -386,6 +407,11 @@ ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Fo
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 if pacman -Qq obs-studio >/dev/null 2>&1; then
     ok "OBS Studio installed"
+fi
+if [ -n "$VIDEO_EDITOR_NAME" ]; then
+    ok "$VIDEO_EDITOR_NAME installed"
+else
+    ok "Video editor install skipped, as requested"
 fi
 if pacman -Qq lutris >/dev/null 2>&1; then
     ok "Lutris installed"
