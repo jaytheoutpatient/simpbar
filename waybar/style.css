@@ -1,6 +1,6 @@
 
 * {
-    font-family: JetBrainsMonoNL;
+    font-family: JetBrainsMonoNLNerdFontRegular;
     font-size: 14px;  /* Slightly smaller font size */
 }
 /* The whole bar */
@@ -301,6 +301,21 @@ label:focus {
 #tray > .needs-attention {
     -gtk-icon-effect: highlight;
     background-color: #eb4d4b;
+}
+
+/* Collapsible tray drawer */
+#custom-tray-toggle {
+    color: rgba(220,220,220,1);
+    padding: 0 6px;
+}
+
+#custom-tray-toggle:hover {
+    color: rgba(220,220,220,1);
+    background-color: rgba(69,69,69,0.5);
+}
+
+.tray-group-item {
+    padding: 0 2px;
 }
 
 #idle_inhibitor {

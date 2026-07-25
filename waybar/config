@@ -19,7 +19,7 @@
 
     "modules-left": [
         "hyprland/workspaces",
-        "custom/media"
+        "mpris"
     ],
     "modules-center": [
               "custom/rofi",
@@ -29,7 +29,7 @@
     ],
     "modules-right": [
          "custom/waypaper",
-         "tray",
+         "group/tray-expander",
          "custom/power"
     ],
 
@@ -375,5 +375,45 @@
     "tray": {
         "icon-size": 12,
         "spacing": 4
+    },
+
+    "group/tray-expander": {
+        "orientation": "horizontal",
+        "drawer": {
+            "transition-duration": 400,
+            "children-class": "tray-group-item",
+            "transition-left-to-right": false,
+            "click-to-reveal": true
+        },
+        "modules": [
+            "custom/tray-toggle",
+            "tray"
+        ]
+    },
+
+    "custom/tray-toggle": {
+        "format": "▾",
+        "tooltip": false
+    },
+
+    "mpris": {
+        "format": "{dynamic}",
+        "format-paused": "<i>{dynamic}</i>",
+        "player-icons": {
+            "default": "▶",
+            "spotify": "",
+            "firefox": "",
+            "mpv": ""
+        },
+        "status-icons": {
+            "paused": "⏸",
+            "playing": "▶"
+        },
+        "ignored-players": ["firefox"],
+        "tooltip": false,
+        "tooltip-format": "{artist} - {title}",
+        "on-click": "playerctl play-pause",
+        "on-scroll-up": "playerctl next",
+        "on-scroll-down": "playerctl previous"
     }
 }
