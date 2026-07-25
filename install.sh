@@ -360,7 +360,7 @@ EOF
 fi
 
 # wlogout, waypaper & protonplus are AUR-only — need an AUR helper
-AUR_PKGS=(wlogout waypaper protonplus)
+AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 
@@ -396,6 +396,33 @@ if [ "${#MISSING_AUR[@]}" -gt 0 ]; then
     warn "AUR packages not installed: ${MISSING_AUR[*]} — install manually if needed"
 else
     ok "Verified all AUR packages are installed"
+fi
+
+# Apply the Dracula GTK + icon theme (both ship in the same package) and
+# the Bibata cursor theme, now that they're actually installed. This uses
+# the same gsettings mechanism nwg-look reads/writes, so it shows up as
+# already selected there too.
+if pacman -Qq dracula-gtk-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
+    run_spinner "Applying Dracula GTK theme" \
+        gsettings set org.gnome.desktop.interface gtk-theme 'Dracula' \
+        || warn "Could not apply the Dracula GTK theme — select it manually in nwg-look"
+    run_spinner "Applying Dracula icon theme" \
+        gsettings set org.gnome.desktop.interface icon-theme 'Dracula' \
+        || warn "Could not apply the Dracula icon theme — select it manually in nwg-look"
+elif ! pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
+    warn "dracula-gtk-theme isn't installed — skipping GTK/icon theme apply"
+else
+    warn "gsettings not found — select the Dracula theme manually in nwg-look"
+fi
+
+if pacman -Qq bibata-cursor-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
+    run_spinner "Applying Bibata Modern Classic cursor" \
+        gsettings set org.gnome.desktop.interface cursor-theme 'Bibata-Modern-Classic' \
+        || warn "Could not apply the cursor theme — select it manually in nwg-look"
+elif ! pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
+    warn "bibata-cursor-theme isn't installed — skipping cursor theme apply"
+else
+    warn "gsettings not found — select the Bibata cursor theme manually in nwg-look"
 fi
 
 # ── Step 4: choose a browser ─────────────────────────────────────────
@@ -476,6 +503,12 @@ else
 fi
 ok "Flathub remote added for flatpak/bazaar"
 ok "nwg-look set to prefer dark theme"
+if pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
+    ok "Dracula GTK + icon theme installed and applied"
+fi
+if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
+    ok "Bibata Modern Classic cursor installed and applied"
+fi
 if [ -e ~/.config/rofi/config.rasi ]; then
     ok "rofi configured with the Material theme"
 fi
@@ -500,7 +533,7 @@ printf '  %s/usr/lib/mate-polkit/polkit-mate-authentication-agent-1 &%s   # need
 printf '\n%sKeybindings:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %sSUPER%s                    = Windows key\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + Enter%s            = Open terminal\n' "$C_CYAN" "$C_RESET"
-printf '  %sSUPER + Space%s                = Open Rofi\n' "$C_CYAN" "$C_RESET"
+printf '  %sSUPER + R%s                = Open Rofi\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + E%s                = Open Nautilus\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + Q%s                = Exit the application\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + [1-0]%s            = Switch workspaces\n' "$C_CYAN" "$C_RESET"
