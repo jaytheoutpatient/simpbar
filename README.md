@@ -15,6 +15,15 @@ to use obs-studio, what browser would you like to use, it will detect that you a
 Firefox and ask if you want to remove or keep it, And what discord client you want <br>
 such as discord, vesktop or equibop. It's going to give you also flatpak and bazaar <br>
 
+
+<b>Waybar</b> <br>
+The waybar comes with workspaces you can scroll up or down to scroll<br>
+, Media Player as whatever music you are playing spotify youtube etc will show up<br>
+, A menu button which will bring up the rofi menu scroll and click what you need<br>
+ or type & search what you need, Weather, Time & date if you click on it the gnome calendar app will spawn in the middle<br>
+  of the screen, A collapsible tray with a arrow icon click on it to reveal the volume or change wallpaper and finally a power<br>
+   button click on it to access the wlogout menu.
+
 <b> Just a warning </b> <br>
 It is going to be jank this is still a wip but I can gurantee it's not going to <br>
 mess your system up! 
