@@ -14,7 +14,7 @@ else
     C_RESET=""; C_BOLD=""; C_BLUE=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_CYAN=""; C_MAGENTA=""
 fi
 
-TOTAL_STEPS=6
+TOTAL_STEPS=7
 STEP=0
 
 banner() {
@@ -246,7 +246,35 @@ done
 rm -rf /tmp/simpbar-temp /tmp/simpbar.zip
 ok "Configs placed in ~/.config/{${CONFIG_DIRS[*]// /,}}"
 
-# ── Step 3: install packages ───────────────────────────────────────
+# ── Step 3: set up Chaotic-AUR ───────────────────────────────────────
+step "Setting up Chaotic-AUR"
+
+if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
+    ok "Chaotic-AUR already configured"
+else
+    run_spinner "Importing Chaotic-AUR signing key" \
+        sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com \
+        || die "Failed to import the Chaotic-AUR signing key."
+
+    run_spinner "Trusting Chaotic-AUR signing key" \
+        sudo pacman-key --lsign-key 3056513887B78AEB \
+        || die "Failed to locally sign the Chaotic-AUR key."
+
+    run_spinner "Installing Chaotic-AUR keyring & mirrorlist" \
+        sudo pacman -U --noconfirm \
+            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
+            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
+        || die "Failed to install the Chaotic-AUR keyring/mirrorlist packages."
+
+    printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
+
+    run_spinner "Syncing package databases" sudo pacman -Sy \
+        || die "Failed to sync package databases after enabling Chaotic-AUR."
+
+    ok "Chaotic-AUR enabled"
+fi
+
+# ── Step 4: install packages ───────────────────────────────────────
 step "Installing packages"
 
 # Steam lives in the multilib repo, which isn't enabled by default.
@@ -425,7 +453,7 @@ else
     warn "gsettings not found — select the Bibata cursor theme manually in nwg-look"
 fi
 
-# ── Step 4: choose a browser ─────────────────────────────────────────
+# ── Step 5: choose a browser ─────────────────────────────────────────
 step "Choosing a browser"
 
 prompt_choice BROWSER_CHOICE 6 "Which browser would you like to install?" \
@@ -464,7 +492,7 @@ if pacman -Qq firefox >/dev/null 2>&1; then
     esac
 fi
 
-# ── Step 5: LazyVim ─────────────────────────────────────────────────
+# ── Step 6: LazyVim ─────────────────────────────────────────────────
 step "Setting up LazyVim"
 
 if [ -e ~/.config/nvim ]; then
@@ -478,7 +506,17 @@ else
         || warn "Could not clone LazyVim starter — install manually: https://www.lazyvim.org/installation"
 fi
 
-# ── Step 6: done ────────────────────────────────────────────────────
+# Run fastfetch on new terminal sessions, without duplicating the line if
+# the script gets re-run.
+touch ~/.bashrc
+if grep -qx 'fastfetch' ~/.bashrc 2>/dev/null; then
+    ok "fastfetch already set to run in ~/.bashrc"
+else
+    printf '\nfastfetch\n' >> ~/.bashrc
+    ok "fastfetch added to ~/.bashrc"
+fi
+
+# ── Step 7: done ────────────────────────────────────────────────────
 step "Done"
 ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility installed (pacman)"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
@@ -518,10 +556,14 @@ if [ -n "$BROWSER_NAME" ]; then
 else
     ok "Browser install skipped, as requested"
 fi
+if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
+    ok "Chaotic-AUR repo enabled"
+fi
 ok "waybar config in ~/.config/waybar"
 ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
+ok "fastfetch runs automatically in new terminal sessions (~/.bashrc)"
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
@@ -533,10 +575,11 @@ printf '  %s/usr/lib/mate-polkit/polkit-mate-authentication-agent-1 &%s   # need
 printf '\n%sKeybindings:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %sSUPER%s                    = Windows key\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + Enter%s            = Open terminal\n' "$C_CYAN" "$C_RESET"
-printf '  %sSUPER + R%s                = Open Rofi\n' "$C_CYAN" "$C_RESET"
+printf '  %sSUPER + Space%s            = Open Rofi\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + E%s                = Open Nautilus\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + Q%s                = Exit the application\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + [1-0]%s            = Switch workspaces\n' "$C_CYAN" "$C_RESET"
 printf '\n%sTo change your keybindings or set your monitor resolution, edit the config with:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %snvim ~/.config/hypr/hyprland.lua%s\n' "$C_CYAN" "$C_RESET"
 printf '\n%sEnjoy your new home & workflow! :)%s\n' "$C_GREEN$C_BOLD" "$C_RESET"
+printf '\n%sDon'"'"'t forget to reboot! Please use: systemctl reboot%s\n' "$C_YELLOW" "$C_RESET"
