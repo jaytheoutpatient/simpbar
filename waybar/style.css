@@ -123,7 +123,7 @@ button {
   color: rgba(80,80,80,1);
 
 }
-#custom-rofi.hover {
+#custom-rofi:hover {
   color: rgba(220,220,220,1);
 }
 /*#custom-screenshot_t {
