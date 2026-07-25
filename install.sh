@@ -726,6 +726,71 @@ else
     ok "Verified all AUR packages are installed"
 fi
 
+# Download today's Bing wallpaper and set up waypaper to use it by default.
+WALLPAPER_DIR="$HOME/Pictures/Wallpaper"
+mkdir -p "$WALLPAPER_DIR"
+
+BING_JSON=$(curl -fsSL "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=en-US" 2>/dev/null)
+BING_URLBASE=$(printf '%s' "$BING_JSON" | grep -o '"urlbase":"[^"]*"' | head -1 | cut -d'"' -f4)
+BING_URL=$(printf '%s' "$BING_JSON" | grep -o '"url":"[^"]*"' | head -1 | cut -d'"' -f4)
+BING_FILE=""
+
+if [ -n "$BING_URLBASE" ]; then
+    BING_FILE="$WALLPAPER_DIR/bing-$(date +%F).jpg"
+    if ! run_spinner "Downloading today's Bing wallpaper (UHD)" \
+        curl -fsSL -o "$BING_FILE" "https://www.bing.com${BING_URLBASE}_UHD.jpg"; then
+        if [ -n "$BING_URL" ]; then
+            run_spinner "UHD unavailable — downloading standard resolution instead" \
+                curl -fsSL -o "$BING_FILE" "https://www.bing.com${BING_URL}" \
+                || { warn "Could not download today's Bing wallpaper"; BING_FILE=""; }
+        else
+            warn "Could not download today's Bing wallpaper"
+            BING_FILE=""
+        fi
+    fi
+else
+    warn "Could not fetch Bing's wallpaper metadata — skipping wallpaper download"
+fi
+
+if pacman -Qq waypaper >/dev/null 2>&1; then
+    mkdir -p ~/.config/waypaper
+    if [ -e ~/.config/waypaper/config.ini ]; then
+        warn "~/.config/waypaper/config.ini already exists — leaving your existing waypaper config alone"
+    else
+        cat > ~/.config/waypaper/config.ini <<EOF
+[Settings]
+language = en
+folder = $WALLPAPER_DIR
+wallpaper = $BING_FILE
+backend = swaybg
+monitors = All
+fill = Fill
+sort = name
+color = #ffffff
+subfolders = False
+all_subfolders = False
+show_hidden = False
+show_gifs_only = False
+show_path_in_tooltip = True
+number_of_columns = 3
+use_xdg_state = False
+zen_mode = False
+swww_transition_type = any
+swww_transition_step = 63
+swww_transition_angle = 0
+swww_transition_duration = 2
+swww_transition_fps = 60
+mpvpaper_sound = False
+mpvpaper_options =
+post_command =
+keybindings = ~/.config/waypaper/keybindings.ini
+EOF
+        ok "waypaper set to use ~/Pictures/Wallpaper as its default folder"
+    fi
+else
+    warn "waypaper isn't installed — skipping wallpaper folder setup"
+fi
+
 # Apply the Dracula GTK + icon theme (both ship in the same package) and
 # the Bibata cursor theme, now that they're actually installed. This uses
 # the same gsettings mechanism nwg-look reads/writes, so it shows up as
@@ -893,6 +958,12 @@ else
 fi
 if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
     ok "Chaotic-AUR repo enabled"
+fi
+if [ -e ~/.config/waypaper/config.ini ]; then
+    ok "waypaper default folder set to ~/Pictures/Wallpaper"
+fi
+if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
+    ok "Today's Bing wallpaper downloaded to ~/Pictures/Wallpaper"
 fi
 ok "waybar config in ~/.config/waybar"
 ok "hypr config in ~/.config/hypr"
