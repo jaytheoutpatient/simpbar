@@ -1,4 +1,5 @@
 # simpbar
+<img width="644" height="210" alt="image" src="https://github.com/user-attachments/assets/e65a412b-ed55-4cbe-9f6b-5879e8fef875" />
 
 <b>Waybar</b> <br>
 The waybar comes with workspaces you can scroll up or down to scroll,<br> 
@@ -45,6 +46,14 @@ Copy and paste this line below paste it into your terminal: <br>
 
 The install script is all thanks to @Ryzendew aka Mattscreative <br>
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/503f458d-43d6-4773-b424-d9f6414382d6" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/2dd0e792-da80-487d-88ae-8b03b6b03753" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/a6d59fca-696b-4890-a33d-c2fcbe65aa2c" />
+<img width="1919" height="1080" alt="image" src="https://github.com/user-attachments/assets/c764e1fa-c313-483f-b51d-5daa9919b38b" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/6a94eaa0-dc0e-4d6c-9daf-45e0f2edf471" />
+
+
+
+
+
 
 
