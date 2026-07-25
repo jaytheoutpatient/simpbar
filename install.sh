@@ -834,6 +834,19 @@ else
     ok "fastfetch added to fish config"
 fi
 
+# Switch the default login shell to fish.
+FISH_PATH=$(command -v fish)
+if [ -z "$FISH_PATH" ]; then
+    warn "Could not find the fish binary — skipping default shell switch"
+elif [ "$SHELL" = "$FISH_PATH" ]; then
+    ok "fish is already the default shell"
+else
+    grep -qx "$FISH_PATH" /etc/shells 2>/dev/null \
+        || printf '%s\n' "$FISH_PATH" | sudo tee -a /etc/shells >/dev/null
+    run_spinner "Setting fish as the default shell" chsh -s "$FISH_PATH" \
+        || warn "Could not switch the default shell — run 'chsh -s $FISH_PATH' manually"
+fi
+
 run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfirm \
     || warn "Full system update failed — run 'sudo pacman -Syu' manually to check for issues"
 
@@ -887,6 +900,9 @@ ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
 ok "fastfetch runs automatically in new terminal sessions (~/.bashrc)"
 ok "fish shell installed with an empty greeting message and fastfetch on launch"
+if [ -n "$FISH_PATH" ] && [ "$(getent passwd "$USER" | cut -d: -f7)" = "$FISH_PATH" ]; then
+    ok "Default login shell switched to fish (takes effect next login)"
+fi
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
