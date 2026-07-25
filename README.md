@@ -42,4 +42,6 @@ Copy and paste this line below paste it into your terminal: <br>
 
 The install script is all thanks to @Ryzendew aka Mattscreative <br>
 
-<img width="1920" height="40" alt="image" src="https://github.com/user-attachments/assets/169b48f9-fba9-405d-9096-d8f5a4223bc9" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/503f458d-43d6-4773-b424-d9f6414382d6" />
+
+
