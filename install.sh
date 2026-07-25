@@ -516,8 +516,12 @@ else
     ok "fastfetch added to ~/.bashrc"
 fi
 
+run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfirm \
+    || warn "Full system update failed — run 'sudo pacman -Syu' manually to check for issues"
+
 # ── Step 7: done ────────────────────────────────────────────────────
 step "Done"
+ok "Full system updated (pacman -Syu)"
 ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility installed (pacman)"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 if pacman -Qq obs-studio >/dev/null 2>&1; then
