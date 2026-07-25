@@ -1,12 +1,12 @@
 # simpbar
 
-This is my waybar configuration for simplicity,<br>
-it has the weather, time and the day. Its got a power button to allow you <br> 
-to shutdown or reboot the pc. You might have to set the waybars resolution <br>
-as it is set to my monitor 1920x1080 with the scale 1 as I was using hyprland making <br>
-this waybar configuration. You got a picture logo where you can click to change wallpaper <br>
-just make sure to add `waypaper --restore` in your desired window managers autostart configuration. <br>
-Originally this about just a waybar configuration till I noticed this is becoming a hyprland setup to <br>
+<b>Waybar</b> <br>
+The waybar comes with workspaces you can scroll up or down to scroll<br>, 
+ Media Player as whatever music you are playing spotify youtube etc will show up<br>
+, A menu button which will bring up the rofi menu scroll and click what you need<br>
+ or type & search what you need, Weather, Time & date if you click on it the gnome calendar app will spawn in the middle<br>
+  of the screen, A collapsible tray with a arrow icon click on it to reveal the volume or change wallpaper and finally a power<br>
+   button click on it to access the wlogout menu.
 
 There is a install script below do know this only works for archlinux atm <br>
 but will try make it work for other Linux distributions! <br>
@@ -16,13 +16,7 @@ Firefox and ask if you want to remove or keep it, And what discord client you wa
 such as discord, vesktop or equibop. It's going to give you also flatpak and bazaar <br>
 
 
-<b>Waybar</b> <br>
-The waybar comes with workspaces you can scroll up or down to scroll<br>
-, Media Player as whatever music you are playing spotify youtube etc will show up<br>
-, A menu button which will bring up the rofi menu scroll and click what you need<br>
- or type & search what you need, Weather, Time & date if you click on it the gnome calendar app will spawn in the middle<br>
-  of the screen, A collapsible tray with a arrow icon click on it to reveal the volume or change wallpaper and finally a power<br>
-   button click on it to access the wlogout menu.
+
 
 <b> Just a warning </b> <br>
 It is going to be jank this is still a wip but I can gurantee it's not going to <br>
