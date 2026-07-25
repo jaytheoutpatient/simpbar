@@ -28,7 +28,7 @@
               "clock#1"
     ],
     "modules-right": [
-         "custom/waypaper",
+   //      "custom/waypaper",
          "group/tray-expander",
          "custom/power"
     ],
@@ -328,7 +328,7 @@
 
     "pulseaudio": {
         "scroll-step": 3, // %, can be a float
-        "format": "{icon} {volume}% {format_source}",
+        "format": "{icon} {volume} {format_source}",
         "format-bluetooth": "{volume}% {icon} {format_source}",
         "format-bluetooth-muted": " {icon} {format_source}",
         "format-muted": " {format_source}",
@@ -368,7 +368,7 @@
             "phone": " ",
             "portable": " ",
             "car": " ",
-            //"default": [" ", " ", " "]
+            "default": [" ", " ", " "]
         },
     },
 
@@ -387,6 +387,8 @@
         },
         "modules": [
             "custom/tray-toggle",
+            "custom/waypaper",
+            "wireplumber",
             "tray"
         ]
     },
@@ -397,8 +399,8 @@
     },
 
     "mpris": {
-        "format": "{dynamic}",
-        "format-paused": "<i>{dynamic}</i>",
+        "format": "{artist} - {title} ▶",
+        "format-paused": "{artist} - {title} ⏸",
         "player-icons": {
             "default": "▶",
             "spotify": "",
