@@ -309,6 +309,25 @@ else
     warn "gsettings not found — open nwg-look and toggle 'Prefer dark' manually"
 fi
 
+# Rofi ships a bundled "material" theme in /usr/share/rofi/themes — just
+# point config.rasi at it rather than fetching anything extra.
+mkdir -p ~/.config/rofi
+if [ -e ~/.config/rofi/config.rasi ]; then
+    warn "~/.config/rofi/config.rasi already exists — leaving your existing rofi config alone"
+else
+    cat > ~/.config/rofi/config.rasi <<'EOF'
+configuration {
+    display-drun: "Apps";
+    display-run: "Run";
+    display-window: "Window";
+    show-icons: true;
+}
+
+@theme "material"
+EOF
+    ok "rofi set to use the Material theme"
+fi
+
 # wlogout, waypaper & protonplus are AUR-only — need an AUR helper
 AUR_PKGS=(wlogout waypaper protonplus)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
@@ -426,6 +445,9 @@ else
 fi
 ok "Flathub remote added for flatpak/bazaar"
 ok "nwg-look set to prefer dark theme"
+if [ -e ~/.config/rofi/config.rasi ]; then
+    ok "rofi configured with the Material theme"
+fi
 ok "wlogout, waypaper, protonplus installed via AUR helper (if available)"
 if [ -n "$BROWSER_NAME" ]; then
     ok "$BROWSER_NAME installed via AUR helper (if available)"
@@ -447,7 +469,7 @@ printf '  %s/usr/lib/mate-polkit/polkit-mate-authentication-agent-1 &%s   # need
 printf '\n%sKeybindings:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %sSUPER%s                    = Windows key\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + Enter%s            = Open terminal\n' "$C_CYAN" "$C_RESET"
-printf '  %sSUPER + Space%s                = Open Rofi\n' "$C_CYAN" "$C_RESET"
+printf '  %sSUPER + R%s                = Open Rofi\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + E%s                = Open Nautilus\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + Q%s                = Exit the application\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + [1-0]%s            = Switch workspaces\n' "$C_CYAN" "$C_RESET"
