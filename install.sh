@@ -288,7 +288,7 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish)
 
 prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
 [ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
@@ -816,6 +816,24 @@ else
     ok "fastfetch added to ~/.bashrc"
 fi
 
+# Keep fish's default greeting message empty.
+mkdir -p ~/.config/fish
+touch ~/.config/fish/config.fish
+if grep -qx 'set -g fish_greeting' ~/.config/fish/config.fish 2>/dev/null; then
+    ok "fish greeting already set to empty"
+else
+    printf '\nset -g fish_greeting\n' >> ~/.config/fish/config.fish
+    ok "fish greeting set to empty"
+fi
+
+# Run fastfetch on new fish sessions too.
+if grep -qx 'fastfetch' ~/.config/fish/config.fish 2>/dev/null; then
+    ok "fastfetch already set to run in fish"
+else
+    printf '\nfastfetch\n' >> ~/.config/fish/config.fish
+    ok "fastfetch added to fish config"
+fi
+
 run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfirm \
     || warn "Full system update failed — run 'sudo pacman -Syu' manually to check for issues"
 
@@ -868,6 +886,7 @@ ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
 ok "fastfetch runs automatically in new terminal sessions (~/.bashrc)"
+ok "fish shell installed with an empty greeting message and fastfetch on launch"
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
