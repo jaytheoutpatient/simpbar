@@ -9,25 +9,50 @@ if [ -t 1 ] && command -v tput >/dev/null && [ "$(tput colors 2>/dev/null || ech
     C_RESET=$(tput sgr0); C_BOLD=$(tput bold)
     C_BLUE=$(tput setaf 4); C_GREEN=$(tput setaf 2)
     C_RED=$(tput setaf 1); C_YELLOW=$(tput setaf 3); C_CYAN=$(tput setaf 6)
+    C_MAGENTA=$(tput setaf 5)
 else
-    C_RESET=""; C_BOLD=""; C_BLUE=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_CYAN=""
+    C_RESET=""; C_BOLD=""; C_BLUE=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_CYAN=""; C_MAGENTA=""
 fi
 
 TOTAL_STEPS=6
 STEP=0
 
 banner() {
-    printf '%s%s\n' "$C_CYAN$C_BOLD" "
+    local logo_text art_text
+    logo_text=$(cat <<'LOGO'
+        /\
+       /  \
+      /    \
+     /      \
+    /   ,,   \
+   /   |  |  -\
+  /_-''    ''-_\
+
+LOGO
+)
+    art_text=$(cat <<'ART'
    _____ _                 _
   / ____(_)               | |
  | (___  _ _ __ ___  _ __ | |__   __ _ _ __
-  \___ \| | '_ \` _ \| '_ \| '_ \ / _\` | '__|
+  \___ \| | '_ ` _ \| '_ \| '_ \ / _` | '__|
   ____) | | | | | | | |_) | |_) | (_| | |
  |_____/|_|_| |_| |_| .__/|_.__/ \__,_|_|
                      | |
                      |_|          installer
-"
-    printf '%s\n' "$C_RESET"
+ART
+)
+    mapfile -t logo_lines <<< "$logo_text"
+    mapfile -t art_lines <<< "$art_text"
+
+    printf '\n'
+    local i n
+    n=${#art_lines[@]}
+    for ((i = 0; i < n; i++)); do
+        printf '  %s%-18s%s   %s%s%s\n' \
+            "$C_BLUE$C_BOLD" "${logo_lines[$i]:-}" "$C_RESET" \
+            "$C_MAGENTA$C_BOLD" "${art_lines[$i]:-}" "$C_RESET"
+    done
+    printf '\n'
 }
 
 step() {
