@@ -119,7 +119,13 @@ button {
 #custom-weather.default {
   color: rgba(80,80,80,1);
 }
+#custom-rofi {
+  color: rgba(80,80,80,1);
 
+}
+#custom-rofi.hover {
+  color: rgba(220,220,220,1);
+}
 /*#custom-screenshot_t {
     background-color: #111827;
     border-radius: 14px;

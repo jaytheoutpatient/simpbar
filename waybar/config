@@ -18,25 +18,16 @@
     "spacing": 2, // Gaps between modules (4px)
 
     "modules-left": [
-        "hyprland/workspaces"
-       //"hyprland/submap",
-       // "temperature",
-        //"idle_inhibitor",
-        //"custom/spotify"
+        "hyprland/workspaces",
+        "custom/media"
     ],
     "modules-center": [
+              "custom/rofi",
               "custom/weather",
               "custom/sp1",
               "clock#1"
-       // "custom/weather"
-        //"custom/gammastep"
     ],
     "modules-right": [
-       // "backlight",
-       // "custom/storage",
-        //"battery",
-        //"pulseaudio",
-       // "custom/screenshot_t",
          "custom/waypaper",
          "tray",
          "custom/power"
@@ -57,14 +48,15 @@
     },
     
     "custom/waypaper": {
-	    "format": "🖾 ",
-	    "on-click": "waypaper"
+	    "format": "🖾  ",
+	    "on-click": "waypaper",
+      "tooltip": true,
+      "tooltip-format": "Change wallpaper?"
     },
 
     "custom/rofi": {
-        "format": "",
+        "format": " Menu ",
         "tooltip": false,
-        "on-click-right": "nwg-drawer",
         "on-click": "rofi -show drun",
         "on-click-middle": "pkill -9 wofi"
     },
@@ -170,7 +162,7 @@
     },
     "custom/weather": {
         "format": "{}",
-        "format-alt": "{alt}: {}",
+        "format-alt": "{alt} :{}",
         "format-alt-click": "click-right",
         "interval": 3600,
         "exec": "curl -s 'https://wttr.in/?format=1'",
