@@ -50,6 +50,8 @@ The install script is all thanks to @Ryzendew aka Mattscreative <br>
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/a6d59fca-696b-4890-a33d-c2fcbe65aa2c" />
 <img width="1919" height="1080" alt="image" src="https://github.com/user-attachments/assets/c764e1fa-c313-483f-b51d-5daa9919b38b" />
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/6a94eaa0-dc0e-4d6c-9daf-45e0f2edf471" />
+<img width="1920" height="1079" alt="image" src="https://github.com/user-attachments/assets/83371301-982c-4f45-88c4-dd49177447f2" />
+
 
 
 
