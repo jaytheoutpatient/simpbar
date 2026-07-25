@@ -1,9 +1,9 @@
 # simpbar
 
 <b>Waybar</b> <br>
-The waybar comes with workspaces you can scroll up or down to scroll<br>, 
- Media Player as whatever music you are playing spotify youtube etc will show up<br>
-, A menu button which will bring up the rofi menu scroll and click what you need<br>
+The waybar comes with workspaces you can scroll up or down to scroll,<br> 
+ Media Player as whatever music you are playing spotify youtube etc will show up,<br>
+ A menu button which will bring up the rofi menu scroll and click what you need<br>
  or type & search what you need, Weather, Time & date if you click on it the gnome calendar app will spawn in the middle<br>
   of the screen, A collapsible tray with a arrow icon click on it to reveal the volume or change wallpaper and finally a power<br>
    button click on it to access the wlogout menu.
