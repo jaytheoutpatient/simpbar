@@ -500,7 +500,7 @@ printf '  %s/usr/lib/mate-polkit/polkit-mate-authentication-agent-1 &%s   # need
 printf '\n%sKeybindings:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %sSUPER%s                    = Windows key\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + Enter%s            = Open terminal\n' "$C_CYAN" "$C_RESET"
-printf '  %sSUPER + R%s                = Open Rofi\n' "$C_CYAN" "$C_RESET"
+printf '  %sSUPER + Space%s                = Open Rofi\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + E%s                = Open Nautilus\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + Q%s                = Exit the application\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + [1-0]%s            = Switch workspaces\n' "$C_CYAN" "$C_RESET"
