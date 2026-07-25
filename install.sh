@@ -85,6 +85,13 @@ install_paru() {
 # Run a command quietly, showing a spinner, then a check/cross line.
 run_spinner() {
     local msg="$1"; shift
+    # Cap the label length: a message long enough to wrap the terminal
+    # line breaks the \r redraw below (it only returns to the start of
+    # the current wrapped row, not the true start), which prints a new
+    # stacked line every tick instead of overwriting one line in place.
+    if [ "${#msg}" -gt 60 ]; then
+        msg="${msg:0:57}..."
+    fi
     # Refresh (or acquire) the sudo timestamp synchronously first. If a
     # password prompt is actually needed, it happens here on its own
     # line — before any spinner output starts — instead of colliding
@@ -271,7 +278,8 @@ case "$DISCORD_CHOICE" in
     *) DISCORD_NAME="" ;;
 esac
 
-run_spinner "pacman: ${PACMAN_PKGS[*]}" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
+printf '  Installing %d packages via pacman:\n    %s\n' "${#PACMAN_PKGS[@]}" "${PACMAN_PKGS[*]}"
+run_spinner "pacman: installing ${#PACMAN_PKGS[@]} packages" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
 MISSING_PKGS=()
@@ -347,11 +355,12 @@ if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
     esac
 fi
 
+printf '  Installing %d AUR packages:\n    %s\n' "${#AUR_PKGS[@]}" "${AUR_PKGS[*]}"
 if command -v yay >/dev/null; then
-    run_spinner "yay: ${AUR_PKGS[*]} (AUR)" yay -S --noconfirm --needed "${AUR_PKGS[@]}" \
+    run_spinner "yay: installing ${#AUR_PKGS[@]} AUR packages" yay -S --noconfirm --needed "${AUR_PKGS[@]}" \
         || warn "Some AUR packages failed via yay — install manually: yay -S ${AUR_PKGS[*]}"
 elif command -v paru >/dev/null; then
-    run_spinner "paru: ${AUR_PKGS[*]} (AUR)" paru -S --noconfirm --needed "${AUR_PKGS[@]}" \
+    run_spinner "paru: installing ${#AUR_PKGS[@]} AUR packages" paru -S --noconfirm --needed "${AUR_PKGS[@]}" \
         || warn "Some AUR packages failed via paru — install manually: paru -S ${AUR_PKGS[*]}"
 else
     warn "No AUR helper available — install manually: yay -S ${AUR_PKGS[*]}"
