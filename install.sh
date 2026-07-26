@@ -288,7 +288,7 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome)
 
 prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
 [ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
@@ -791,6 +791,31 @@ else
     warn "waypaper isn't installed — skipping wallpaper folder setup"
 fi
 
+# waypaper is just a GUI front-end — the actual wallpaper daemon is swaybg,
+# and it has no config file of its own. Give it a systemd user service
+# pointed at today's wallpaper so it starts automatically each session,
+# rather than only being set inside waypaper's own config.
+if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ] && command -v swaybg >/dev/null; then
+    mkdir -p ~/.config/systemd/user
+    cat > ~/.config/systemd/user/swaybg.service <<EOF
+[Unit]
+Description=swaybg wallpaper
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=$(command -v swaybg) -i $BING_FILE -m fill
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+    run_spinner "Enabling swaybg.service" systemctl --user enable swaybg.service \
+        || warn "Could not enable swaybg.service — it'll still work if launched manually or via Hyprland autostart"
+    ok "swaybg pointed at today's Bing wallpaper via ~/.config/systemd/user/swaybg.service"
+else
+    warn "No downloaded wallpaper or swaybg not installed — skipping swaybg service setup"
+fi
+
 # Apply the Dracula GTK + icon theme (both ship in the same package) and
 # the Bibata cursor theme, now that they're actually installed. This uses
 # the same gsettings mechanism nwg-look reads/writes, so it shows up as
@@ -965,6 +990,9 @@ fi
 if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
     ok "Today's Bing wallpaper downloaded to ~/Pictures/Wallpaper"
 fi
+if [ -e ~/.config/systemd/user/swaybg.service ]; then
+    ok "swaybg.service enabled — will set the wallpaper automatically each session"
+fi
 ok "waybar config in ~/.config/waybar"
 ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
@@ -978,7 +1006,11 @@ fi
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %swaybar &%s\n' "$C_CYAN" "$C_RESET"
-printf '  %sswaybg -i /path/to/your/wallpaper.jpg -m fill &%s   # example\n' "$C_CYAN" "$C_RESET"
+if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
+    printf '  %sswaybg -i %s -m fill &%s\n' "$C_CYAN" "$BING_FILE" "$C_RESET"
+else
+    printf '  %sswaybg -i /path/to/your/wallpaper.jpg -m fill &%s   # example\n' "$C_CYAN" "$C_RESET"
+fi
 printf '  %swaypaper%s                                          # pick a wallpaper\n' "$C_CYAN" "$C_RESET"
 printf '  %s/usr/lib/mate-polkit/polkit-mate-authentication-agent-1 &%s   # needed for GUI auth prompts\n' "$C_CYAN" "$C_RESET"
 
