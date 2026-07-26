@@ -288,7 +288,7 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland)
 
 prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
 [ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
@@ -336,7 +336,12 @@ printf '  you having to flip settings manually. %sfalcond-gui%s is a GTK app to\
 printf '  configure and monitor it.\n'
 prompt_choice FALCOND_CHOICE 2 "Would you like to install falcond & falcond-gui?" "Yes" "No"
 INSTALL_FALCOND=0
-[ "$FALCOND_CHOICE" = 1 ] && INSTALL_FALCOND=1
+if [ "$FALCOND_CHOICE" = 1 ]; then
+    INSTALL_FALCOND=1
+    # falcond's scx_sched option switches between sched_ext schedulers —
+    # scx-scheds (official repo) is what actually provides those binaries.
+    PACMAN_PKGS+=(scx-scheds)
+fi
 
 printf '  Installing %d packages via pacman:\n    %s\n' "${#PACMAN_PKGS[@]}" "${PACMAN_PKGS[*]}"
 run_spinner "pacman: installing ${#PACMAN_PKGS[@]} packages" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
@@ -988,6 +993,9 @@ if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
 fi
 if pacman -Qq falcond >/dev/null 2>&1; then
     ok "falcond & falcond-gui installed (log out/in for group membership to apply)"
+fi
+if pacman -Qq scx-scheds >/dev/null 2>&1; then
+    ok "scx-scheds installed (provides the sched_ext schedulers falcond can switch between)"
 fi
 if [ -e ~/.config/rofi/config.rasi ]; then
     ok "rofi configured with the Material theme"
