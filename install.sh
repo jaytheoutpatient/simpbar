@@ -329,6 +329,15 @@ case "$DISCORD_CHOICE" in
     *) DISCORD_NAME="" ;;
 esac
 
+printf '\n  %sfalcond%s is a gaming performance daemon: it watches for running games\n' "$C_BOLD" "$C_RESET"
+printf '  (including Proton/Wine) and automatically applies performance profiles —\n'
+printf '  CPU scheduler switching, AMD 3D V-Cache mode, performance mode — without\n'
+printf '  you having to flip settings manually. %sfalcond-gui%s is a GTK app to\n' "$C_BOLD" "$C_RESET"
+printf '  configure and monitor it.\n'
+prompt_choice FALCOND_CHOICE 2 "Would you like to install falcond & falcond-gui?" "Yes" "No"
+INSTALL_FALCOND=0
+[ "$FALCOND_CHOICE" = 1 ] && INSTALL_FALCOND=1
+
 printf '  Installing %d packages via pacman:\n    %s\n' "${#PACMAN_PKGS[@]}" "${PACMAN_PKGS[*]}"
 run_spinner "pacman: installing ${#PACMAN_PKGS[@]} packages" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
@@ -691,6 +700,7 @@ fi
 AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
+[ "$INSTALL_FALCOND" -eq 1 ] && AUR_PKGS+=(falcond falcond-gui)
 
 if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
     prompt_choice AUR_CHOICE 1 "No AUR helper found. Install which one?" "yay" "paru" "skip"
@@ -724,6 +734,21 @@ if [ "${#MISSING_AUR[@]}" -gt 0 ]; then
     warn "AUR packages not installed: ${MISSING_AUR[*]} — install manually if needed"
 else
     ok "Verified all AUR packages are installed"
+fi
+
+if pacman -Qq falcond >/dev/null 2>&1; then
+    # falcond-gui needs the user in the 'falcond' group to talk to the
+    # daemon without root. The package creates the group; existing users
+    # aren't added to it automatically.
+    if getent group falcond >/dev/null 2>&1; then
+        run_spinner "Adding $USER to the falcond group" sudo usermod -aG falcond "$USER" \
+            || warn "Could not add $USER to the falcond group — run 'sudo usermod -aG falcond $USER' manually"
+    else
+        warn "falcond group not found — falcond-gui may need to be run as root, or check the package docs"
+    fi
+
+    run_spinner "Enabling falcond.service" sudo systemctl enable --now falcond.service \
+        || warn "Could not enable falcond.service — check 'systemctl status falcond' after reboot"
 fi
 
 # Download today's Bing wallpaper and set up waypaper to use it by default.
@@ -960,6 +985,9 @@ if pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
 fi
 if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
     ok "Bibata Modern Classic cursor installed and applied"
+fi
+if pacman -Qq falcond >/dev/null 2>&1; then
+    ok "falcond & falcond-gui installed (log out/in for group membership to apply)"
 fi
 if [ -e ~/.config/rofi/config.rasi ]; then
     ok "rofi configured with the Material theme"
