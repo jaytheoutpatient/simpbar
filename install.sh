@@ -924,18 +924,7 @@ else
     ok "fastfetch added to fish config"
 fi
 
-# Switch the default login shell to fish.
 FISH_PATH=$(command -v fish)
-if [ -z "$FISH_PATH" ]; then
-    warn "Could not find the fish binary — skipping default shell switch"
-elif [ "$SHELL" = "$FISH_PATH" ]; then
-    ok "fish is already the default shell"
-else
-    grep -qx "$FISH_PATH" /etc/shells 2>/dev/null \
-        || printf '%s\n' "$FISH_PATH" | sudo tee -a /etc/shells >/dev/null
-    run_spinner "Setting fish as the default shell" chsh -s "$FISH_PATH" \
-        || warn "Could not switch the default shell — run 'chsh -s $FISH_PATH' manually"
-fi
 
 run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfirm \
     || warn "Full system update failed — run 'sudo pacman -Syu' manually to check for issues"
@@ -999,9 +988,6 @@ ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
 ok "fastfetch runs automatically in new terminal sessions (~/.bashrc)"
 ok "fish shell installed with an empty greeting message and fastfetch on launch"
-if [ -n "$FISH_PATH" ] && [ "$(getent passwd "$USER" | cut -d: -f7)" = "$FISH_PATH" ]; then
-    ok "Default login shell switched to fish (takes effect next login)"
-fi
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
@@ -1025,3 +1011,26 @@ printf '\n%sTo change your keybindings or set your monitor resolution, edit the 
 printf '  %snvim ~/.config/hypr/hyprland.lua%s\n' "$C_CYAN" "$C_RESET"
 printf '\n%sEnjoy your new home & workflow! :)%s\n' "$C_GREEN$C_BOLD" "$C_RESET"
 printf '\n%sDon'"'"'t forget to reboot! Please use: systemctl reboot%s\n' "$C_YELLOW" "$C_RESET"
+
+# Switch the default login shell to fish. This runs last, on its own, with
+# stdin/stdout attached directly to /dev/tty — chsh needs a real interactive
+# terminal to prompt for your password, which it doesn't have if this
+# script is being run as `curl ... | bash` (stdin is the piped script, not
+# your keyboard). Running it through run_spinner earlier made this worse,
+# since that also backgrounds the command and swallows its output.
+if [ -z "$FISH_PATH" ]; then
+    warn "Could not find the fish binary — skipping default shell switch"
+elif [ "$SHELL" = "$FISH_PATH" ]; then
+    ok "fish is already the default shell"
+elif [ ! -r /dev/tty ]; then
+    warn "No interactive terminal available — run 'chsh -s $FISH_PATH' manually to switch your default shell"
+else
+    grep -qx "$FISH_PATH" /etc/shells 2>/dev/null \
+        || printf '%s\n' "$FISH_PATH" | sudo tee -a /etc/shells >/dev/null
+    printf '\n%sSwitching your default shell to fish — enter your password if asked:%s\n' "$C_BOLD" "$C_RESET"
+    if chsh -s "$FISH_PATH" < /dev/tty > /dev/tty 2>&1; then
+        ok "Default login shell switched to fish (takes effect next login)"
+    else
+        warn "Could not switch the default shell — run 'chsh -s $FISH_PATH' manually"
+    fi
+fi
