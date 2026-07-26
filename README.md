@@ -42,7 +42,9 @@ It will install the dependencies such as: <br>
 <b>That's it!</b>
 
 Copy and paste this line below paste it into your terminal: <br>
-`curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash`
+```bash
+curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash
+```
 
 The install script is all thanks to @Ryzendew aka Mattscreative <br>
 
