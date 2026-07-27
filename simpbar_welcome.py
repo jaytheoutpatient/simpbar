@@ -21,7 +21,9 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 APP_ID = "dev.jaytheoutpatient.simpbar.Welcome"
 FIRST_RUN_MARKER = Path.home() / ".config" / "simpbar" / "welcome-shown"
+LOGO_PATH = Path.home() / ".local" / "share" / "simpbar" / "logo.png"
 REPO_URL = "https://github.com/jaytheoutpatient/simpbar"
+CONTACT_EMAIL = "jaytheoutpatient@protonmail.com"
 HYPRLAND_CONF = "~/.config/hypr/hyprland.lua"
 
 KEYBINDINGS = [
@@ -82,18 +84,26 @@ class WelcomePage(Gtk.Box):
         self.set_margin_start(36)
         self.set_margin_end(36)
 
-        icon = Gtk.Image.new_from_icon_name("preferences-desktop-display-symbolic")
-        icon.set_pixel_size(64)
-        icon.add_css_class("dim-label")
-        self.append(icon)
+        if LOGO_PATH.exists():
+            logo = Gtk.Picture.new_for_filename(str(LOGO_PATH))
+            logo.set_content_fit(Gtk.ContentFit.CONTAIN)
+            logo.set_size_request(128, 128)
+            logo.set_halign(Gtk.Align.CENTER)
+            self.append(logo)
+        else:
+            icon = Gtk.Image.new_from_icon_name("preferences-desktop-display-symbolic")
+            icon.set_pixel_size(64)
+            icon.add_css_class("dim-label")
+            self.append(icon)
 
         title = Gtk.Label(label="Welcome to Simpbar")
         title.add_css_class("title-1")
         self.append(title)
 
         subtitle = Gtk.Label(
-            label="A Hyprland + Waybar setup for Arch Linux.\n"
-            "Use the sidebar to run setup, check keybindings, or find links."
+            label="Hello and welcome to Simpbar hope you'll find your\n"
+            "home here!, If there is any bugs or any suggestions you want\n"
+            "please send me a email in the links page!"
         )
         subtitle.add_css_class("dim-label")
         subtitle.set_justify(Gtk.Justification.CENTER)
@@ -177,6 +187,17 @@ class AboutPage(Gtk.Box):
             "activated", lambda _r: launch(["xdg-open", f"{REPO_URL}/issues"])
         )
         group.add(issues_row)
+
+        email_row = Adw.ActionRow(
+            title="Email — bugs & suggestions",
+            subtitle=CONTACT_EMAIL,
+            activatable=True,
+        )
+        email_row.set_icon_name("mail-send-symbolic")
+        email_row.connect(
+            "activated", lambda _r: launch(["xdg-open", f"mailto:{CONTACT_EMAIL}"])
+        )
+        group.add(email_row)
 
         self.append(group)
 
