@@ -339,8 +339,11 @@ INSTALL_FALCOND=0
 if [ "$FALCOND_CHOICE" = 1 ]; then
     INSTALL_FALCOND=1
     # falcond's scx_sched option switches between sched_ext schedulers —
-    # scx-scheds (official repo) is what actually provides those binaries.
-    PACMAN_PKGS+=(scx-scheds)
+    # scx-scheds (official repo) provides the actual scheduler binaries.
+    # falcond-gui detects/manages them via scx_loader's D-Bus service,
+    # which ships in the separate scx-tools package — without it there's
+    # nothing for falcond-gui to query, so the scheduler list shows empty.
+    PACMAN_PKGS+=(scx-scheds scx-tools)
 fi
 
 printf '  Installing %d packages via pacman:\n    %s\n' "${#PACMAN_PKGS[@]}" "${PACMAN_PKGS[*]}"
@@ -754,6 +757,11 @@ if pacman -Qq falcond >/dev/null 2>&1; then
 
     run_spinner "Enabling falcond.service" sudo systemctl enable --now falcond.service \
         || warn "Could not enable falcond.service — check 'systemctl status falcond' after reboot"
+
+    if pacman -Qq scx-tools >/dev/null 2>&1; then
+        run_spinner "Enabling scx_loader.service" sudo systemctl enable --now scx_loader.service \
+            || warn "Could not enable scx_loader.service — falcond-gui won't detect schedulers without it running"
+    fi
 fi
 
 # Download today's Bing wallpaper and set up waypaper to use it by default.
@@ -996,6 +1004,9 @@ if pacman -Qq falcond >/dev/null 2>&1; then
 fi
 if pacman -Qq scx-scheds >/dev/null 2>&1; then
     ok "scx-scheds installed (provides the sched_ext schedulers falcond can switch between)"
+fi
+if pacman -Qq scx-tools >/dev/null 2>&1; then
+    ok "scx-tools installed and scx_loader.service enabled (lets falcond-gui detect schedulers)"
 fi
 if [ -e ~/.config/rofi/config.rasi ]; then
     ok "rofi configured with the Material theme"
