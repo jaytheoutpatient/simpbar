@@ -21,10 +21,10 @@
 -- See https://wiki.hypr.land/Configuring/Basics/Monitors/
 
 hl.monitor({
-	output = "",
-	mode = "",
-	position = "",
-	scale = "",
+	output = "DP-2",
+	mode = "1920x1080@240",
+	position = "auto",
+	scale = "1",
 })
 
 ---------------------
@@ -407,5 +407,11 @@ hl.window_rule({
 	match = { class = "hyprland-run" },
 
 	move = "20 monitor_h-120",
+	float = true,
+})
+hl.window_rule({
+	name = "foot",
+	match = { class = "foot" },
+	size = { 900, 700 },
 	float = true,
 })
