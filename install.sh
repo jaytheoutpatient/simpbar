@@ -371,13 +371,6 @@ for unit in "${PIPEWIRE_UNITS[@]}"; do
         || warn "Could not enable $unit — enable it manually: systemctl --user enable --now $unit"
 done
 
-# cliphist's Arch package ships its own systemd user unit — no need to
-# hand-roll a wl-paste --watch exec-once ourselves.
-if pacman -Qq cliphist >/dev/null 2>&1; then
-    run_spinner "Enabling cliphist.service" systemctl --user enable --now cliphist.service \
-        || warn "Could not enable cliphist.service — enable it manually: systemctl --user enable --now cliphist.service"
-fi
-
 run_spinner "Adding Flathub remote" \
     flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo \
     || warn "Could not add Flathub remote — add it manually: flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo"
@@ -1343,7 +1336,7 @@ ok "Full system updated (pacman -Syu)"
 ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility installed (pacman)"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 if pacman -Qq cliphist >/dev/null 2>&1; then
-    ok "cliphist installed and enabled (bind a key to it yourself, e.g. in hyprland.lua)"
+    ok "cliphist installed (bind a key to it yourself, e.g. in hyprland.lua)"
 fi
 if pacman -Qq obs-studio >/dev/null 2>&1; then
     ok "OBS Studio installed"
