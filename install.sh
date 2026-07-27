@@ -1291,12 +1291,21 @@ if __name__ == "__main__":
 WELCOMEPYEOF
 chmod +x ~/.local/share/simpbar/simpbar_welcome.py
 
+# A thin /usr/bin wrapper so it's launchable by name — from a terminal,
+# rofi's "run" mode, etc. — not just via the .desktop entry. Uses $HOME
+# at runtime (not baked in), so it works correctly for any user.
+sudo tee /usr/bin/simpbar-welcome >/dev/null <<'WRAPPEREOF'
+#!/bin/bash
+exec python3 "$HOME/.local/share/simpbar/simpbar_welcome.py" "$@"
+WRAPPEREOF
+sudo chmod +x /usr/bin/simpbar-welcome
+
 cat > ~/.local/share/applications/simpbar-welcome.desktop <<'WELCOMEDESKTOPEOF'
 [Desktop Entry]
 Type=Application
 Name=Simpbar Welcome
 Comment=Setup actions, keybindings, and links for the simpbar Hyprland setup
-Exec=python3 %h/.local/share/simpbar/simpbar_welcome.py
+Exec=simpbar-welcome
 Icon=preferences-desktop-display-symbolic
 Terminal=false
 Categories=Settings;
@@ -1310,7 +1319,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 $HOME/.local/share/simpbar/simpbar_welcome.py --autostart
+ExecStart=/usr/bin/simpbar-welcome --autostart
 
 [Install]
 WantedBy=graphical-session.target
@@ -1318,7 +1327,7 @@ EOF
 
 if pacman -Qq gtk4 >/dev/null 2>&1 && pacman -Qq libadwaita >/dev/null 2>&1 && pacman -Qq python-gobject >/dev/null 2>&1; then
     run_spinner "Enabling simpbar-welcome.service" systemctl --user enable --now simpbar-welcome.service \
-        || warn "Could not enable simpbar-welcome.service — launch it manually: python3 ~/.local/share/simpbar/simpbar_welcome.py"
+        || warn "Could not enable simpbar-welcome.service — launch it manually: simpbar-welcome"
     ok "Simpbar Welcome app installed — will show once on first login, or launch it anytime from rofi"
 else
     warn "GTK4/libadwaita/python-gobject not fully installed — skipping Simpbar Welcome autostart"
