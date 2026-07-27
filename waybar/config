@@ -23,12 +23,11 @@
     ],
     "modules-center": [
               "custom/rofi",
-              "custom/weather",
-              "custom/sp1",
               "clock#1"
     ],
     "modules-right": [
    //      "custom/waypaper",
+         "custom/weather",      
          "group/tray-expander",
          "custom/power"
     ],
@@ -39,7 +38,7 @@
     // -------------------------------------------------------------------------
 
     "custom/sp1": {
-        "format": " ⛧ ",
+        "format": "",
         "tooltip": false
     },
     "custom/sp2": {
