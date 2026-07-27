@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Simpbar Welcome
+Comment=Setup actions, keybindings, and links for the simpbar Hyprland setup
+Exec=python3 %h/.local/share/simpbar/simpbar_welcome.py
+Icon=preferences-desktop-display-symbolic
+Terminal=false
+Categories=Settings;
+StartupNotify=true
