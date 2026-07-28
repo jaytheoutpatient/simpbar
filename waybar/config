@@ -54,7 +54,7 @@
     },
     
     "custom/waypaper": {
-	    "format": "🖾  ",
+	    "format": " 🖾  ",
 	    "on-click": "waypaper",
       "tooltip": true,
       "tooltip-format": "Change wallpaper?"
@@ -203,20 +203,20 @@
     },
     "custom/weather": {
         "format": "{}",
-        "format-alt": "{alt} :{}",
+        "format-alt": "{alt}:{}",
         "format-alt-click": "click-right",
-        "interval": 3600,
+        "interval": 1200,
         "exec": "curl -s 'https://wttr.in/?format=1'",
         //"return-type": "json",
         //"exec": "~/.config/waybar/modules/weather.sh",
         "exec-if": "ping wttr.in -c1"
     },
     "custom/pacman": {
-        "format": "<big>􏆲</big>  {}",
+        "format": "<big>ᗧ</big> {}",
         "interval": 3600,                     // every hour
         "exec": "checkupdates | wc -l",       // # of updates
         "exec-if": "exit 0",                  // always run; consider advanced run conditions
-        "on-click": "alacritty -e 'paru'; pkill -SIGRTMIN+8 waybar", // update system
+        "on-click": "foot -e 'paru'; pkill -SIGRTMIN+8 waybar", // update system
         "signal": 8,
         "max-length": 5,
         "min-length": 3
@@ -396,7 +396,7 @@
         //on-click: "${wpctl} set-mute @DEFAULT_AUDIO_SINK@ toggle";
         //on-scroll-down: "${wpctl} set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 0.04+";
         //on-scroll-up: "${wpctl} set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 0.04-";
-       // "format": "<span foreground='#fab387'>{icon}</span>  {volume}%",
+        "format": "<span foreground='#ffffff'>{icon}{volume} </span>",
         //"format-muted": " ",
         "format-source": "",
         "format-source-muted": "",
@@ -409,7 +409,7 @@
             "phone": " ",
             "portable": " ",
             "car": " ",
-            //"default": [" ", " ", " "]
+            "default": [" ", " ", " "]
         },
     },
 
@@ -428,6 +428,9 @@
         },
         "modules": [
             "custom/tray-toggle",
+            "custom/pacman",
+            "custom/waypaper", 
+            "wireplumber",
             "tray"
         ]
     },
