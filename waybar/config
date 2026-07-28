@@ -23,7 +23,6 @@
     ],
     "modules-center": [
               "custom/rofi",
-              "clock#1",
               "custom/browser",
               "custom/discord",
               "custom/files",
@@ -31,6 +30,7 @@
               "custom/steam",
               "custom/hyprmod",
               "custom/simpbar-welcome"
+              "clock#1"
 
     ],
     "modules-right": [
