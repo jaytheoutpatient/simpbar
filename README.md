@@ -1,4 +1,4 @@
-# simpbar
+# Simpbar
 
 A Waybar setup for Hyprland that's simple, looks nice, and isn't distracting — plus an install script that sets up a whole ricing-friendly Arch desktop around it, and a companion GTK app to manage it all afterward.
 
