@@ -1023,6 +1023,17 @@ SETUP_ACTIONS = [
          "simpbar/main/install.sh | bash; echo; read -p 'Press Enter to close...'"],
     ),
     (
+        "Update Simpbar & Arch Linux",
+        "Runs a full system update, then re-fetches the latest install script "
+        "and configs from GitHub. Opens in a terminal — asks a few of the same "
+        "setup questions again as part of the refresh.",
+        "software-update-available-symbolic",
+        ["foot", "-e", "bash", "-lc",
+         "sudo pacman -Syu --noconfirm; echo; "
+         "curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/"
+         "simpbar/main/install.sh | bash; echo; read -p 'Press Enter to close...'"],
+    ),
+    (
         "Pick a wallpaper",
         "Opens waypaper, pointed at ~/Pictures/Wallpaper by default.",
         "preferences-desktop-wallpaper-symbolic",
