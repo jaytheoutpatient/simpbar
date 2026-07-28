@@ -9,6 +9,7 @@ Usage:
                                      been shown before (first-login use).
 """
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -180,6 +181,35 @@ def build_apply_pin_argv(binary: str, pkg: str, needs_aur: bool, pref_file: Path
     return ["foot", "-e", "bash", "-lc", full_cmd]
 
 
+WAYBAR_CONFIG_PATH = Path.home() / ".config" / "waybar" / "config"
+POSITION_RE = re.compile(r'"position"\s*:\s*"(top|bottom)"')
+
+
+def get_waybar_position() -> str:
+    try:
+        match = POSITION_RE.search(WAYBAR_CONFIG_PATH.read_text())
+        return match.group(1) if match else "bottom"
+    except OSError:
+        return "bottom"
+
+
+def set_waybar_position(position: str) -> bool:
+    """position is 'top' or 'bottom'. Restarts waybar so it takes effect
+    right away. Returns True on success."""
+    try:
+        content = WAYBAR_CONFIG_PATH.read_text()
+        new_content, count = POSITION_RE.subn(f'"position": "{position}"', content, count=1)
+        if count == 0:
+            return False
+        WAYBAR_CONFIG_PATH.write_text(new_content)
+        subprocess.run(["pkill", "-x", "waybar"], check=False)
+        subprocess.Popen(["waybar"], start_new_session=True)
+        return True
+    except OSError as exc:
+        print(f"simpbar-welcome: couldn't update waybar position: {exc}", file=sys.stderr)
+        return False
+
+
 REMOVE_NEOVIM_ARGV = [
     "foot", "-e", "bash", "-lc",
     "sudo pacman -Rns --noconfirm neovim; "
@@ -334,6 +364,34 @@ class SetupPage(Gtk.Box):
         pins_group.add(discord_row)
 
         self.append(pins_group)
+
+        waybar_group = Adw.PreferencesGroup(title="Waybar")
+
+        position_row = Adw.ComboRow(
+            title="Bar position",
+            subtitle="Moves the bar and restarts waybar right away.",
+            model=Gtk.StringList.new(["Top", "Bottom"]),
+        )
+        position_row.set_selected(0 if get_waybar_position() == "top" else 1)
+
+        position_button = Gtk.Button(label="Apply")
+        position_button.add_css_class("flat")
+        position_button.set_valign(Gtk.Align.CENTER)
+
+        def _on_position_apply(_b: Gtk.Button) -> None:
+            choice = "top" if position_row.get_selected() == 0 else "bottom"
+            if set_waybar_position(choice):
+                position_row.set_subtitle(f"Bar moved to the {choice}.")
+            else:
+                position_row.set_subtitle(
+                    "Could not update the config — check ~/.config/waybar/config exists."
+                )
+
+        position_button.connect("clicked", _on_position_apply)
+        position_row.add_suffix(position_button)
+        waybar_group.add(position_row)
+
+        self.append(waybar_group)
 
 
 class KeybindingsPage(Gtk.Box):
