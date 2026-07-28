@@ -705,7 +705,7 @@ FOOTEOF
 fi
 
 # wlogout, waypaper & protonplus are AUR-only — need an AUR helper
-AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme)
+AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme hyprmod)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 [ "$INSTALL_FALCOND" -eq 1 ] && AUR_PKGS+=(falcond falcond-gui)
@@ -1047,6 +1047,14 @@ SETUP_ACTIONS = [
         ["nwg-look"],
     ),
     (
+        "Tweak Hyprland settings",
+        "Opens HyprMod — keybinds, monitors, animations, window rules, and "
+        "more, with a live preview. Writes to its own config, doesn't touch "
+        "hyprland.lua directly.",
+        "preferences-desktop-display-symbolic",
+        ["hyprmod"],
+    ),
+    (
         "Adjust audio devices and volumes",
         "Opens pavucontrol.",
         "audio-speakers-symbolic",
@@ -1383,6 +1391,9 @@ if pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
 fi
 if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
     ok "Bibata Modern Classic cursor installed and applied"
+fi
+if pacman -Qq hyprmod >/dev/null 2>&1; then
+    ok "HyprMod installed (GTK4 settings app for Hyprland — writes only to its own hyprland-gui.conf)"
 fi
 if pacman -Qq falcond >/dev/null 2>&1; then
     ok "falcond & falcond-gui installed (log out/in for group membership to apply)"

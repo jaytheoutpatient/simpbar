@@ -70,6 +70,14 @@ SETUP_ACTIONS = [
         ["nwg-look"],
     ),
     (
+        "Tweak Hyprland settings",
+        "Opens HyprMod — keybinds, monitors, animations, window rules, and "
+        "more, with a live preview. Writes to its own config, doesn't touch "
+        "hyprland.lua directly.",
+        "preferences-desktop-display-symbolic",
+        ["hyprmod"],
+    ),
+    (
         "Adjust audio devices and volumes",
         "Opens pavucontrol.",
         "audio-speakers-symbolic",
