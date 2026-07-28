@@ -1772,7 +1772,11 @@ class WelcomeWindow(Adw.ApplicationWindow):
         self.content_stack = Gtk.Stack()
         self.content_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         for name, widget in self.pages.items():
-            self.content_stack.add_named(widget, name)
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_hscrollbar_policy(Gtk.PolicyType.NEVER)
+            scrolled.set_vscrollbar_policy(Gtk.PolicyType.AUTOMATIC)
+            scrolled.set_child(widget)
+            self.content_stack.add_named(scrolled, name)
 
         content_toolbar = Adw.ToolbarView()
         content_toolbar.add_top_bar(Adw.HeaderBar())
