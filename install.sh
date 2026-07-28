@@ -1124,6 +1124,45 @@ def build_editor_install_argv(name: str) -> list[str]:
     return ["foot", "-e", "bash", "-lc", full_cmd]
 
 
+SIMPBAR_CONFIG_DIR = Path.home() / ".config" / "simpbar"
+BROWSER_PREF_FILE = SIMPBAR_CONFIG_DIR / "browser-choice"
+DISCORD_PREF_FILE = SIMPBAR_CONFIG_DIR / "discord-choice"
+
+# name -> (binary to launch, package to install, needs an AUR helper)
+PIN_BROWSER_OPTIONS = ["Brave", "Zen Browser", "Vivaldi", "Microsoft Edge", "LibreWolf", "Firefox"]
+PIN_BROWSER_INFO = {
+    "Brave": ("brave", "brave-bin", True),
+    "Zen Browser": ("zen-browser", "zen-browser-bin", True),
+    "Vivaldi": ("vivaldi-stable", "vivaldi", True),
+    "Microsoft Edge": ("microsoft-edge-stable", "microsoft-edge-stable-bin", True),
+    "LibreWolf": ("librewolf", "librewolf-bin", True),
+    "Firefox": ("firefox", "firefox", False),
+}
+
+PIN_DISCORD_OPTIONS = ["Discord", "Vesktop", "Equibop"]
+PIN_DISCORD_INFO = {
+    "Discord": ("discord", "discord", False),
+    "Vesktop": ("vesktop", "vesktop-bin", True),
+    "Equibop": ("equibop", "equibop-bin", True),
+}
+
+
+def build_apply_pin_argv(binary: str, pkg: str, needs_aur: bool, pref_file: Path) -> list[str]:
+    """Install the package (if needed) and write it as the waybar pin's
+    preferred binary, checked by simpbar-launch-browser/-discord."""
+    if needs_aur:
+        install_cmd = (
+            f"if command -v yay >/dev/null; then yay -S --noconfirm --needed {pkg}; "
+            f"elif command -v paru >/dev/null; then paru -S --noconfirm --needed {pkg}; "
+            f'else echo "No AUR helper found — install {pkg} manually"; fi'
+        )
+    else:
+        install_cmd = f"sudo pacman -S --noconfirm --needed {pkg}"
+    write_pref = f"mkdir -p {SIMPBAR_CONFIG_DIR} && echo {binary} > {pref_file}"
+    full_cmd = f"{install_cmd}; {write_pref}; echo; read -p 'Press Enter to close...'"
+    return ["foot", "-e", "bash", "-lc", full_cmd]
+
+
 REMOVE_NEOVIM_ARGV = [
     "foot", "-e", "bash", "-lc",
     "sudo pacman -Rns --noconfirm neovim; "
@@ -1236,6 +1275,48 @@ class SetupPage(Gtk.Box):
         editor_group.add(remove_row)
 
         self.append(editor_group)
+
+        pins_group = Adw.PreferencesGroup(
+            title="Pinned apps",
+            description="Picks which app the waybar Browser/Discord pins launch. "
+            "Installs it if needed.",
+        )
+
+        browser_row = Adw.ComboRow(
+            title="Pinned browser",
+            model=Gtk.StringList.new(PIN_BROWSER_OPTIONS),
+        )
+        browser_button = Gtk.Button(label="Apply")
+        browser_button.add_css_class("flat")
+        browser_button.set_valign(Gtk.Align.CENTER)
+        browser_button.connect(
+            "clicked",
+            lambda _b: launch(build_apply_pin_argv(
+                *PIN_BROWSER_INFO[PIN_BROWSER_OPTIONS[browser_row.get_selected()]],
+                BROWSER_PREF_FILE,
+            )),
+        )
+        browser_row.add_suffix(browser_button)
+        pins_group.add(browser_row)
+
+        discord_row = Adw.ComboRow(
+            title="Pinned Discord client",
+            model=Gtk.StringList.new(PIN_DISCORD_OPTIONS),
+        )
+        discord_button = Gtk.Button(label="Apply")
+        discord_button.add_css_class("flat")
+        discord_button.set_valign(Gtk.Align.CENTER)
+        discord_button.connect(
+            "clicked",
+            lambda _b: launch(build_apply_pin_argv(
+                *PIN_DISCORD_INFO[PIN_DISCORD_OPTIONS[discord_row.get_selected()]],
+                DISCORD_PREF_FILE,
+            )),
+        )
+        discord_row.add_suffix(discord_button)
+        pins_group.add(discord_row)
+
+        self.append(pins_group)
 
 
 class KeybindingsPage(Gtk.Box):
@@ -1501,6 +1582,53 @@ if [ "${#MESSAGES[@]}" -gt 0 ] && command -v notify-send >/dev/null 2>&1; then
 fi
 CHECKERPEOF
 sudo chmod +x /usr/bin/simpbar-check-updates
+
+# Pinned-app launchers for waybar — browser and Discord client are both
+# user-chosen at install time, so these try known binaries in order and
+# launch whichever's actually installed.
+sudo tee /usr/bin/simpbar-launch-browser >/dev/null <<'BROWSERWRAPEOF'
+#!/bin/bash
+# simpbar-launch-browser — checks ~/.config/simpbar/browser-choice first (set
+# via the Welcome app's Setup tab); falls back to trying known binaries in
+# order if no preference is set or the preferred one isn't actually installed.
+PREF_FILE="$HOME/.config/simpbar/browser-choice"
+if [ -r "$PREF_FILE" ]; then
+    preferred=$(cat "$PREF_FILE")
+    [ -n "$preferred" ] && command -v "$preferred" >/dev/null 2>&1 && exec "$preferred"
+fi
+for bin in brave zen-browser zen vivaldi-stable vivaldi microsoft-edge-stable librewolf firefox; do
+    if command -v "$bin" >/dev/null 2>&1; then
+        exec "$bin"
+    fi
+done
+command -v notify-send >/dev/null 2>&1 && \
+    notify-send -a "Simpbar" "No browser found" \
+        "Install one from the Simpbar Welcome app or install script."
+BROWSERWRAPEOF
+sudo chmod +x /usr/bin/simpbar-launch-browser
+
+sudo tee /usr/bin/simpbar-launch-discord >/dev/null <<'DISCORDWRAPEOF'
+#!/bin/bash
+# simpbar-launch-discord — checks ~/.config/simpbar/discord-choice first (set
+# via the Welcome app's Setup tab); falls back to trying known binaries in
+# order if no preference is set or the preferred one isn't actually installed.
+PREF_FILE="$HOME/.config/simpbar/discord-choice"
+if [ -r "$PREF_FILE" ]; then
+    preferred=$(cat "$PREF_FILE")
+    [ -n "$preferred" ] && command -v "$preferred" >/dev/null 2>&1 && exec "$preferred"
+fi
+for bin in vesktop equibop discord; do
+    if command -v "$bin" >/dev/null 2>&1; then
+        exec "$bin"
+    fi
+done
+command -v notify-send >/dev/null 2>&1 && \
+    notify-send -a "Simpbar" "No Discord client found" \
+        "Install one from the Simpbar Welcome app or install script."
+DISCORDWRAPEOF
+sudo chmod +x /usr/bin/simpbar-launch-discord
+ok "Pinned-app launchers (browser, Discord) ready for waybar"
+
 
 cat > ~/.config/systemd/user/simpbar-update-checker.service <<'CHECKERSVCEOF'
 [Unit]

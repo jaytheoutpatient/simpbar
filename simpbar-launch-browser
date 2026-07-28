@@ -1,0 +1,17 @@
+#!/bin/bash
+# simpbar-launch-browser — checks ~/.config/simpbar/browser-choice first (set
+# via the Welcome app's Setup tab); falls back to trying known binaries in
+# order if no preference is set or the preferred one isn't actually installed.
+PREF_FILE="$HOME/.config/simpbar/browser-choice"
+if [ -r "$PREF_FILE" ]; then
+    preferred=$(cat "$PREF_FILE")
+    [ -n "$preferred" ] && command -v "$preferred" >/dev/null 2>&1 && exec "$preferred"
+fi
+for bin in brave zen-browser zen vivaldi-stable vivaldi microsoft-edge-stable librewolf firefox; do
+    if command -v "$bin" >/dev/null 2>&1; then
+        exec "$bin"
+    fi
+done
+command -v notify-send >/dev/null 2>&1 && \
+    notify-send -a "Simpbar" "No browser found" \
+        "Install one from the Simpbar Welcome app or install script."
