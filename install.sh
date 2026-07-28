@@ -288,7 +288,7 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify jstest-gtk)
 
 prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
 [ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
@@ -705,7 +705,7 @@ FOOTEOF
 fi
 
 # wlogout, waypaper & protonplus are AUR-only — need an AUR helper
-AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme hyprmod)
+AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme hyprmod game-devices-udev)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 [ "$INSTALL_FALCOND" -eq 1 ] && AUR_PKGS+=(falcond falcond-gui)
@@ -742,6 +742,12 @@ if [ "${#MISSING_AUR[@]}" -gt 0 ]; then
     warn "AUR packages not installed: ${MISSING_AUR[*]} — install manually if needed"
 else
     ok "Verified all AUR packages are installed"
+fi
+
+if pacman -Qq game-devices-udev >/dev/null 2>&1; then
+    run_spinner "Reloading udev rules for game controllers" \
+        sudo bash -c 'udevadm control --reload-rules && udevadm trigger' \
+        || warn "Could not reload udev rules — replug your controller or reboot for the new rules to apply"
 fi
 
 if pacman -Qq falcond >/dev/null 2>&1; then
@@ -1092,6 +1098,14 @@ SETUP_ACTIONS = [
         "hyprland.lua directly.",
         "preferences-desktop-display-symbolic",
         ["hyprmod"],
+    ),
+    (
+        "Test and configure game controllers",
+        "Opens jstest-gtk to test buttons/axes. Controller permissions are "
+        "already fixed via game-devices-udev — Xbox, PlayStation, and most "
+        "generic controllers should just work.",
+        "input-gaming-symbolic",
+        ["jstest-gtk"],
     ),
     (
         "Adjust audio devices and volumes",
@@ -1539,6 +1553,12 @@ if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
 fi
 if pacman -Qq hyprmod >/dev/null 2>&1; then
     ok "HyprMod installed (GTK4 settings app for Hyprland — writes only to its own hyprland-gui.conf)"
+fi
+if pacman -Qq game-devices-udev >/dev/null 2>&1; then
+    ok "game-devices-udev installed — Xbox/PlayStation/generic controllers get proper permissions"
+fi
+if pacman -Qq jstest-gtk >/dev/null 2>&1; then
+    ok "jstest-gtk installed for testing/calibrating controllers"
 fi
 if [ -e ~/.config/systemd/user/simpbar-update-checker.timer ]; then
     ok "Update checker enabled — notifies on new Arch/AUR updates or new commits on the simpbar repo (checks every 6h)"

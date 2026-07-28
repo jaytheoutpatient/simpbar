@@ -117,6 +117,14 @@ SETUP_ACTIONS = [
         ["hyprmod"],
     ),
     (
+        "Test and configure game controllers",
+        "Opens jstest-gtk to test buttons/axes. Controller permissions are "
+        "already fixed via game-devices-udev — Xbox, PlayStation, and most "
+        "generic controllers should just work.",
+        "input-gaming-symbolic",
+        ["jstest-gtk"],
+    ),
+    (
         "Adjust audio devices and volumes",
         "Opens pavucontrol.",
         "audio-speakers-symbolic",
