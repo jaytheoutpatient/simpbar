@@ -23,7 +23,6 @@
     ],
     "modules-center": [
               "custom/rofi",
-              "custom/weather",
               "clock#1",
               "custom/browser",
               "custom/discord",
@@ -35,6 +34,7 @@
 
     ],
     "modules-right": [
+        "custom/weather",
          "group/tray-expander",
          "custom/power"
     ],

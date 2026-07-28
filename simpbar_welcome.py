@@ -210,6 +210,43 @@ def set_waybar_position(position: str) -> bool:
         return False
 
 
+COMMON_RESOLUTIONS = [
+    "1920x1080",
+    "2560x1440",
+    "3840x2160",
+    "1366x768",
+    "1600x900",
+    "1280x1024",
+    "2560x1080",
+    "3440x1440",
+]
+WIDTH_RE = re.compile(r'"width"\s*:\s*(\d+)')
+
+
+def get_waybar_width() -> str:
+    try:
+        match = WIDTH_RE.search(WAYBAR_CONFIG_PATH.read_text())
+        return match.group(1) if match else "1920"
+    except OSError:
+        return "1920"
+
+
+def set_waybar_width(width: int) -> bool:
+    """Restarts waybar so it takes effect right away. Returns True on success."""
+    try:
+        content = WAYBAR_CONFIG_PATH.read_text()
+        new_content, count = WIDTH_RE.subn(f'"width": {width}', content, count=1)
+        if count == 0:
+            return False
+        WAYBAR_CONFIG_PATH.write_text(new_content)
+        subprocess.run(["pkill", "-x", "waybar"], check=False)
+        subprocess.Popen(["waybar"], start_new_session=True)
+        return True
+    except OSError as exc:
+        print(f"simpbar-welcome: couldn't update waybar width: {exc}", file=sys.stderr)
+        return False
+
+
 REMOVE_NEOVIM_ARGV = [
     "foot", "-e", "bash", "-lc",
     "sudo pacman -Rns --noconfirm neovim; "
@@ -390,6 +427,35 @@ class SetupPage(Gtk.Box):
         position_button.connect("clicked", _on_position_apply)
         position_row.add_suffix(position_button)
         waybar_group.add(position_row)
+
+        resolution_row = Adw.ComboRow(
+            title="Screen resolution",
+            subtitle="Sets the bar's width to span your monitor.",
+            model=Gtk.StringList.new(COMMON_RESOLUTIONS),
+        )
+        current_width = get_waybar_width()
+        resolution_row.set_selected(next(
+            (i for i, res in enumerate(COMMON_RESOLUTIONS) if res.split("x")[0] == current_width),
+            0,
+        ))
+
+        resolution_button = Gtk.Button(label="Apply")
+        resolution_button.add_css_class("flat")
+        resolution_button.set_valign(Gtk.Align.CENTER)
+
+        def _on_resolution_apply(_b: Gtk.Button) -> None:
+            res = COMMON_RESOLUTIONS[resolution_row.get_selected()]
+            width = int(res.split("x")[0])
+            if set_waybar_width(width):
+                resolution_row.set_subtitle(f"Bar width set to {width}px ({res}).")
+            else:
+                resolution_row.set_subtitle(
+                    "Could not update the config — check ~/.config/waybar/config exists."
+                )
+
+        resolution_button.connect("clicked", _on_resolution_apply)
+        resolution_row.add_suffix(resolution_button)
+        waybar_group.add(resolution_row)
 
         self.append(waybar_group)
 
