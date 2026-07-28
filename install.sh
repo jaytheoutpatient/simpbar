@@ -288,7 +288,7 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify jstest-gtk)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify)
 
 prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
 [ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
@@ -1100,14 +1100,6 @@ SETUP_ACTIONS = [
         ["hyprmod"],
     ),
     (
-        "Test and configure game controllers",
-        "Opens jstest-gtk to test buttons/axes. Controller permissions are "
-        "already fixed via game-devices-udev — Xbox, PlayStation, and most "
-        "generic controllers should just work.",
-        "input-gaming-symbolic",
-        ["jstest-gtk"],
-    ),
-    (
         "Adjust audio devices and volumes",
         "Opens pavucontrol.",
         "audio-speakers-symbolic",
@@ -1556,9 +1548,6 @@ if pacman -Qq hyprmod >/dev/null 2>&1; then
 fi
 if pacman -Qq game-devices-udev >/dev/null 2>&1; then
     ok "game-devices-udev installed — Xbox/PlayStation/generic controllers get proper permissions"
-fi
-if pacman -Qq jstest-gtk >/dev/null 2>&1; then
-    ok "jstest-gtk installed for testing/calibrating controllers"
 fi
 if [ -e ~/.config/systemd/user/simpbar-update-checker.timer ]; then
     ok "Update checker enabled — notifies on new Arch/AUR updates or new commits on the simpbar repo (checks every 6h)"
