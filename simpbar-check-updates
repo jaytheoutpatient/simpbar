@@ -1,0 +1,45 @@
+#!/bin/bash
+# simpbar-check-updates — checks for Arch/AUR package updates and new
+# commits on the simpbar GitHub repo, and fires a desktop notification
+# (via notify-send / swaync) if either is found. Safe to run repeatedly
+# and safe with no network (just does nothing that turn).
+
+CACHE_DIR="$HOME/.cache/simpbar"
+COMMIT_CACHE="$CACHE_DIR/last-commit-sha"
+mkdir -p "$CACHE_DIR"
+
+MESSAGES=()
+
+# Official repo updates — checkupdates syncs its own temp db, no root needed.
+if command -v checkupdates >/dev/null 2>&1; then
+    PKG_COUNT=$(checkupdates 2>/dev/null | wc -l)
+    [ "$PKG_COUNT" -gt 0 ] && MESSAGES+=("$PKG_COUNT Arch package update(s) available")
+fi
+
+# AUR updates, if a helper is available.
+if command -v yay >/dev/null 2>&1; then
+    AUR_COUNT=$(yay -Qua 2>/dev/null | wc -l)
+    [ "$AUR_COUNT" -gt 0 ] && MESSAGES+=("$AUR_COUNT AUR update(s) available")
+elif command -v paru >/dev/null 2>&1; then
+    AUR_COUNT=$(paru -Qua 2>/dev/null | wc -l)
+    [ "$AUR_COUNT" -gt 0 ] && MESSAGES+=("$AUR_COUNT AUR update(s) available")
+fi
+
+# New commits on the simpbar repo's main branch.
+LATEST_SHA=$(curl -fsSL "https://api.github.com/repos/jaytheoutpatient/simpbar/commits/main" 2>/dev/null \
+    | grep -m1 '"sha"' | cut -d'"' -f4)
+if [ -n "$LATEST_SHA" ]; then
+    PREV_SHA=$(cat "$COMMIT_CACHE" 2>/dev/null || echo "")
+    # Only notify if we've seen a previous commit before (i.e. not the very
+    # first run) and it's actually different.
+    if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$LATEST_SHA" ]; then
+        MESSAGES+=("New commit(s) on the simpbar GitHub repo")
+    fi
+    echo "$LATEST_SHA" > "$COMMIT_CACHE"
+fi
+
+if [ "${#MESSAGES[@]}" -gt 0 ] && command -v notify-send >/dev/null 2>&1; then
+    BODY=$(printf '%s\n' "${MESSAGES[@]}")
+    notify-send -a "Simpbar" -i software-update-available-symbolic \
+        "Simpbar updates available" "$BODY"
+fi

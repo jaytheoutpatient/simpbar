@@ -25,6 +25,37 @@ LOGO_PATH = Path.home() / ".local" / "share" / "simpbar" / "logo.png"
 REPO_URL = "https://github.com/jaytheoutpatient/simpbar"
 CONTACT_EMAIL = "jaytheoutpatient@protonmail.com"
 HYPRLAND_CONF = "~/.config/hypr/hyprland.lua"
+HYPRLAND_LUA_PATH = Path.home() / ".config" / "hypr" / "hyprland.lua"
+AUTOSTART_LINE = 'hl.exec_cmd("simpbar-welcome")'
+
+
+def is_autostart_enabled() -> bool:
+    try:
+        return AUTOSTART_LINE in HYPRLAND_LUA_PATH.read_text()
+    except OSError:
+        return False
+
+
+def set_autostart_enabled(enabled: bool) -> bool:
+    """Add or remove AUTOSTART_LINE in hyprland.lua. Returns True on success."""
+    try:
+        if enabled:
+            HYPRLAND_LUA_PATH.parent.mkdir(parents=True, exist_ok=True)
+            content = HYPRLAND_LUA_PATH.read_text() if HYPRLAND_LUA_PATH.exists() else ""
+            if AUTOSTART_LINE not in content:
+                if content and not content.endswith("\n"):
+                    content += "\n"
+                content += AUTOSTART_LINE + "\n"
+                HYPRLAND_LUA_PATH.write_text(content)
+        elif HYPRLAND_LUA_PATH.exists():
+            lines = HYPRLAND_LUA_PATH.read_text().splitlines(keepends=True)
+            lines = [ln for ln in lines if ln.strip() != AUTOSTART_LINE]
+            HYPRLAND_LUA_PATH.write_text("".join(lines))
+        return True
+    except OSError as exc:
+        print(f"simpbar-welcome: couldn't update hyprland.lua: {exc}", file=sys.stderr)
+        return False
+
 
 KEYBINDINGS = [
     ("SUPER", "Windows key"),
@@ -55,6 +86,14 @@ SETUP_ACTIONS = [
          "sudo pacman -Syu --noconfirm; echo; "
          "curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/"
          "simpbar/main/install.sh | bash; echo; read -p 'Press Enter to close...'"],
+    ),
+    (
+        "Check for updates now",
+        "Checks for Arch/AUR package updates and new commits on the simpbar "
+        "repo, and sends a notification if it finds anything. Runs "
+        "automatically every few hours in the background too.",
+        "view-refresh-symbolic",
+        ["simpbar-check-updates"],
     ),
     (
         "Pick a wallpaper",
@@ -227,7 +266,10 @@ class WelcomeWindow(Adw.ApplicationWindow):
         self.set_default_size(760, 520)
 
         split_view = Adw.NavigationSplitView()
-        self.set_content(split_view)
+
+        overlay = Gtk.Overlay()
+        overlay.set_child(split_view)
+        self.set_content(overlay)
 
         # Sidebar
         sidebar_list = Gtk.ListBox()
@@ -282,9 +324,31 @@ class WelcomeWindow(Adw.ApplicationWindow):
         content_page = Adw.NavigationPage(title="", child=content_toolbar)
         split_view.set_content(content_page)
 
+        # Floating "launch on startup" toggle, bottom-right, visible on every page.
+        autostart_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        autostart_box.add_css_class("osd")
+        autostart_box.add_css_class("toolbar")
+        autostart_box.set_halign(Gtk.Align.END)
+        autostart_box.set_valign(Gtk.Align.END)
+        autostart_box.set_margin_end(16)
+        autostart_box.set_margin_bottom(16)
+
+        autostart_label = Gtk.Label(label="Launch on startup")
+        autostart_switch = Gtk.Switch()
+        autostart_switch.set_valign(Gtk.Align.CENTER)
+        autostart_switch.set_active(is_autostart_enabled())
+        autostart_switch.connect("notify::active", self._on_autostart_toggled)
+
+        autostart_box.append(autostart_label)
+        autostart_box.append(autostart_switch)
+        overlay.add_overlay(autostart_box)
+
         sidebar_list.select_row(sidebar_list.get_row_at_index(0))
 
         self.connect("close-request", self._on_close_request)
+
+    def _on_autostart_toggled(self, switch: Gtk.Switch, _pspec) -> None:
+        set_autostart_enabled(switch.get_active())
 
     def _on_row_selected(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
         if row is not None:

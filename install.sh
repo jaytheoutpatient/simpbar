@@ -288,7 +288,7 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita)
+PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify)
 
 prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
 [ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
@@ -1002,6 +1002,37 @@ LOGO_PATH = Path.home() / ".local" / "share" / "simpbar" / "logo.png"
 REPO_URL = "https://github.com/jaytheoutpatient/simpbar"
 CONTACT_EMAIL = "jaytheoutpatient@protonmail.com"
 HYPRLAND_CONF = "~/.config/hypr/hyprland.lua"
+HYPRLAND_LUA_PATH = Path.home() / ".config" / "hypr" / "hyprland.lua"
+AUTOSTART_LINE = 'hl.exec_cmd("simpbar-welcome")'
+
+
+def is_autostart_enabled() -> bool:
+    try:
+        return AUTOSTART_LINE in HYPRLAND_LUA_PATH.read_text()
+    except OSError:
+        return False
+
+
+def set_autostart_enabled(enabled: bool) -> bool:
+    """Add or remove AUTOSTART_LINE in hyprland.lua. Returns True on success."""
+    try:
+        if enabled:
+            HYPRLAND_LUA_PATH.parent.mkdir(parents=True, exist_ok=True)
+            content = HYPRLAND_LUA_PATH.read_text() if HYPRLAND_LUA_PATH.exists() else ""
+            if AUTOSTART_LINE not in content:
+                if content and not content.endswith("\n"):
+                    content += "\n"
+                content += AUTOSTART_LINE + "\n"
+                HYPRLAND_LUA_PATH.write_text(content)
+        elif HYPRLAND_LUA_PATH.exists():
+            lines = HYPRLAND_LUA_PATH.read_text().splitlines(keepends=True)
+            lines = [ln for ln in lines if ln.strip() != AUTOSTART_LINE]
+            HYPRLAND_LUA_PATH.write_text("".join(lines))
+        return True
+    except OSError as exc:
+        print(f"simpbar-welcome: couldn't update hyprland.lua: {exc}", file=sys.stderr)
+        return False
+
 
 KEYBINDINGS = [
     ("SUPER", "Windows key"),
@@ -1032,6 +1063,14 @@ SETUP_ACTIONS = [
          "sudo pacman -Syu --noconfirm; echo; "
          "curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/"
          "simpbar/main/install.sh | bash; echo; read -p 'Press Enter to close...'"],
+    ),
+    (
+        "Check for updates now",
+        "Checks for Arch/AUR package updates and new commits on the simpbar "
+        "repo, and sends a notification if it finds anything. Runs "
+        "automatically every few hours in the background too.",
+        "view-refresh-symbolic",
+        ["simpbar-check-updates"],
     ),
     (
         "Pick a wallpaper",
@@ -1204,7 +1243,10 @@ class WelcomeWindow(Adw.ApplicationWindow):
         self.set_default_size(760, 520)
 
         split_view = Adw.NavigationSplitView()
-        self.set_content(split_view)
+
+        overlay = Gtk.Overlay()
+        overlay.set_child(split_view)
+        self.set_content(overlay)
 
         # Sidebar
         sidebar_list = Gtk.ListBox()
@@ -1259,9 +1301,31 @@ class WelcomeWindow(Adw.ApplicationWindow):
         content_page = Adw.NavigationPage(title="", child=content_toolbar)
         split_view.set_content(content_page)
 
+        # Floating "launch on startup" toggle, bottom-right, visible on every page.
+        autostart_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        autostart_box.add_css_class("osd")
+        autostart_box.add_css_class("toolbar")
+        autostart_box.set_halign(Gtk.Align.END)
+        autostart_box.set_valign(Gtk.Align.END)
+        autostart_box.set_margin_end(16)
+        autostart_box.set_margin_bottom(16)
+
+        autostart_label = Gtk.Label(label="Launch on startup")
+        autostart_switch = Gtk.Switch()
+        autostart_switch.set_valign(Gtk.Align.CENTER)
+        autostart_switch.set_active(is_autostart_enabled())
+        autostart_switch.connect("notify::active", self._on_autostart_toggled)
+
+        autostart_box.append(autostart_label)
+        autostart_box.append(autostart_switch)
+        overlay.add_overlay(autostart_box)
+
         sidebar_list.select_row(sidebar_list.get_row_at_index(0))
 
         self.connect("close-request", self._on_close_request)
+
+    def _on_autostart_toggled(self, switch: Gtk.Switch, _pspec) -> None:
+        set_autostart_enabled(switch.get_active())
 
     def _on_row_selected(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
         if row is not None:
@@ -1319,6 +1383,87 @@ sudo tee /usr/bin/simpbar-welcome >/dev/null <<'WRAPPEREOF'
 exec python3 "$HOME/.local/share/simpbar/simpbar_welcome.py" "$@"
 WRAPPEREOF
 sudo chmod +x /usr/bin/simpbar-welcome
+
+# Background update checker — Arch/AUR package updates + new commits on
+# the simpbar repo — fires a desktop notification via notify-send/swaync.
+sudo tee /usr/bin/simpbar-check-updates >/dev/null <<'CHECKERPEOF'
+#!/bin/bash
+# simpbar-check-updates — checks for Arch/AUR package updates and new
+# commits on the simpbar GitHub repo, and fires a desktop notification
+# (via notify-send / swaync) if either is found. Safe to run repeatedly
+# and safe with no network (just does nothing that turn).
+
+CACHE_DIR="$HOME/.cache/simpbar"
+COMMIT_CACHE="$CACHE_DIR/last-commit-sha"
+mkdir -p "$CACHE_DIR"
+
+MESSAGES=()
+
+# Official repo updates — checkupdates syncs its own temp db, no root needed.
+if command -v checkupdates >/dev/null 2>&1; then
+    PKG_COUNT=$(checkupdates 2>/dev/null | wc -l)
+    [ "$PKG_COUNT" -gt 0 ] && MESSAGES+=("$PKG_COUNT Arch package update(s) available")
+fi
+
+# AUR updates, if a helper is available.
+if command -v yay >/dev/null 2>&1; then
+    AUR_COUNT=$(yay -Qua 2>/dev/null | wc -l)
+    [ "$AUR_COUNT" -gt 0 ] && MESSAGES+=("$AUR_COUNT AUR update(s) available")
+elif command -v paru >/dev/null 2>&1; then
+    AUR_COUNT=$(paru -Qua 2>/dev/null | wc -l)
+    [ "$AUR_COUNT" -gt 0 ] && MESSAGES+=("$AUR_COUNT AUR update(s) available")
+fi
+
+# New commits on the simpbar repo's main branch.
+LATEST_SHA=$(curl -fsSL "https://api.github.com/repos/jaytheoutpatient/simpbar/commits/main" 2>/dev/null \
+    | grep -m1 '"sha"' | cut -d'"' -f4)
+if [ -n "$LATEST_SHA" ]; then
+    PREV_SHA=$(cat "$COMMIT_CACHE" 2>/dev/null || echo "")
+    # Only notify if we've seen a previous commit before (i.e. not the very
+    # first run) and it's actually different.
+    if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$LATEST_SHA" ]; then
+        MESSAGES+=("New commit(s) on the simpbar GitHub repo")
+    fi
+    echo "$LATEST_SHA" > "$COMMIT_CACHE"
+fi
+
+if [ "${#MESSAGES[@]}" -gt 0 ] && command -v notify-send >/dev/null 2>&1; then
+    BODY=$(printf '%s\n' "${MESSAGES[@]}")
+    notify-send -a "Simpbar" -i software-update-available-symbolic \
+        "Simpbar updates available" "$BODY"
+fi
+CHECKERPEOF
+sudo chmod +x /usr/bin/simpbar-check-updates
+
+cat > ~/.config/systemd/user/simpbar-update-checker.service <<'CHECKERSVCEOF'
+[Unit]
+Description=Check for simpbar/Arch updates
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/simpbar-check-updates
+CHECKERSVCEOF
+
+cat > ~/.config/systemd/user/simpbar-update-checker.timer <<'CHECKERTIMEREOF'
+[Unit]
+Description=Periodically check for simpbar/Arch updates
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+CHECKERTIMEREOF
+
+if pacman -Qq pacman-contrib >/dev/null 2>&1 && pacman -Qq libnotify >/dev/null 2>&1; then
+    run_spinner "Enabling simpbar-update-checker.timer" systemctl --user enable --now simpbar-update-checker.timer \
+        || warn "Could not enable simpbar-update-checker.timer — enable it manually: systemctl --user enable --now simpbar-update-checker.timer"
+else
+    warn "pacman-contrib/libnotify not fully installed — skipping the update-checker timer"
+fi
+
 
 cat > ~/.local/share/applications/simpbar-welcome.desktop <<'WELCOMEDESKTOPEOF'
 [Desktop Entry]
@@ -1394,6 +1539,9 @@ if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
 fi
 if pacman -Qq hyprmod >/dev/null 2>&1; then
     ok "HyprMod installed (GTK4 settings app for Hyprland — writes only to its own hyprland-gui.conf)"
+fi
+if [ -e ~/.config/systemd/user/simpbar-update-checker.timer ]; then
+    ok "Update checker enabled — notifies on new Arch/AUR updates or new commits on the simpbar repo (checks every 6h)"
 fi
 if pacman -Qq falcond >/dev/null 2>&1; then
     ok "falcond & falcond-gui installed (log out/in for group membership to apply)"
