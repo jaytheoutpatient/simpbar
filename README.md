@@ -1,72 +1,85 @@
 # simpbar
-<img width="644" height="210" alt="image" src="https://github.com/user-attachments/assets/e65a412b-ed55-4cbe-9f6b-5879e8fef875" />
 
-<b>Waybar</b> <br>
-The waybar comes with workspaces you can scroll up or down to scroll,<br> 
- Media Player as whatever music you are playing spotify youtube etc will show up,<br>
- A menu button which will bring up the rofi menu scroll and click what you need<br>
- or type & search what you need, Weather, Time & date if you click on it the gnome calendar app will spawn in the middle<br>
-  of the screen, A collapsible tray with a arrow icon click on it to reveal the volume or change wallpaper and finally a power<br>
-   button click on it to access the wlogout menu.
-   
-Copy and paste this line below paste it into your terminal: <br>
-```bash
+A Waybar setup for Hyprland that's simple, looks nice, and isn't distracting — plus an install script that sets up a whole ricing-friendly Arch desktop around it, and a companion GTK app to manage it all afterward.
+
+Built for **Arch Linux** (and Arch-based distros like EndeavourOS, CachyOS, Garuda, XeroLinux — your mileage may vary depending on how much those ship pre-configured). Assumes **Hyprland 0.55+** (Lua config, `~/.config/hypr/hyprland.lua`).
+
+## Install
+
+```
 curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash
 ```
 
-There is a install script below do know this only works for archlinux atm <br>
-but will try make it work for other Linux distributions! <br>
-The install script is going to ask some questions like ask if you are going <br>
-to use obs-studio, what browser would you like to use, it will detect that you are using <br>
-Firefox and ask if you want to remove or keep it, And what discord client you want <br>
-such as discord, vesktop or equibop. It's going to give you also flatpak and bazaar <br>
+The script is interactive — it'll ask a handful of questions (browser, Discord client, whether you want OBS/a video editor/game launchers/falcond, etc.) and needs your sudo password partway through. Grab a coffee; it installs a lot.
 
-<b> Just a warning </b> <br>
-It is going to be jank this is still a wip but I can gurantee it's not going to <br>
-mess your system up! 
+Waybar is set to `1920x1080` at scale `1` (my monitor) — adjust `hyprland.lua` if yours is different.
 
-It will install the dependencies such as: <br>
-1. A Welcome Gui that starts on boot for updates!
-2. Hyprmod which allows to edit hyprland settings set your monitors resolution with a gui!
-3. nwg-drawer as your application menu!
-4. Wlogout
-5. Swaybg
-6. Waypaper
-7. Neovim with (Lazyvim)
-8. Steam
-9. ProtonPlus
-10. Flatpak
-11. Bazaar
-12. Nautilus
-13. Hyprland
-14. Gnome-polkit
-15. Fastfetch because ya gotta flex
-16. Foot (Terminal)
-17. Gnome Calendar <br>
-<b>That's it!</b> <br>
-Go support the Hyprmod developer:<br>
+## What the install script sets up
 
-https://github.com/BlueManCZ/hyprmod
+**Bar, compositor & theming**
+- Waybar (this repo's config), Hyprland, foot (terminal), rofi with its bundled Material theme, swaync (notifications)
+- Dracula GTK + icon theme, Bibata Modern Classic cursor, nwg-look (already pointed at both) — all applied automatically, no manual toggling needed
+- fastfetch (also wired into every new bash/fish shell)
 
+**Wallpaper**
+- Downloads that day's Bing wallpaper into `~/Pictures/Wallpaper` and points waypaper at it
+- swaybg is enabled as a systemd user service so it's already showing the wallpaper on login — no need to add anything to your Hyprland autostart yourself
 
-Copy and paste this line below paste it into your terminal: <br>
-```bash
-curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash
+**Shell**
+- fish, set as your default login shell, empty greeting, fastfetch on launch
+
+**Editors**
+- Neovim + LazyVim installed by default
+- The Welcome app's Setup tab can install Gedit, Kate, Zed, or VS Code instead/alongside, or fully remove Neovim + LazyVim if you'd rather not have it
+
+**Gaming**
+- Steam (multilib enabled automatically), ProtonPlus, optional Lutris/Heroic
+- falcond + falcond-gui (per-game performance profiles) with scx-scheds/scx-tools for sched_ext scheduler switching, if you opt in
+- game-devices-udev for proper Xbox/PlayStation/generic controller permissions — no root or relog needed
+
+**Browsers & chat** — pick one of each during install (or skip):
+- Brave, Zen Browser, Vivaldi, Microsoft Edge, or LibreWolf
+- Discord, Vesktop, or Equibop
+
+**Extras**
+- OBS Studio and a video editor (Kdenlive, Shotcut, or Flowblade), both optional
+- cliphist (clipboard history), grim + slurp + xdg-desktop-portal-hyprland (screenshots/screen-share)
+- HyprMod — a native GTK4/libadwaita settings app for tweaking Hyprland itself (keybinds, monitors, animations, window rules) without touching `hyprland.lua` by hand
+- nwg-drawer as the app-menu behind the bar's Menu button
+- Chaotic-AUR set up automatically for faster package installs
+- A background update checker (systemd timer, runs every 6h) that notifies you when there's a new Arch/AUR update or a new commit on this repo
+
+**Pinned apps in the bar**
+Waybar ships with quick-launch icons for: Browser, Discord, Files (Nautilus), Terminal, Steam, HyprMod, and Simpbar Welcome. Browser and Discord are smart about it — whichever one you actually installed is what launches, and you can change your mind later from the Welcome app.
+
+## Simpbar Welcome
+
+A small GTK4 + libadwaita app that pops up once on first login (and is always reachable afterward — pinned in the bar, or via rofi/nwg-drawer). Tabs:
+
+- **Welcome** — quick intro
+- **Setup** — update Simpbar & Arch in one click, check for updates now, jump into waypaper/nwg-look/HyprMod/pavucontrol, install or remove text editors, and set which browser/Discord client the bar's pinned buttons should launch
+- **Keybindings** — the list below, always at hand
+- **About** — links to this repo, issues, and a contact email for bugs/suggestions
+
+## Keybindings
+
+| Keys | Action |
+|---|---|
+| `SUPER` | (modifier) |
+| `SUPER + Enter` | Open terminal |
+| `SUPER + Space` | Open Rofi |
+| `SUPER + E` | Open Nautilus |
+| `SUPER + Q` | Exit the focused app |
+| `SUPER + [1–0]` | Switch workspaces |
+
+To change keybindings or your monitor setup:
+
+```
+nvim ~/.config/hypr/hyprland.lua
 ```
 
-The install script is all thanks to @Ryzendew aka Mattscreative <br>
+Don't forget to reboot once the install finishes (`systemctl reboot`) so everything (shell, theme, services) is fully in effect.
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/2dd0e792-da80-487d-88ae-8b03b6b03753" />
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/a6d59fca-696b-4890-a33d-c2fcbe65aa2c" />
-<img width="1919" height="1080" alt="image" src="https://github.com/user-attachments/assets/c764e1fa-c313-483f-b51d-5daa9919b38b" />
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/6a94eaa0-dc0e-4d6c-9daf-45e0f2edf471" />
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/eb1195e8-0834-45e2-9adc-f6a9e00cc8b7" />
+## Credits
 
-
-
-
-
-
-
-
-
+The install script is all thanks to **@Ryzendew** aka **Mattscreative**.
