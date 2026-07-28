@@ -56,7 +56,7 @@
     "custom/rofi": {
         "format": " Menu ",
         "tooltip": false,
-        "on-click": "rofi -show drun",
+        "on-click": "nwg-drawer",
         "on-click-middle": "pkill -9 wofi"
     },
     "custom/screenshot_t":{
