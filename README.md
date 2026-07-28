@@ -83,4 +83,5 @@ Don't forget to reboot once the install finishes (`systemctl reboot`) so everyth
 ## Credits
 
 The install script is all thanks to **@Ryzendew** aka **Mattscreative**.
-The Hyprmod app is all thanks to **BlueManCZ** Support the developer!
+
+The Hyprmod app is all thanks to **BlueManCZ** Support the developer!.
