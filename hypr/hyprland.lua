@@ -21,8 +21,8 @@
 -- See https://wiki.hypr.land/Configuring/Basics/Monitors/
 
 hl.monitor({
-	output = "",
-	mode = "preferred",
+	output = "DP-2",
+	mode = "1920x1080@240",
 	position = "auto",
 	scale = "1",
 })
@@ -49,6 +49,9 @@ hl.on("hyprland.start", function()
 	--   hl.exec_cmd(terminal)
 	--   hl.exec_cmd("nm-applet")
 	hl.exec_cmd("waybar &")
+	--Delete this line to prevent it starting at every boot
+	hl.exec_cmd("simpbar-welcome")
+	-- This Line here ^^
 	hl.exec_cmd("swaync")
 	hl.exec_cmd("gnome-calendar -silent")
 	hl.exec_cmd("waypaper --restore")
