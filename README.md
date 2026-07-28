@@ -42,7 +42,7 @@ It will install the dependencies such as: <br>
 14. Fastfetch because ya gotta flex
 15. Foot (Terminal)
 16. Gnome Calendar <br>
-<b>That's it!</b>
+<b>That's it!</b> <br>
 Go support the Hyprmod developer:<br>
 
 https://github.com/BlueManCZ/hyprmod
