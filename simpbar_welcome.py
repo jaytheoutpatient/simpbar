@@ -68,15 +68,6 @@ KEYBINDINGS = [
 
 SETUP_ACTIONS = [
     (
-        "Run the simpbar install script",
-        "Installs/updates packages, configs, and themes. Opens in a terminal "
-        "since it needs your password and asks a few questions.",
-        "utilities-terminal-symbolic",
-        ["foot", "-e", "bash", "-lc",
-         "curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/"
-         "simpbar/main/install.sh | bash; echo; read -p 'Press Enter to close...'"],
-    ),
-    (
         "Update Simpbar and Arch Linux",
         "Runs a full system update, then re-fetches the latest install script "
         "and configs from GitHub. Opens in a terminal — asks a few of the same "
@@ -122,6 +113,39 @@ SETUP_ACTIONS = [
         "audio-speakers-symbolic",
         ["pavucontrol"],
     ),
+]
+
+
+EDITOR_OPTIONS = ["Neovim", "Gedit", "Kate", "Zed", "VS Code"]
+EDITOR_PACKAGES = {
+    "Neovim": "neovim",
+    "Gedit": "gedit",
+    "Kate": "kate",
+    "Zed": "zed",
+    "VS Code": "visual-studio-code-bin",
+}
+EDITOR_NEEDS_AUR = {"VS Code"}  # not in the official repos
+
+
+def build_editor_install_argv(name: str) -> list[str]:
+    pkg = EDITOR_PACKAGES[name]
+    if name in EDITOR_NEEDS_AUR:
+        install_cmd = (
+            f"if command -v yay >/dev/null; then yay -S --noconfirm --needed {pkg}; "
+            f"elif command -v paru >/dev/null; then paru -S --noconfirm --needed {pkg}; "
+            f'else echo "No AUR helper found — install {pkg} manually"; fi'
+        )
+    else:
+        install_cmd = f"sudo pacman -S --noconfirm --needed {pkg}"
+    full_cmd = f"{install_cmd}; echo; read -p 'Press Enter to close...'"
+    return ["foot", "-e", "bash", "-lc", full_cmd]
+
+
+REMOVE_NEOVIM_ARGV = [
+    "foot", "-e", "bash", "-lc",
+    "sudo pacman -Rns --noconfirm neovim; "
+    "rm -rf ~/.config/nvim ~/.local/share/nvim ~/.local/state/nvim ~/.cache/nvim; "
+    "echo; read -p 'Press Enter to close...'",
 ]
 
 
@@ -171,7 +195,7 @@ class WelcomePage(Gtk.Box):
 
 class SetupPage(Gtk.Box):
     def __init__(self) -> None:
-        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         self.set_margin_top(24)
         self.set_margin_bottom(24)
         self.set_margin_start(24)
@@ -192,6 +216,43 @@ class SetupPage(Gtk.Box):
             group.add(row)
 
         self.append(group)
+
+        editor_group = Adw.PreferencesGroup(
+            title="Text editors",
+            description="Neovim + LazyVim comes installed by default.",
+        )
+
+        install_row = Adw.ComboRow(
+            title="Install a text editor",
+            subtitle="Gedit and Kate are GUI editors; VS Code installs via the AUR.",
+            model=Gtk.StringList.new(EDITOR_OPTIONS),
+        )
+        install_button = Gtk.Button(label="Install")
+        install_button.add_css_class("flat")
+        install_button.set_valign(Gtk.Align.CENTER)
+        install_button.connect(
+            "clicked",
+            lambda _b: launch(
+                build_editor_install_argv(EDITOR_OPTIONS[install_row.get_selected()])
+            ),
+        )
+        install_row.add_suffix(install_button)
+        editor_group.add(install_row)
+
+        remove_row = Adw.ActionRow(
+            title="Remove Neovim and LazyVim",
+            subtitle="Uninstalls neovim and deletes its config/data/cache directories.",
+        )
+        remove_row.set_icon_name("user-trash-symbolic")
+        remove_button = Gtk.Button(label="Remove")
+        remove_button.add_css_class("flat")
+        remove_button.add_css_class("destructive-action")
+        remove_button.set_valign(Gtk.Align.CENTER)
+        remove_button.connect("clicked", lambda _b: launch(REMOVE_NEOVIM_ARGV))
+        remove_row.add_suffix(remove_button)
+        editor_group.add(remove_row)
+
+        self.append(editor_group)
 
 
 class KeybindingsPage(Gtk.Box):
