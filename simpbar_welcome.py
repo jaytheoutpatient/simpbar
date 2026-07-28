@@ -726,7 +726,7 @@ class AboutPage(Gtk.Box):
 class WelcomeWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application) -> None:
         super().__init__(application=app, title="Simpbar Welcome")
-        self.set_default_size(760, 520)
+        self.set_default_size(760, 700)
 
         split_view = Adw.NavigationSplitView()
         self.set_content(split_view)
@@ -778,8 +778,7 @@ class WelcomeWindow(Adw.ApplicationWindow):
         self.content_stack.set_hexpand(True)
         for name, widget in self.pages.items():
             scrolled = Gtk.ScrolledWindow()
-            scrolled.set_hscrollbar_policy(Gtk.PolicyType.NEVER)
-            scrolled.set_vscrollbar_policy(Gtk.PolicyType.AUTOMATIC)
+            scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
             scrolled.set_vexpand(True)
             scrolled.set_hexpand(True)
             scrolled.set_child(widget)
