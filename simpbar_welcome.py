@@ -777,15 +777,12 @@ class WelcomeWindow(Adw.ApplicationWindow):
         self.content_stack.set_vexpand(True)
         self.content_stack.set_hexpand(True)
         for name, widget in self.pages.items():
-            viewport = Gtk.Viewport()
-            viewport.set_child(widget)
-
             scrolled = Gtk.ScrolledWindow()
             scrolled.set_hscrollbar_policy(Gtk.PolicyType.NEVER)
             scrolled.set_vscrollbar_policy(Gtk.PolicyType.AUTOMATIC)
             scrolled.set_vexpand(True)
             scrolled.set_hexpand(True)
-            scrolled.set_child(viewport)
+            scrolled.set_child(widget)
             self.content_stack.add_named(scrolled, name)
 
         content_toolbar = Adw.ToolbarView()
