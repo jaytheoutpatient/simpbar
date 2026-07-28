@@ -1007,8 +1007,10 @@ Usage:
 """
 
 import re
+import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import gi
@@ -1071,6 +1073,14 @@ KEYBINDINGS = [
 ]
 
 SETUP_ACTIONS = [
+    (
+        "Update Arch Linux",
+        "Runs a plain system update (sudo pacman -Syu) — no config/script "
+        "refresh, just your packages. Opens in a terminal for the password prompt.",
+        "system-software-update-symbolic",
+        ["foot", "-e", "bash", "-lc",
+         "sudo pacman -Syu --noconfirm; echo; read -p 'Press Enter to close...'"],
+    ),
     (
         "Update Simpbar and Arch Linux",
         "Runs a full system update, then re-fetches the latest install script "
@@ -1328,6 +1338,87 @@ def launch(argv: list[str]) -> None:
         subprocess.Popen(argv, start_new_session=True)
     except FileNotFoundError:
         print(f"simpbar-welcome: couldn't find '{argv[0]}' on PATH", file=sys.stderr)
+
+
+def _parse_pkg_update_line(line: str):
+    """Parses a "pkgname oldver -> newver" line (checkupdates/yay/paru format)."""
+    if "->" not in line:
+        return None
+    left, _, new_ver = line.partition("->")
+    parts = left.strip().rsplit(" ", 1)
+    if len(parts) != 2:
+        return None
+    name, old_ver = parts
+    return name.strip(), f"{old_ver.strip()} \u2192 {new_ver.strip()}"
+
+
+def fetch_arch_updates():
+    """Returns a list of (name, "old → new") tuples, or None if checkupdates
+    isn't available/failed. Runs quickly and never needs sudo."""
+    if not shutil.which("checkupdates"):
+        return None
+    try:
+        result = subprocess.run(["checkupdates"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    entries = []
+    for line in result.stdout.strip().splitlines():
+        parsed = _parse_pkg_update_line(line)
+        if parsed:
+            entries.append(parsed)
+    return entries
+
+
+def fetch_aur_updates():
+    """Returns [] (not an error) if no AUR helper is installed at all."""
+    helper = "yay" if shutil.which("yay") else ("paru" if shutil.which("paru") else None)
+    if helper is None:
+        return []
+    try:
+        result = subprocess.run([helper, "-Qua"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    entries = []
+    for line in result.stdout.strip().splitlines():
+        parsed = _parse_pkg_update_line(line)
+        if parsed:
+            entries.append(parsed)
+    return entries
+
+
+def fetch_flatpak_updates():
+    """Returns [] (not an error) if flatpak isn't installed at all."""
+    if not shutil.which("flatpak"):
+        return []
+    try:
+        # Refresh available-update metadata first — safe, doesn't install anything.
+        subprocess.run(["flatpak", "update", "--appstream", "-y"],
+                       capture_output=True, text=True, timeout=60)
+        result = subprocess.run(
+            ["flatpak", "remote-ls", "--updates", "--columns=application,version", "flathub"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    entries = []
+    for line in result.stdout.strip().splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t") if "\t" in line else line.split()
+        if len(fields) < 2 or fields[0].strip().lower() == "application":
+            continue
+        entries.append((fields[0].strip(), fields[1].strip()))
+    return entries
+
+
+APPLY_ALL_UPDATES_ARGV = [
+    "foot", "-e", "bash", "-lc",
+    "sudo pacman -Syu --noconfirm; "
+    "if command -v yay >/dev/null; then yay -Sua --noconfirm; "
+    "elif command -v paru >/dev/null; then paru -Sua --noconfirm; fi; "
+    "command -v flatpak >/dev/null && flatpak update -y; "
+    "echo; read -p 'Press Enter to close...'",
+]
 
 
 class WelcomePage(Gtk.Box):
@@ -1720,6 +1811,111 @@ class AboutPage(Gtk.Box):
         self.append(group)
 
 
+class UpdatesPage(Gtk.Box):
+    def __init__(self) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        self.set_margin_top(24)
+        self.set_margin_bottom(24)
+        self.set_margin_start(24)
+        self.set_margin_end(24)
+
+        button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.check_button = Gtk.Button(label="Check for Updates")
+        self.check_button.add_css_class("suggested-action")
+        self.check_button.connect("clicked", self._on_check_clicked)
+        button_row.append(self.check_button)
+
+        self.spinner = Gtk.Spinner()
+        button_row.append(self.spinner)
+        self.append(button_row)
+
+        self.arch_group = Adw.PreferencesGroup(title="Arch Linux packages")
+        self.aur_group = Adw.PreferencesGroup(title="AUR packages")
+        self.flatpak_group = Adw.PreferencesGroup(title="Flatpak apps")
+        self._group_rows: dict[Adw.PreferencesGroup, list[Adw.ActionRow]] = {
+            self.arch_group: [], self.aur_group: [], self.flatpak_group: []
+        }
+        for group in (self.arch_group, self.aur_group, self.flatpak_group):
+            self.append(group)
+
+        self.apply_button = Gtk.Button(label="Apply all updates")
+        self.apply_button.add_css_class("flat")
+        self.apply_button.set_sensitive(False)
+        self.apply_button.connect("clicked", self._on_apply_clicked)
+        self.append(self.apply_button)
+
+        for group in (self.arch_group, self.aur_group, self.flatpak_group):
+            self._set_group_message(group, 'Click "Check for Updates" above to scan.')
+
+    def _clear_group(self, group: Adw.PreferencesGroup) -> None:
+        for row in self._group_rows[group]:
+            group.remove(row)
+        self._group_rows[group] = []
+
+    def _set_group_message(self, group: Adw.PreferencesGroup, message: str) -> None:
+        self._clear_group(group)
+        row = Adw.ActionRow(title=message)
+        group.add(row)
+        self._group_rows[group].append(row)
+
+    def _populate_group(
+        self, group: Adw.PreferencesGroup, entries: list[tuple[str, str]], empty_message: str
+    ) -> None:
+        self._clear_group(group)
+        if not entries:
+            row = Adw.ActionRow(title=empty_message)
+            group.add(row)
+            self._group_rows[group].append(row)
+            return
+        for name, version_info in entries:
+            row = Adw.ActionRow(title=name, subtitle=version_info)
+            group.add(row)
+            self._group_rows[group].append(row)
+
+    def _on_check_clicked(self, _button: Gtk.Button) -> None:
+        self.check_button.set_sensitive(False)
+        self.apply_button.set_sensitive(False)
+        self.spinner.start()
+        for group in (self.arch_group, self.aur_group, self.flatpak_group):
+            self._set_group_message(group, "Checking\u2026")
+        threading.Thread(target=self._check_updates_thread, daemon=True).start()
+
+    def _check_updates_thread(self) -> None:
+        arch_updates = fetch_arch_updates()
+        aur_updates = fetch_aur_updates()
+        flatpak_updates = fetch_flatpak_updates()
+        GLib.idle_add(self._on_check_finished, arch_updates, aur_updates, flatpak_updates)
+
+    def _on_check_finished(self, arch_updates, aur_updates, flatpak_updates) -> bool:
+        self.spinner.stop()
+        self.check_button.set_sensitive(True)
+
+        if arch_updates is None:
+            self._set_group_message(self.arch_group, "Could not check — is pacman-contrib installed?")
+        else:
+            self._populate_group(self.arch_group, arch_updates, "Everything up to date.")
+
+        if aur_updates is None:
+            self._set_group_message(self.aur_group, "Could not check AUR updates.")
+        else:
+            self._populate_group(
+                self.aur_group, aur_updates,
+                "Everything up to date, or no AUR helper installed.",
+            )
+
+        if flatpak_updates is None:
+            self._set_group_message(self.flatpak_group, "Could not check — is flatpak installed?")
+        else:
+            self._populate_group(self.flatpak_group, flatpak_updates, "Everything up to date.")
+
+        total = len(arch_updates or []) + len(aur_updates or []) + len(flatpak_updates or [])
+        self.apply_button.set_sensitive(total > 0)
+        return False  # GLib.idle_add: run once, don't repeat
+
+    def _on_apply_clicked(self, _button: Gtk.Button) -> None:
+        launch(APPLY_ALL_UPDATES_ARGV)
+
+
 class WelcomeWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application) -> None:
         super().__init__(application=app, title="Simpbar Welcome")
@@ -1736,12 +1932,14 @@ class WelcomeWindow(Adw.ApplicationWindow):
         self.pages = {
             "Welcome": WelcomePage(),
             "Setup": SetupPage(),
+            "Updates": UpdatesPage(),
             "Keybindings": KeybindingsPage(),
             "About": AboutPage(),
         }
         icons = {
             "Welcome": "go-home-symbolic",
             "Setup": "emblem-system-symbolic",
+            "Updates": "software-update-available-symbolic",
             "Keybindings": "input-keyboard-symbolic",
             "About": "help-about-symbolic",
         }
