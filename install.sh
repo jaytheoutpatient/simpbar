@@ -705,7 +705,7 @@ FOOTEOF
 fi
 
 # wlogout, waypaper & protonplus are AUR-only — need an AUR helper
-AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme hyprmod game-devices-udev)
+AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme hyprmod game-devices-udev zafiro-icon-theme)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 [ "$INSTALL_FALCOND" -eq 1 ] && AUR_PKGS+=(falcond falcond-gui)
@@ -860,21 +860,35 @@ else
     warn "No downloaded wallpaper or swaybg not installed — skipping swaybg service setup"
 fi
 
-# Apply the Dracula GTK + icon theme (both ship in the same package) and
-# the Bibata cursor theme, now that they're actually installed. This uses
-# the same gsettings mechanism nwg-look reads/writes, so it shows up as
-# already selected there too.
+# Apply the Dracula GTK theme and the Bibata cursor theme, now that
+# they're actually installed. This uses the same gsettings mechanism
+# nwg-look reads/writes, so it shows up as already selected there too.
 if pacman -Qq dracula-gtk-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
     run_spinner "Applying Dracula GTK theme" \
         gsettings set org.gnome.desktop.interface gtk-theme 'Dracula' \
         || warn "Could not apply the Dracula GTK theme — select it manually in nwg-look"
-    run_spinner "Applying Dracula icon theme" \
-        gsettings set org.gnome.desktop.interface icon-theme 'Dracula' \
-        || warn "Could not apply the Dracula icon theme — select it manually in nwg-look"
 elif ! pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
-    warn "dracula-gtk-theme isn't installed — skipping GTK/icon theme apply"
+    warn "dracula-gtk-theme isn't installed — skipping GTK theme apply"
 else
     warn "gsettings not found — select the Dracula theme manually in nwg-look"
+fi
+
+# Zafiro's AUR package has had reported issues with how it lays out its
+# newer color-variant folders, so check the exact folder actually exists
+# before pointing gsettings at it rather than assuming the name.
+if pacman -Qq zafiro-icon-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
+    ZAFIRO_DRACULA_DIR=$(find /usr/share/icons -maxdepth 1 -iname 'zafiro-dracula*' -print -quit 2>/dev/null)
+    if [ -n "$ZAFIRO_DRACULA_DIR" ]; then
+        run_spinner "Applying Zafiro-Dracula icon theme" \
+            gsettings set org.gnome.desktop.interface icon-theme "$(basename "$ZAFIRO_DRACULA_DIR")" \
+            || warn "Could not apply the Zafiro-Dracula icon theme — select it manually in nwg-look"
+    else
+        warn "zafiro-icon-theme installed but no Zafiro-Dracula folder found under /usr/share/icons — check available variants with: ls /usr/share/icons | grep -i zafiro"
+    fi
+elif ! pacman -Qq zafiro-icon-theme >/dev/null 2>&1; then
+    warn "zafiro-icon-theme isn't installed — skipping icon theme apply"
+else
+    warn "gsettings not found — select the Zafiro-Dracula icon theme manually in nwg-look"
 fi
 
 if pacman -Qq bibata-cursor-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
@@ -1902,7 +1916,10 @@ fi
 ok "Flathub remote added for flatpak/bazaar"
 ok "nwg-look set to prefer dark theme"
 if pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
-    ok "Dracula GTK + icon theme installed and applied"
+    ok "Dracula GTK theme installed and applied"
+fi
+if pacman -Qq zafiro-icon-theme >/dev/null 2>&1; then
+    ok "Zafiro-Dracula icon theme installed"
 fi
 if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
     ok "Bibata Modern Classic cursor installed and applied"
