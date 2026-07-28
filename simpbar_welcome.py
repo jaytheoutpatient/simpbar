@@ -104,6 +104,13 @@ SETUP_ACTIONS = [
         ["simpbar-check-updates"],
     ),
     (
+        "Browse and install software",
+        "Opens Bazaar, a graphical software manager for finding and "
+        "installing Flatpak apps.",
+        "system-software-install-symbolic",
+        ["bazaar"],
+    ),
+    (
         "Pick a wallpaper",
         "Opens waypaper, pointed at ~/Pictures/Wallpaper by default.",
         "preferences-desktop-wallpaper-symbolic",
