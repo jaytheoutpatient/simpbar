@@ -23,11 +23,18 @@
     ],
     "modules-center": [
               "custom/rofi",
-              "clock#1"
+              "custom/weather",
+              "clock#1",
+              "custom/browser",
+              "custom/discord",
+              "custom/files",
+              "custom/terminal",
+              "custom/steam",
+              "custom/hyprmod",
+              "custom/simpbar-welcome"
+
     ],
     "modules-right": [
-   //      "custom/waypaper",
-         "custom/weather",      
          "group/tray-expander",
          "custom/power"
     ],
@@ -38,7 +45,7 @@
     // -------------------------------------------------------------------------
 
     "custom/sp1": {
-        "format": "",
+        "format": " ⛧ ",
         "tooltip": false
     },
     "custom/sp2": {
@@ -58,6 +65,41 @@
         "tooltip": false,
         "on-click": "nwg-drawer",
         "on-click-middle": "pkill -9 wofi"
+    },
+    "custom/browser": {
+        "format": " Browser ",
+        "tooltip": false,
+        "on-click": "simpbar-launch-browser"
+    },
+    "custom/discord": {
+        "format": " Discord ",
+        "tooltip": false,
+        "on-click": "simpbar-launch-discord"
+    },
+    "custom/files": {
+        "format": " Files ",
+        "tooltip": false,
+        "on-click": "nautilus"
+    },
+    "custom/terminal": {
+        "format": " Term ",
+        "tooltip": false,
+        "on-click": "foot"
+    },
+    "custom/steam": {
+        "format": " Steam ",
+        "tooltip": false,
+        "on-click": "steam"
+    },
+    "custom/hyprmod": {
+        "format": " HyprMod ",
+        "tooltip": false,
+        "on-click": "hyprmod"
+    },
+    "custom/simpbar-welcome": {
+        "format": " Welcome ",
+        "tooltip": false,
+        "on-click": "simpbar-welcome"
     },
     "custom/screenshot_t":{
         "format":" ",
@@ -327,7 +369,7 @@
 
     "pulseaudio": {
         "scroll-step": 3, // %, can be a float
-        "format": "{icon} {volume} {format_source}",
+        "format": "{icon} {volume}% {format_source}",
         "format-bluetooth": "{volume}% {icon} {format_source}",
         "format-bluetooth-muted": " {icon} {format_source}",
         "format-muted": " {format_source}",
@@ -367,7 +409,7 @@
             "phone": " ",
             "portable": " ",
             "car": " ",
-            "default": [" ", " ", " "]
+            //"default": [" ", " ", " "]
         },
     },
 
@@ -386,8 +428,6 @@
         },
         "modules": [
             "custom/tray-toggle",
-            "custom/waypaper",
-            "wireplumber",
             "tray"
         ]
     },
@@ -398,8 +438,8 @@
     },
 
     "mpris": {
-        "format": "{artist} - {title} ▶",
-        "format-paused": "{artist} - {title} ⏸",
+        "format": "{dynamic}",
+        "format-paused": "<i>{dynamic}</i>",
         "player-icons": {
             "default": "▶",
             "spotify": "",

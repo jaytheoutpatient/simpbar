@@ -123,8 +123,30 @@ button {
   color: rgba(80,80,80,1);
 
 }
-#custom-rofi:hover {
+#custom-rofi.hover {
   color: rgba(220,220,220,1);
+}
+
+/* Pinned apps */
+#custom-browser,
+#custom-discord,
+#custom-files,
+#custom-terminal,
+#custom-steam,
+#custom-hyprmod,
+#custom-simpbar-welcome {
+  color: rgba(220,220,220,1);
+  padding: 0 4px;
+}
+#custom-browser:hover,
+#custom-discord:hover,
+#custom-files:hover,
+#custom-terminal:hover,
+#custom-steam:hover,
+#custom-hyprmod:hover,
+#custom-simpbar-welcome:hover {
+  background-color: rgba(220, 0, 80, 1);
+  color: rgba(15,15,15,1);
 }
 /*#custom-screenshot_t {
     background-color: #111827;
@@ -310,8 +332,8 @@ label:focus {
 }
 
 #custom-tray-toggle:hover {
-    color: rgba(220,220,220,1);
-    background-color: rgba(69,69,69,0.5);
+    background-color: rgba(220, 0, 80, 1);
+    color: rgba(15,15,15,1);
 }
 
 .tray-group-item {
