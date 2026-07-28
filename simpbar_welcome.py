@@ -508,6 +508,57 @@ class SetupPage(Gtk.Box):
 
         self.append(group)
 
+        media_group = Adw.PreferencesGroup(title="Audio and graphics")
+
+        easyeffects_row = Adw.ActionRow(
+            title="Install EasyEffects",
+            subtitle="Audio effects for PipeWire, with the Calf, LSP, MDA, x42, "
+            "and ZAM plugin packs included.",
+        )
+        easyeffects_row.set_icon_name("multimedia-volume-control-symbolic")
+        easyeffects_button = Gtk.Button(label="Install")
+        easyeffects_button.add_css_class("flat")
+        easyeffects_button.set_valign(Gtk.Align.CENTER)
+        easyeffects_button.connect("clicked", lambda _b: launch(EASYEFFECTS_ARGV))
+        easyeffects_row.add_suffix(easyeffects_button)
+        media_group.add(easyeffects_row)
+
+        graphics_row = Adw.ComboRow(
+            title="Install a graphics app",
+            subtitle="GIMP (photo editing), Inkscape (vector art), or Krita (painting).",
+            model=Gtk.StringList.new(GRAPHICS_OPTIONS),
+        )
+        graphics_button = Gtk.Button(label="Install")
+        graphics_button.add_css_class("flat")
+        graphics_button.set_valign(Gtk.Align.CENTER)
+        graphics_button.connect(
+            "clicked",
+            lambda _b: launch(build_pacman_install_argv(
+                GRAPHICS_PACKAGES[GRAPHICS_OPTIONS[graphics_row.get_selected()]]
+            )),
+        )
+        graphics_row.add_suffix(graphics_button)
+        media_group.add(graphics_row)
+
+        video_player_row = Adw.ComboRow(
+            title="Install a video player",
+            subtitle="mpv (lightweight) or VLC (more built-in codecs/features).",
+            model=Gtk.StringList.new(VIDEO_PLAYER_OPTIONS),
+        )
+        video_player_button = Gtk.Button(label="Install")
+        video_player_button.add_css_class("flat")
+        video_player_button.set_valign(Gtk.Align.CENTER)
+        video_player_button.connect(
+            "clicked",
+            lambda _b: launch(build_pacman_install_argv(
+                VIDEO_PLAYER_PACKAGES[VIDEO_PLAYER_OPTIONS[video_player_row.get_selected()]]
+            )),
+        )
+        video_player_row.add_suffix(video_player_button)
+        media_group.add(video_player_row)
+
+        self.append(media_group)
+
         editor_group = Adw.PreferencesGroup(
             title="Text editors",
             description="Neovim + LazyVim comes installed by default.",
@@ -664,57 +715,6 @@ class SetupPage(Gtk.Box):
         waybar_group.add(font_row)
 
         self.append(waybar_group)
-
-        media_group = Adw.PreferencesGroup(title="Audio and graphics")
-
-        easyeffects_row = Adw.ActionRow(
-            title="Install EasyEffects",
-            subtitle="Audio effects for PipeWire, with the Calf, LSP, MDA, x42, "
-            "and ZAM plugin packs included.",
-        )
-        easyeffects_row.set_icon_name("multimedia-volume-control-symbolic")
-        easyeffects_button = Gtk.Button(label="Install")
-        easyeffects_button.add_css_class("flat")
-        easyeffects_button.set_valign(Gtk.Align.CENTER)
-        easyeffects_button.connect("clicked", lambda _b: launch(EASYEFFECTS_ARGV))
-        easyeffects_row.add_suffix(easyeffects_button)
-        media_group.add(easyeffects_row)
-
-        graphics_row = Adw.ComboRow(
-            title="Install a graphics app",
-            subtitle="GIMP (photo editing), Inkscape (vector art), or Krita (painting).",
-            model=Gtk.StringList.new(GRAPHICS_OPTIONS),
-        )
-        graphics_button = Gtk.Button(label="Install")
-        graphics_button.add_css_class("flat")
-        graphics_button.set_valign(Gtk.Align.CENTER)
-        graphics_button.connect(
-            "clicked",
-            lambda _b: launch(build_pacman_install_argv(
-                GRAPHICS_PACKAGES[GRAPHICS_OPTIONS[graphics_row.get_selected()]]
-            )),
-        )
-        graphics_row.add_suffix(graphics_button)
-        media_group.add(graphics_row)
-
-        video_player_row = Adw.ComboRow(
-            title="Install a video player",
-            subtitle="mpv (lightweight) or VLC (more built-in codecs/features).",
-            model=Gtk.StringList.new(VIDEO_PLAYER_OPTIONS),
-        )
-        video_player_button = Gtk.Button(label="Install")
-        video_player_button.add_css_class("flat")
-        video_player_button.set_valign(Gtk.Align.CENTER)
-        video_player_button.connect(
-            "clicked",
-            lambda _b: launch(build_pacman_install_argv(
-                VIDEO_PLAYER_PACKAGES[VIDEO_PLAYER_OPTIONS[video_player_row.get_selected()]]
-            )),
-        )
-        video_player_row.add_suffix(video_player_button)
-        media_group.add(video_player_row)
-
-        self.append(media_group)
 
         autostart_group = Adw.PreferencesGroup(
             title="Autostart",
