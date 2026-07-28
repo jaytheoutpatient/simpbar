@@ -8,6 +8,11 @@ The waybar comes with workspaces you can scroll up or down to scroll,<br>
  or type & search what you need, Weather, Time & date if you click on it the gnome calendar app will spawn in the middle<br>
   of the screen, A collapsible tray with a arrow icon click on it to reveal the volume or change wallpaper and finally a power<br>
    button click on it to access the wlogout menu.
+   
+Copy and paste this line below paste it into your terminal: <br>
+```bash
+curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash
+```
 
 There is a install script below do know this only works for archlinux atm <br>
 but will try make it work for other Linux distributions! <br>
@@ -16,30 +21,31 @@ to use obs-studio, what browser would you like to use, it will detect that you a
 Firefox and ask if you want to remove or keep it, And what discord client you want <br>
 such as discord, vesktop or equibop. It's going to give you also flatpak and bazaar <br>
 
-
-
-
 <b> Just a warning </b> <br>
 It is going to be jank this is still a wip but I can gurantee it's not going to <br>
 mess your system up! 
 
 It will install the dependencies such as: <br>
-1. Waybar
-2. Wlogout
-3. Swaybg
-4. Waypaper
-5. Neovim with (Lazyvim)
-6. Steam
-7. ProtonPlus
-8. Flatpak
-9. Bazaar
+1. A Welcome Gui that starts on boot for updates!
+2. Hyprmod which allows to edit hyprland settings set your monitors resolution with a gui!
+3. Wlogout
+4. Swaybg
+5. Waypaper
+6. Neovim with (Lazyvim)
+7. Steam
+8. ProtonPlus
+9. Flatpak
+10. Bazaar
 11. Nautilus
 12. Hyprland
-13. Mate-polkit
+13. Gnome-polkit
 14. Fastfetch because ya gotta flex
 15. Foot (Terminal)
 16. Gnome Calendar <br>
 <b>That's it!</b>
+Go support the Hyprmod developer:
+https://github.com/BlueManCZ/hyprmod
+
 
 Copy and paste this line below paste it into your terminal: <br>
 ```bash
