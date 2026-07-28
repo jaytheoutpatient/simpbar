@@ -1024,30 +1024,36 @@ REPO_URL = "https://github.com/jaytheoutpatient/simpbar"
 CONTACT_EMAIL = "jaytheoutpatient@protonmail.com"
 HYPRLAND_CONF = "~/.config/hypr/hyprland.lua"
 HYPRLAND_LUA_PATH = Path.home() / ".config" / "hypr" / "hyprland.lua"
-AUTOSTART_LINE = 'hl.exec_cmd("simpbar-welcome")'
+
+# Autostart commands must be wrapped in hl.on("hyprland.start", ...) — a bare
+# top-level hl.exec_cmd(...) line would re-run on every config reload (Hyprland
+# reparses hyprland.lua on every save), not just once at actual startup.
+SIMPBAR_WELCOME_AUTOSTART_LINE = 'hl.on("hyprland.start", function() hl.exec_cmd("simpbar-welcome") end)'
+STEAM_SILENT_AUTOSTART_LINE = 'hl.on("hyprland.start", function() hl.exec_cmd("steam -silent") end)'
+EASYEFFECTS_AUTOSTART_LINE = 'hl.on("hyprland.start", function() hl.exec_cmd("easyeffects --gapplication-service") end)'
 
 
-def is_autostart_enabled() -> bool:
+def is_hypr_line_enabled(line: str) -> bool:
     try:
-        return AUTOSTART_LINE in HYPRLAND_LUA_PATH.read_text()
+        return line in HYPRLAND_LUA_PATH.read_text()
     except OSError:
         return False
 
 
-def set_autostart_enabled(enabled: bool) -> bool:
-    """Add or remove AUTOSTART_LINE in hyprland.lua. Returns True on success."""
+def set_hypr_line_enabled(line: str, enabled: bool) -> bool:
+    """Add or remove an exact line in hyprland.lua. Returns True on success."""
     try:
         if enabled:
             HYPRLAND_LUA_PATH.parent.mkdir(parents=True, exist_ok=True)
             content = HYPRLAND_LUA_PATH.read_text() if HYPRLAND_LUA_PATH.exists() else ""
-            if AUTOSTART_LINE not in content:
+            if line not in content:
                 if content and not content.endswith("\n"):
                     content += "\n"
-                content += AUTOSTART_LINE + "\n"
+                content += line + "\n"
                 HYPRLAND_LUA_PATH.write_text(content)
         elif HYPRLAND_LUA_PATH.exists():
             lines = HYPRLAND_LUA_PATH.read_text().splitlines(keepends=True)
-            lines = [ln for ln in lines if ln.strip() != AUTOSTART_LINE]
+            lines = [ln for ln in lines if ln.strip() != line]
             HYPRLAND_LUA_PATH.write_text("".join(lines))
         return True
     except OSError as exc:
@@ -1282,6 +1288,32 @@ def build_apply_font_argv(family: str, pkg: str) -> list[str]:
     return ["foot", "-e", "bash", "-lc", full_cmd]
 
 
+EASYEFFECTS_PKGS = ["easyeffects", "calf", "lsp-plugins-lv2", "mda.lv2", "x42-plugins-lv2", "zam-plugins-lv2"]
+EASYEFFECTS_ARGV = [
+    "foot", "-e", "bash", "-lc",
+    f"sudo pacman -S --noconfirm --needed {' '.join(EASYEFFECTS_PKGS)}; "
+    "echo; read -p 'Press Enter to close...'",
+]
+
+GRAPHICS_OPTIONS = ["GIMP", "Inkscape", "Krita"]
+GRAPHICS_PACKAGES = {
+    "GIMP": "gimp",
+    "Inkscape": "inkscape",
+    "Krita": "krita",
+}
+
+VIDEO_PLAYER_OPTIONS = ["mpv", "VLC"]
+VIDEO_PLAYER_PACKAGES = {
+    "mpv": "mpv",
+    "VLC": "vlc",
+}
+
+
+def build_pacman_install_argv(pkg: str) -> list[str]:
+    full_cmd = f"sudo pacman -S --noconfirm --needed {pkg}; echo; read -p 'Press Enter to close...'"
+    return ["foot", "-e", "bash", "-lc", full_cmd]
+
+
 REMOVE_NEOVIM_ARGV = [
     "foot", "-e", "bash", "-lc",
     "sudo pacman -Rns --noconfirm neovim; "
@@ -1340,7 +1372,7 @@ class WelcomePage(Gtk.Box):
         autostart_label = Gtk.Label(label="Launch on startup")
         autostart_switch = Gtk.Switch()
         autostart_switch.set_valign(Gtk.Align.CENTER)
-        autostart_switch.set_active(is_autostart_enabled())
+        autostart_switch.set_active(is_hypr_line_enabled(SIMPBAR_WELCOME_AUTOSTART_LINE))
         autostart_switch.connect("notify::active", self._on_autostart_toggled)
 
         autostart_box.append(autostart_label)
@@ -1348,7 +1380,7 @@ class WelcomePage(Gtk.Box):
         self.append(autostart_box)
 
     def _on_autostart_toggled(self, switch: Gtk.Switch, _pspec) -> None:
-        set_autostart_enabled(switch.get_active())
+        set_hypr_line_enabled(SIMPBAR_WELCOME_AUTOSTART_LINE, switch.get_active())
 
 
 class SetupPage(Gtk.Box):
@@ -1531,6 +1563,95 @@ class SetupPage(Gtk.Box):
         waybar_group.add(font_row)
 
         self.append(waybar_group)
+
+        media_group = Adw.PreferencesGroup(title="Audio and graphics")
+
+        easyeffects_row = Adw.ActionRow(
+            title="Install EasyEffects",
+            subtitle="Audio effects for PipeWire, with the Calf, LSP, MDA, x42, "
+            "and ZAM plugin packs included.",
+        )
+        easyeffects_row.set_icon_name("multimedia-volume-control-symbolic")
+        easyeffects_button = Gtk.Button(label="Install")
+        easyeffects_button.add_css_class("flat")
+        easyeffects_button.set_valign(Gtk.Align.CENTER)
+        easyeffects_button.connect("clicked", lambda _b: launch(EASYEFFECTS_ARGV))
+        easyeffects_row.add_suffix(easyeffects_button)
+        media_group.add(easyeffects_row)
+
+        graphics_row = Adw.ComboRow(
+            title="Install a graphics app",
+            subtitle="GIMP (photo editing), Inkscape (vector art), or Krita (painting).",
+            model=Gtk.StringList.new(GRAPHICS_OPTIONS),
+        )
+        graphics_button = Gtk.Button(label="Install")
+        graphics_button.add_css_class("flat")
+        graphics_button.set_valign(Gtk.Align.CENTER)
+        graphics_button.connect(
+            "clicked",
+            lambda _b: launch(build_pacman_install_argv(
+                GRAPHICS_PACKAGES[GRAPHICS_OPTIONS[graphics_row.get_selected()]]
+            )),
+        )
+        graphics_row.add_suffix(graphics_button)
+        media_group.add(graphics_row)
+
+        video_player_row = Adw.ComboRow(
+            title="Install a video player",
+            subtitle="mpv (lightweight) or VLC (more built-in codecs/features).",
+            model=Gtk.StringList.new(VIDEO_PLAYER_OPTIONS),
+        )
+        video_player_button = Gtk.Button(label="Install")
+        video_player_button.add_css_class("flat")
+        video_player_button.set_valign(Gtk.Align.CENTER)
+        video_player_button.connect(
+            "clicked",
+            lambda _b: launch(build_pacman_install_argv(
+                VIDEO_PLAYER_PACKAGES[VIDEO_PLAYER_OPTIONS[video_player_row.get_selected()]]
+            )),
+        )
+        video_player_row.add_suffix(video_player_button)
+        media_group.add(video_player_row)
+
+        self.append(media_group)
+
+        autostart_group = Adw.PreferencesGroup(
+            title="Autostart",
+            description="Launch these silently in the background on login.",
+        )
+
+        steam_row = Adw.ActionRow(
+            title="Start Steam silently",
+            subtitle="Runs steam -silent — Steam starts minimized to the tray.",
+        )
+        steam_row.set_icon_name("applications-games-symbolic")
+        steam_switch = Gtk.Switch()
+        steam_switch.set_valign(Gtk.Align.CENTER)
+        steam_switch.set_active(is_hypr_line_enabled(STEAM_SILENT_AUTOSTART_LINE))
+        steam_switch.connect(
+            "notify::active",
+            lambda sw, _p: set_hypr_line_enabled(STEAM_SILENT_AUTOSTART_LINE, sw.get_active()),
+        )
+        steam_row.add_suffix(steam_switch)
+        autostart_group.add(steam_row)
+
+        easyeffects_autostart_row = Adw.ActionRow(
+            title="Start EasyEffects",
+            subtitle="Runs easyeffects --gapplication-service — applies your audio "
+            "effects without opening a window.",
+        )
+        easyeffects_autostart_row.set_icon_name("multimedia-volume-control-symbolic")
+        easyeffects_autostart_switch = Gtk.Switch()
+        easyeffects_autostart_switch.set_valign(Gtk.Align.CENTER)
+        easyeffects_autostart_switch.set_active(is_hypr_line_enabled(EASYEFFECTS_AUTOSTART_LINE))
+        easyeffects_autostart_switch.connect(
+            "notify::active",
+            lambda sw, _p: set_hypr_line_enabled(EASYEFFECTS_AUTOSTART_LINE, sw.get_active()),
+        )
+        easyeffects_autostart_row.add_suffix(easyeffects_autostart_switch)
+        autostart_group.add(easyeffects_autostart_row)
+
+        self.append(autostart_group)
 
 
 class KeybindingsPage(Gtk.Box):
