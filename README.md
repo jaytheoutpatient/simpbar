@@ -28,20 +28,21 @@ mess your system up!
 It will install the dependencies such as: <br>
 1. A Welcome Gui that starts on boot for updates!
 2. Hyprmod which allows to edit hyprland settings set your monitors resolution with a gui!
-3. Wlogout
-4. Swaybg
-5. Waypaper
-6. Neovim with (Lazyvim)
-7. Steam
-8. ProtonPlus
-9. Flatpak
-10. Bazaar
-11. Nautilus
-12. Hyprland
-13. Gnome-polkit
-14. Fastfetch because ya gotta flex
-15. Foot (Terminal)
-16. Gnome Calendar <br>
+3. nwg-drawer as your application menu!
+4. Wlogout
+5. Swaybg
+6. Waypaper
+7. Neovim with (Lazyvim)
+8. Steam
+9. ProtonPlus
+10. Flatpak
+11. Bazaar
+12. Nautilus
+13. Hyprland
+14. Gnome-polkit
+15. Fastfetch because ya gotta flex
+16. Foot (Terminal)
+17. Gnome Calendar <br>
 <b>That's it!</b> <br>
 Go support the Hyprmod developer:<br>
 
