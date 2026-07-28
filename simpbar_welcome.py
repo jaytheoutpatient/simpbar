@@ -46,7 +46,7 @@ SETUP_ACTIONS = [
          "simpbar/main/install.sh | bash; echo; read -p 'Press Enter to close...'"],
     ),
     (
-        "Update Simpbar & Arch Linux",
+        "Update Simpbar and Arch Linux",
         "Runs a full system update, then re-fetches the latest install script "
         "and configs from GitHub. Opens in a terminal — asks a few of the same "
         "setup questions again as part of the refresh.",
@@ -63,14 +63,14 @@ SETUP_ACTIONS = [
         ["waypaper"],
     ),
     (
-        "Customize GTK theme, icons & cursor",
+        "Customize GTK theme, icons and cursor",
         "Opens nwg-look. Dracula GTK/icons and Bibata Modern Classic are "
         "already set as defaults.",
         "preferences-desktop-theme-symbolic",
         ["nwg-look"],
     ),
     (
-        "Adjust audio devices & volumes",
+        "Adjust audio devices and volumes",
         "Opens pavucontrol.",
         "audio-speakers-symbolic",
         ["pavucontrol"],
@@ -130,7 +130,7 @@ class SetupPage(Gtk.Box):
         self.set_margin_start(24)
         self.set_margin_end(24)
 
-        group = Adw.PreferencesGroup(title="Setup & quick actions")
+        group = Adw.PreferencesGroup(title="Setup and quick actions")
         for title, subtitle, icon_name, argv in SETUP_ACTIONS:
             row = Adw.ActionRow(title=title, subtitle=subtitle)
             row.set_icon_name(icon_name)
@@ -200,7 +200,7 @@ class AboutPage(Gtk.Box):
         group.add(issues_row)
 
         email_row = Adw.ActionRow(
-            title="Email — bugs & suggestions",
+            title="Email — bugs and suggestions",
             subtitle=CONTACT_EMAIL,
             activatable=True,
         )
@@ -302,6 +302,14 @@ class WelcomeApp(Adw.Application):
             # Already shown once before — nothing to do on this login.
             self.quit()
             return
+
+        # The system-wide icon theme (Dracula) doesn't have full coverage
+        # of generic symbolic icon names like "audio-speakers-symbolic".
+        # Force Adwaita for this app specifically — doesn't touch the
+        # system-wide setting, just makes our own icons resolve reliably.
+        settings = Gtk.Settings.get_default()
+        if settings is not None:
+            settings.set_property("gtk-icon-theme-name", "Adwaita")
 
         win = self.props.active_window or WelcomeWindow(self)
         win.present()
