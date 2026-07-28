@@ -1230,6 +1230,44 @@ def set_waybar_width(width: int) -> bool:
         return False
 
 
+WAYBAR_STYLE_PATH = Path.home() / ".config" / "waybar" / "style.css"
+FONT_RE = re.compile(r'font-family:\s*([^;]+);')
+
+# name -> (CSS font-family value, package to install)
+FONT_OPTIONS = [
+    "JetBrainsMono Nerd Font (default)",
+    "FiraCode Nerd Font",
+    "Hack Nerd Font",
+    "CaskaydiaCove Nerd Font",
+    "Iosevka Nerd Font",
+]
+FONT_INFO = {
+    "JetBrainsMono Nerd Font (default)": ("JetBrainsMonoNLNerdFontRegular", "ttf-jetbrains-mono-nerd"),
+    "FiraCode Nerd Font": ("FiraCode Nerd Font", "ttf-firacode-nerd"),
+    "Hack Nerd Font": ("Hack Nerd Font", "ttf-hack-nerd"),
+    "CaskaydiaCove Nerd Font": ("CaskaydiaCove Nerd Font", "ttf-cascadia-code-nerd"),
+    "Iosevka Nerd Font": ("Iosevka Nerd Font", "ttf-iosevka-nerd"),
+}
+
+
+def get_current_font_family() -> str:
+    try:
+        match = FONT_RE.search(WAYBAR_STYLE_PATH.read_text())
+        return match.group(1).strip() if match else "JetBrainsMonoNLNerdFontRegular"
+    except OSError:
+        return "JetBrainsMonoNLNerdFontRegular"
+
+
+def build_apply_font_argv(family: str, pkg: str) -> list[str]:
+    """Installs the font package (all official-repo, so a plain pacman
+    install), edits waybar's style.css, then restarts waybar."""
+    install_cmd = f"sudo pacman -S --noconfirm --needed {pkg}"
+    edit_cmd = f"sed -i 's/font-family:.*/font-family: {family};/' {WAYBAR_STYLE_PATH}"
+    restart_cmd = "pkill -x waybar; (waybar & disown)"
+    full_cmd = f"{install_cmd}; {edit_cmd}; {restart_cmd}; echo; read -p 'Press Enter to close...'"
+    return ["foot", "-e", "bash", "-lc", full_cmd]
+
+
 REMOVE_NEOVIM_ARGV = [
     "foot", "-e", "bash", "-lc",
     "sudo pacman -Rns --noconfirm neovim; "
@@ -1439,6 +1477,27 @@ class SetupPage(Gtk.Box):
         resolution_button.connect("clicked", _on_resolution_apply)
         resolution_row.add_suffix(resolution_button)
         waybar_group.add(resolution_row)
+
+        font_row = Adw.ComboRow(
+            title="Font",
+            subtitle="Installs the font if needed, then applies it to the bar.",
+            model=Gtk.StringList.new(FONT_OPTIONS),
+        )
+        current_family = get_current_font_family()
+        font_row.set_selected(next(
+            (i for i, name in enumerate(FONT_OPTIONS) if FONT_INFO[name][0] == current_family),
+            0,
+        ))
+
+        font_button = Gtk.Button(label="Apply")
+        font_button.add_css_class("flat")
+        font_button.set_valign(Gtk.Align.CENTER)
+        font_button.connect(
+            "clicked",
+            lambda _b: launch(build_apply_font_argv(*FONT_INFO[FONT_OPTIONS[font_row.get_selected()]])),
+        )
+        font_row.add_suffix(font_button)
+        waybar_group.add(font_row)
 
         self.append(waybar_group)
 
