@@ -43,7 +43,8 @@ It will install the dependencies such as: <br>
 15. Foot (Terminal)
 16. Gnome Calendar <br>
 <b>That's it!</b>
-Go support the Hyprmod developer:
+Go support the Hyprmod developer:<br>
+
 https://github.com/BlueManCZ/hyprmod
 
 
