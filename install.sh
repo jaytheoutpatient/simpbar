@@ -1319,6 +1319,23 @@ class WelcomePage(Gtk.Box):
         subtitle.set_wrap(True)
         self.append(subtitle)
 
+        autostart_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        autostart_box.set_halign(Gtk.Align.CENTER)
+        autostart_box.set_margin_top(12)
+
+        autostart_label = Gtk.Label(label="Launch on startup")
+        autostart_switch = Gtk.Switch()
+        autostart_switch.set_valign(Gtk.Align.CENTER)
+        autostart_switch.set_active(is_autostart_enabled())
+        autostart_switch.connect("notify::active", self._on_autostart_toggled)
+
+        autostart_box.append(autostart_label)
+        autostart_box.append(autostart_switch)
+        self.append(autostart_box)
+
+    def _on_autostart_toggled(self, switch: Gtk.Switch, _pspec) -> None:
+        set_autostart_enabled(switch.get_active())
+
 
 class SetupPage(Gtk.Box):
     def __init__(self) -> None:
@@ -1574,10 +1591,7 @@ class WelcomeWindow(Adw.ApplicationWindow):
         self.set_default_size(760, 520)
 
         split_view = Adw.NavigationSplitView()
-
-        overlay = Gtk.Overlay()
-        overlay.set_child(split_view)
-        self.set_content(overlay)
+        self.set_content(split_view)
 
         # Sidebar
         sidebar_list = Gtk.ListBox()
@@ -1632,31 +1646,9 @@ class WelcomeWindow(Adw.ApplicationWindow):
         content_page = Adw.NavigationPage(title="", child=content_toolbar)
         split_view.set_content(content_page)
 
-        # Floating "launch on startup" toggle, bottom-right, visible on every page.
-        autostart_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        autostart_box.add_css_class("osd")
-        autostart_box.add_css_class("toolbar")
-        autostart_box.set_halign(Gtk.Align.END)
-        autostart_box.set_valign(Gtk.Align.END)
-        autostart_box.set_margin_end(16)
-        autostart_box.set_margin_bottom(16)
-
-        autostart_label = Gtk.Label(label="Launch on startup")
-        autostart_switch = Gtk.Switch()
-        autostart_switch.set_valign(Gtk.Align.CENTER)
-        autostart_switch.set_active(is_autostart_enabled())
-        autostart_switch.connect("notify::active", self._on_autostart_toggled)
-
-        autostart_box.append(autostart_label)
-        autostart_box.append(autostart_switch)
-        overlay.add_overlay(autostart_box)
-
         sidebar_list.select_row(sidebar_list.get_row_at_index(0))
 
         self.connect("close-request", self._on_close_request)
-
-    def _on_autostart_toggled(self, switch: Gtk.Switch, _pspec) -> None:
-        set_autostart_enabled(switch.get_active())
 
     def _on_row_selected(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
         if row is not None:
