@@ -27,6 +27,7 @@ FIRST_RUN_MARKER = Path.home() / ".config" / "simpbar" / "welcome-shown"
 LOGO_PATH = Path.home() / ".local" / "share" / "simpbar" / "logo.png"
 REPO_URL = "https://github.com/jaytheoutpatient/simpbar"
 CONTACT_EMAIL = "jaytheoutpatient@protonmail.com"
+DISCORD_URL = "https://discord.gg/sAMMXSPx9R"
 HYPRLAND_CONF = "~/.config/hypr/hyprland.lua"
 HYPRLAND_LUA_PATH = Path.home() / ".config" / "hypr" / "hyprland.lua"
 
@@ -817,6 +818,15 @@ class AboutPage(Gtk.Box):
             "activated", lambda _r: launch(["xdg-open", f"mailto:{CONTACT_EMAIL}"])
         )
         group.add(email_row)
+
+        discord_row = Adw.ActionRow(
+            title="Join the Discord",
+            subtitle=DISCORD_URL,
+            activatable=True,
+        )
+        discord_row.set_icon_name("user-available-symbolic")
+        discord_row.connect("activated", lambda _r: launch(["xdg-open", DISCORD_URL]))
+        group.add(discord_row)
 
         self.append(group)
 
