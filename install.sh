@@ -767,38 +767,63 @@ AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme hypr
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 [ "$INSTALL_FALCOND" -eq 1 ] && AUR_PKGS+=(falcond falcond-gui)
 
-if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
-    prompt_choice AUR_CHOICE 1 "No AUR helper found. Install which one?" "yay" "paru" "skip"
-    case "$AUR_CHOICE" in
-        2) install_paru || warn "Could not install paru automatically — install manually: ${AUR_PKGS[*]}" ;;
-        3) warn "Skipping AUR helper install — install manually: ${AUR_PKGS[*]}" ;;
-        1) install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}" ;;
-        *)
-            warn "Unrecognized choice — defaulting to yay"
-            install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}"
-            ;;
-    esac
-fi
+if [ "$DISTRO_FAMILY" = "arch" ]; then
+    if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
+        prompt_choice AUR_CHOICE 1 "No AUR helper found. Install which one?" "yay" "paru" "skip"
+        case "$AUR_CHOICE" in
+            2) install_paru || warn "Could not install paru automatically — install manually: ${AUR_PKGS[*]}" ;;
+            3) warn "Skipping AUR helper install — install manually: ${AUR_PKGS[*]}" ;;
+            1) install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}" ;;
+            *)
+                warn "Unrecognized choice — defaulting to yay"
+                install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}"
+                ;;
+        esac
+    fi
 
-printf '  Installing %d AUR packages:\n    %s\n' "${#AUR_PKGS[@]}" "${AUR_PKGS[*]}"
-if command -v yay >/dev/null; then
-    run_spinner "yay: installing ${#AUR_PKGS[@]} AUR packages" yay -S --noconfirm --needed "${AUR_PKGS[@]}" \
-        || warn "Some AUR packages failed via yay — install manually: yay -S ${AUR_PKGS[*]}"
-elif command -v paru >/dev/null; then
-    run_spinner "paru: installing ${#AUR_PKGS[@]} AUR packages" paru -S --noconfirm --needed "${AUR_PKGS[@]}" \
-        || warn "Some AUR packages failed via paru — install manually: paru -S ${AUR_PKGS[*]}"
-else
-    warn "No AUR helper available — install manually: yay -S ${AUR_PKGS[*]}"
-fi
+    printf '  Installing %d AUR packages:\n    %s\n' "${#AUR_PKGS[@]}" "${AUR_PKGS[*]}"
+    if command -v yay >/dev/null; then
+        run_spinner "yay: installing ${#AUR_PKGS[@]} AUR packages" yay -S --noconfirm --needed "${AUR_PKGS[@]}" \
+            || warn "Some AUR packages failed via yay — install manually: yay -S ${AUR_PKGS[*]}"
+    elif command -v paru >/dev/null; then
+        run_spinner "paru: installing ${#AUR_PKGS[@]} AUR packages" paru -S --noconfirm --needed "${AUR_PKGS[@]}" \
+            || warn "Some AUR packages failed via paru — install manually: paru -S ${AUR_PKGS[*]}"
+    else
+        warn "No AUR helper available — install manually: yay -S ${AUR_PKGS[*]}"
+    fi
 
-MISSING_AUR=()
-for pkg in "${AUR_PKGS[@]}"; do
-    pacman -Qq "$pkg" >/dev/null 2>&1 || MISSING_AUR+=("$pkg")
-done
-if [ "${#MISSING_AUR[@]}" -gt 0 ]; then
-    warn "AUR packages not installed: ${MISSING_AUR[*]} — install manually if needed"
+    MISSING_AUR=()
+    for pkg in "${AUR_PKGS[@]}"; do
+        pacman -Qq "$pkg" >/dev/null 2>&1 || MISSING_AUR+=("$pkg")
+    done
+    if [ "${#MISSING_AUR[@]}" -gt 0 ]; then
+        warn "AUR packages not installed: ${MISSING_AUR[*]} — install manually if needed"
+    else
+        ok "Verified all AUR packages are installed"
+    fi
 else
-    ok "Verified all AUR packages are installed"
+    # Fedora: no AUR-equivalent build tool exists, so install what's
+    # actually verified available via dnf (Terra/official repos, already
+    # enabled) directly. wlogout is in Fedora's own repos; bibata-cursor-theme
+    # and cliphist are confirmed on Terra.
+    FEDORA_DNF_PKGS=(wlogout bibata-cursor-theme cliphist)
+    printf '  Installing %d packages via dnf:\n    %s\n' "${#FEDORA_DNF_PKGS[@]}" "${FEDORA_DNF_PKGS[*]}"
+    run_spinner "dnf: installing ${#FEDORA_DNF_PKGS[@]} packages" pkg_install "${FEDORA_DNF_PKGS[@]}" \
+        || warn "Some packages failed to install via dnf — install manually: ${FEDORA_DNF_PKGS[*]}"
+
+    # Dracula GTK theme isn't packaged for Fedora anywhere (checked Terra
+    # and Fedora's own repos) — its own documented install method is a
+    # direct git clone, which works identically on any distro.
+    if [ -d ~/.themes/Dracula ]; then
+        ok "Dracula GTK theme already present"
+    else
+        mkdir -p ~/.themes
+        run_spinner "Cloning Dracula GTK theme" \
+            git clone --quiet https://github.com/dracula/gtk ~/.themes/Dracula \
+            || warn "Could not clone the Dracula GTK theme — get it manually: https://draculatheme.com/gtk"
+    fi
+
+    warn "Not yet ported for Fedora — install these manually for now: waypaper, protonplus, hyprmod, zafiro-icon-theme, game-devices-udev, falcond/falcond-gui, browsers, Discord clients"
 fi
 
 
