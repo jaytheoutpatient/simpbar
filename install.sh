@@ -192,7 +192,32 @@ install_aur_pkg() {
 banner
 
 # ── Step 0: platform check ─────────────────────────────────────────
-command -v pacman >/dev/null || die "This script is Arch-only (pacman not found)."
+if command -v pacman >/dev/null; then
+    DISTRO_FAMILY="arch"
+elif command -v dnf >/dev/null; then
+    DISTRO_FAMILY="fedora"
+else
+    die "This script supports Arch-based (pacman) or Fedora-based (dnf) systems only."
+fi
+
+# pkg_install <pkg1> [pkg2 ...] — installs from official/enabled repos,
+# translating to the right package manager for the detected distro.
+pkg_install() {
+    if [ "$DISTRO_FAMILY" = "arch" ]; then
+        sudo pacman -S --noconfirm --needed "$@"
+    else
+        sudo dnf install -y "$@"
+    fi
+}
+
+# pkg_installed <pkg> — true if already installed, works on either distro.
+pkg_installed() {
+    if [ "$DISTRO_FAMILY" = "arch" ]; then
+        pacman -Qq "$1" >/dev/null 2>&1
+    else
+        rpm -q "$1" >/dev/null 2>&1
+    fi
+}
 
 # Authenticate sudo up front so the password prompt never lands in the
 # middle of a spinner later on. Keep it alive in the background for the
@@ -246,32 +271,60 @@ done
 rm -rf /tmp/simpbar-temp /tmp/simpbar.zip
 ok "Configs placed in ~/.config/{${CONFIG_DIRS[*]// /,}}"
 
-# ── Step 3: set up Chaotic-AUR ───────────────────────────────────────
-step "Setting up Chaotic-AUR"
+# ── Step 3: set up extra repos ───────────────────────────────────────
+step "Setting up extra repos"
 
-if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
-    ok "Chaotic-AUR already configured"
+if [ "$DISTRO_FAMILY" = "arch" ]; then
+    if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
+        ok "Chaotic-AUR already configured"
+    else
+        run_spinner "Importing Chaotic-AUR signing key" \
+            sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com \
+            || die "Failed to import the Chaotic-AUR signing key."
+
+        run_spinner "Trusting Chaotic-AUR signing key" \
+            sudo pacman-key --lsign-key 3056513887B78AEB \
+            || die "Failed to locally sign the Chaotic-AUR key."
+
+        run_spinner "Installing Chaotic-AUR keyring & mirrorlist" \
+            sudo pacman -U --noconfirm \
+                'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
+                'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
+            || die "Failed to install the Chaotic-AUR keyring/mirrorlist packages."
+
+        printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
+
+        run_spinner "Syncing package databases" sudo pacman -Sy \
+            || die "Failed to sync package databases after enabling Chaotic-AUR."
+
+        ok "Chaotic-AUR enabled"
+    fi
 else
-    run_spinner "Importing Chaotic-AUR signing key" \
-        sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com \
-        || die "Failed to import the Chaotic-AUR signing key."
+    # Terra covers general desktop software; the Hyprland-specific tooling
+    # (nwg-look, hyprpaper, etc.) lives in a separate community COPR that
+    # the popular Fedora-Hyprland installer projects also rely on.
+    run_spinner "Installing dnf-plugins-core" pkg_install dnf-plugins-core \
+        || die "Failed to install dnf-plugins-core."
 
-    run_spinner "Trusting Chaotic-AUR signing key" \
-        sudo pacman-key --lsign-key 3056513887B78AEB \
-        || die "Failed to locally sign the Chaotic-AUR key."
+    if dnf repolist 2>/dev/null | grep -qi '^terra'; then
+        ok "Terra already configured"
+    else
+        run_spinner "Enabling Terra repo" \
+            sudo dnf install -y --nogpgcheck --repofrompath \
+                "terra,https://repos.fyralabs.com/terra\$releasever" \
+                terra-release terra-gpg-keys \
+            || die "Failed to enable the Terra repo."
+        ok "Terra enabled"
+    fi
 
-    run_spinner "Installing Chaotic-AUR keyring & mirrorlist" \
-        sudo pacman -U --noconfirm \
-            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
-            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
-        || die "Failed to install the Chaotic-AUR keyring/mirrorlist packages."
-
-    printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
-
-    run_spinner "Syncing package databases" sudo pacman -Sy \
-        || die "Failed to sync package databases after enabling Chaotic-AUR."
-
-    ok "Chaotic-AUR enabled"
+    if dnf copr list 2>/dev/null | grep -qi 'solopasha/hyprland'; then
+        ok "solopasha/hyprland COPR already configured"
+    else
+        run_spinner "Enabling solopasha/hyprland COPR" \
+            sudo dnf copr enable -y solopasha/hyprland \
+            || die "Failed to enable the solopasha/hyprland COPR."
+        ok "solopasha/hyprland COPR enabled"
+    fi
 fi
 
 # ── Step 4: install packages ───────────────────────────────────────
@@ -743,6 +796,7 @@ if [ "${#MISSING_AUR[@]}" -gt 0 ]; then
 else
     ok "Verified all AUR packages are installed"
 fi
+
 
 if pacman -Qq game-devices-udev >/dev/null 2>&1; then
     run_spinner "Reloading udev rules for game controllers" \
