@@ -942,15 +942,16 @@ EOF
 else
     warn "No downloaded wallpaper or swaybg not installed — skipping swaybg service setup"
 fi
-
 # Apply the Dracula GTK theme and the Bibata cursor theme, now that
 # they're actually installed. This uses the same gsettings mechanism
 # nwg-look reads/writes, so it shows up as already selected there too.
-if pacman -Qq dracula-gtk-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
+# (Dracula is a pacman/AUR package on Arch, but a plain git-clone into
+# ~/.themes/Dracula on Fedora — check for either.)
+if { pkg_installed dracula-gtk-theme || [ -d ~/.themes/Dracula ]; } && command -v gsettings >/dev/null; then
     run_spinner "Applying Dracula GTK theme" \
         gsettings set org.gnome.desktop.interface gtk-theme 'Dracula' \
         || warn "Could not apply the Dracula GTK theme — select it manually in nwg-look"
-elif ! pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
+elif ! { pkg_installed dracula-gtk-theme || [ -d ~/.themes/Dracula ]; }; then
     warn "dracula-gtk-theme isn't installed — skipping GTK theme apply"
 else
     warn "gsettings not found — select the Dracula theme manually in nwg-look"
@@ -959,7 +960,7 @@ fi
 # Zafiro's AUR package has had reported issues with how it lays out its
 # newer color-variant folders, so check the exact folder actually exists
 # before pointing gsettings at it rather than assuming the name.
-if pacman -Qq zafiro-icon-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
+if pkg_installed zafiro-icon-theme && command -v gsettings >/dev/null; then
     ZAFIRO_DRACULA_DIR=$(find /usr/share/icons -maxdepth 1 -iname 'zafiro-dracula*' -print -quit 2>/dev/null)
     if [ -n "$ZAFIRO_DRACULA_DIR" ]; then
         run_spinner "Applying Zafiro-Dracula icon theme" \
@@ -968,17 +969,17 @@ if pacman -Qq zafiro-icon-theme >/dev/null 2>&1 && command -v gsettings >/dev/nu
     else
         warn "zafiro-icon-theme installed but no Zafiro-Dracula folder found under /usr/share/icons — check available variants with: ls /usr/share/icons | grep -i zafiro"
     fi
-elif ! pacman -Qq zafiro-icon-theme >/dev/null 2>&1; then
+elif ! pkg_installed zafiro-icon-theme; then
     warn "zafiro-icon-theme isn't installed — skipping icon theme apply"
 else
     warn "gsettings not found — select the Zafiro-Dracula icon theme manually in nwg-look"
 fi
 
-if pacman -Qq bibata-cursor-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
+if pkg_installed bibata-cursor-theme && command -v gsettings >/dev/null; then
     run_spinner "Applying Bibata Modern Classic cursor" \
         gsettings set org.gnome.desktop.interface cursor-theme 'Bibata-Modern-Classic' \
         || warn "Could not apply the cursor theme — select it manually in nwg-look"
-elif ! pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
+elif ! pkg_installed bibata-cursor-theme; then
     warn "bibata-cursor-theme isn't installed — skipping cursor theme apply"
 else
     warn "gsettings not found — select the Bibata cursor theme manually in nwg-look"
@@ -1002,7 +1003,7 @@ esac
 if [ -z "$BROWSER_NAME" ]; then
     warn "Skipping browser install, as requested"
 else
-    install_aur_pkg "$BROWSER_NAME" "$BROWSER_PKG"
+    install_aur_pkg "$BROWSER_NAME" "$BROWSER_PKG" || true
 fi
 
 if [ -n "$BROWSER_PKG" ] && pacman -Qq "$BROWSER_PKG" >/dev/null 2>&1; then
@@ -2317,7 +2318,7 @@ step "Done"
 ok "Full system updated (pacman -Syu)"
 ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility, nwg-drawer installed (pacman)"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
-if pacman -Qq cliphist >/dev/null 2>&1; then
+if pkg_installed cliphist; then
     ok "cliphist installed (bind a key to it yourself, e.g. in hyprland.lua)"
 fi
 if pacman -Qq obs-studio >/dev/null 2>&1; then
@@ -2341,13 +2342,13 @@ else
 fi
 ok "Flathub remote added for flatpak/bazaar"
 ok "nwg-look set to prefer dark theme"
-if pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
+if pkg_installed dracula-gtk-theme || [ -d ~/.themes/Dracula ]; then
     ok "Dracula GTK theme installed and applied"
 fi
-if pacman -Qq zafiro-icon-theme >/dev/null 2>&1; then
+if pkg_installed zafiro-icon-theme; then
     ok "Zafiro-Dracula icon theme installed"
 fi
-if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
+if pkg_installed bibata-cursor-theme; then
     ok "Bibata Modern Classic cursor installed and applied"
 fi
 if pacman -Qq hyprmod >/dev/null 2>&1; then
