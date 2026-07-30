@@ -330,8 +330,8 @@ fi
 # ── Step 4: install packages ───────────────────────────────────────
 step "Installing packages"
 
-# Steam lives in the multilib repo, which isn't enabled by default.
-if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
+# Steam lives in the multilib repo, which isn't enabled by default (Arch only).
+if [ "$DISTRO_FAMILY" = "arch" ] && ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
     warn "multilib repo not enabled — enabling it for Steam"
     sudo sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /etc/pacman.conf
     if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
@@ -400,17 +400,21 @@ if [ "$FALCOND_CHOICE" = 1 ]; then
 fi
 
 printf '  Installing %d packages via pacman:\n    %s\n' "${#PACMAN_PKGS[@]}" "${PACMAN_PKGS[*]}"
-run_spinner "pacman: installing ${#PACMAN_PKGS[@]} packages" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
-    || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
+if [ "$DISTRO_FAMILY" = "arch" ]; then
+    run_spinner "pacman: installing ${#PACMAN_PKGS[@]} packages" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
+        || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
-MISSING_PKGS=()
-for pkg in "${PACMAN_PKGS[@]}"; do
-    pacman -Qq "$pkg" >/dev/null 2>&1 || MISSING_PKGS+=("$pkg")
-done
-if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
-    warn "pacman reported success but these packages aren't actually installed: ${MISSING_PKGS[*]}"
+    MISSING_PKGS=()
+    for pkg in "${PACMAN_PKGS[@]}"; do
+        pacman -Qq "$pkg" >/dev/null 2>&1 || MISSING_PKGS+=("$pkg")
+    done
+    if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
+        warn "pacman reported success but these packages aren't actually installed: ${MISSING_PKGS[*]}"
+    else
+        ok "Verified all pacman packages are installed"
+    fi
 else
-    ok "Verified all pacman packages are installed"
+    warn "Fedora package installation is still being built out — skipping the package list for now (this is a known work-in-progress, not a bug)."
 fi
 
 run_spinner "Refreshing font cache" fc-cache -f \
