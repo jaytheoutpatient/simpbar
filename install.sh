@@ -2310,8 +2310,13 @@ else
 fi
 
 
-run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfirm \
-    || warn "Full system update failed — run 'sudo pacman -Syu' manually to check for issues"
+if [ "$DISTRO_FAMILY" = "arch" ]; then
+    run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfirm \
+        || warn "Full system update failed — run 'sudo pacman -Syu' manually to check for issues"
+else
+    run_spinner "Updating the full system (dnf upgrade)" sudo dnf upgrade -y \
+        || warn "Full system update failed — run 'sudo dnf upgrade' manually to check for issues"
+fi
 
 # ── Step 7: done ────────────────────────────────────────────────────
 step "Done"
@@ -2395,7 +2400,9 @@ ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
 ok "fastfetch runs automatically in new terminal sessions (~/.bashrc)"
-ok "fish shell installed with an empty greeting message and fastfetch on launch"
+if pkg_installed fish; then
+    ok "fish shell installed with an empty greeting message and fastfetch on launch"
+fi
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
