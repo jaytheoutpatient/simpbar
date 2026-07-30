@@ -1066,7 +1066,7 @@ else
     ok "fastfetch added to fish config"
 fi
 
-FISH_PATH=$(command -v fish)
+FISH_PATH=$(command -v fish) || true
 
 # Deploy the Simpbar Welcome app (GTK4 + libadwaita) — setup shortcuts,
 # keybindings reference, and links. Always refreshed from source since
