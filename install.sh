@@ -805,8 +805,9 @@ else
     # Fedora: no AUR-equivalent build tool exists, so install what's
     # actually verified available via dnf (Terra/official repos, already
     # enabled) directly. wlogout is in Fedora's own repos; bibata-cursor-theme
-    # and cliphist are confirmed on Terra.
-    FEDORA_DNF_PKGS=(wlogout bibata-cursor-theme cliphist)
+    # and cliphist are confirmed on Terra; waypaper is in the already-enabled
+    # solopasha/hyprland COPR.
+    FEDORA_DNF_PKGS=(wlogout bibata-cursor-theme cliphist waypaper)
     printf '  Installing %d packages via dnf:\n    %s\n' "${#FEDORA_DNF_PKGS[@]}" "${FEDORA_DNF_PKGS[*]}"
     run_spinner "dnf: installing ${#FEDORA_DNF_PKGS[@]} packages" pkg_install "${FEDORA_DNF_PKGS[@]}" \
         || warn "Some packages failed to install via dnf — install manually: ${FEDORA_DNF_PKGS[*]}"
@@ -823,7 +824,19 @@ else
             || warn "Could not clone the Dracula GTK theme — get it manually: https://draculatheme.com/gtk"
     fi
 
-    warn "Not yet ported for Fedora — install these manually for now: waypaper, protonplus, hyprmod, zafiro-icon-theme, game-devices-udev, falcond/falcond-gui, browsers, Discord clients"
+    # ProtonPlus is officially distributed via Flathub — cleaner than
+    # enabling yet another COPR just for this one app, and Flathub is
+    # already set up later in the script anyway.
+    if command -v flatpak >/dev/null; then
+        flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null
+        run_spinner "Installing ProtonPlus (Flatpak)" \
+            flatpak install -y --noninteractive flathub com.vysp3r.ProtonPlus \
+            || warn "Could not install ProtonPlus via Flatpak — install manually: flatpak install flathub com.vysp3r.ProtonPlus"
+    else
+        warn "flatpak not found — install ProtonPlus manually once Flatpak is set up"
+    fi
+
+    warn "Not yet ported for Fedora — install these manually for now: hyprmod, zafiro-icon-theme, game-devices-udev, falcond/falcond-gui, browsers, Discord clients"
 fi
 
 
