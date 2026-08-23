@@ -1,0 +1,26 @@
+.{
+    .name = .zbar,
+    .version = "0.0.1",
+    .fingerprint = 0xac78ca5c3577ab30,
+    .minimum_zig_version = "0.13.0",
+
+    // Run this once, from the project root, with network access:
+    //
+    //   zig fetch --save git+https://codeberg.org/ifreund/zig-wayland#main
+    //
+    // That will add the correct `.hash` field automatically and pin a
+    // specific commit. Don't hand-write the hash.
+    .dependencies = .{
+        .wayland = .{
+            .url = "git+https://codeberg.org/ifreund/zig-wayland?ref=main#23839e41161de025d71ce082561ecba1c5331281",
+            .hash = "wayland-0.7.0-dev-lQa1kl38AQC-kQolS5D4jV1GJ2rH2jv1VWHr14YLVnyn",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "protocols",
+    },
+}
