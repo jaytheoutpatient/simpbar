@@ -192,32 +192,7 @@ install_aur_pkg() {
 banner
 
 # ── Step 0: platform check ─────────────────────────────────────────
-if command -v pacman >/dev/null; then
-    DISTRO_FAMILY="arch"
-elif command -v dnf >/dev/null; then
-    DISTRO_FAMILY="fedora"
-else
-    die "This script supports Arch-based (pacman) or Fedora-based (dnf) systems only."
-fi
-
-# pkg_install <pkg1> [pkg2 ...] — installs from official/enabled repos,
-# translating to the right package manager for the detected distro.
-pkg_install() {
-    if [ "$DISTRO_FAMILY" = "arch" ]; then
-        sudo pacman -S --noconfirm --needed "$@"
-    else
-        sudo dnf install -y "$@"
-    fi
-}
-
-# pkg_installed <pkg> — true if already installed, works on either distro.
-pkg_installed() {
-    if [ "$DISTRO_FAMILY" = "arch" ]; then
-        pacman -Qq "$1" >/dev/null 2>&1
-    else
-        rpm -q "$1" >/dev/null 2>&1
-    fi
-}
+command -v pacman >/dev/null || die "This script is Arch-only (pacman not found)."
 
 # Authenticate sudo up front so the password prompt never lands in the
 # middle of a spinner later on. Keep it alive in the background for the
@@ -271,67 +246,64 @@ done
 rm -rf /tmp/simpbar-temp /tmp/simpbar.zip
 ok "Configs placed in ~/.config/{${CONFIG_DIRS[*]// /,}}"
 
-# ── Step 3: set up extra repos ───────────────────────────────────────
-step "Setting up extra repos"
+# ── Step 3: set up Chaotic-AUR ───────────────────────────────────────
+step "Setting up Chaotic-AUR"
 
-if [ "$DISTRO_FAMILY" = "arch" ]; then
-    if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
-        ok "Chaotic-AUR already configured"
-    else
-        run_spinner "Importing Chaotic-AUR signing key" \
-            sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com \
-            || die "Failed to import the Chaotic-AUR signing key."
-
-        run_spinner "Trusting Chaotic-AUR signing key" \
-            sudo pacman-key --lsign-key 3056513887B78AEB \
-            || die "Failed to locally sign the Chaotic-AUR key."
-
-        run_spinner "Installing Chaotic-AUR keyring & mirrorlist" \
-            sudo pacman -U --noconfirm \
-                'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
-                'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
-            || die "Failed to install the Chaotic-AUR keyring/mirrorlist packages."
-
-        printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
-
-        run_spinner "Syncing package databases" sudo pacman -Sy \
-            || die "Failed to sync package databases after enabling Chaotic-AUR."
-
-        ok "Chaotic-AUR enabled"
-    fi
+if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
+    ok "Chaotic-AUR already configured"
 else
-    # Terra covers general desktop software; the Hyprland-specific tooling
-    # (nwg-look, hyprpaper, etc.) lives in a separate community COPR that
-    # the popular Fedora-Hyprland installer projects also rely on.
-    run_spinner "Installing dnf-plugins-core" pkg_install dnf-plugins-core \
-        || die "Failed to install dnf-plugins-core."
+    run_spinner "Importing Chaotic-AUR signing key" \
+        sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com \
+        || die "Failed to import the Chaotic-AUR signing key."
 
-    if dnf repolist 2>/dev/null | grep -qi '^terra'; then
-        ok "Terra already configured"
-    else
-        run_spinner "Enabling Terra repo" \
-            sudo dnf install -y --nogpgcheck --repofrompath \
-                "terra,https://repos.fyralabs.com/terra\$releasever" \
-                terra-release terra-gpg-keys \
-            || die "Failed to enable the Terra repo."
-        ok "Terra enabled"
-    fi
+    run_spinner "Trusting Chaotic-AUR signing key" \
+        sudo pacman-key --lsign-key 3056513887B78AEB \
+        || die "Failed to locally sign the Chaotic-AUR key."
 
-    if dnf copr list 2>/dev/null | grep -qi 'solopasha/hyprland'; then
-        ok "solopasha/hyprland COPR already configured"
-    else
-        run_spinner "Enabling solopasha/hyprland COPR" \
-            sudo dnf copr enable -y solopasha/hyprland \
-            || die "Failed to enable the solopasha/hyprland COPR."
-        ok "solopasha/hyprland COPR enabled"
-    fi
+    run_spinner "Installing Chaotic-AUR keyring & mirrorlist" \
+        sudo pacman -U --noconfirm \
+            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
+            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
+        || die "Failed to install the Chaotic-AUR keyring/mirrorlist packages."
+
+    printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
+
+    run_spinner "Syncing package databases" sudo pacman -Sy \
+        || die "Failed to sync package databases after enabling Chaotic-AUR."
+
+    ok "Chaotic-AUR enabled"
 fi
 
-# ── Step 4: install packages ───────────────────────────────────────
+# ── Step 4: detect GPU and install packages ──────────────────────────
+step "Detecting GPU"
+
+GPU_INFO=$(lspci 2>/dev/null | grep -Ei 'vga compatible controller|3d controller')
+GPU_PKGS=()
+
+if echo "$GPU_INFO" | grep -qi nvidia; then
+    ok "NVIDIA GPU detected — adding the proprietary driver + Vulkan packages"
+    GPU_PKGS+=(nvidia nvidia-utils lib32-nvidia-utils nvidia-settings)
+fi
+if echo "$GPU_INFO" | grep -Eqi 'amd|advanced micro devices|radeon'; then
+    ok "AMD GPU detected — adding Mesa + Vulkan (RADV) packages"
+    GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon)
+fi
+if echo "$GPU_INFO" | grep -qi intel; then
+    ok "Intel GPU detected — adding Mesa + Vulkan packages"
+    GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel)
+fi
+
+if [ "${#GPU_PKGS[@]}" -eq 0 ]; then
+    warn "Could not detect a known GPU vendor (NVIDIA/AMD/Intel) via lspci — install graphics drivers manually if needed"
+else
+    # De-dupe for hybrid graphics (e.g. Intel+NVIDIA laptops both pull in mesa/lib32-mesa)
+    mapfile -t GPU_PKGS < <(printf '%s\n' "${GPU_PKGS[@]}" | sort -u)
+fi
+
 step "Installing packages"
 
-# Steam lives in the multilib repo, which isn't enabled by default (Arch only).
-if [ "$DISTRO_FAMILY" = "arch" ] && ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
+# Steam lives in the multilib repo, which isn't enabled by default.
+if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
     warn "multilib repo not enabled — enabling it for Steam"
     sudo sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /etc/pacman.conf
     if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
@@ -342,6 +314,7 @@ if [ "$DISTRO_FAMILY" = "arch" ] && ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /e
 fi
 
 PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer)
+PACMAN_PKGS+=("${GPU_PKGS[@]}")
 
 prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
 [ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
@@ -400,21 +373,17 @@ if [ "$FALCOND_CHOICE" = 1 ]; then
 fi
 
 printf '  Installing %d packages via pacman:\n    %s\n' "${#PACMAN_PKGS[@]}" "${PACMAN_PKGS[*]}"
-if [ "$DISTRO_FAMILY" = "arch" ]; then
-    run_spinner "pacman: installing ${#PACMAN_PKGS[@]} packages" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
-        || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
+run_spinner "pacman: installing ${#PACMAN_PKGS[@]} packages" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
+    || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
 
-    MISSING_PKGS=()
-    for pkg in "${PACMAN_PKGS[@]}"; do
-        pacman -Qq "$pkg" >/dev/null 2>&1 || MISSING_PKGS+=("$pkg")
-    done
-    if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
-        warn "pacman reported success but these packages aren't actually installed: ${MISSING_PKGS[*]}"
-    else
-        ok "Verified all pacman packages are installed"
-    fi
+MISSING_PKGS=()
+for pkg in "${PACMAN_PKGS[@]}"; do
+    pacman -Qq "$pkg" >/dev/null 2>&1 || MISSING_PKGS+=("$pkg")
+done
+if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
+    warn "pacman reported success but these packages aren't actually installed: ${MISSING_PKGS[*]}"
 else
-    warn "Fedora package installation is still being built out — skipping the package list for now (this is a known work-in-progress, not a bug)."
+    ok "Verified all pacman packages are installed"
 fi
 
 run_spinner "Refreshing font cache" fc-cache -f \
@@ -767,76 +736,38 @@ AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme hypr
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 [ "$INSTALL_FALCOND" -eq 1 ] && AUR_PKGS+=(falcond falcond-gui)
 
-if [ "$DISTRO_FAMILY" = "arch" ]; then
-    if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
-        prompt_choice AUR_CHOICE 1 "No AUR helper found. Install which one?" "yay" "paru" "skip"
-        case "$AUR_CHOICE" in
-            2) install_paru || warn "Could not install paru automatically — install manually: ${AUR_PKGS[*]}" ;;
-            3) warn "Skipping AUR helper install — install manually: ${AUR_PKGS[*]}" ;;
-            1) install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}" ;;
-            *)
-                warn "Unrecognized choice — defaulting to yay"
-                install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}"
-                ;;
-        esac
-    fi
+if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
+    prompt_choice AUR_CHOICE 1 "No AUR helper found. Install which one?" "yay" "paru" "skip"
+    case "$AUR_CHOICE" in
+        2) install_paru || warn "Could not install paru automatically — install manually: ${AUR_PKGS[*]}" ;;
+        3) warn "Skipping AUR helper install — install manually: ${AUR_PKGS[*]}" ;;
+        1) install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}" ;;
+        *)
+            warn "Unrecognized choice — defaulting to yay"
+            install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}"
+            ;;
+    esac
+fi
 
-    printf '  Installing %d AUR packages:\n    %s\n' "${#AUR_PKGS[@]}" "${AUR_PKGS[*]}"
-    if command -v yay >/dev/null; then
-        run_spinner "yay: installing ${#AUR_PKGS[@]} AUR packages" yay -S --noconfirm --needed "${AUR_PKGS[@]}" \
-            || warn "Some AUR packages failed via yay — install manually: yay -S ${AUR_PKGS[*]}"
-    elif command -v paru >/dev/null; then
-        run_spinner "paru: installing ${#AUR_PKGS[@]} AUR packages" paru -S --noconfirm --needed "${AUR_PKGS[@]}" \
-            || warn "Some AUR packages failed via paru — install manually: paru -S ${AUR_PKGS[*]}"
-    else
-        warn "No AUR helper available — install manually: yay -S ${AUR_PKGS[*]}"
-    fi
-
-    MISSING_AUR=()
-    for pkg in "${AUR_PKGS[@]}"; do
-        pacman -Qq "$pkg" >/dev/null 2>&1 || MISSING_AUR+=("$pkg")
-    done
-    if [ "${#MISSING_AUR[@]}" -gt 0 ]; then
-        warn "AUR packages not installed: ${MISSING_AUR[*]} — install manually if needed"
-    else
-        ok "Verified all AUR packages are installed"
-    fi
+printf '  Installing %d AUR packages:\n    %s\n' "${#AUR_PKGS[@]}" "${AUR_PKGS[*]}"
+if command -v yay >/dev/null; then
+    run_spinner "yay: installing ${#AUR_PKGS[@]} AUR packages" yay -S --noconfirm --needed "${AUR_PKGS[@]}" \
+        || warn "Some AUR packages failed via yay — install manually: yay -S ${AUR_PKGS[*]}"
+elif command -v paru >/dev/null; then
+    run_spinner "paru: installing ${#AUR_PKGS[@]} AUR packages" paru -S --noconfirm --needed "${AUR_PKGS[@]}" \
+        || warn "Some AUR packages failed via paru — install manually: paru -S ${AUR_PKGS[*]}"
 else
-    # Fedora: no AUR-equivalent build tool exists, so install what's
-    # actually verified available via dnf (Terra/official repos, already
-    # enabled) directly. wlogout is in Fedora's own repos; bibata-cursor-theme
-    # and cliphist are confirmed on Terra; waypaper is in the already-enabled
-    # solopasha/hyprland COPR.
-    FEDORA_DNF_PKGS=(wlogout bibata-cursor-theme cliphist waypaper)
-    printf '  Installing %d packages via dnf:\n    %s\n' "${#FEDORA_DNF_PKGS[@]}" "${FEDORA_DNF_PKGS[*]}"
-    run_spinner "dnf: installing ${#FEDORA_DNF_PKGS[@]} packages" pkg_install "${FEDORA_DNF_PKGS[@]}" \
-        || warn "Some packages failed to install via dnf — install manually: ${FEDORA_DNF_PKGS[*]}"
+    warn "No AUR helper available — install manually: yay -S ${AUR_PKGS[*]}"
+fi
 
-    # Dracula GTK theme isn't packaged for Fedora anywhere (checked Terra
-    # and Fedora's own repos) — its own documented install method is a
-    # direct git clone, which works identically on any distro.
-    if [ -d ~/.themes/Dracula ]; then
-        ok "Dracula GTK theme already present"
-    else
-        mkdir -p ~/.themes
-        run_spinner "Cloning Dracula GTK theme" \
-            git clone --quiet https://github.com/dracula/gtk ~/.themes/Dracula \
-            || warn "Could not clone the Dracula GTK theme — get it manually: https://draculatheme.com/gtk"
-    fi
-
-    # ProtonPlus is officially distributed via Flathub — cleaner than
-    # enabling yet another COPR just for this one app, and Flathub is
-    # already set up later in the script anyway.
-    if command -v flatpak >/dev/null; then
-        flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null
-        run_spinner "Installing ProtonPlus (Flatpak)" \
-            flatpak install -y --noninteractive flathub com.vysp3r.ProtonPlus \
-            || warn "Could not install ProtonPlus via Flatpak — install manually: flatpak install flathub com.vysp3r.ProtonPlus"
-    else
-        warn "flatpak not found — install ProtonPlus manually once Flatpak is set up"
-    fi
-
-    warn "Not yet ported for Fedora — install these manually for now: hyprmod, zafiro-icon-theme, game-devices-udev, falcond/falcond-gui, browsers, Discord clients"
+MISSING_AUR=()
+for pkg in "${AUR_PKGS[@]}"; do
+    pacman -Qq "$pkg" >/dev/null 2>&1 || MISSING_AUR+=("$pkg")
+done
+if [ "${#MISSING_AUR[@]}" -gt 0 ]; then
+    warn "AUR packages not installed: ${MISSING_AUR[*]} — install manually if needed"
+else
+    ok "Verified all AUR packages are installed"
 fi
 
 
@@ -958,13 +889,11 @@ fi
 # Apply the Dracula GTK theme and the Bibata cursor theme, now that
 # they're actually installed. This uses the same gsettings mechanism
 # nwg-look reads/writes, so it shows up as already selected there too.
-# (Dracula is a pacman/AUR package on Arch, but a plain git-clone into
-# ~/.themes/Dracula on Fedora — check for either.)
-if { pkg_installed dracula-gtk-theme || [ -d ~/.themes/Dracula ]; } && command -v gsettings >/dev/null; then
+if pacman -Qq dracula-gtk-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
     run_spinner "Applying Dracula GTK theme" \
         gsettings set org.gnome.desktop.interface gtk-theme 'Dracula' \
         || warn "Could not apply the Dracula GTK theme — select it manually in nwg-look"
-elif ! { pkg_installed dracula-gtk-theme || [ -d ~/.themes/Dracula ]; }; then
+elif ! pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
     warn "dracula-gtk-theme isn't installed — skipping GTK theme apply"
 else
     warn "gsettings not found — select the Dracula theme manually in nwg-look"
@@ -973,7 +902,7 @@ fi
 # Zafiro's AUR package has had reported issues with how it lays out its
 # newer color-variant folders, so check the exact folder actually exists
 # before pointing gsettings at it rather than assuming the name.
-if pkg_installed zafiro-icon-theme && command -v gsettings >/dev/null; then
+if pacman -Qq zafiro-icon-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
     ZAFIRO_DRACULA_DIR=$(find /usr/share/icons -maxdepth 1 -iname 'zafiro-dracula*' -print -quit 2>/dev/null)
     if [ -n "$ZAFIRO_DRACULA_DIR" ]; then
         run_spinner "Applying Zafiro-Dracula icon theme" \
@@ -982,17 +911,17 @@ if pkg_installed zafiro-icon-theme && command -v gsettings >/dev/null; then
     else
         warn "zafiro-icon-theme installed but no Zafiro-Dracula folder found under /usr/share/icons — check available variants with: ls /usr/share/icons | grep -i zafiro"
     fi
-elif ! pkg_installed zafiro-icon-theme; then
+elif ! pacman -Qq zafiro-icon-theme >/dev/null 2>&1; then
     warn "zafiro-icon-theme isn't installed — skipping icon theme apply"
 else
     warn "gsettings not found — select the Zafiro-Dracula icon theme manually in nwg-look"
 fi
 
-if pkg_installed bibata-cursor-theme && command -v gsettings >/dev/null; then
+if pacman -Qq bibata-cursor-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
     run_spinner "Applying Bibata Modern Classic cursor" \
         gsettings set org.gnome.desktop.interface cursor-theme 'Bibata-Modern-Classic' \
         || warn "Could not apply the cursor theme — select it manually in nwg-look"
-elif ! pkg_installed bibata-cursor-theme; then
+elif ! pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
     warn "bibata-cursor-theme isn't installed — skipping cursor theme apply"
 else
     warn "gsettings not found — select the Bibata cursor theme manually in nwg-look"
@@ -2323,20 +2252,15 @@ else
 fi
 
 
-if [ "$DISTRO_FAMILY" = "arch" ]; then
-    run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfirm \
-        || warn "Full system update failed — run 'sudo pacman -Syu' manually to check for issues"
-else
-    run_spinner "Updating the full system (dnf upgrade)" sudo dnf upgrade -y \
-        || warn "Full system update failed — run 'sudo dnf upgrade' manually to check for issues"
-fi
+run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfirm \
+    || warn "Full system update failed — run 'sudo pacman -Syu' manually to check for issues"
 
 # ── Step 7: done ────────────────────────────────────────────────────
 step "Done"
 ok "Full system updated (pacman -Syu)"
 ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility, nwg-drawer installed (pacman)"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
-if pkg_installed cliphist; then
+if pacman -Qq cliphist >/dev/null 2>&1; then
     ok "cliphist installed (bind a key to it yourself, e.g. in hyprland.lua)"
 fi
 if pacman -Qq obs-studio >/dev/null 2>&1; then
@@ -2360,13 +2284,13 @@ else
 fi
 ok "Flathub remote added for flatpak/bazaar"
 ok "nwg-look set to prefer dark theme"
-if pkg_installed dracula-gtk-theme || [ -d ~/.themes/Dracula ]; then
+if pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
     ok "Dracula GTK theme installed and applied"
 fi
-if pkg_installed zafiro-icon-theme; then
+if pacman -Qq zafiro-icon-theme >/dev/null 2>&1; then
     ok "Zafiro-Dracula icon theme installed"
 fi
-if pkg_installed bibata-cursor-theme; then
+if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
     ok "Bibata Modern Classic cursor installed and applied"
 fi
 if pacman -Qq hyprmod >/dev/null 2>&1; then
@@ -2413,7 +2337,7 @@ ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
 ok "fastfetch runs automatically in new terminal sessions (~/.bashrc)"
-if pkg_installed fish; then
+if pacman -Qq fish >/dev/null 2>&1; then
     ok "fish shell installed with an empty greeting message and fastfetch on launch"
 fi
 
