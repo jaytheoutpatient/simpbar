@@ -296,6 +296,10 @@ fi
 if [ "${#GPU_PKGS[@]}" -eq 0 ]; then
     warn "Could not detect a known GPU vendor (NVIDIA/AMD/Intel) via lspci — install graphics drivers manually if needed"
 else
+    # The Vulkan loader is a separate package from the vendor driver itself —
+    # without it, Vulkan apps (and therefore Proton/DXVK) can't find the
+    # driver even if it's installed. Needed regardless of vendor.
+    GPU_PKGS+=(vulkan-icd-loader lib32-vulkan-icd-loader)
     # De-dupe for hybrid graphics (e.g. Intel+NVIDIA laptops both pull in mesa/lib32-mesa)
     mapfile -t GPU_PKGS < <(printf '%s\n' "${GPU_PKGS[@]}" | sort -u)
 fi
