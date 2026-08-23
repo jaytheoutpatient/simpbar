@@ -9,7 +9,6 @@ Usage:
                                      been shown before (first-login use).
 """
 
-import re
 import shutil
 import subprocess
 import sys
@@ -190,7 +189,7 @@ PIN_DISCORD_INFO = {
 
 
 def build_apply_pin_argv(binary: str, pkg: str, needs_aur: bool, pref_file: Path) -> list[str]:
-    """Install the package (if needed) and write it as the waybar pin's
+    """Install the package (if needed) and write it as the bar pin's
     preferred binary, checked by simpbar-launch-browser/-discord."""
     if needs_aur:
         install_cmd = (
@@ -202,110 +201,6 @@ def build_apply_pin_argv(binary: str, pkg: str, needs_aur: bool, pref_file: Path
         install_cmd = f"sudo pacman -S --noconfirm --needed {pkg}"
     write_pref = f"mkdir -p {SIMPBAR_CONFIG_DIR} && echo {binary} > {pref_file}"
     full_cmd = f"{install_cmd}; {write_pref}; echo; read -p 'Press Enter to close...'"
-    return ["foot", "-e", "bash", "-lc", full_cmd]
-
-
-WAYBAR_CONFIG_PATH = Path.home() / ".config" / "waybar" / "config"
-POSITION_RE = re.compile(r'"position"\s*:\s*"(top|bottom)"')
-
-
-def get_waybar_position() -> str:
-    try:
-        match = POSITION_RE.search(WAYBAR_CONFIG_PATH.read_text())
-        return match.group(1) if match else "bottom"
-    except OSError:
-        return "bottom"
-
-
-def set_waybar_position(position: str) -> bool:
-    """position is 'top' or 'bottom'. Restarts waybar so it takes effect
-    right away. Returns True on success."""
-    try:
-        content = WAYBAR_CONFIG_PATH.read_text()
-        new_content, count = POSITION_RE.subn(f'"position": "{position}"', content, count=1)
-        if count == 0:
-            return False
-        WAYBAR_CONFIG_PATH.write_text(new_content)
-        subprocess.run(["pkill", "-x", "waybar"], check=False)
-        subprocess.Popen(["waybar"], start_new_session=True)
-        return True
-    except OSError as exc:
-        print(f"simpbar-welcome: couldn't update waybar position: {exc}", file=sys.stderr)
-        return False
-
-
-COMMON_RESOLUTIONS = [
-    "1920x1080",
-    "2560x1440",
-    "3840x2160",
-    "1366x768",
-    "1600x900",
-    "1280x1024",
-    "2560x1080",
-    "3440x1440",
-]
-WIDTH_RE = re.compile(r'"width"\s*:\s*(\d+)')
-
-
-def get_waybar_width() -> str:
-    try:
-        match = WIDTH_RE.search(WAYBAR_CONFIG_PATH.read_text())
-        return match.group(1) if match else "1920"
-    except OSError:
-        return "1920"
-
-
-def set_waybar_width(width: int) -> bool:
-    """Restarts waybar so it takes effect right away. Returns True on success."""
-    try:
-        content = WAYBAR_CONFIG_PATH.read_text()
-        new_content, count = WIDTH_RE.subn(f'"width": {width}', content, count=1)
-        if count == 0:
-            return False
-        WAYBAR_CONFIG_PATH.write_text(new_content)
-        subprocess.run(["pkill", "-x", "waybar"], check=False)
-        subprocess.Popen(["waybar"], start_new_session=True)
-        return True
-    except OSError as exc:
-        print(f"simpbar-welcome: couldn't update waybar width: {exc}", file=sys.stderr)
-        return False
-
-
-WAYBAR_STYLE_PATH = Path.home() / ".config" / "waybar" / "style.css"
-FONT_RE = re.compile(r'font-family:\s*([^;]+);')
-
-# name -> (CSS font-family value, package to install)
-FONT_OPTIONS = [
-    "JetBrainsMono Nerd Font (default)",
-    "FiraCode Nerd Font",
-    "Hack Nerd Font",
-    "CaskaydiaCove Nerd Font",
-    "Iosevka Nerd Font",
-]
-FONT_INFO = {
-    "JetBrainsMono Nerd Font (default)": ("JetBrainsMonoNLNerdFontRegular", "ttf-jetbrains-mono-nerd"),
-    "FiraCode Nerd Font": ("FiraCode Nerd Font", "ttf-firacode-nerd"),
-    "Hack Nerd Font": ("Hack Nerd Font", "ttf-hack-nerd"),
-    "CaskaydiaCove Nerd Font": ("CaskaydiaCove Nerd Font", "ttf-cascadia-code-nerd"),
-    "Iosevka Nerd Font": ("Iosevka Nerd Font", "ttf-iosevka-nerd"),
-}
-
-
-def get_current_font_family() -> str:
-    try:
-        match = FONT_RE.search(WAYBAR_STYLE_PATH.read_text())
-        return match.group(1).strip() if match else "JetBrainsMonoNLNerdFontRegular"
-    except OSError:
-        return "JetBrainsMonoNLNerdFontRegular"
-
-
-def build_apply_font_argv(family: str, pkg: str) -> list[str]:
-    """Installs the font package (all official-repo, so a plain pacman
-    install), edits waybar's style.css, then restarts waybar."""
-    install_cmd = f"sudo pacman -S --noconfirm --needed {pkg}"
-    edit_cmd = f"sed -i 's/font-family:.*/font-family: {family};/' {WAYBAR_STYLE_PATH}"
-    restart_cmd = "pkill -x waybar; (waybar & disown)"
-    full_cmd = f"{install_cmd}; {edit_cmd}; {restart_cmd}; echo; read -p 'Press Enter to close...'"
     return ["foot", "-e", "bash", "-lc", full_cmd]
 
 
@@ -599,7 +494,7 @@ class SetupPage(Gtk.Box):
 
         pins_group = Adw.PreferencesGroup(
             title="Pinned apps",
-            description="Picks which app the waybar Browser/Discord pins launch. "
+            description="Picks which app the bar's Browser/Discord pins launch. "
             "Installs it if needed.",
         )
 
@@ -638,84 +533,6 @@ class SetupPage(Gtk.Box):
         pins_group.add(discord_row)
 
         self.append(pins_group)
-
-        waybar_group = Adw.PreferencesGroup(title="Waybar")
-
-        position_row = Adw.ComboRow(
-            title="Bar position",
-            subtitle="Moves the bar and restarts waybar right away.",
-            model=Gtk.StringList.new(["Top", "Bottom"]),
-        )
-        position_row.set_selected(0 if get_waybar_position() == "top" else 1)
-
-        position_button = Gtk.Button(label="Apply")
-        position_button.add_css_class("flat")
-        position_button.set_valign(Gtk.Align.CENTER)
-
-        def _on_position_apply(_b: Gtk.Button) -> None:
-            choice = "top" if position_row.get_selected() == 0 else "bottom"
-            if set_waybar_position(choice):
-                position_row.set_subtitle(f"Bar moved to the {choice}.")
-            else:
-                position_row.set_subtitle(
-                    "Could not update the config — check ~/.config/waybar/config exists."
-                )
-
-        position_button.connect("clicked", _on_position_apply)
-        position_row.add_suffix(position_button)
-        waybar_group.add(position_row)
-
-        resolution_row = Adw.ComboRow(
-            title="Screen resolution",
-            subtitle="Sets the bar's width to span your monitor.",
-            model=Gtk.StringList.new(COMMON_RESOLUTIONS),
-        )
-        current_width = get_waybar_width()
-        resolution_row.set_selected(next(
-            (i for i, res in enumerate(COMMON_RESOLUTIONS) if res.split("x")[0] == current_width),
-            0,
-        ))
-
-        resolution_button = Gtk.Button(label="Apply")
-        resolution_button.add_css_class("flat")
-        resolution_button.set_valign(Gtk.Align.CENTER)
-
-        def _on_resolution_apply(_b: Gtk.Button) -> None:
-            res = COMMON_RESOLUTIONS[resolution_row.get_selected()]
-            width = int(res.split("x")[0])
-            if set_waybar_width(width):
-                resolution_row.set_subtitle(f"Bar width set to {width}px ({res}).")
-            else:
-                resolution_row.set_subtitle(
-                    "Could not update the config — check ~/.config/waybar/config exists."
-                )
-
-        resolution_button.connect("clicked", _on_resolution_apply)
-        resolution_row.add_suffix(resolution_button)
-        waybar_group.add(resolution_row)
-
-        font_row = Adw.ComboRow(
-            title="Font",
-            subtitle="Installs the font if needed, then applies it to the bar.",
-            model=Gtk.StringList.new(FONT_OPTIONS),
-        )
-        current_family = get_current_font_family()
-        font_row.set_selected(next(
-            (i for i, name in enumerate(FONT_OPTIONS) if FONT_INFO[name][0] == current_family),
-            0,
-        ))
-
-        font_button = Gtk.Button(label="Apply")
-        font_button.add_css_class("flat")
-        font_button.set_valign(Gtk.Align.CENTER)
-        font_button.connect(
-            "clicked",
-            lambda _b: launch(build_apply_font_argv(*FONT_INFO[FONT_OPTIONS[font_row.get_selected()]])),
-        )
-        font_row.add_suffix(font_button)
-        waybar_group.add(font_row)
-
-        self.append(waybar_group)
 
         autostart_group = Adw.PreferencesGroup(
             title="Autostart",

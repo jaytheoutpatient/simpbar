@@ -1,6 +1,6 @@
 # Simpbar
 
-A Waybar setup for Hyprland that's simple, looks nice, and isn't distracting — plus an install script that sets up a whole ricing-friendly Arch desktop around it, and a companion GTK app to manage it all afterward.
+A status bar for Hyprland — zbar, a native Zig/Wayland bar built for this repo — that's simple, looks nice, and isn't distracting, plus an install script that sets up a whole ricing-friendly Arch desktop around it, and a companion GTK app to manage it all afterward.
 
 Built for **Arch Linux** (and Arch-based distros like EndeavourOS, CachyOS, Garuda, XeroLinux — your mileage may vary depending on how much those ship pre-configured). Assumes **Hyprland 0.55+** (Lua config, `~/.config/hypr/hyprland.lua`).
 
@@ -15,7 +15,7 @@ The script is interactive — it'll ask a handful of questions (browser, Discord
 ## What the install script sets up
 
 **Bar, compositor & theming**
-- Waybar (this repo's config), Hyprland, foot (terminal), rofi with its bundled Material theme, swaync (notifications)
+- zbar (this repo's source, built from scratch during install), Hyprland, foot (terminal), rofi with its bundled Material theme, swaync (notifications)
 - Dracula GTK theme, Zafiro-Dracula icon theme, Bibata Modern Classic cursor — all applied automatically via nwg-look's settings, no manual toggling needed
 - nwg-drawer as the app-menu behind the bar's Menu button (ArcMenu-style GNOME Shell extensions don't run under Hyprland at all — this is the actual Wayland-native equivalent)
 - fastfetch (also wired into every new bash/fish shell)
@@ -48,7 +48,7 @@ The script is interactive — it'll ask a handful of questions (browser, Discord
 - A background update checker (systemd timer, runs every 6h) that notifies you when there's a new Arch/AUR update or a new commit on this repo
 
 **Pinned apps in the bar**
-Waybar ships with quick-launch icons next to the menu button: Browser, Discord, Files (Nautilus), Terminal, Steam, HyprMod, and Simpbar Welcome. Browser and Discord are smart about it — whichever one you actually installed is what launches by default, and you can change your mind later from the Welcome app without needing to touch waybar's config directly.
+zbar ships with quick-launch icons next to the menu button: Browser, Discord, Files (Nautilus), Terminal, Steam, HyprMod, and Simpbar Welcome. Browser and Discord are smart about it — whichever one you actually installed is what launches by default, and you can change your mind later from the Welcome app without needing to touch any config directly.
 
 ## Simpbar Welcome
 
@@ -60,7 +60,6 @@ A small GTK4 + libadwaita app that pops up once on first login (and is always re
   - Quick launchers for waypaper, nwg-look, HyprMod, and pavucontrol
   - Install or remove text editors (Neovim/Gedit/Kate/Zed/VS Code)
   - Set which browser and Discord client the bar's pinned buttons should launch
-  - Waybar controls: bar position (top/bottom), screen resolution (bar width), and font — each applies immediately and restarts the bar
 - **Keybindings** — the list below, always at hand
 - **About** — links to this repo, issues, and a contact email for bugs/suggestions
 

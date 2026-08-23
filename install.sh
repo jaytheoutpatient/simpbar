@@ -220,7 +220,7 @@ HOME_DIRS=(Pictures Videos Documents Music Projects)
 mkdir -p "${HOME_DIRS[@]/#/$HOME/}"
 ok "Created ~/{${HOME_DIRS[*]// /,}}"
 
-# ── Step 2: fetch waybar config ────────────────────────────────────
+# ── Step 2: fetch simpbar config + zbar source ───────────────────────
 step "Fetching simpbar theme"
 mkdir -p ~/.config
 
@@ -231,11 +231,12 @@ run_spinner "Downloading simpbar config" \
 run_spinner "Extracting archive" \
     unzip -o /tmp/simpbar.zip -d /tmp/simpbar-temp \
     || die "Could not extract simpbar archive."
+rm -f /tmp/simpbar.zip
 
-CONFIG_DIRS=(waybar hypr swaync fastfetch)
-for d in "${CONFIG_DIRS[@]}"; do
+CONFIG_DIRS=(hypr swaync fastfetch)
+for d in "${CONFIG_DIRS[@]}" zbar; do
     if [ ! -d "/tmp/simpbar-temp/simpbar-main/$d" ]; then
-        rm -rf /tmp/simpbar-temp /tmp/simpbar.zip
+        rm -rf /tmp/simpbar-temp
         die "Downloaded archive did not contain a $d/ directory — layout may have changed upstream."
     fi
 done
@@ -243,8 +244,18 @@ done
 for d in "${CONFIG_DIRS[@]}"; do
     cp -r "/tmp/simpbar-temp/simpbar-main/$d" ~/.config/
 done
-rm -rf /tmp/simpbar-temp /tmp/simpbar.zip
 ok "Configs placed in ~/.config/{${CONFIG_DIRS[*]// /,}}"
+
+# zbar is source, not a config dir — kept out of CONFIG_DIRS/~/.config on
+# purpose, and copied somewhere persistent (rather than built straight out
+# of /tmp) so the source is still there afterward if anyone wants to poke
+# at it or rebuild by hand. The actual build happens later, once the
+# packages below (zig, freetype2, ...) are installed.
+mkdir -p ~/.local/share/simpbar
+rm -rf ~/.local/share/simpbar/zbar
+cp -r /tmp/simpbar-temp/simpbar-main/zbar ~/.local/share/simpbar/zbar
+ok "zbar source placed in ~/.local/share/simpbar/zbar"
+rm -rf /tmp/simpbar-temp
 
 # ── Step 3: set up Chaotic-AUR ───────────────────────────────────────
 step "Setting up Chaotic-AUR"
@@ -317,7 +328,13 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-PACMAN_PKGS=(waybar gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer)
+# zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl are
+# zbar's build/runtime deps (Wayland client + layer-shell, FreeType glyph
+# rendering, gdk-pixbuf for tray icon-name decode, and the mpris source it
+# shells out to) — all official-repo, no AUR needed. pacman-contrib
+# (checkupdates) and wireplumber (wpctl) were already here for other
+# reasons but zbar's pacman-update-count and volume widgets need them too.
+PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer)
 PACMAN_PKGS+=("${GPU_PKGS[@]}")
 
 prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
@@ -392,6 +409,18 @@ fi
 
 run_spinner "Refreshing font cache" fc-cache -f \
     || warn "Could not refresh the font cache — run 'fc-cache -f' manually if icons look missing"
+
+# Build zbar from the source placed in ~/.local/share/simpbar/zbar back in
+# Step 2, now that zig/freetype2/gdk-pixbuf2/wayland-protocols are actually
+# installed. A release build (not the plain debug build zbar's own dev
+# workflow uses) — this is what ends up running on every login.
+run_spinner "Building zbar" bash -c 'cd ~/.local/share/simpbar/zbar && zig build -Doptimize=ReleaseFast' \
+    || die "Failed to build zbar — check zig, freetype2, gdk-pixbuf2, wayland, and wayland-protocols installed correctly."
+
+run_spinner "Installing zbar to /usr/bin" \
+    sudo install -Dm755 ~/.local/share/simpbar/zbar/zig-out/bin/zbar /usr/bin/zbar \
+    || die "Failed to install the zbar binary to /usr/bin."
+ok "zbar built and installed to /usr/bin/zbar"
 
 # Enable the pipewire audio stack as user services so pavucontrol has
 # something to control without needing a reboot/relogin first.
@@ -1036,7 +1065,6 @@ Usage:
                                      been shown before (first-login use).
 """
 
-import re
 import shutil
 import subprocess
 import sys
@@ -1217,7 +1245,7 @@ PIN_DISCORD_INFO = {
 
 
 def build_apply_pin_argv(binary: str, pkg: str, needs_aur: bool, pref_file: Path) -> list[str]:
-    """Install the package (if needed) and write it as the waybar pin's
+    """Install the package (if needed) and write it as the bar pin's
     preferred binary, checked by simpbar-launch-browser/-discord."""
     if needs_aur:
         install_cmd = (
@@ -1229,110 +1257,6 @@ def build_apply_pin_argv(binary: str, pkg: str, needs_aur: bool, pref_file: Path
         install_cmd = f"sudo pacman -S --noconfirm --needed {pkg}"
     write_pref = f"mkdir -p {SIMPBAR_CONFIG_DIR} && echo {binary} > {pref_file}"
     full_cmd = f"{install_cmd}; {write_pref}; echo; read -p 'Press Enter to close...'"
-    return ["foot", "-e", "bash", "-lc", full_cmd]
-
-
-WAYBAR_CONFIG_PATH = Path.home() / ".config" / "waybar" / "config"
-POSITION_RE = re.compile(r'"position"\s*:\s*"(top|bottom)"')
-
-
-def get_waybar_position() -> str:
-    try:
-        match = POSITION_RE.search(WAYBAR_CONFIG_PATH.read_text())
-        return match.group(1) if match else "bottom"
-    except OSError:
-        return "bottom"
-
-
-def set_waybar_position(position: str) -> bool:
-    """position is 'top' or 'bottom'. Restarts waybar so it takes effect
-    right away. Returns True on success."""
-    try:
-        content = WAYBAR_CONFIG_PATH.read_text()
-        new_content, count = POSITION_RE.subn(f'"position": "{position}"', content, count=1)
-        if count == 0:
-            return False
-        WAYBAR_CONFIG_PATH.write_text(new_content)
-        subprocess.run(["pkill", "-x", "waybar"], check=False)
-        subprocess.Popen(["waybar"], start_new_session=True)
-        return True
-    except OSError as exc:
-        print(f"simpbar-welcome: couldn't update waybar position: {exc}", file=sys.stderr)
-        return False
-
-
-COMMON_RESOLUTIONS = [
-    "1920x1080",
-    "2560x1440",
-    "3840x2160",
-    "1366x768",
-    "1600x900",
-    "1280x1024",
-    "2560x1080",
-    "3440x1440",
-]
-WIDTH_RE = re.compile(r'"width"\s*:\s*(\d+)')
-
-
-def get_waybar_width() -> str:
-    try:
-        match = WIDTH_RE.search(WAYBAR_CONFIG_PATH.read_text())
-        return match.group(1) if match else "1920"
-    except OSError:
-        return "1920"
-
-
-def set_waybar_width(width: int) -> bool:
-    """Restarts waybar so it takes effect right away. Returns True on success."""
-    try:
-        content = WAYBAR_CONFIG_PATH.read_text()
-        new_content, count = WIDTH_RE.subn(f'"width": {width}', content, count=1)
-        if count == 0:
-            return False
-        WAYBAR_CONFIG_PATH.write_text(new_content)
-        subprocess.run(["pkill", "-x", "waybar"], check=False)
-        subprocess.Popen(["waybar"], start_new_session=True)
-        return True
-    except OSError as exc:
-        print(f"simpbar-welcome: couldn't update waybar width: {exc}", file=sys.stderr)
-        return False
-
-
-WAYBAR_STYLE_PATH = Path.home() / ".config" / "waybar" / "style.css"
-FONT_RE = re.compile(r'font-family:\s*([^;]+);')
-
-# name -> (CSS font-family value, package to install)
-FONT_OPTIONS = [
-    "JetBrainsMono Nerd Font (default)",
-    "FiraCode Nerd Font",
-    "Hack Nerd Font",
-    "CaskaydiaCove Nerd Font",
-    "Iosevka Nerd Font",
-]
-FONT_INFO = {
-    "JetBrainsMono Nerd Font (default)": ("JetBrainsMonoNLNerdFontRegular", "ttf-jetbrains-mono-nerd"),
-    "FiraCode Nerd Font": ("FiraCode Nerd Font", "ttf-firacode-nerd"),
-    "Hack Nerd Font": ("Hack Nerd Font", "ttf-hack-nerd"),
-    "CaskaydiaCove Nerd Font": ("CaskaydiaCove Nerd Font", "ttf-cascadia-code-nerd"),
-    "Iosevka Nerd Font": ("Iosevka Nerd Font", "ttf-iosevka-nerd"),
-}
-
-
-def get_current_font_family() -> str:
-    try:
-        match = FONT_RE.search(WAYBAR_STYLE_PATH.read_text())
-        return match.group(1).strip() if match else "JetBrainsMonoNLNerdFontRegular"
-    except OSError:
-        return "JetBrainsMonoNLNerdFontRegular"
-
-
-def build_apply_font_argv(family: str, pkg: str) -> list[str]:
-    """Installs the font package (all official-repo, so a plain pacman
-    install), edits waybar's style.css, then restarts waybar."""
-    install_cmd = f"sudo pacman -S --noconfirm --needed {pkg}"
-    edit_cmd = f"sed -i 's/font-family:.*/font-family: {family};/' {WAYBAR_STYLE_PATH}"
-    restart_cmd = "pkill -x waybar; (waybar & disown)"
-    full_cmd = f"{install_cmd}; {edit_cmd}; {restart_cmd}; echo; read -p 'Press Enter to close...'"
     return ["foot", "-e", "bash", "-lc", full_cmd]
 
 
@@ -1626,7 +1550,7 @@ class SetupPage(Gtk.Box):
 
         pins_group = Adw.PreferencesGroup(
             title="Pinned apps",
-            description="Picks which app the waybar Browser/Discord pins launch. "
+            description="Picks which app the bar's Browser/Discord pins launch. "
             "Installs it if needed.",
         )
 
@@ -1665,84 +1589,6 @@ class SetupPage(Gtk.Box):
         pins_group.add(discord_row)
 
         self.append(pins_group)
-
-        waybar_group = Adw.PreferencesGroup(title="Waybar")
-
-        position_row = Adw.ComboRow(
-            title="Bar position",
-            subtitle="Moves the bar and restarts waybar right away.",
-            model=Gtk.StringList.new(["Top", "Bottom"]),
-        )
-        position_row.set_selected(0 if get_waybar_position() == "top" else 1)
-
-        position_button = Gtk.Button(label="Apply")
-        position_button.add_css_class("flat")
-        position_button.set_valign(Gtk.Align.CENTER)
-
-        def _on_position_apply(_b: Gtk.Button) -> None:
-            choice = "top" if position_row.get_selected() == 0 else "bottom"
-            if set_waybar_position(choice):
-                position_row.set_subtitle(f"Bar moved to the {choice}.")
-            else:
-                position_row.set_subtitle(
-                    "Could not update the config — check ~/.config/waybar/config exists."
-                )
-
-        position_button.connect("clicked", _on_position_apply)
-        position_row.add_suffix(position_button)
-        waybar_group.add(position_row)
-
-        resolution_row = Adw.ComboRow(
-            title="Screen resolution",
-            subtitle="Sets the bar's width to span your monitor.",
-            model=Gtk.StringList.new(COMMON_RESOLUTIONS),
-        )
-        current_width = get_waybar_width()
-        resolution_row.set_selected(next(
-            (i for i, res in enumerate(COMMON_RESOLUTIONS) if res.split("x")[0] == current_width),
-            0,
-        ))
-
-        resolution_button = Gtk.Button(label="Apply")
-        resolution_button.add_css_class("flat")
-        resolution_button.set_valign(Gtk.Align.CENTER)
-
-        def _on_resolution_apply(_b: Gtk.Button) -> None:
-            res = COMMON_RESOLUTIONS[resolution_row.get_selected()]
-            width = int(res.split("x")[0])
-            if set_waybar_width(width):
-                resolution_row.set_subtitle(f"Bar width set to {width}px ({res}).")
-            else:
-                resolution_row.set_subtitle(
-                    "Could not update the config — check ~/.config/waybar/config exists."
-                )
-
-        resolution_button.connect("clicked", _on_resolution_apply)
-        resolution_row.add_suffix(resolution_button)
-        waybar_group.add(resolution_row)
-
-        font_row = Adw.ComboRow(
-            title="Font",
-            subtitle="Installs the font if needed, then applies it to the bar.",
-            model=Gtk.StringList.new(FONT_OPTIONS),
-        )
-        current_family = get_current_font_family()
-        font_row.set_selected(next(
-            (i for i, name in enumerate(FONT_OPTIONS) if FONT_INFO[name][0] == current_family),
-            0,
-        ))
-
-        font_button = Gtk.Button(label="Apply")
-        font_button.add_css_class("flat")
-        font_button.set_valign(Gtk.Align.CENTER)
-        font_button.connect(
-            "clicked",
-            lambda _b: launch(build_apply_font_argv(*FONT_INFO[FONT_OPTIONS[font_row.get_selected()]])),
-        )
-        font_row.add_suffix(font_button)
-        waybar_group.add(font_row)
-
-        self.append(waybar_group)
 
         autostart_group = Adw.PreferencesGroup(
             title="Autostart",
@@ -2145,7 +1991,7 @@ fi
 CHECKERPEOF
 sudo chmod +x /usr/bin/simpbar-check-updates
 
-# Pinned-app launchers for waybar — browser and Discord client are both
+# Pinned-app launchers for the bar — browser and Discord client are both
 # user-chosen at install time, so these try known binaries in order and
 # launch whichever's actually installed.
 sudo tee /usr/bin/simpbar-launch-browser >/dev/null <<'BROWSERWRAPEOF'
@@ -2189,7 +2035,7 @@ command -v notify-send >/dev/null 2>&1 && \
         "Install one from the Simpbar Welcome app or install script."
 DISCORDWRAPEOF
 sudo chmod +x /usr/bin/simpbar-launch-discord
-ok "Pinned-app launchers (browser, Discord) ready for waybar"
+ok "Pinned-app launchers (browser, Discord) ready for zbar"
 
 
 cat > ~/.config/systemd/user/simpbar-update-checker.service <<'CHECKERSVCEOF'
@@ -2262,7 +2108,7 @@ run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfir
 # ── Step 7: done ────────────────────────────────────────────────────
 step "Done"
 ok "Full system updated (pacman -Syu)"
-ok "waybar, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility, nwg-drawer installed (pacman)"
+ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility, nwg-drawer installed (pacman)"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 if pacman -Qq cliphist >/dev/null 2>&1; then
     ok "cliphist installed (bind a key to it yourself, e.g. in hyprland.lua)"
@@ -2336,7 +2182,9 @@ fi
 if [ -e ~/.config/systemd/user/swaybg.service ]; then
     ok "swaybg.service enabled — will set the wallpaper automatically each session"
 fi
-ok "waybar config in ~/.config/waybar"
+if [ -x /usr/bin/zbar ]; then
+    ok "zbar built and installed to /usr/bin/zbar (source in ~/.local/share/simpbar/zbar)"
+fi
 ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
@@ -2347,7 +2195,7 @@ fi
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
-printf '  %swaybar &%s\n' "$C_CYAN" "$C_RESET"
+printf '  %szbar &%s\n' "$C_CYAN" "$C_RESET"
 if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
     printf '  %sswaybg -i %s -m fill &%s\n' "$C_CYAN" "$BING_FILE" "$C_RESET"
 else

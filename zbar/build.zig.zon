@@ -2,7 +2,7 @@
     .name = .zbar,
     .version = "0.0.1",
     .fingerprint = 0xac78ca5c3577ab30,
-    .minimum_zig_version = "0.13.0",
+    .minimum_zig_version = "0.16.0",
 
     // Run this once, from the project root, with network access:
     //

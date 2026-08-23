@@ -48,7 +48,7 @@ local menu = "rofi -show drun"
 hl.on("hyprland.start", function()
 	--   hl.exec_cmd(terminal)
 	--   hl.exec_cmd("nm-applet")
-	hl.exec_cmd("waybar &")
+	hl.exec_cmd("zbar &")
 	--Delete this line to prevent it starting at every boot
 	hl.exec_cmd("simpbar-welcome")
 	-- This Line here ^^
@@ -274,7 +274,7 @@ hl.bind(mainMod .. " + V", hl.dsp.window.float({ action = "toggle" }))
 hl.bind(mainMod .. " + Space", hl.dsp.exec_cmd(menu))
 hl.bind(mainMod .. " + P", hl.dsp.window.pseudo())
 hl.bind(mainMod .. " + J", hl.dsp.layout("togglesplit")) -- dwindle only
-hl.bind(mainMod .. " + W", hl.dsp.exec_cmd("pkill waybar || waybar &"))
+hl.bind(mainMod .. " + W", hl.dsp.exec_cmd("pkill -x zbar || zbar &"))
 -- Move focus with mainMod + arrow keys
 hl.bind(mainMod .. " + left", hl.dsp.focus({ direction = "left" }))
 hl.bind(mainMod .. " + right", hl.dsp.focus({ direction = "right" }))
