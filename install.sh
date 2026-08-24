@@ -292,8 +292,8 @@ GPU_INFO=$(lspci 2>/dev/null | grep -Ei 'vga compatible controller|3d controller
 GPU_PKGS=()
 
 if echo "$GPU_INFO" | grep -qi nvidia; then
-    ok "NVIDIA GPU detected — adding the proprietary driver + Vulkan packages"
-    GPU_PKGS+=(nvidia nvidia-utils lib32-nvidia-utils nvidia-settings)
+    ok "NVIDIA GPU detected — adding the proprietary driver + Vulkan + OpenCL packages"
+    GPU_PKGS+=(nvidia nvidia-utils lib32-nvidia-utils nvidia-settings opencl-nvidia lib32-opencl-nvidia)
 fi
 if echo "$GPU_INFO" | grep -Eqi 'amd|advanced micro devices|radeon'; then
     ok "AMD GPU detected — adding Mesa + Vulkan (RADV) packages"
