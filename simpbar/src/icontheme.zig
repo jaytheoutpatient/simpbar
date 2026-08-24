@@ -95,16 +95,16 @@ pub const DecodedIcon = struct {
 /// `target_size`x`target_size`, preserving aspect ratio (so the result may
 /// be smaller than target_size in one dimension).
 pub fn decodeIcon(gpa: std.mem.Allocator, path: [:0]const u8, target_size: u32) !DecodedIcon {
-    const pb = c.zbar_pixbuf_load(path.ptr, @intCast(target_size)) orelse return error.DecodeFailed;
-    defer c.zbar_pixbuf_free(pb);
+    const pb = c.simpbar_pixbuf_load(path.ptr, @intCast(target_size)) orelse return error.DecodeFailed;
+    defer c.simpbar_pixbuf_free(pb);
 
-    const w: u32 = @intCast(c.zbar_pixbuf_width(pb));
-    const h: u32 = @intCast(c.zbar_pixbuf_height(pb));
+    const w: u32 = @intCast(c.simpbar_pixbuf_width(pb));
+    const h: u32 = @intCast(c.simpbar_pixbuf_height(pb));
     if (w == 0 or h == 0) return error.EmptyImage;
-    const rowstride: u32 = @intCast(c.zbar_pixbuf_rowstride(pb));
-    const n_channels: u32 = @intCast(c.zbar_pixbuf_channels(pb));
-    const has_alpha = c.zbar_pixbuf_has_alpha(pb) != 0;
-    const src = c.zbar_pixbuf_pixels(pb);
+    const rowstride: u32 = @intCast(c.simpbar_pixbuf_rowstride(pb));
+    const n_channels: u32 = @intCast(c.simpbar_pixbuf_channels(pb));
+    const has_alpha = c.simpbar_pixbuf_has_alpha(pb) != 0;
+    const src = c.simpbar_pixbuf_pixels(pb);
 
     const pixels = try gpa.alloc(u32, w * h);
     errdefer gpa.free(pixels);

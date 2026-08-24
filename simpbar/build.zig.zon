@@ -1,7 +1,7 @@
 .{
-    .name = .zbar,
+    .name = .simpbar,
     .version = "0.0.1",
-    .fingerprint = 0xac78ca5c3577ab30,
+    .fingerprint = 0xec340d828bffbd62,
     .minimum_zig_version = "0.16.0",
 
     // Run this once, from the project root, with network access:

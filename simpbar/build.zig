@@ -53,7 +53,7 @@ pub fn build(b: *Build) !void {
     exe_mod.addCSourceFile(.{ .file = b.path("src/gdkpixbuf_shim.c"), .flags = &.{} });
 
     const exe = b.addExecutable(.{
-        .name = "zbar",
+        .name = "simpbar",
         .root_module = exe_mod,
     });
 
@@ -63,6 +63,6 @@ pub fn build(b: *Build) !void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    const run_step = b.step("run", "Run zbar");
+    const run_step = b.step("run", "Run simpbar");
     run_step.dependOn(&run_cmd.step);
 }

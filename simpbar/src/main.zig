@@ -34,7 +34,7 @@ const TEXT_COLOR: u32 = 0xFFDCDCDC; // general label color, rgba(220,220,220,1)
 const BORDER_COLOR: u32 = 0xFF454545; // window#waybar border-color, rgba(69,69,69,1)
 const HOVER_COLOR: u32 = 0xFF3A3A3A; // same shade as POPUP_HOVER_COLOR, for the bar's own clickable buttons
 const BORDER_PX: u32 = 2; // window#waybar border-width: 2px 0px 0px 0px
-// waybar's config had a 10px margin-left/margin-right here; zbar spans the
+// waybar's config had a 10px margin-left/margin-right here; simpbar spans the
 // full monitor width edge-to-edge instead.
 const MARGIN_SIDE: i32 = 0;
 
@@ -1042,7 +1042,7 @@ fn drawPopup(bar: *Bar) !void {
     const stride = pm.width * 4;
     const size: usize = @as(usize, stride) * pm.height;
 
-    const fd = try posix.memfd_create("zbar-popup", 0);
+    const fd = try posix.memfd_create("simpbar-popup", 0);
     defer _ = posix.system.close(fd);
     switch (posix.errno(posix.system.ftruncate(fd, @intCast(size)))) {
         .SUCCESS => {},
@@ -1196,7 +1196,7 @@ pub fn main() !void {
         surface,
         globals.output,
         .top, // layer: show above normal windows
-        "zbar",
+        "simpbar",
     );
     defer layer_surface.destroy();
 
@@ -2413,7 +2413,7 @@ fn drawAndCommit(bar: *Bar) !void {
     const stride = bar.width * 4; // ARGB8888
     const size: usize = @as(usize, stride) * bar.height;
 
-    const fd = try posix.memfd_create("zbar-buffer", 0);
+    const fd = try posix.memfd_create("simpbar-buffer", 0);
     defer _ = posix.system.close(fd);
     switch (posix.errno(posix.system.ftruncate(fd, @intCast(size)))) {
         .SUCCESS => {},

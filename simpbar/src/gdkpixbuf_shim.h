@@ -5,20 +5,20 @@
  * plain declarations, so @cImport-ing *this* file works fine; the real
  * gdk-pixbuf.h is only included from the .c side, compiled by a real C
  * compiler instead of translate-c. */
-#ifndef ZBAR_GDKPIXBUF_SHIM_H
-#define ZBAR_GDKPIXBUF_SHIM_H
+#ifndef SIMPBAR_GDKPIXBUF_SHIM_H
+#define SIMPBAR_GDKPIXBUF_SHIM_H
 
-typedef struct ZbarPixbuf ZbarPixbuf;
+typedef struct SimpbarPixbuf SimpbarPixbuf;
 
 /* NULL on failure (bad path, unsupported format, decode error). */
-ZbarPixbuf *zbar_pixbuf_load(const char *path, int target_size);
-void zbar_pixbuf_free(ZbarPixbuf *pb);
+SimpbarPixbuf *simpbar_pixbuf_load(const char *path, int target_size);
+void simpbar_pixbuf_free(SimpbarPixbuf *pb);
 
-int zbar_pixbuf_width(ZbarPixbuf *pb);
-int zbar_pixbuf_height(ZbarPixbuf *pb);
-int zbar_pixbuf_rowstride(ZbarPixbuf *pb);
-int zbar_pixbuf_channels(ZbarPixbuf *pb);
-int zbar_pixbuf_has_alpha(ZbarPixbuf *pb);
-const unsigned char *zbar_pixbuf_pixels(ZbarPixbuf *pb);
+int simpbar_pixbuf_width(SimpbarPixbuf *pb);
+int simpbar_pixbuf_height(SimpbarPixbuf *pb);
+int simpbar_pixbuf_rowstride(SimpbarPixbuf *pb);
+int simpbar_pixbuf_channels(SimpbarPixbuf *pb);
+int simpbar_pixbuf_has_alpha(SimpbarPixbuf *pb);
+const unsigned char *simpbar_pixbuf_pixels(SimpbarPixbuf *pb);
 
 #endif

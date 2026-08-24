@@ -1,4 +1,4 @@
-# zbar — a waybar-alike, in Zig
+# simpbar — a waybar-alike, in Zig
 
 Minimal scaffold: connects to Wayland, opens a `wlr-layer-shell` surface
 anchored to the top edge, reserves screen space for it, and paints it a

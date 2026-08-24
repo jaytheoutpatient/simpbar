@@ -220,7 +220,7 @@ HOME_DIRS=(Pictures Videos Documents Music Projects)
 mkdir -p "${HOME_DIRS[@]/#/$HOME/}"
 ok "Created ~/{${HOME_DIRS[*]// /,}}"
 
-# ── Step 2: fetch simpbar config + zbar source ───────────────────────
+# ── Step 2: fetch simpbar config + source ─────────────────────────────
 step "Fetching simpbar theme"
 mkdir -p ~/.config
 
@@ -234,7 +234,7 @@ run_spinner "Extracting archive" \
 rm -f /tmp/simpbar.zip
 
 CONFIG_DIRS=(hypr swaync fastfetch)
-for d in "${CONFIG_DIRS[@]}" zbar; do
+for d in "${CONFIG_DIRS[@]}" simpbar; do
     if [ ! -d "/tmp/simpbar-temp/simpbar-main/$d" ]; then
         rm -rf /tmp/simpbar-temp
         die "Downloaded archive did not contain a $d/ directory — layout may have changed upstream."
@@ -246,15 +246,15 @@ for d in "${CONFIG_DIRS[@]}"; do
 done
 ok "Configs placed in ~/.config/{${CONFIG_DIRS[*]// /,}}"
 
-# zbar is source, not a config dir — kept out of CONFIG_DIRS/~/.config on
+# simpbar is source, not a config dir — kept out of CONFIG_DIRS/~/.config on
 # purpose, and copied somewhere persistent (rather than built straight out
 # of /tmp) so the source is still there afterward if anyone wants to poke
 # at it or rebuild by hand. The actual build happens later, once the
 # packages below (zig, freetype2, ...) are installed.
 mkdir -p ~/.local/share/simpbar
-rm -rf ~/.local/share/simpbar/zbar
-cp -r /tmp/simpbar-temp/simpbar-main/zbar ~/.local/share/simpbar/zbar
-ok "zbar source placed in ~/.local/share/simpbar/zbar"
+rm -rf ~/.local/share/simpbar/simpbar
+cp -r /tmp/simpbar-temp/simpbar-main/simpbar ~/.local/share/simpbar/simpbar
+ok "simpbar source placed in ~/.local/share/simpbar/simpbar"
 rm -rf /tmp/simpbar-temp
 
 # ── Step 3: set up Chaotic-AUR ───────────────────────────────────────
@@ -329,11 +329,11 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
 fi
 
 # zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl are
-# zbar's build/runtime deps (Wayland client + layer-shell, FreeType glyph
+# simpbar's build/runtime deps (Wayland client + layer-shell, FreeType glyph
 # rendering, gdk-pixbuf for tray icon-name decode, and the mpris source it
 # shells out to) — all official-repo, no AUR needed. pacman-contrib
 # (checkupdates) and wireplumber (wpctl) were already here for other
-# reasons but zbar's pacman-update-count and volume widgets need them too.
+# reasons but simpbar's pacman-update-count and volume widgets need them too.
 PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer)
 PACMAN_PKGS+=("${GPU_PKGS[@]}")
 
@@ -410,17 +410,17 @@ fi
 run_spinner "Refreshing font cache" fc-cache -f \
     || warn "Could not refresh the font cache — run 'fc-cache -f' manually if icons look missing"
 
-# Build zbar from the source placed in ~/.local/share/simpbar/zbar back in
-# Step 2, now that zig/freetype2/gdk-pixbuf2/wayland-protocols are actually
-# installed. A release build (not the plain debug build zbar's own dev
+# Build simpbar from the source placed in ~/.local/share/simpbar/simpbar back
+# in Step 2, now that zig/freetype2/gdk-pixbuf2/wayland-protocols are actually
+# installed. A release build (not the plain debug build simpbar's own dev
 # workflow uses) — this is what ends up running on every login.
-run_spinner "Building zbar" bash -c 'cd ~/.local/share/simpbar/zbar && zig build -Doptimize=ReleaseFast' \
-    || die "Failed to build zbar — check zig, freetype2, gdk-pixbuf2, wayland, and wayland-protocols installed correctly."
+run_spinner "Building simpbar" bash -c 'cd ~/.local/share/simpbar/simpbar && zig build -Doptimize=ReleaseFast' \
+    || die "Failed to build simpbar — check zig, freetype2, gdk-pixbuf2, wayland, and wayland-protocols installed correctly."
 
-run_spinner "Installing zbar to /usr/bin" \
-    sudo install -Dm755 ~/.local/share/simpbar/zbar/zig-out/bin/zbar /usr/bin/zbar \
-    || die "Failed to install the zbar binary to /usr/bin."
-ok "zbar built and installed to /usr/bin/zbar"
+run_spinner "Installing simpbar to /usr/bin" \
+    sudo install -Dm755 ~/.local/share/simpbar/simpbar/zig-out/bin/simpbar /usr/bin/simpbar \
+    || die "Failed to install the simpbar binary to /usr/bin."
+ok "simpbar built and installed to /usr/bin/simpbar"
 
 # Enable the pipewire audio stack as user services so pavucontrol has
 # something to control without needing a reboot/relogin first.
@@ -2035,7 +2035,7 @@ command -v notify-send >/dev/null 2>&1 && \
         "Install one from the Simpbar Welcome app or install script."
 DISCORDWRAPEOF
 sudo chmod +x /usr/bin/simpbar-launch-discord
-ok "Pinned-app launchers (browser, Discord) ready for zbar"
+ok "Pinned-app launchers (browser, Discord) ready for simpbar"
 
 
 cat > ~/.config/systemd/user/simpbar-update-checker.service <<'CHECKERSVCEOF'
@@ -2182,8 +2182,8 @@ fi
 if [ -e ~/.config/systemd/user/swaybg.service ]; then
     ok "swaybg.service enabled — will set the wallpaper automatically each session"
 fi
-if [ -x /usr/bin/zbar ]; then
-    ok "zbar built and installed to /usr/bin/zbar (source in ~/.local/share/simpbar/zbar)"
+if [ -x /usr/bin/simpbar ]; then
+    ok "simpbar built and installed to /usr/bin/simpbar (source in ~/.local/share/simpbar/simpbar)"
 fi
 ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
@@ -2195,7 +2195,7 @@ fi
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
-printf '  %szbar &%s\n' "$C_CYAN" "$C_RESET"
+printf '  %ssimpbar &%s\n' "$C_CYAN" "$C_RESET"
 if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
     printf '  %sswaybg -i %s -m fill &%s\n' "$C_CYAN" "$BING_FILE" "$C_RESET"
 else
