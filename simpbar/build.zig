@@ -65,4 +65,31 @@ pub fn build(b: *Build) !void {
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run simpbar");
     run_step.dependOn(&run_cmd.step);
+
+    // simpbar-welcome: separate GTK4/libadwaita companion app, independent
+    // of the bar above (no Wayland/freetype/gdk-pixbuf deps). Talks to
+    // GTK/libadwaita through hand-written extern bindings in
+    // src/welcome_gtk.zig rather than @cImport — see that file for why.
+    const welcome_mod = b.createModule(.{
+        .root_source_file = b.path("src/welcome_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    welcome_mod.linkSystemLibrary("gtk4", .{});
+    welcome_mod.linkSystemLibrary("libadwaita-1", .{});
+    welcome_mod.linkSystemLibrary("gobject-2.0", .{});
+    welcome_mod.linkSystemLibrary("glib-2.0", .{});
+    welcome_mod.linkSystemLibrary("gio-2.0", .{});
+
+    const welcome_exe = b.addExecutable(.{
+        .name = "simpbar-welcome",
+        .root_module = welcome_mod,
+    });
+    b.installArtifact(welcome_exe);
+
+    const run_welcome_cmd = b.addRunArtifact(welcome_exe);
+    run_welcome_cmd.step.dependOn(b.getInstallStep());
+    const run_welcome_step = b.step("run-welcome", "Run simpbar-welcome");
+    run_welcome_step.dependOn(&run_welcome_cmd.step);
 }
