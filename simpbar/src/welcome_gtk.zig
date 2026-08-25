@@ -178,6 +178,7 @@ pub extern "c" fn adw_action_row_set_activatable_widget(self: *AdwActionRow, wid
 pub extern "c" fn adw_combo_row_new() *AdwComboRow;
 pub extern "c" fn adw_combo_row_set_model(self: *AdwComboRow, model: ?*anyopaque) void;
 pub extern "c" fn adw_combo_row_get_selected(self: *AdwComboRow) c_uint;
+pub extern "c" fn adw_combo_row_set_selected(self: *AdwComboRow, position: c_uint) void;
 
 // AdwToolbarView / AdwHeaderBar
 pub extern "c" fn adw_toolbar_view_new() *AdwToolbarView;
@@ -190,3 +191,117 @@ pub extern "c" fn adw_navigation_page_new(child: *anyopaque, title: [*:0]const u
 pub extern "c" fn adw_navigation_split_view_new() *AdwNavigationSplitView;
 pub extern "c" fn adw_navigation_split_view_set_sidebar(self: *AdwNavigationSplitView, sidebar: ?*AdwNavigationPage) void;
 pub extern "c" fn adw_navigation_split_view_set_content(self: *AdwNavigationSplitView, content: ?*AdwNavigationPage) void;
+
+// GdkRGBA — unlike every other type in this file, this is a real,
+// ABI-stable plain struct (not an opaque GObject pointer): GTK4's actual
+// public layout, four packed floats. Safe to mirror directly.
+pub const GdkRGBA = extern struct {
+    red: f32,
+    green: f32,
+    blue: f32,
+    alpha: f32,
+};
+
+// GtkColorDialog / GtkColorDialogButton — used by the Appearance tab's per-
+// color pickers (config_main.zig). GtkColorDialogButton owns a reference to
+// the dialog it's constructed with; we only ever need one dialog per button
+// (no shared-dialog reuse), so callers just pass a fresh gtk_color_dialog_new()
+// to each button.
+pub const GtkColorDialog = opaque {};
+pub const GtkColorDialogButton = opaque {};
+pub extern "c" fn gtk_color_dialog_new() *GtkColorDialog;
+pub extern "c" fn gtk_color_dialog_button_new(dialog: ?*GtkColorDialog) *GtkColorDialogButton;
+pub extern "c" fn gtk_color_dialog_button_set_rgba(self: *GtkColorDialogButton, rgba: *const GdkRGBA) void;
+pub extern "c" fn gtk_color_dialog_button_get_rgba(self: *GtkColorDialogButton) *GdkRGBA;
+
+// GtkSpinButton — used by the Appearance tab's numeric spacing fields.
+pub const GtkSpinButton = opaque {};
+pub extern "c" fn gtk_spin_button_new_with_range(min: f64, max: f64, step: f64) *GtkSpinButton;
+pub extern "c" fn gtk_spin_button_get_value_as_int(self: *GtkSpinButton) c_int;
+pub extern "c" fn gtk_spin_button_set_value(self: *GtkSpinButton, value: f64) void;
+
+// GtkEntry / GtkEntryBuffer — used by the Modules tab's custom-script
+// label/command fields (config_main.zig). GtkEntry owns its buffer
+// internally by default (gtk_entry_new() creates one for you); we read/write
+// through the buffer rather than the entry widget itself since that's where
+// the "notify::text" signal actually lives.
+pub const GtkEntry = opaque {};
+pub const GtkEntryBuffer = opaque {};
+pub extern "c" fn gtk_entry_new() *GtkEntry;
+pub extern "c" fn gtk_entry_get_buffer(self: *GtkEntry) *GtkEntryBuffer;
+pub extern "c" fn gtk_entry_buffer_get_text(self: *GtkEntryBuffer) [*:0]const u8;
+pub extern "c" fn gtk_entry_buffer_set_text(self: *GtkEntryBuffer, text: [*:0]const u8, len: c_int) void;
+
+// --- Drag-and-drop (Modules tab row reordering, config_main.zig) ----------
+//
+// Every symbol here was verified against this machine's real installed
+// headers/.gir before binding (not guessed) — a wrong signal signature is a
+// silent ABI mismatch that corrupts the stack/crashes at runtime:
+//   - "drop"'s real signature (gtk/gtkdroptarget.c's doc example + the .gir
+//     <glib:signal name="drop"> block) is
+//     gboolean (GtkDropTarget*, const GValue*, gdouble x, gdouble y, gpointer)
+//     — NOT the raw-bytes shape a first guess might reach for.
+//   - "prepare"'s real signature (.gir <glib:signal name="prepare"> under
+//     the DragSource class) is
+//     GdkContentProvider* (GtkDragSource*, gdouble x, gdouble y, gpointer).
+//   - gdk_content_provider_new_for_value/gtk_drop_target_new/
+//     gtk_list_box_remove_all/gtk_list_box_get_row_at_y/
+//     gtk_widget_add_controller and the g_value_*/g_object_*_data symbols
+//     below were all confirmed present via `nm -D` against the actual
+//     linked libgtk-4.so.1/libgobject-2.0.so.0 on this machine.
+//
+// Drag payload: a raw process-local pointer (the dragged AdwActionRow's
+// backing ModuleRow) boxed in a G_TYPE_POINTER GValue, rather than
+// GBytes/mime-type plumbing — this is the standard GTK4 pattern for
+// same-process, same-widget-tree reordering (the exact thing GDK restricts
+// G_TYPE_POINTER content to: it can never round-trip through a different
+// process, which is exactly the scope wanted here) and avoids the much
+// larger binding surface GBytes or a real serialized format would need.
+
+// GValue — a real, ABI-stable plain struct (not opaque), matching GLib's
+// public layout: a GType tag followed by a 2-word union big enough for
+// every fundamental type glib/gobject/gvalue.h defines (int/long/int64/
+// float/double/pointer, ...). We only ever populate/read it as
+// G_TYPE_POINTER here, but the struct's layout doesn't depend on which
+// union member is active.
+pub const GValue = extern struct {
+    g_type: usize = 0,
+    data: [2]u64 = .{ 0, 0 },
+};
+
+// Fundamental GType IDs are compile-time constants in glib's gtype.h
+// (`G_TYPE_MAKE_FUNDAMENTAL(x) = x << G_TYPE_FUNDAMENTAL_SHIFT(2)`), not
+// something you look up at runtime — G_TYPE_POINTER is fundamental #17.
+pub const G_TYPE_POINTER: usize = 17 << 2;
+
+// GdkDragAction (gdk/gdkenums.h): GDK_ACTION_MOVE = 1 << 1.
+pub const GDK_ACTION_MOVE: c_uint = 2;
+
+pub extern "c" fn g_value_init(value: *GValue, g_type: usize) *GValue;
+pub extern "c" fn g_value_set_pointer(value: *GValue, v_pointer: ?*anyopaque) void;
+pub extern "c" fn g_value_get_pointer(value: *const GValue) ?*anyopaque;
+
+pub extern "c" fn g_object_set_data(object: *anyopaque, key: [*:0]const u8, data: ?*anyopaque) void;
+pub extern "c" fn g_object_get_data(object: *anyopaque, key: [*:0]const u8) ?*anyopaque;
+
+pub const GdkContentProvider = opaque {};
+pub extern "c" fn gdk_content_provider_new_for_value(value: *const GValue) *GdkContentProvider;
+
+pub const GtkDragSource = opaque {};
+pub extern "c" fn gtk_drag_source_new() *GtkDragSource;
+pub extern "c" fn gtk_drag_source_set_actions(self: *GtkDragSource, actions: c_uint) void;
+
+pub const GtkDropTarget = opaque {};
+pub extern "c" fn gtk_drop_target_new(gtype: usize, actions: c_uint) *GtkDropTarget;
+
+pub extern "c" fn gtk_widget_add_controller(widget: *anyopaque, controller: *anyopaque) void;
+
+pub extern "c" fn gtk_list_box_remove_all(self: *GtkListBox) void;
+pub extern "c" fn gtk_list_box_get_row_at_y(self: *GtkListBox, y: c_int) ?*GtkListBoxRow;
+
+// GtkImage — set_from_icon_name lets the Shortcuts tab (config_main.zig)
+// live-update an icon preview as the user types an icon name, reusing GTK's
+// own icon-theme resolution (fallback/sizing/dark-light variants) rather
+// than pulling icontheme.zig's raw-pixel decoder (built for the bar's SHM
+// buffer, not a GTK widget) into this binary.
+pub extern "c" fn gtk_image_set_from_icon_name(self: *GtkImage, icon_name: ?[*:0]const u8) void;

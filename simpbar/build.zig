@@ -92,4 +92,31 @@ pub fn build(b: *Build) !void {
     run_welcome_cmd.step.dependOn(b.getInstallStep());
     const run_welcome_step = b.step("run-welcome", "Run simpbar-welcome");
     run_welcome_step.dependOn(&run_welcome_cmd.step);
+
+    // simpbar-config: GUI for configuring the bar's appearance/module
+    // layout and creating/pinning desktop shortcuts. Same dep set as
+    // simpbar-welcome (no Wayland/freetype/gdk-pixbuf) — reuses
+    // src/welcome_gtk.zig's GObject bindings directly.
+    const config_mod = b.createModule(.{
+        .root_source_file = b.path("src/config_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    config_mod.linkSystemLibrary("gtk4", .{});
+    config_mod.linkSystemLibrary("libadwaita-1", .{});
+    config_mod.linkSystemLibrary("gobject-2.0", .{});
+    config_mod.linkSystemLibrary("glib-2.0", .{});
+    config_mod.linkSystemLibrary("gio-2.0", .{});
+
+    const config_exe = b.addExecutable(.{
+        .name = "simpbar-config",
+        .root_module = config_mod,
+    });
+    b.installArtifact(config_exe);
+
+    const run_config_cmd = b.addRunArtifact(config_exe);
+    run_config_cmd.step.dependOn(b.getInstallStep());
+    const run_config_step = b.step("run-config", "Run simpbar-config");
+    run_config_step.dependOn(&run_config_cmd.step);
 }

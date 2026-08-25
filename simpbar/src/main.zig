@@ -27,22 +27,11 @@ const CLOEXEC: u32 = 0o2000000;
 fn setCloexec(fd: posix.fd_t) void {
     _ = std.c.fcntl(fd, 2, @as(c_int, 1)); // F_SETFD, FD_CLOEXEC
 }
-const BAR_HEIGHT: u32 = 28;
-// Colors lifted from ~/.config/waybar/style.css (0xAARRGGBB).
-const BG_COLOR: u32 = 0xFF0F0F0F; // window#waybar background-color
-const TEXT_COLOR: u32 = 0xFFDCDCDC; // general label color, rgba(220,220,220,1)
-const BORDER_COLOR: u32 = 0xFF454545; // window#waybar border-color, rgba(69,69,69,1)
-const HOVER_COLOR: u32 = 0xFF3A3A3A; // same shade as POPUP_HOVER_COLOR, for the bar's own clickable buttons
-const BORDER_PX: u32 = 2; // window#waybar border-width: 2px 0px 0px 0px
 // waybar's config had a 10px margin-left/margin-right here; simpbar spans the
 // full monitor width edge-to-edge instead.
 const MARGIN_SIDE: i32 = 0;
 
-// #workspaces button.active / inactive colors from style.css.
-const WORKSPACE_ACTIVE_COLOR: u32 = 0xFFDCDCDC; // rgba(220,220,220,1)
-const WORKSPACE_INACTIVE_COLOR: u32 = 0xFF505050; // rgba(80,80,80,1)
 const WORKSPACE_LEFT_MARGIN: i64 = 8;
-const WORKSPACE_GAP: i64 = 10;
 
 // Spacing for the custom/* launcher buttons and custom/power.
 const LAUNCHER_GAP: i64 = 16;
@@ -336,6 +325,10 @@ fn spawnPlayerctlCommand(player: []const u8, command: [*:0]const u8) void {
 const LauncherButton = struct {
     label: []const u8,
     command: [:0]const u8,
+    // Not yet rendered by the bar (the font only draws label glyphs) —
+    // carried through config for forward-compat with an icon-aware GUI/
+    // pinning flow added in a later step.
+    icon: ?[]const u8 = null,
 };
 
 // The custom/* launcher buttons from ~/.config/waybar/config's
@@ -367,6 +360,459 @@ const WAYPAPER_BUTTON = LauncherButton{ .label = "\u{f030}", .command = "waypape
 // expanded like the real one's rotating chevron does, but it's the actual
 // character now instead of a stand-in letter.
 const DRAWER_TOGGLE_LABEL = "\u{25be}";
+
+// --- runtime config (module layout, appearance, launcher pins) -----------
+//
+// Loaded once at startup into `current_config` and (in a later step)
+// replaced wholesale on a reload signal. `defaultConfig()` below reproduces
+// today's exact hardcoded layout/order/colors, so a bar with no config file
+// on disk yet (or one that fails to parse, once real JSON reading lands)
+// behaves identically to this bar as it existed before any of this was
+// added — see loadConfig().
+
+const ModuleKind = enum {
+    workspaces,
+    mpris,
+    clock,
+    launchers,
+    power,
+    drawer_toggle,
+    volume,
+    waypaper,
+    pacman,
+    tray,
+    weather,
+    cpu,
+    ram,
+    network,
+    disk,
+    battery,
+    custom_script,
+    cpu_temp,
+};
+
+/// One entry in a left/center/right module list. Flat + all-optional
+/// (beyond kind/enabled) rather than a tagged union, since std.json's
+/// reflection-based parser (used starting in a later step) handles a flat
+/// struct with optional fields directly, with no hand-written jsonParse.
+const ModuleEntry = struct {
+    kind: ModuleKind,
+    enabled: bool = true,
+    in_drawer: bool = false,
+    interval_secs: ?u32 = null,
+    label: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+    mode: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+};
+
+const Appearance = struct {
+    bg_color: u32,
+    text_color: u32,
+    border_color: u32,
+    hover_color: u32,
+    workspace_active_color: u32,
+    workspace_inactive_color: u32,
+    popup_bg_color: u32,
+    popup_hover_color: u32,
+    popup_separator_color: u32,
+    popup_disabled_color: u32,
+    bar_height: u32,
+    /// Four independent edges (px), replacing the old single top-only
+    /// border_px — which edge "faces the desktop" flips with `position`, but
+    /// these are deliberately NOT auto-selected based on that: the user can
+    /// have borders on any combination of sides regardless of anchor.
+    border_top_px: u32,
+    border_bottom_px: u32,
+    border_left_px: u32,
+    border_right_px: u32,
+    workspace_gap: i64,
+    font_path: []const u8,
+    /// 0-100. Only the background fill's alpha varies with this — text,
+    /// icons, and the border stay at their own configured (always fully
+    /// opaque) colors, matching the typical "frosted glass" look rather than
+    /// fading everything uniformly. Meant to be paired with the "simpbar"
+    /// layer-shell namespace's Hyprland-side blur rule (hyprland.lua), since
+    /// an app can't blur what's behind its own surface on Wayland — without
+    /// that rule this is just a plain transparent cutout, not a blur.
+    bg_opacity_percent: u8,
+    /// "top" or "bottom" — which screen edge the layer-shell surface anchors
+    /// to. Anything else falls back to "bottom" (today's only behavior)
+    /// rather than erroring, same permissive-fallback spirit as every other
+    /// config field.
+    position: []const u8,
+    /// Rounds all 4 corners by this many px, applied as the very last step
+    /// of every draw (after background/borders/every module), by zeroing
+    /// out (fully transparent, not just recolored) whichever corner pixels
+    /// fall outside each corner's rounding circle. 0 = today's square
+    /// corners. Clamped at draw time to at most half the shorter of
+    /// bar.width/bar.height, since a bigger radius makes the corner math
+    /// degenerate.
+    corner_radius_px: u32,
+    /// One of the CLOCK_FORMAT_* keys below. Unrecognized values fall back
+    /// to "date_24h" (today's only-ever behavior) rather than erroring, same
+    /// permissive-fallback spirit as `position`.
+    clock_format: []const u8,
+    /// Which output(s) to run a bar surface on. "" (default) = today's exact
+    /// behavior (compositor picks whichever output it hands us first, one
+    /// bar). "all" = one independent bar surface per currently-connected
+    /// output. Anything else = the specific output name to target (e.g.
+    /// "DP-1"); if no connected output currently has that name, main()
+    /// falls back to "" behavior (single default bar) rather than showing no
+    /// bar at all. Takes effect on the next bar restart, not live via
+    /// SIGUSR1 — creating/destroying Wayland surfaces at runtime is a much
+    /// bigger, riskier change than anything else this config drives live.
+    monitor: []const u8,
+};
+
+// Curated clock-format presets (not a full strftime-style parser — matches
+// this codebase's established "curated dropdown, not free-form input"
+// pattern already used for network `mode`/`font_path`/`position`).
+const CLOCK_FORMAT_DATE_24H = "date_24h"; // "DD - HH:MM" — today's default, unchanged
+const CLOCK_FORMAT_TIME_24H = "time_24h"; // "HH:MM"
+const CLOCK_FORMAT_TIME_24H_SECONDS = "time_24h_seconds"; // "HH:MM:SS"
+const CLOCK_FORMAT_TIME_12H = "time_12h"; // "hh:mm AM/PM"
+const CLOCK_FORMAT_DATE_12H = "date_12h"; // "DD - hh:mm AM/PM"
+
+const ModuleLists = struct {
+    left: []const ModuleEntry,
+    center: []const ModuleEntry,
+    right: []const ModuleEntry,
+};
+
+const Config = struct {
+    appearance: Appearance,
+    modules: ModuleLists,
+    launchers: []const LauncherButton,
+};
+
+// Today's exact hardcoded layout/order — see the header comment above.
+const DEFAULT_LEFT = [_]ModuleEntry{
+    .{ .kind = .workspaces, .enabled = true },
+    .{ .kind = .mpris, .enabled = true },
+};
+const DEFAULT_CENTER = [_]ModuleEntry{
+    .{ .kind = .launchers, .enabled = true },
+    .{ .kind = .clock, .enabled = true },
+};
+const DEFAULT_RIGHT = [_]ModuleEntry{
+    .{ .kind = .power, .enabled = true },
+    .{ .kind = .drawer_toggle, .enabled = true },
+    .{ .kind = .volume, .enabled = true, .in_drawer = true },
+    .{ .kind = .waypaper, .enabled = true, .in_drawer = true },
+    .{ .kind = .pacman, .enabled = true, .in_drawer = true },
+    .{ .kind = .tray, .enabled = true, .in_drawer = true },
+    .{ .kind = .weather, .enabled = true },
+};
+
+fn defaultConfig() Config {
+    return .{
+        .appearance = .{
+            // Colors lifted from ~/.config/waybar/style.css (0xAARRGGBB),
+            // same values this file hardcoded before runtime config existed.
+            .bg_color = 0xFF0F0F0F, // window#waybar background-color
+            .text_color = 0xFFDCDCDC, // general label color, rgba(220,220,220,1)
+            .border_color = 0xFF454545, // window#waybar border-color, rgba(69,69,69,1)
+            .hover_color = 0xFF3A3A3A, // same shade as popup_hover_color, for the bar's own clickable buttons
+            .workspace_active_color = 0xFFDCDCDC, // #workspaces button.active, rgba(220,220,220,1)
+            .workspace_inactive_color = 0xFF505050, // #workspaces button, rgba(80,80,80,1)
+            .popup_bg_color = 0xFF262626,
+            .popup_hover_color = 0xFF3A3A3A,
+            .popup_separator_color = 0xFF444444,
+            .popup_disabled_color = 0xFF707070,
+            .bar_height = 28,
+            .border_top_px = 2, // window#waybar border-width: 2px 0px 0px 0px
+            .border_bottom_px = 0,
+            .border_left_px = 0,
+            .border_right_px = 0,
+            .workspace_gap = 10,
+            .font_path = font_mod.FONT_PATH,
+            .bg_opacity_percent = 100,
+            .position = "bottom",
+            .corner_radius_px = 0,
+            .clock_format = CLOCK_FORMAT_DATE_24H,
+            .monitor = "",
+        },
+        .modules = .{
+            .left = &DEFAULT_LEFT,
+            .center = &DEFAULT_CENTER,
+            .right = &DEFAULT_RIGHT,
+        },
+        .launchers = &CENTER_LAUNCHERS,
+    };
+}
+
+var current_config: Config = undefined;
+
+/// Looks up `kind`'s `enabled` flag in `entries`; defaults to shown (true)
+/// if `kind` isn't present at all, so a partially-specified config doesn't
+/// silently hide modules it never mentioned.
+fn isModuleEnabled(entries: []const ModuleEntry, kind: ModuleKind) bool {
+    for (entries) |e| {
+        if (e.kind == kind) return e.enabled;
+    }
+    return true;
+}
+
+// --- config file I/O + JSON schema ----------------------------------------
+//
+// ~/.config/simpbar/config.json, read once at startup and re-read whenever
+// SIGUSR1 arrives (see main()'s event loop). File I/O goes through
+// posix.system (== std.c when libc is linked, same as the posix.system.close
+// calls already used throughout this file for fds) rather than std.fs, for
+// the same reason the rest of this file avoids Zig 0.16's reworked
+// std.fs/std.Io surface — posix.zig in this version doesn't expose a plain
+// open()/write()/mkdir() the way it does read()/poll()/signalfd(), only
+// openat() (which needs a dirfd) and the raw libc-backed `system` namespace,
+// so `system` is what's used here instead of hand-declaring new externs
+// (welcome_main.zig's approach, which predates posix.system being available
+// as an option in this file).
+
+var config_json_path_buf: [512]u8 = undefined;
+var pidfile_path_buf: [512]u8 = undefined;
+var config_json_path: [:0]const u8 = "";
+var pidfile_path: [:0]const u8 = "";
+
+/// Resolves ~/.config/simpbar/{config.json,simpbar.pid} from $HOME, creating
+/// ~/.config/simpbar first if it doesn't exist yet (best-effort — mkdir's
+/// result is intentionally ignored; if the directory truly can't be created,
+/// the open() calls below will fail instead, and that failure path is
+/// already handled). Mirrors welcome_main.zig's resolvePaths() pattern.
+fn resolveConfigPaths() void {
+    const home = std.mem.span(getenv("HOME") orelse "/root");
+    var dir_buf: [480]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/.config/simpbar", .{home}) catch return;
+    _ = posix.system.mkdir(dir.ptr, 0o755);
+    config_json_path = std.fmt.bufPrintZ(&config_json_path_buf, "{s}/config.json", .{dir}) catch "";
+    pidfile_path = std.fmt.bufPrintZ(&pidfile_path_buf, "{s}/simpbar.pid", .{dir}) catch "";
+}
+
+/// Writes this process's PID to ~/.config/simpbar/simpbar.pid so the (future)
+/// config GUI knows what to `kill -USR1` to trigger a live reload. Best
+/// effort — a missing/stale pidfile just means a reload signal won't reach
+/// us, not a reason to fail startup.
+fn writePidfile() void {
+    if (pidfile_path.len == 0) return;
+    const raw_fd = posix.system.open(pidfile_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(posix.mode_t, 0o644));
+    if (raw_fd < 0) return;
+    const fd: posix.fd_t = @intCast(raw_fd);
+    defer _ = posix.system.close(fd);
+    var buf: [16]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d}\n", .{std.c.getpid()}) catch return;
+    var off: usize = 0;
+    while (off < text.len) {
+        const n = posix.system.write(fd, text[off..].ptr, text.len - off);
+        if (n <= 0) return;
+        off += @intCast(n);
+    }
+}
+
+/// Reads all of `path` into memory allocated from `allocator`. Small sanity
+/// cap since config.json is never going to legitimately be large.
+fn readFileAlloc(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
+    if (path.len == 0) return error.NoPath;
+    const raw_fd = posix.system.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(posix.mode_t, 0));
+    if (raw_fd < 0) return error.OpenFailed;
+    const fd: posix.fd_t = @intCast(raw_fd);
+    defer _ = posix.system.close(fd);
+
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = posix.read(fd, &chunk) catch break;
+        if (n == 0) break;
+        try list.appendSlice(allocator, chunk[0..n]);
+        if (list.items.len > 1024 * 1024) break; // sanity cap; config.json is tiny
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// Converts a "#RRGGBB" hex string (as written by the config GUI / hand-
+/// edited by a user) into this file's internal 0xAARRGGBB u32 form, alpha
+/// forced to 0xFF — every color this bar draws is fully opaque today, so
+/// there's nothing for the user-facing format to control there.
+fn parseHexColor(s: []const u8) !u32 {
+    if (s.len != 7 or s[0] != '#') return error.InvalidColor;
+    const rgb = try std.fmt.parseInt(u32, s[1..7], 16);
+    return 0xFF000000 | rgb;
+}
+
+// JSON-facing shape of "appearance" — colors arrive as hex strings (parsed
+// via parseHexColor below), everything else matches Appearance's fields
+// directly. Every field has a default matching defaultConfig()'s values, so
+// a config.json that only overrides e.g. bg_color doesn't need to spell out
+// every other color too.
+const JsonAppearance = struct {
+    bg_color: []const u8 = "#0F0F0F",
+    text_color: []const u8 = "#DCDCDC",
+    border_color: []const u8 = "#454545",
+    hover_color: []const u8 = "#3A3A3A",
+    workspace_active_color: []const u8 = "#DCDCDC",
+    workspace_inactive_color: []const u8 = "#505050",
+    popup_bg_color: []const u8 = "#262626",
+    popup_hover_color: []const u8 = "#3A3A3A",
+    popup_separator_color: []const u8 = "#444444",
+    popup_disabled_color: []const u8 = "#707070",
+    bar_height: u32 = 28,
+    border_top_px: u32 = 2,
+    border_bottom_px: u32 = 0,
+    border_left_px: u32 = 0,
+    border_right_px: u32 = 0,
+    workspace_gap: i64 = 10,
+    font_path: []const u8 = font_mod.FONT_PATH,
+    bg_opacity_percent: u8 = 100,
+    position: []const u8 = "bottom",
+    corner_radius_px: u32 = 0,
+    clock_format: []const u8 = CLOCK_FORMAT_DATE_24H,
+    monitor: []const u8 = "",
+};
+
+// JSON-facing shape of "modules" — ModuleEntry's own fields already match
+// the schema exactly (kind parses straight from a JSON string via std.json's
+// enum support, matching ModuleKind's tag names), so no separate JSON-only
+// module-entry type is needed. Defaults to today's hardcoded layout, so a
+// config.json that only overrides "appearance" doesn't wipe out every
+// module the moment it's read.
+const JsonModules = struct {
+    left: []const ModuleEntry = &DEFAULT_LEFT,
+    center: []const ModuleEntry = &DEFAULT_CENTER,
+    right: []const ModuleEntry = &DEFAULT_RIGHT,
+};
+
+const JsonConfig = struct {
+    appearance: JsonAppearance = .{},
+    modules: JsonModules = .{},
+    launchers: []const LauncherButton = &CENTER_LAUNCHERS,
+};
+
+/// Two persistent arenas backing successfully-parsed Configs, used as a
+/// double buffer: `config_arenas[config_arena_active]` backs whatever
+/// `current_config` currently points to, and every load parses into the
+/// *other* (inactive) arena, only flipping `config_arena_active` to it once
+/// parsing has fully succeeded. This is required, not cosmetic — a single
+/// shared arena reset unconditionally at the start of every load (including
+/// reloads) frees the *live* config's memory before the new parse is known
+/// to succeed, so a failed reload (missing/malformed file) leaves
+/// `current_config` pointing at freed/reused memory and segfaults on the
+/// next draw. Swapping only on success means a failed reload never touches
+/// the arena backing the config still in use.
+var config_arenas = [2]std.heap.ArenaAllocator{
+    std.heap.ArenaAllocator.init(std.heap.page_allocator),
+    std.heap.ArenaAllocator.init(std.heap.page_allocator),
+};
+var config_arena_active: usize = 0;
+
+/// Copies `path` into `buf` with a null terminator and returns a
+/// sentinel-terminated view of it — font_mod.Font.init needs `[:0]const u8`,
+/// but Appearance.font_path (like every other config-sourced string) is a
+/// plain `[]const u8` from config_arena, not necessarily null-terminated.
+/// Returns null if `path` doesn't fit in `buf`.
+fn fontPathZ(path: []const u8, buf: []u8) ?[:0]const u8 {
+    if (path.len >= buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return buf[0..path.len :0];
+}
+
+fn parseAppearance(j: JsonAppearance) ?Appearance {
+    return Appearance{
+        .bg_color = parseHexColor(j.bg_color) catch return null,
+        .text_color = parseHexColor(j.text_color) catch return null,
+        .border_color = parseHexColor(j.border_color) catch return null,
+        .hover_color = parseHexColor(j.hover_color) catch return null,
+        .workspace_active_color = parseHexColor(j.workspace_active_color) catch return null,
+        .workspace_inactive_color = parseHexColor(j.workspace_inactive_color) catch return null,
+        .popup_bg_color = parseHexColor(j.popup_bg_color) catch return null,
+        .popup_hover_color = parseHexColor(j.popup_hover_color) catch return null,
+        .popup_separator_color = parseHexColor(j.popup_separator_color) catch return null,
+        .popup_disabled_color = parseHexColor(j.popup_disabled_color) catch return null,
+        .bar_height = j.bar_height,
+        .border_top_px = j.border_top_px,
+        .border_bottom_px = j.border_bottom_px,
+        .border_left_px = j.border_left_px,
+        .border_right_px = j.border_right_px,
+        .workspace_gap = j.workspace_gap,
+        .font_path = j.font_path,
+        .bg_opacity_percent = @min(j.bg_opacity_percent, 100),
+        .position = if (std.mem.eql(u8, j.position, "top")) "top" else "bottom",
+        .corner_radius_px = j.corner_radius_px,
+        .clock_format = validClockFormat(j.clock_format),
+        // No validation against currently-connected outputs here — parsing
+        // happens before Wayland registry discovery has run, so there's
+        // nothing to validate against yet. main()'s target-output-selection
+        // step (after outputs are discovered) is what falls back to ""
+        // behavior for a name that doesn't match any connected output.
+        .monitor = j.monitor,
+    };
+}
+
+/// Returns `raw` unchanged if it's one of the recognized CLOCK_FORMAT_*
+/// keys, else falls back to the default — same permissive-fallback
+/// treatment `position` already gets, so a stale/mistyped value in a
+/// hand-edited config.json never crashes or blanks the clock.
+fn validClockFormat(raw: []const u8) []const u8 {
+    const known = [_][]const u8{
+        CLOCK_FORMAT_DATE_24H, CLOCK_FORMAT_TIME_24H, CLOCK_FORMAT_TIME_24H_SECONDS,
+        CLOCK_FORMAT_TIME_12H, CLOCK_FORMAT_DATE_12H,
+    };
+    for (known) |k| {
+        if (std.mem.eql(u8, raw, k)) return k;
+    }
+    return CLOCK_FORMAT_DATE_24H;
+}
+
+/// Reads + parses ~/.config/simpbar/config.json. Returns null on ANY
+/// failure (missing file, unreadable, malformed JSON, bad color hex, ...) —
+/// callers decide what null means: loadConfig() (startup) falls back to
+/// defaultConfig(), while the SIGUSR1 reload handler in main() instead keeps
+/// whatever current_config already is, so a bad edit never reverts a
+/// working bar to defaults and never crashes it.
+fn loadConfigFromFile() ?Config {
+    // Parse into the INACTIVE arena — config_arenas[config_arena_active]
+    // backs the live current_config and must not be touched unless/until
+    // this parse fully succeeds (see the arena doc comment above).
+    const next_index = 1 - config_arena_active;
+    _ = config_arenas[next_index].reset(.free_all);
+    const allocator = config_arenas[next_index].allocator();
+
+    const bytes = readFileAlloc(allocator, config_json_path) catch |err| {
+        std.debug.print("config: could not read {s}: {}\n", .{ config_json_path, err });
+        return null;
+    };
+
+    const parsed = std.json.parseFromSliceLeaky(JsonConfig, allocator, bytes, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        std.debug.print("config: could not parse {s}: {}\n", .{ config_json_path, err });
+        return null;
+    };
+
+    const appearance = parseAppearance(parsed.appearance) orelse {
+        std.debug.print("config: bad color value in {s}\n", .{config_json_path});
+        return null;
+    };
+
+    config_arena_active = next_index;
+    return Config{
+        .appearance = appearance,
+        .modules = .{
+            .left = parsed.modules.left,
+            .center = parsed.modules.center,
+            .right = parsed.modules.right,
+        },
+        .launchers = parsed.launchers,
+    };
+}
+
+/// Startup load only: the real file if present and valid, else
+/// defaultConfig() — so a bar with no config.json on disk yet behaves
+/// exactly like it always has. Reloads (SIGUSR1) call loadConfigFromFile()
+/// directly instead, specifically to skip this fallback — see its doc
+/// comment.
+fn loadConfig() Config {
+    return loadConfigFromFile() orelse defaultConfig();
+}
 
 // --- tray (org.kde.StatusNotifierItem via a hand-rolled D-Bus client) -----
 //
@@ -840,10 +1286,6 @@ const POPUP_SEPARATOR_HEIGHT: i32 = 7;
 const POPUP_PADDING_X: i32 = 10;
 const POPUP_MIN_WIDTH: i32 = 80;
 const POPUP_MAX_WIDTH: i32 = 320;
-const POPUP_BG_COLOR: u32 = 0xFF262626;
-const POPUP_HOVER_COLOR: u32 = 0xFF3A3A3A;
-const POPUP_SEPARATOR_COLOR: u32 = 0xFF444444;
-const POPUP_DISABLED_COLOR: u32 = 0xFF707070;
 const MAX_POPUP_ROWS = 40;
 
 const PopupRow = struct {
@@ -1051,7 +1493,7 @@ fn drawPopup(bar: *Bar) !void {
     const data = try posix.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
     defer posix.munmap(data);
     const pixels: [*]u32 = @ptrCast(@alignCast(data.ptr));
-    @memset(pixels[0 .. size / 4], POPUP_BG_COLOR);
+    @memset(pixels[0 .. size / 4], current_config.appearance.popup_bg_color);
 
     var top_idx: [MAX_POPUP_ROWS]usize = undefined;
     const top_children = pm.menu.childrenOf(0, &top_idx);
@@ -1077,7 +1519,7 @@ fn drawPopup(bar: *Bar) !void {
             const line_y = y_start + @divTrunc(row_h, 2);
             if (line_y >= 0 and line_y < pm.height) {
                 var x: u32 = 0;
-                while (x < pm.width) : (x += 1) pixels[@as(u32, @intCast(line_y)) * pm.width + x] = POPUP_SEPARATOR_COLOR;
+                while (x < pm.width) : (x += 1) pixels[@as(u32, @intCast(line_y)) * pm.width + x] = current_config.appearance.popup_separator_color;
             }
         } else {
             const hovered = pm.pointer_y >= y_start and pm.pointer_y < y_end;
@@ -1086,10 +1528,10 @@ fn drawPopup(bar: *Bar) !void {
                 while (py < y_end and py < pm.height) : (py += 1) {
                     if (py < 0) continue;
                     var x: u32 = 0;
-                    while (x < pm.width) : (x += 1) pixels[@as(u32, @intCast(py)) * pm.width + x] = POPUP_HOVER_COLOR;
+                    while (x < pm.width) : (x += 1) pixels[@as(u32, @intCast(py)) * pm.width + x] = current_config.appearance.popup_hover_color;
                 }
             }
-            const color = if (it.enabled) TEXT_COLOR else POPUP_DISABLED_COLOR;
+            const color = if (it.enabled) current_config.appearance.text_color else current_config.appearance.popup_disabled_color;
             const baseline = y_start + @divTrunc(row_h + bar.font.ascentPx() - bar.font.descentPx(), 2);
             var x0: i64 = POPUP_PADDING_X;
             var ci: usize = 0;
@@ -1110,13 +1552,44 @@ fn drawPopup(bar: *Bar) !void {
     pm.surface.commit();
 }
 
+const MAX_OUTPUTS = 8;
+
+/// One connected monitor discovered via the registry. `name`/`description`
+/// are core wl_output v4 events (already the version this file binds at) —
+/// no xdg-output protocol extension needed to get a human-readable connector
+/// name like "DP-1". The name arrives asynchronously right after binding;
+/// by the time main()'s existing second roundtrip finishes (already done
+/// there for wl_seat's capabilities event, for the same reason), every
+/// output's name has had a chance to arrive too.
+const OutputInfo = struct {
+    output: *wl.Output,
+    name_buf: [64]u8 = undefined,
+    name_len: usize = 0,
+
+    fn name(self: *const OutputInfo) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
+fn outputListener(_: *wl.Output, event: wl.Output.Event, info: *OutputInfo) void {
+    switch (event) {
+        .name => |n| {
+            const s = std.mem.sliceTo(n.name, 0);
+            info.name_len = @min(s.len, info.name_buf.len);
+            @memcpy(info.name_buf[0..info.name_len], s[0..info.name_len]);
+        },
+        else => {},
+    }
+}
+
 /// Globals we collect while walking the registry. Filled in as events
 /// arrive, then used once the initial roundtrip finishes.
 const Globals = struct {
     compositor: ?*wl.Compositor = null,
     shm: ?*wl.Shm = null,
     layer_shell: ?*zwlr.LayerShellV1 = null,
-    output: ?*wl.Output = null,
+    outputs: [MAX_OUTPUTS]OutputInfo = undefined,
+    output_count: usize = 0,
     seat: ?*wl.Seat = null,
     seat_has_pointer: bool = false,
     wm_base: ?*xdg.WmBase = null, // needed for xdg_popup (the DBusMenu context menu surface)
@@ -1139,7 +1612,7 @@ const Bar = struct {
     wm_base: ?*xdg.WmBase,
     seat: ?*wl.Seat,
     width: u32 = 0,
-    height: u32 = BAR_HEIGHT,
+    height: u32,
     configured: bool = false,
     click_regions: ClickRegions = .{},
     pointer_x: i32 = -1,
@@ -1155,12 +1628,62 @@ const Bar = struct {
     popup: ?PopupMenu = null,
 };
 
+/// (Re-)applies the layer-shell anchor/size/exclusive-zone/margin from
+/// current_config and commits — called once at startup, and again from the
+/// SIGUSR1 reload handler whenever `position` or `bar_height` changes. This
+/// does NOT block for the resulting configure event (that would stall the
+/// whole event loop on a reload) — it just re-issues the requests and
+/// commits; layerSurfaceListener's existing .configure handler already
+/// updates bar.width/bar.height and redraws whenever the compositor
+/// responds, the same as it does for the initial configure and for any
+/// compositor-initiated resize, so no separate handling is needed here.
+fn applyLayerGeometry(bar: *Bar) void {
+    if (std.mem.eql(u8, current_config.appearance.position, "top")) {
+        bar.layer_surface.setAnchor(.{ .top = true, .left = true, .right = true });
+    } else {
+        bar.layer_surface.setAnchor(.{ .bottom = true, .left = true, .right = true });
+    }
+    bar.layer_surface.setSize(0, current_config.appearance.bar_height);
+    bar.layer_surface.setExclusiveZone(@intCast(current_config.appearance.bar_height));
+    bar.layer_surface.setMargin(0, MARGIN_SIDE, 0, MARGIN_SIDE);
+    bar.surface.commit();
+}
+
+/// Redraws every currently-running bar, logging (not propagating) any
+/// individual failure — matches every existing single-bar
+/// `drawAndCommit(&bar) catch |err| { ... }` call site's error handling,
+/// just applied across however many bars are actually running (1, in the
+/// default single-monitor case; N when "monitor": "all" is configured)
+/// instead of assuming exactly one.
+fn drawAllBars(bars: []Bar) void {
+    for (bars) |*b| {
+        drawAndCommit(b) catch |err| {
+            std.debug.print("draw failed: {}\n", .{err});
+        };
+    }
+}
+
 pub fn main() !void {
+    resolveConfigPaths();
+    current_config = loadConfig();
+    writePidfile();
+
     var gpa_state = std.heap.DebugAllocator(.{}){};
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    var app_font = try font_mod.Font.init(gpa, font_mod.FONT_PATH, FONT_PIXEL_SIZE);
+    var app_font = init_font: {
+        var buf: [512]u8 = undefined;
+        const path_z = fontPathZ(current_config.appearance.font_path, &buf) orelse font_mod.FONT_PATH;
+        break :init_font font_mod.Font.init(gpa, path_z, FONT_PIXEL_SIZE) catch |err| blk: {
+            // A user-configured font_path that fails to load (bad path, not
+            // actually a font file, ...) shouldn't take the whole bar down —
+            // fall back to the built-in default, matching every other
+            // "never let a bad config value crash the bar" convention here.
+            std.debug.print("font: could not load {s}: {} — falling back to {s}\n", .{ path_z, err, font_mod.FONT_PATH });
+            break :blk try font_mod.Font.init(gpa, font_mod.FONT_PATH, FONT_PIXEL_SIZE);
+        };
+    };
     defer app_font.deinit();
 
     const display = try wl.Display.connect(null);
@@ -1186,19 +1709,41 @@ pub fn main() !void {
     const compositor = globals.compositor orelse return error.NoCompositor;
     const shm = globals.shm orelse return error.NoShm;
     const layer_shell = globals.layer_shell orelse return error.NoLayerShell;
-    // output may be null — passing null to get_layer_surface lets the
-    // compositor pick one, which is fine for a first pass.
 
-    const surface = try compositor.createSurface();
-    defer surface.destroy();
-
-    const layer_surface = try layer_shell.getLayerSurface(
-        surface,
-        globals.output,
-        .top, // layer: show above normal windows
-        "simpbar",
-    );
-    defer layer_surface.destroy();
+    // Resolve which output(s) to run a bar surface on from
+    // current_config.appearance.monitor: "" = a single bar, compositor picks
+    // (today's exact behavior — pass null to get_layer_surface); "all" = one
+    // independent bar per currently-connected output; anything else = the
+    // one connected output with that name, falling back to "" behavior if no
+    // connected output currently has it (renamed/unplugged since it was
+    // configured) — never show zero bars over a stale/bad monitor setting,
+    // same permissive-fallback spirit as every other config field.
+    const monitor_cfg = current_config.appearance.monitor;
+    var target_outputs: [MAX_OUTPUTS]?*wl.Output = undefined;
+    var target_count: usize = 0;
+    if (std.mem.eql(u8, monitor_cfg, "all")) {
+        for (globals.outputs[0..globals.output_count]) |*info| {
+            target_outputs[target_count] = info.output;
+            target_count += 1;
+        }
+        if (target_count == 0) {
+            target_outputs[0] = null; // nothing discovered; fall back to default single bar
+            target_count = 1;
+        }
+    } else if (monitor_cfg.len > 0) {
+        var found: ?*wl.Output = null;
+        for (globals.outputs[0..globals.output_count]) |*info| {
+            if (std.mem.eql(u8, info.name(), monitor_cfg)) {
+                found = info.output;
+                break;
+            }
+        }
+        target_outputs[0] = found; // null (not found) == compositor-picks, same as "" case
+        target_count = 1;
+    } else {
+        target_outputs[0] = null;
+        target_count = 1;
+    }
 
     // Hyprland-specific, matching waybar's "hyprland/workspaces" module.
     // Both IPC sockets live at $XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.
@@ -1238,47 +1783,77 @@ pub fn main() !void {
     var tray = Tray.init(gpa);
     defer tray.deinit();
 
-    var bar = Bar{
-        .shm = shm,
-        .surface = surface,
-        .layer_surface = layer_surface,
-        .workspaces = &workspaces,
-        .weather = &weather,
-        .pacman = &pacman_updates,
-        .volume = &volume,
-        .mpris = &mpris,
-        .tray = &tray,
-        .font = &app_font,
-        .compositor = compositor,
-        .wm_base = globals.wm_base,
-        .seat = globals.seat,
-    };
-
-    layer_surface.setListener(*Bar, layerSurfaceListener, &bar);
+    // One Bar per target output, sharing every pointer to global/system
+    // state (weather, tray, font, workspaces, ...) below — only the fields
+    // that are genuinely per-surface (surface handle, click regions,
+    // pointer/hover state, drawer animation, popup) differ per instance.
+    // Individual surface/layer_surface objects are deliberately not
+    // `defer`-destroyed here: this is a long-running daemon whose only exit
+    // paths are `std.process.exit(0)` (which skips defers entirely) or a
+    // hard error during this very setup, in which case the OS reclaims
+    // everything on process exit anyway — matching the original single-bar
+    // code's defers, which likewise never actually ran in practice.
+    var bars: [MAX_OUTPUTS]Bar = undefined;
+    var bar_count: usize = 0;
+    for (target_outputs[0..target_count]) |target_output| {
+        const surface = compositor.createSurface() catch continue;
+        const layer_surface = layer_shell.getLayerSurface(
+            surface,
+            target_output,
+            .top, // layer: show above normal windows
+            "simpbar",
+        ) catch {
+            surface.destroy();
+            continue;
+        };
+        bars[bar_count] = .{
+            .shm = shm,
+            .surface = surface,
+            .layer_surface = layer_surface,
+            .workspaces = &workspaces,
+            .weather = &weather,
+            .pacman = &pacman_updates,
+            .volume = &volume,
+            .mpris = &mpris,
+            .tray = &tray,
+            .font = &app_font,
+            .compositor = compositor,
+            .wm_base = globals.wm_base,
+            .seat = globals.seat,
+            .height = current_config.appearance.bar_height,
+        };
+        layer_surface.setListener(*Bar, layerSurfaceListener, &bars[bar_count]);
+        bar_count += 1;
+    }
+    if (bar_count == 0) return error.NoBarSurfaceCreated;
 
     // Click handling: get a pointer off the seat (if the compositor gave us
-    // one) and route button-press events through `bar.click_regions`, which
-    // each draw pass repopulates with the current module layout.
+    // one) and route button-press events through whichever bar (of possibly
+    // several) is currently under it, via a shared BarRouter — see
+    // pointerListener's doc comment for why a single wl_pointer object must
+    // route to multiple bars rather than each bar getting its own.
+    var bar_router = BarRouter{ .bars = bars[0..bar_count] };
     const pointer: ?*wl.Pointer = if (globals.seat) |seat|
         (if (globals.seat_has_pointer) seat.getPointer() catch null else null)
     else
         null;
     defer if (pointer) |p| p.release();
-    if (pointer) |p| p.setListener(*Bar, pointerListener, &bar);
+    if (pointer) |p| p.setListener(*BarRouter, pointerListener, &bar_router);
 
-    // Anchor to the bottom edge and stretch full width (0 = "as wide as the
-    // output"), matching "position": "bottom" in ~/.config/waybar/config.
-    // Reserve the height (+ side margins) so windows don't overlap the bar.
-    layer_surface.setAnchor(.{ .bottom = true, .left = true, .right = true });
-    layer_surface.setSize(0, BAR_HEIGHT);
-    layer_surface.setExclusiveZone(@intCast(BAR_HEIGHT));
-    layer_surface.setMargin(0, MARGIN_SIDE, 0, MARGIN_SIDE);
+    // Anchor every bar to the configured edge and stretch full width (0 =
+    // "as wide as the output"). Reserve the height (+ side margins) so
+    // windows don't overlap the bar.
+    for (bars[0..bar_count]) |*b| applyLayerGeometry(b);
 
-    surface.commit();
-
-    // Block until the compositor sends the first configure event, which is
-    // where we learn the actual width to allocate a buffer for.
-    while (!bar.configured) {
+    // Block until every bar's compositor has sent its first configure
+    // event, which is where we learn the actual width to allocate a buffer
+    // for.
+    while (true) {
+        var all_configured = true;
+        for (bars[0..bar_count]) |*b| {
+            if (!b.configured) all_configured = false;
+        }
+        if (all_configured) break;
         if (display.dispatch() != .SUCCESS) return error.DispatchFailed;
     }
 
@@ -1309,6 +1884,87 @@ pub fn main() !void {
     defer _ = posix.system.close(tray_timer_fd);
     defer _ = posix.system.close(timer_fd);
 
+    // SIGUSR1 live-reload: block the signal (so it queues instead of using
+    // its default terminate disposition) and read it via a signalfd, same
+    // multiplexed-in-poll() shape as every timerfd above. A failure here
+    // (vanishingly unlikely — signalfd() only fails on fd/memory exhaustion)
+    // just means live-reload doesn't work this run; not worth failing
+    // startup over.
+    var sigusr1_mask = posix.sigemptyset();
+    posix.sigaddset(&sigusr1_mask, .USR1);
+    posix.sigprocmask(posix.SIG.BLOCK, &sigusr1_mask, null);
+    const sigusr1_fd = posix.signalfd(-1, &sigusr1_mask, std.os.linux.SFD.CLOEXEC) catch |err| blk: {
+        std.debug.print("signalfd(SIGUSR1) failed, live config reload disabled: {}\n", .{err});
+        break :blk -1;
+    };
+    defer if (sigusr1_fd >= 0) {
+        _ = posix.system.close(sigusr1_fd);
+    };
+
+    // New modules (Step 3): cpu/ram share one timer; battery/disk/network
+    // each get their own; network's "ssid" mode additionally needs a
+    // PolledCommand pipe-fd pair like weather/pacman/volume/mpris above.
+    // interval_secs is honored where a single config entry unambiguously
+    // determines it (disk/battery/network-speed/network-ssid; cpu/ram share
+    // one timer, resolved from whichever of the two entries specifies an
+    // override first) — NOT for custom scripts' own intervals, which are
+    // resolved separately below since there can be several of them.
+    const sysstats_interval: i64 = blk: {
+        if (findRightEntry(.cpu)) |e| {
+            if (e.interval_secs) |s| break :blk @intCast(s);
+        }
+        if (findRightEntry(.ram)) |e| {
+            if (e.interval_secs) |s| break :blk @intCast(s);
+        }
+        break :blk SYSSTATS_REFRESH_SECONDS;
+    };
+    const battery_interval: i64 = if (findRightEntry(.battery)) |e|
+        (if (e.interval_secs) |s| @intCast(s) else BATTERY_REFRESH_SECONDS)
+    else
+        BATTERY_REFRESH_SECONDS;
+    const disk_interval: i64 = if (findRightEntry(.disk)) |e|
+        (if (e.interval_secs) |s| @intCast(s) else DISK_REFRESH_SECONDS)
+    else
+        DISK_REFRESH_SECONDS;
+    const network_entry_interval: ?i64 = if (findRightEntry(.network)) |e|
+        (if (e.interval_secs) |s| @intCast(s) else null)
+    else
+        null;
+    const netspeed_interval: i64 = network_entry_interval orelse NET_SPEED_REFRESH_SECONDS;
+    const netssid_interval: i64 = network_entry_interval orelse NET_SSID_REFRESH_SECONDS;
+
+    const sysstats_timer_fd = try createIntervalTimer(sysstats_interval);
+    defer _ = posix.system.close(sysstats_timer_fd);
+    const battery_timer_fd = try createIntervalTimer(battery_interval);
+    defer _ = posix.system.close(battery_timer_fd);
+    const disk_timer_fd = try createIntervalTimer(disk_interval);
+    defer _ = posix.system.close(disk_timer_fd);
+    const netspeed_timer_fd = try createIntervalTimer(netspeed_interval);
+    defer _ = posix.system.close(netspeed_timer_fd);
+    const netssid_timer_fd = try createIntervalTimer(netssid_interval);
+    defer _ = posix.system.close(netssid_timer_fd);
+    defer if (net_ssid.pending_fd >= 0) {
+        _ = posix.system.close(net_ssid.pending_fd);
+    };
+
+    findBattery();
+    findCpuTempSensor();
+    sampleSysStats(); // first sample has no delta yet (cpu_pct stays 0 until the next tick); ram_pct/cpu_temp are valid immediately
+    sampleDisk();
+    sampleNetSpeed();
+    startNetSsidFetch(&net_ssid);
+
+    initCustomScripts();
+    var custom_script_timer_fds: [MAX_CUSTOM_SCRIPTS]posix.fd_t = [_]posix.fd_t{-1} ** MAX_CUSTOM_SCRIPTS;
+    for (0..custom_script_count) |i| {
+        custom_script_timer_fds[i] = createIntervalTimer(custom_script_intervals[i]) catch -1;
+        if (custom_script_timer_fds[i] >= 0) startCustomScriptFetch(&custom_scripts[i], customScriptCommand(i));
+    }
+    defer for (0..MAX_CUSTOM_SCRIPTS) |i| {
+        if (custom_script_timer_fds[i] >= 0) _ = posix.system.close(custom_script_timer_fds[i]);
+        if (custom_scripts[i].pending_fd >= 0) _ = posix.system.close(custom_scripts[i].pending_fd);
+    };
+
     // Main event loop: multiplex the Wayland display fd (compositor events),
     // a 1s timerfd (clock ticks), and the Hyprland event socket (workspace
     // changes) — a negative fd (Hyprland not running) is simply ignored by
@@ -1329,7 +1985,25 @@ pub fn main() !void {
         .{ .fd = scroll_timer_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // tray.pollFd(), refreshed below
         .{ .fd = tray_timer_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = sigusr1_fd, .events = posix.POLL.IN, .revents = 0 }, // [14]
+        .{ .fd = sysstats_timer_fd, .events = posix.POLL.IN, .revents = 0 }, // [15]
+        .{ .fd = battery_timer_fd, .events = posix.POLL.IN, .revents = 0 }, // [16]
+        .{ .fd = disk_timer_fd, .events = posix.POLL.IN, .revents = 0 }, // [17]
+        .{ .fd = netspeed_timer_fd, .events = posix.POLL.IN, .revents = 0 }, // [18]
+        .{ .fd = netssid_timer_fd, .events = posix.POLL.IN, .revents = 0 }, // [19]
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [20] net_ssid.pending_fd, refreshed below
+        .{ .fd = custom_script_timer_fds[0], .events = posix.POLL.IN, .revents = 0 }, // [21]
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [22] custom_scripts[0].pending_fd, refreshed below
+        .{ .fd = custom_script_timer_fds[1], .events = posix.POLL.IN, .revents = 0 }, // [23]
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [24] custom_scripts[1].pending_fd, refreshed below
+        .{ .fd = custom_script_timer_fds[2], .events = posix.POLL.IN, .revents = 0 }, // [25]
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [26] custom_scripts[2].pending_fd, refreshed below
+        .{ .fd = custom_script_timer_fds[3], .events = posix.POLL.IN, .revents = 0 }, // [27]
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [28] custom_scripts[3].pending_fd, refreshed below
     };
+    comptime {
+        if (MAX_CUSTOM_SCRIPTS != 4) @compileError("poll_fds' custom-script slots [21..28] are hand-unrolled for MAX_CUSTOM_SCRIPTS == 4; update both if that changes");
+    }
 
     while (true) {
         // Flush any outstanding requests (e.g. from the last commit) before
@@ -1340,6 +2014,11 @@ pub fn main() !void {
         poll_fds[8].fd = volume.pending_fd;
         poll_fds[10].fd = mpris.pending_fd;
         poll_fds[12].fd = tray.pollFd(); // -1 if the tray failed to set up; poll() ignores it
+        poll_fds[20].fd = net_ssid.pending_fd;
+        poll_fds[22].fd = custom_scripts[0].pending_fd;
+        poll_fds[24].fd = custom_scripts[1].pending_fd;
+        poll_fds[26].fd = custom_scripts[2].pending_fd;
+        poll_fds[28].fd = custom_scripts[3].pending_fd;
 
         _ = try posix.poll(&poll_fds, -1);
 
@@ -1355,9 +2034,7 @@ pub fn main() !void {
             // (returns 0). Piggyback on this once-a-second tick instead of
             // reaping exactly at EOF, so it's retried until it succeeds.
             reapChildren();
-            drawAndCommit(&bar) catch |err| {
-                std.debug.print("draw failed: {}\n", .{err});
-            };
+            drawAllBars(bars[0..bar_count]);
         }
         if (poll_fds[2].revents & posix.POLL.IN != 0) {
             // Don't bother parsing which event(s) arrived — just drain
@@ -1369,9 +2046,7 @@ pub fn main() !void {
             workspaces.refresh() catch |err| {
                 std.debug.print("workspaces refresh failed: {}\n", .{err});
             };
-            drawAndCommit(&bar) catch |err| {
-                std.debug.print("draw failed: {}\n", .{err});
-            };
+            drawAllBars(bars[0..bar_count]);
         }
         if (poll_fds[3].revents & posix.POLL.IN != 0) {
             var expirations: u64 = undefined;
@@ -1390,9 +2065,7 @@ pub fn main() !void {
                 _ = posix.system.close(weather.pending_fd);
                 weather.pending_fd = -1;
                 // Not reaped here — see the once-a-second tick above.
-                drawAndCommit(&bar) catch |err| {
-                    std.debug.print("draw failed: {}\n", .{err});
-                };
+                drawAllBars(bars[0..bar_count]);
             }
         }
         if (poll_fds[5].revents & posix.POLL.IN != 0) {
@@ -1404,9 +2077,7 @@ pub fn main() !void {
             if (pacman_updates.onReadable()) {
                 _ = posix.system.close(pacman_updates.pending_fd);
                 pacman_updates.pending_fd = -1;
-                drawAndCommit(&bar) catch |err| {
-                    std.debug.print("draw failed: {}\n", .{err});
-                };
+                drawAllBars(bars[0..bar_count]);
             }
         }
         if (poll_fds[7].revents & posix.POLL.IN != 0) {
@@ -1418,9 +2089,7 @@ pub fn main() !void {
             if (volume.onReadable()) {
                 _ = posix.system.close(volume.pending_fd);
                 volume.pending_fd = -1;
-                drawAndCommit(&bar) catch |err| {
-                    std.debug.print("draw failed: {}\n", .{err});
-                };
+                drawAllBars(bars[0..bar_count]);
             }
         }
         if (poll_fds[9].revents & posix.POLL.IN != 0) {
@@ -1432,9 +2101,7 @@ pub fn main() !void {
             if (mpris.onReadable()) {
                 _ = posix.system.close(mpris.pending_fd);
                 mpris.pending_fd = -1;
-                drawAndCommit(&bar) catch |err| {
-                    std.debug.print("draw failed: {}\n", .{err});
-                };
+                drawAllBars(bars[0..bar_count]);
             }
         }
         if (poll_fds[11].revents & posix.POLL.IN != 0) {
@@ -1443,30 +2110,33 @@ pub fn main() !void {
             // Only bother animating (and redrawing) when there's actually
             // something to show — no point burning a redraw every 60ms
             // while nothing's playing and the drawer's fade isn't mid-flight.
-            var needs_redraw = false;
-            if (bar.mpris.text().len > 0) {
-                bar.mpris_scroll_step += SCROLL_STEP_PX;
-                needs_redraw = true;
-            }
-            const drawer_target: f32 = if (bar.drawer_expanded) 1.0 else 0.0;
-            if (bar.drawer_anim != drawer_target) {
-                bar.drawer_anim = if (bar.drawer_anim < drawer_target)
-                    @min(drawer_target, bar.drawer_anim + DRAWER_ANIM_STEP)
-                else
-                    @max(drawer_target, bar.drawer_anim - DRAWER_ANIM_STEP);
-                needs_redraw = true;
-            }
-            if (needs_redraw) {
-                drawAndCommit(&bar) catch |err| {
-                    std.debug.print("draw failed: {}\n", .{err});
-                };
+            // mpris_scroll_step/drawer_anim are per-bar state (each bar's
+            // own scroll position/fade progresses independently), so this
+            // loops over every bar rather than updating one shared value.
+            for (bars[0..bar_count]) |*b| {
+                var needs_redraw = false;
+                if (b.mpris.text().len > 0) {
+                    b.mpris_scroll_step += SCROLL_STEP_PX;
+                    needs_redraw = true;
+                }
+                const drawer_target: f32 = if (b.drawer_expanded) 1.0 else 0.0;
+                if (b.drawer_anim != drawer_target) {
+                    b.drawer_anim = if (b.drawer_anim < drawer_target)
+                        @min(drawer_target, b.drawer_anim + DRAWER_ANIM_STEP)
+                    else
+                        @max(drawer_target, b.drawer_anim - DRAWER_ANIM_STEP);
+                    needs_redraw = true;
+                }
+                if (needs_redraw) {
+                    drawAndCommit(b) catch |err| {
+                        std.debug.print("draw failed: {}\n", .{err});
+                    };
+                }
             }
         }
         if (poll_fds[12].revents & posix.POLL.IN != 0) {
-            tray.onReadable();
-            drawAndCommit(&bar) catch |err| {
-                std.debug.print("draw failed: {}\n", .{err});
-            };
+            tray.onReadable(); // shared: one D-Bus connection/icon set for every bar
+            drawAllBars(bars[0..bar_count]);
         }
         if (poll_fds[13].revents & posix.POLL.IN != 0) {
             var expirations: u64 = undefined;
@@ -1474,11 +2144,150 @@ pub fn main() !void {
             tray.refreshOne();
             // drawer_anim, not drawer_expanded — icons are still visible
             // (fading) partway through a collapse even once drawer_expanded
-            // has already flipped back to false.
-            if (bar.drawer_anim > 0.0) {
-                drawAndCommit(&bar) catch |err| {
-                    std.debug.print("draw failed: {}\n", .{err});
-                };
+            // has already flipped back to false. Per-bar: each bar's own
+            // drawer independently decides whether it needs a redraw.
+            for (bars[0..bar_count]) |*b| {
+                if (b.drawer_anim > 0.0) {
+                    drawAndCommit(b) catch |err| {
+                        std.debug.print("draw failed: {}\n", .{err});
+                    };
+                }
+            }
+        }
+        if (poll_fds[14].revents & posix.POLL.IN != 0) {
+            var siginfo: std.os.linux.signalfd_siginfo = undefined;
+            _ = posix.read(sigusr1_fd, std.mem.asBytes(&siginfo)) catch {};
+            // Unlike the startup load, a reload NEVER falls back to
+            // defaultConfig() — a config.json that's momentarily missing or
+            // malformed (mid-edit, a bad hand-edit, a GUI bug) should leave
+            // the bar exactly as it was, not silently discard the user's
+            // working config.
+            if (loadConfigFromFile()) |cfg| {
+                const old_font_path = current_config.appearance.font_path;
+                const font_changed = !std.mem.eql(u8, old_font_path, cfg.appearance.font_path);
+                const old_position = current_config.appearance.position;
+                const old_bar_height = current_config.appearance.bar_height;
+                const geometry_changed = !std.mem.eql(u8, old_position, cfg.appearance.position) or
+                    old_bar_height != cfg.appearance.bar_height;
+                current_config = cfg;
+                std.debug.print("config: reloaded {s}\n", .{config_json_path});
+
+                // Closes a previously-known gap: bar_height (and now
+                // position) used to only take effect on the next bar
+                // restart. Re-issuing these layer-shell requests + a commit
+                // is cheap and async — see applyLayerGeometry's doc comment
+                // for why this doesn't need to block on the resulting
+                // configure event here.
+                if (geometry_changed) {
+                    for (bars[0..bar_count]) |*b| applyLayerGeometry(b);
+                }
+
+                // Try loading the NEW font before touching the old one — if
+                // the configured path is bad (missing file, not actually a
+                // font, ...) this leaves app_font exactly as it was rather
+                // than tearing down a working font for a broken one. Note
+                // current_config.appearance.font_path can end up saying a
+                // path that isn't actually what's rendering if this fails —
+                // an accepted, minor inconsistency in exchange for never
+                // breaking bar text/icons on a bad font selection.
+                if (font_changed) {
+                    var font_buf: [512]u8 = undefined;
+                    if (fontPathZ(current_config.appearance.font_path, &font_buf)) |path_z| {
+                        if (font_mod.Font.init(gpa, path_z, FONT_PIXEL_SIZE)) |new_font| {
+                            app_font.deinit();
+                            app_font = new_font;
+                        } else |err| {
+                            std.debug.print("font: could not load {s}: {} — keeping current font\n", .{ path_z, err });
+                        }
+                    } else {
+                        std.debug.print("font: path too long, keeping current font\n", .{});
+                    }
+                }
+
+                // Custom-script commands/intervals live in stable buffers
+                // separate from current_config (see initCustomScripts' doc
+                // comment) — a reload must re-resolve them too, or an
+                // edited/added/removed custom script would only take effect
+                // on the next bar restart. Unconditionally reset every slot
+                // (simpler than diffing what changed, and just as correct
+                // since this only runs on an explicit user save, not every
+                // frame): abandon any in-flight fetch, clear stale text,
+                // recreate each slot's timerfd at its (possibly new)
+                // interval, and kick off a fresh fetch for whatever's now
+                // configured.
+                initCustomScripts();
+                for (0..MAX_CUSTOM_SCRIPTS) |i| {
+                    if (custom_scripts[i].pending_fd >= 0) {
+                        _ = posix.system.close(custom_scripts[i].pending_fd);
+                        custom_scripts[i].pending_fd = -1;
+                    }
+                    custom_scripts[i].text_len = 0;
+                    custom_scripts[i].read_len = 0;
+
+                    if (custom_script_timer_fds[i] >= 0) _ = posix.system.close(custom_script_timer_fds[i]);
+                    custom_script_timer_fds[i] = -1;
+                    if (i < custom_script_count) {
+                        custom_script_timer_fds[i] = createIntervalTimer(custom_script_intervals[i]) catch -1;
+                        if (custom_script_timer_fds[i] >= 0) startCustomScriptFetch(&custom_scripts[i], customScriptCommand(i));
+                    }
+                    poll_fds[21 + i * 2].fd = custom_script_timer_fds[i];
+                }
+
+                drawAllBars(bars[0..bar_count]);
+            } else {
+                std.debug.print("config: reload failed, keeping previous config\n", .{});
+            }
+        }
+        if (poll_fds[15].revents & posix.POLL.IN != 0) {
+            var expirations: u64 = undefined;
+            _ = posix.read(sysstats_timer_fd, std.mem.asBytes(&expirations)) catch {};
+            sampleSysStats();
+            drawAllBars(bars[0..bar_count]);
+        }
+        if (poll_fds[16].revents & posix.POLL.IN != 0) {
+            var expirations: u64 = undefined;
+            _ = posix.read(battery_timer_fd, std.mem.asBytes(&expirations)) catch {};
+            sampleBattery();
+            drawAllBars(bars[0..bar_count]);
+        }
+        if (poll_fds[17].revents & posix.POLL.IN != 0) {
+            var expirations: u64 = undefined;
+            _ = posix.read(disk_timer_fd, std.mem.asBytes(&expirations)) catch {};
+            sampleDisk();
+            drawAllBars(bars[0..bar_count]);
+        }
+        if (poll_fds[18].revents & posix.POLL.IN != 0) {
+            var expirations: u64 = undefined;
+            _ = posix.read(netspeed_timer_fd, std.mem.asBytes(&expirations)) catch {};
+            sampleNetSpeed();
+            drawAllBars(bars[0..bar_count]);
+        }
+        if (poll_fds[19].revents & posix.POLL.IN != 0) {
+            var expirations: u64 = undefined;
+            _ = posix.read(netssid_timer_fd, std.mem.asBytes(&expirations)) catch {};
+            startNetSsidFetch(&net_ssid);
+        }
+        if (poll_fds[20].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+            if (net_ssid.onReadable()) {
+                _ = posix.system.close(net_ssid.pending_fd);
+                net_ssid.pending_fd = -1;
+                drawAllBars(bars[0..bar_count]);
+            }
+        }
+        for (0..MAX_CUSTOM_SCRIPTS) |i| {
+            const timer_slot = 21 + i * 2;
+            const pending_slot = 22 + i * 2;
+            if (poll_fds[timer_slot].revents & posix.POLL.IN != 0) {
+                var expirations: u64 = undefined;
+                _ = posix.read(custom_script_timer_fds[i], std.mem.asBytes(&expirations)) catch {};
+                if (i < custom_script_count) startCustomScriptFetch(&custom_scripts[i], customScriptCommand(i));
+            }
+            if (poll_fds[pending_slot].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+                if (custom_scripts[i].onReadable()) {
+                    _ = posix.system.close(custom_scripts[i].pending_fd);
+                    custom_scripts[i].pending_fd = -1;
+                    drawAllBars(bars[0..bar_count]);
+                }
             }
         }
     }
@@ -1587,6 +2396,512 @@ const PolledCommand = struct {
         return false;
     }
 };
+
+// --- new modules: cpu/ram/battery/disk/network/custom-script --------------
+//
+// Unlike weather/pacman/volume/mpris (state lives on Bar, passed as explicit
+// params down to drawRightGroup), these six follow current_config's own
+// precedent instead: package-level vars, read directly by drawRightGroup's
+// switch cases. Threading six more parameters through drawAndCommit's and
+// drawRightGroup's signatures would just be boilerplate — these modules'
+// "current value" is exactly the same kind of global, rarely-changing,
+// read-only-during-a-frame state current_config already is.
+
+const SYSSTATS_REFRESH_SECONDS: i64 = 2;
+const BATTERY_REFRESH_SECONDS: i64 = 15;
+const DISK_REFRESH_SECONDS: i64 = 30;
+const NET_SPEED_REFRESH_SECONDS: i64 = 5;
+const NET_SSID_REFRESH_SECONDS: i64 = 10;
+const MAX_CUSTOM_SCRIPTS = 4;
+const CUSTOM_SCRIPT_DEFAULT_INTERVAL_SECONDS: i64 = 10;
+
+/// Looks up the first ModuleEntry of `kind` in current_config.modules.right,
+/// if any — lets the new direct-read modules (disk/network/cpu/ram) pick up
+/// user-configured settings (path/mode/interval_secs) without those needing
+/// to be threaded through the timer-setup call chain in main().
+fn findRightEntry(kind: ModuleKind) ?ModuleEntry {
+    for (current_config.modules.right) |e| {
+        if (e.kind == kind) return e;
+    }
+    return null;
+}
+
+/// Reads up to buf.len bytes of a small /proc or /sys pseudo-file directly
+/// into a caller-supplied fixed buffer — no allocation, for the tiny
+/// single-read files these modules need (readFileAlloc's arena round-trip
+/// would be overkill for a one-line file read every couple seconds).
+fn readSmallFile(path: [:0]const u8, buf: []u8) ?[]const u8 {
+    const raw_fd = posix.system.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(posix.mode_t, 0));
+    if (raw_fd < 0) return null;
+    const fd: posix.fd_t = @intCast(raw_fd);
+    defer _ = posix.system.close(fd);
+    const n = posix.read(fd, buf) catch return null;
+    return buf[0..n];
+}
+
+// --- CPU + RAM (one shared timer; both are direct /proc reads) ---
+
+var sys_stats: SysStats = .{};
+
+const SysStats = struct {
+    have_prev: bool = false,
+    prev_total: u64 = 0,
+    prev_idle: u64 = 0,
+    cpu_pct: u32 = 0,
+    ram_pct: u32 = 0,
+};
+
+fn sampleSysStats() void {
+    sampleCpu();
+    sampleRam();
+    sampleCpuTemp();
+}
+
+/// Utilization since the LAST sample (not since boot) — needs one persisted
+/// previous reading, so the first call after startup always reports 0%
+/// (have_prev is still false) until the second tick has something to diff
+/// against. Parses /proc/stat's "cpu  <user> <nice> <system> <idle>
+/// <iowait> <irq> <softirq> [steal guest guest_nice]" line — fields beyond
+/// idle/iowait all count toward "total" the same as the standard
+/// 100*(1-idle/total) utilization formula.
+fn sampleCpu() void {
+    var buf: [512]u8 = undefined;
+    const text = readSmallFile("/proc/stat", &buf) orelse return;
+    const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    const line = text[0..line_end];
+    if (!std.mem.startsWith(u8, line, "cpu ")) return;
+
+    var fields: [10]u64 = [_]u64{0} ** 10;
+    var count: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, line[4..], ' ');
+    while (it.next()) |tok| {
+        if (count >= fields.len) break;
+        fields[count] = std.fmt.parseInt(u64, tok, 10) catch 0;
+        count += 1;
+    }
+    if (count < 4) return;
+
+    const idle = fields[3] + (if (count > 4) fields[4] else 0);
+    var total: u64 = 0;
+    for (fields[0..count]) |v| total += v;
+
+    if (sys_stats.have_prev) {
+        const total_delta = total -% sys_stats.prev_total;
+        const idle_delta = idle -% sys_stats.prev_idle;
+        if (total_delta > 0) {
+            const used_delta = if (idle_delta > total_delta) 0 else total_delta - idle_delta;
+            sys_stats.cpu_pct = @intCast(@min(100, used_delta * 100 / total_delta));
+        }
+    }
+    sys_stats.prev_total = total;
+    sys_stats.prev_idle = idle;
+    sys_stats.have_prev = true;
+}
+
+fn sampleRam() void {
+    var buf: [4096]u8 = undefined;
+    const text = readSmallFile("/proc/meminfo", &buf) orelse return;
+    const total = parseMeminfoField(text, "MemTotal:") orelse return;
+    const avail = parseMeminfoField(text, "MemAvailable:") orelse return;
+    if (total == 0) return;
+    const used = if (avail > total) 0 else total - avail;
+    sys_stats.ram_pct = @intCast(@min(100, used * 100 / total));
+}
+
+/// Scans `text` for a "<key>   <number> kB" line (/proc/meminfo's format)
+/// and returns the number — hand-rolled in the same substring-scan style as
+/// extractFirstId/parseVolumePercent above.
+fn parseMeminfoField(text: []const u8, key: []const u8) ?u64 {
+    const pos = std.mem.indexOf(u8, text, key) orelse return null;
+    var i = pos + key.len;
+    while (i < text.len and text[i] == ' ') : (i += 1) {}
+    const start = i;
+    while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {}
+    if (i == start) return null;
+    return std.fmt.parseInt(u64, text[start..i], 10) catch null;
+}
+
+// --- Battery ---
+
+var battery_state: BatteryState = .{};
+
+const BatteryState = struct {
+    found: bool = false,
+    scanned: bool = false,
+    path_buf: [96]u8 = undefined,
+    path_len: usize = 0,
+    capacity: u32 = 0,
+    charging: bool = false,
+
+    fn path(self: *const BatteryState) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
+};
+
+// Directory scanning has no existing precedent in this file (config/pidfile
+// I/O only ever opens a known path directly) — hand-bound the same way
+// libc_sock/libc_time/libc_proc above bind whatever libc call this codebase
+// needs that isn't exposed by std.c/std.posix directly. Dirent matches
+// glibc's 64-bit struct dirent64 layout on Linux x86_64.
+const libc_dir = struct {
+    const DIR = opaque {};
+    extern "c" fn opendir(name: [*:0]const u8) ?*DIR;
+    extern "c" fn readdir(dir: *DIR) ?*LibcDirent;
+    extern "c" fn closedir(dir: *DIR) c_int;
+};
+
+const LibcDirent = extern struct {
+    d_ino: u64,
+    d_off: i64,
+    d_reclen: u16,
+    d_type: u8,
+    d_name: [256]u8,
+};
+
+/// Scans /sys/class/power_supply once for a BAT* entry — its name isn't
+/// always "BAT0" (BAT1, BATC, etc. all appear on real hardware) — and caches
+/// the path. If none is found (a desktop machine), battery_state.found stays
+/// false forever and the battery module quietly draws nothing when enabled,
+/// same "quietly absent" behavior weather/pacman already have on failure,
+/// rather than rescanning every tick.
+fn findBattery() void {
+    battery_state.scanned = true;
+    const dir = libc_dir.opendir("/sys/class/power_supply") orelse return;
+    defer _ = libc_dir.closedir(dir);
+    while (libc_dir.readdir(dir)) |entry| {
+        const name = std.mem.sliceTo(&entry.d_name, 0);
+        if (!std.mem.startsWith(u8, name, "BAT")) continue;
+        const p = std.fmt.bufPrint(&battery_state.path_buf, "/sys/class/power_supply/{s}", .{name}) catch return;
+        battery_state.path_len = p.len;
+        battery_state.found = true;
+        return;
+    }
+}
+
+fn sampleBattery() void {
+    if (!battery_state.scanned) findBattery();
+    if (!battery_state.found) return;
+
+    var cap_path_buf: [128]u8 = undefined;
+    const cap_path = std.fmt.bufPrintZ(&cap_path_buf, "{s}/capacity", .{battery_state.path()}) catch return;
+    var cap_text_buf: [16]u8 = undefined;
+    if (readSmallFile(cap_path, &cap_text_buf)) |text| {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        battery_state.capacity = std.fmt.parseInt(u32, trimmed, 10) catch battery_state.capacity;
+    }
+
+    var status_path_buf: [128]u8 = undefined;
+    const status_path = std.fmt.bufPrintZ(&status_path_buf, "{s}/status", .{battery_state.path()}) catch return;
+    var status_text_buf: [32]u8 = undefined;
+    if (readSmallFile(status_path, &status_text_buf)) |text| {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        battery_state.charging = std.mem.eql(u8, trimmed, "Charging") or std.mem.eql(u8, trimmed, "Full");
+    }
+}
+
+// --- CPU temperature (hwmon) ---
+//
+// Deliberately NOT /sys/class/thermal/thermal_zone* — confirmed via direct
+// testing that this system has zero thermal zones registered there at all,
+// despite having a perfectly good sensor. hwmon is what `sensors` and every
+// real system monitor actually reads, so that's what this uses too.
+
+var cpu_temp_state: CpuTempState = .{};
+
+const CpuTempState = struct {
+    found: bool = false,
+    scanned: bool = false,
+    // Full path straight to the chosen tempN_input file (unlike
+    // battery_state.path(), which is a directory other paths get appended
+    // to) — this is already the file to read, nothing more to build.
+    path_buf: [96]u8 = undefined,
+    path_len: usize = 0,
+    millidegrees_c: i32 = 0,
+
+    fn path(self: *const CpuTempState) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
+};
+
+/// Scans /sys/class/hwmon once for a device whose driver `name` is a known
+/// CPU-temp sensor ("k10temp" AMD, "coretemp" Intel — deliberately narrow;
+/// this machine also has "nvme" and "amdgpu" hwmon devices that must NOT
+/// match). Within that device, prefers whichever tempN_input has a label of
+/// "Tctl", "Tdie", or "Package id 0" — the conventional "the" CPU
+/// temperature reading (confirmed on this machine: hwmon3 is k10temp,
+/// temp1_input=41375 with temp1_label="Tctl", i.e. 41.375°C) — falling back
+/// to the first temp*_input found with no label check if none of those
+/// labels turn up. If no matching hwmon device exists at all (older driver,
+/// unsupported CPU), cpu_temp_state.found stays false forever and the
+/// module quietly draws nothing when enabled, same "quietly absent"
+/// behavior battery/network-ssid already have on missing hardware, rather
+/// than rescanning every tick.
+fn findCpuTempSensor() void {
+    cpu_temp_state.scanned = true;
+    const dir = libc_dir.opendir("/sys/class/hwmon") orelse return;
+    defer _ = libc_dir.closedir(dir);
+    while (libc_dir.readdir(dir)) |entry| {
+        const name = std.mem.sliceTo(&entry.d_name, 0);
+        if (!std.mem.startsWith(u8, name, "hwmon")) continue;
+
+        var name_path_buf: [96]u8 = undefined;
+        const name_path = std.fmt.bufPrintZ(&name_path_buf, "/sys/class/hwmon/{s}/name", .{name}) catch continue;
+        var driver_buf: [32]u8 = undefined;
+        const driver_raw = readSmallFile(name_path, &driver_buf) orelse continue;
+        const driver = std.mem.trim(u8, driver_raw, " \t\r\n");
+        if (!std.mem.eql(u8, driver, "k10temp") and !std.mem.eql(u8, driver, "coretemp")) continue;
+
+        var fallback_buf: [96]u8 = undefined;
+        var fallback_len: usize = 0;
+        var n: usize = 1;
+        while (n <= 8) : (n += 1) {
+            var input_path_buf: [96]u8 = undefined;
+            const input_path = std.fmt.bufPrintZ(&input_path_buf, "/sys/class/hwmon/{s}/temp{d}_input", .{ name, n }) catch break;
+            var label_path_buf: [96]u8 = undefined;
+            const label_path = std.fmt.bufPrintZ(&label_path_buf, "/sys/class/hwmon/{s}/temp{d}_label", .{ name, n }) catch break;
+            var label_buf: [32]u8 = undefined;
+            const label_raw = readSmallFile(label_path, &label_buf);
+
+            if (fallback_len == 0) {
+                // First temp*_input seen at all for this device, regardless
+                // of label (or lack of one) — the ultimate fallback if no
+                // preferred label ever turns up below.
+                fallback_len = @min(input_path.len, fallback_buf.len);
+                @memcpy(fallback_buf[0..fallback_len], input_path[0..fallback_len]);
+            }
+            if (label_raw) |lr| {
+                const label = std.mem.trim(u8, lr, " \t\r\n");
+                if (std.mem.eql(u8, label, "Tctl") or std.mem.eql(u8, label, "Tdie") or std.mem.eql(u8, label, "Package id 0")) {
+                    cpu_temp_state.path_len = @min(input_path.len, cpu_temp_state.path_buf.len);
+                    @memcpy(cpu_temp_state.path_buf[0..cpu_temp_state.path_len], input_path[0..cpu_temp_state.path_len]);
+                    cpu_temp_state.found = true;
+                    return;
+                }
+            }
+        }
+        if (fallback_len > 0) {
+            cpu_temp_state.path_len = fallback_len;
+            @memcpy(cpu_temp_state.path_buf[0..fallback_len], fallback_buf[0..fallback_len]);
+            cpu_temp_state.found = true;
+            return;
+        }
+    }
+}
+
+fn sampleCpuTemp() void {
+    if (!cpu_temp_state.scanned) findCpuTempSensor();
+    if (!cpu_temp_state.found) return;
+    var path_buf: [96:0]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{cpu_temp_state.path()}) catch return;
+    var text_buf: [16]u8 = undefined;
+    if (readSmallFile(path_z, &text_buf)) |text| {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        cpu_temp_state.millidegrees_c = std.fmt.parseInt(i32, trimmed, 10) catch cpu_temp_state.millidegrees_c;
+    }
+}
+
+// --- Disk usage ---
+
+var disk_pct: u32 = 0;
+
+// Not exposed by std.c/std.posix in this Zig version — hand-bound the same
+// way the rest of this section binds libc calls that aren't. Statvfs
+// mirrors glibc's real struct statvfs layout on Linux x86_64 (including the
+// trailing __f_spare reserved words) so statvfs() doesn't write past the
+// end of a too-small struct.
+const libc_fs = struct {
+    extern "c" fn statvfs(path: [*:0]const u8, buf: *Statvfs) c_int;
+};
+
+const Statvfs = extern struct {
+    f_bsize: u64,
+    f_frsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_favail: u64,
+    f_fsid: u64,
+    f_flag: u64,
+    f_namemax: u64,
+    f_spare: [6]i32,
+};
+
+/// Samples disk usage for the configured `.disk` module's `path` (default
+/// "/" if unset, or if no `.disk` entry is configured at all).
+fn sampleDisk() void {
+    const path = if (findRightEntry(.disk)) |e| (e.path orelse "/") else "/";
+    var path_buf: [256]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return;
+    var stat: Statvfs = undefined;
+    if (libc_fs.statvfs(path_z.ptr, &stat) != 0) return;
+    if (stat.f_blocks == 0) return;
+    const used = stat.f_blocks - stat.f_bfree;
+    disk_pct = @intCast(@min(100, used * 100 / stat.f_blocks));
+}
+
+// --- Network (two modes: direct-read "speed", subprocess "ssid") ---
+//
+// Both mechanisms always run regardless of which mode is currently
+// configured — cheaper than teaching a config reload to tear down/rebuild
+// timerfds when `mode` changes, and both are individually cheap (one /proc
+// read, one occasional nmcli call). drawRightGroup just picks which
+// precomputed value to show based on entry.mode, read fresh every frame.
+
+var net_speed_state: NetSpeedState = .{};
+var net_ssid: PolledCommand = .{};
+
+const NetSpeedState = struct {
+    have_prev: bool = false,
+    prev_rx: u64 = 0,
+    prev_tx: u64 = 0,
+    prev_time: i64 = 0,
+    text_buf: [24]u8 = undefined,
+    text_len: usize = 0,
+
+    fn text(self: *const NetSpeedState) []const u8 {
+        return self.text_buf[0..self.text_len];
+    }
+};
+
+/// Sums rx+tx bytes across every /proc/net/dev interface except loopback,
+/// and turns the delta since the last sample into a bytes/sec rate. Skips
+/// the 8 fields between an interface's rx-bytes and tx-bytes columns
+/// (packets/errs/drop/fifo/frame/compressed/multicast) per /proc/net/dev's
+/// documented column layout.
+fn sampleNetSpeed() void {
+    var buf: [4096]u8 = undefined;
+    const text = readSmallFile("/proc/net/dev", &buf) orelse return;
+
+    var rx_total: u64 = 0;
+    var tx_total: u64 = 0;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const iface = std.mem.trim(u8, line[0..colon], " \t");
+        if (iface.len == 0 or std.mem.eql(u8, iface, "lo")) continue;
+
+        var fields = std.mem.tokenizeAny(u8, line[colon + 1 ..], " \t");
+        const rx_bytes = std.fmt.parseInt(u64, fields.next() orelse continue, 10) catch continue;
+        // Receive side after rx_bytes: packets, errs, drop, fifo, frame,
+        // compressed, multicast (7 columns) — tx_bytes is the 8th token
+        // after rx_bytes (verified against this machine's real
+        // /proc/net/dev: field 9 overall == tx_bytes, field 8 == multicast).
+        var skipped: usize = 0;
+        var tx_bytes: u64 = 0;
+        var found_tx = false;
+        while (fields.next()) |tok| {
+            skipped += 1;
+            if (skipped == 8) {
+                tx_bytes = std.fmt.parseInt(u64, tok, 10) catch 0;
+                found_tx = true;
+                break;
+            }
+        }
+        if (!found_tx) continue;
+        rx_total += rx_bytes;
+        tx_total += tx_bytes;
+    }
+
+    const now = libc_time.time(null);
+    if (net_speed_state.have_prev) {
+        const dt = now - net_speed_state.prev_time;
+        if (dt > 0) {
+            const rx_delta = rx_total -% net_speed_state.prev_rx;
+            const tx_delta = tx_total -% net_speed_state.prev_tx;
+            const bytes_per_sec = (rx_delta + tx_delta) / @as(u64, @intCast(dt));
+            const label = formatByteRate(bytes_per_sec, &net_speed_state.text_buf);
+            net_speed_state.text_len = label.len;
+        }
+    }
+    net_speed_state.prev_rx = rx_total;
+    net_speed_state.prev_tx = tx_total;
+    net_speed_state.prev_time = now;
+    net_speed_state.have_prev = true;
+}
+
+/// Formats a bytes/sec rate as "N KB/s" below 1MB/s, "N.N MB/s" above.
+fn formatByteRate(bytes_per_sec: u64, buf: []u8) []const u8 {
+    if (bytes_per_sec >= 1024 * 1024) {
+        const mb = @as(f64, @floatFromInt(bytes_per_sec)) / (1024.0 * 1024.0);
+        return std.fmt.bufPrint(buf, "{d:.1} MB/s", .{mb}) catch "";
+    }
+    const kb = bytes_per_sec / 1024;
+    return std.fmt.bufPrint(buf, "{d} KB/s", .{kb}) catch "";
+}
+
+fn startNetSsidFetch(cmd: *PolledCommand) void {
+    var argv = [_:null]?[*:0]const u8{ "env", "nmcli", "-t", "-f", "active,ssid", "dev", "wifi", null };
+    cmd.startFetch("/usr/bin/env", &argv);
+}
+
+/// Parses `nmcli -t -f active,ssid dev wifi`'s output (one "yes:SSID" or
+/// "no:SSID" line per visible network) for the active connection's SSID. If
+/// nmcli isn't installed, execve inside startFetch's forked child fails
+/// (exits 127) and this pipeline just never produces any text — same silent
+/// degradation weather/pacman already have when their command is missing;
+/// install.sh doesn't guarantee NetworkManager is what's installed.
+fn parseSsid(raw: []const u8, buf: []u8) []const u8 {
+    var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "yes:")) continue;
+        const ssid = line[4..];
+        const len = @min(ssid.len, buf.len);
+        @memcpy(buf[0..len], ssid[0..len]);
+        return buf[0..len];
+    }
+    return "";
+}
+
+// --- Custom scripts (up to MAX_CUSTOM_SCRIPTS, each its own PolledCommand) ---
+//
+// Which commands run and at what interval is resolved from current_config
+// via initCustomScripts, copied into stable buffers here, decoupled from
+// config_arena. Called once at startup and again on every successful SIGUSR1
+// reload (see that branch in main()'s event loop, which also recreates each
+// slot's timerfd and kicks off a fresh fetch) — so adding, removing, or
+// editing a custom script's command/interval takes effect live, same as
+// every other module. bar_height is the one appearance field that still
+// needs a bar restart (see main()'s comment on that), not this.
+
+var custom_scripts: [MAX_CUSTOM_SCRIPTS]PolledCommand = [_]PolledCommand{.{}} ** MAX_CUSTOM_SCRIPTS;
+var custom_script_commands: [MAX_CUSTOM_SCRIPTS][256]u8 = undefined;
+var custom_script_command_lens: [MAX_CUSTOM_SCRIPTS]usize = [_]usize{0} ** MAX_CUSTOM_SCRIPTS;
+var custom_script_intervals: [MAX_CUSTOM_SCRIPTS]i64 = [_]i64{CUSTOM_SCRIPT_DEFAULT_INTERVAL_SECONDS} ** MAX_CUSTOM_SCRIPTS;
+var custom_script_count: usize = 0;
+
+fn customScriptCommand(index: usize) []const u8 {
+    return custom_script_commands[index][0..custom_script_command_lens[index]];
+}
+
+fn initCustomScripts() void {
+    custom_script_count = 0;
+    for (current_config.modules.right) |entry| {
+        if (entry.kind != .custom_script) continue;
+        if (custom_script_count >= MAX_CUSTOM_SCRIPTS) {
+            std.debug.print("config: more than {d} custom_script entries, ignoring the rest\n", .{MAX_CUSTOM_SCRIPTS});
+            break;
+        }
+        const command = entry.command orelse continue;
+        const idx = custom_script_count;
+        const len = @min(command.len, custom_script_commands[idx].len);
+        @memcpy(custom_script_commands[idx][0..len], command[0..len]);
+        custom_script_command_lens[idx] = len;
+        custom_script_intervals[idx] = if (entry.interval_secs) |s| @intCast(s) else CUSTOM_SCRIPT_DEFAULT_INTERVAL_SECONDS;
+        custom_script_count += 1;
+    }
+}
+
+fn startCustomScriptFetch(cmd: *PolledCommand, command: []const u8) void {
+    var buf: [256]u8 = undefined;
+    if (command.len >= buf.len) return;
+    @memcpy(buf[0..command.len], command);
+    buf[command.len] = 0;
+    const command_z: [:0]const u8 = buf[0..command.len :0];
+    var argv = [_:null]?[*:0]const u8{ "sh", "-c", command_z.ptr, null };
+    cmd.startFetch("/bin/sh", &argv);
+}
 
 const WEATHER_URL = "https://wttr.in/?format=1";
 const WEATHER_REFRESH_SECONDS: i64 = 1200; // matches "interval": 1200 in ~/.config/waybar/config
@@ -1746,9 +3061,11 @@ fn formatMprisText(raw: []const u8, buf: []u8) []const u8 {
     return rest[0..@min(rest.len, buf.len)];
 }
 
-/// Reads the current local wall-clock time as "DD - HH:MM", matching
-/// waybar's "clock#1" module format (`{:%d - %H:%M}`) from
-/// ~/.config/waybar/config.
+/// Reads the current local wall-clock time, formatted per
+/// current_config.appearance.clock_format (one of the CLOCK_FORMAT_* keys).
+/// Default ("date_24h") matches waybar's "clock#1" module format
+/// (`{:%d - %H:%M}`) from ~/.config/waybar/config — the only format this
+/// bar ever had before clock_format existed.
 fn currentTimeText(buf: []u8) ![]u8 {
     const now = libc_time.time(null);
     var tm: libc_time.Tm = undefined;
@@ -1756,11 +3073,30 @@ fn currentTimeText(buf: []u8) ![]u8 {
     // Cast to unsigned: {d:0>2} on a zero-padded *signed* int prints an
     // explicit sign (to disambiguate the padding), which the old blocky
     // font silently ate as an unmapped '+' — real font rendering exposed it.
-    return std.fmt.bufPrint(buf, "{d:0>2} - {d:0>2}:{d:0>2}", .{
-        @as(u32, @intCast(tm.mday)),
-        @as(u32, @intCast(tm.hour)),
-        @as(u32, @intCast(tm.min)),
-    });
+    const mday: u32 = @intCast(tm.mday);
+    const hour24: u32 = @intCast(tm.hour);
+    const min: u32 = @intCast(tm.min);
+    const sec: u32 = @intCast(tm.sec);
+
+    const format = current_config.appearance.clock_format;
+    if (std.mem.eql(u8, format, CLOCK_FORMAT_TIME_24H)) {
+        return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ hour24, min });
+    } else if (std.mem.eql(u8, format, CLOCK_FORMAT_TIME_24H_SECONDS)) {
+        return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}", .{ hour24, min, sec });
+    } else if (std.mem.eql(u8, format, CLOCK_FORMAT_TIME_12H) or std.mem.eql(u8, format, CLOCK_FORMAT_DATE_12H)) {
+        // hour24==0 (midnight) displays as 12 AM; hour24==12 (noon) displays
+        // as 12 PM; everything else is the usual mod-12 wrap.
+        const hour12: u32 = if (hour24 == 0) 12 else if (hour24 > 12) hour24 - 12 else hour24;
+        const suffix: []const u8 = if (hour24 < 12) "AM" else "PM";
+        if (std.mem.eql(u8, format, CLOCK_FORMAT_DATE_12H)) {
+            return std.fmt.bufPrint(buf, "{d:0>2} - {d:0>2}:{d:0>2} {s}", .{ mday, hour12, min, suffix });
+        }
+        return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2} {s}", .{ hour12, min, suffix });
+    }
+    // CLOCK_FORMAT_DATE_24H, or anything unrecognized (shouldn't happen —
+    // validClockFormat already normalizes this at config-load time, but this
+    // function doesn't re-check, so stay defensive rather than assume).
+    return std.fmt.bufPrint(buf, "{d:0>2} - {d:0>2}:{d:0>2}", .{ mday, hour24, min });
 }
 
 const FONT_PIXEL_SIZE: u32 = 11;
@@ -1890,25 +3226,30 @@ fn drawWorkspaces(
     pointer_x: i32,
     click_regions: *ClickRegions,
 ) i64 {
+    // If disabled via config, don't draw or register click regions, but
+    // still hand back a sane starting x for the mpris chain that follows.
+    if (!isModuleEnabled(current_config.modules.left, .workspaces)) return WORKSPACE_LEFT_MARGIN;
+
     const y0: i64 = baselineY(buf_height, font);
+    const workspace_gap = current_config.appearance.workspace_gap;
 
     var x0: i64 = WORKSPACE_LEFT_MARGIN;
     var id_buf: [8]u8 = undefined;
     for (workspaces) |ws| {
-        const color = if (ws.active) WORKSPACE_ACTIVE_COLOR else WORKSPACE_INACTIVE_COLOR;
+        const color = if (ws.active) current_config.appearance.workspace_active_color else current_config.appearance.workspace_inactive_color;
         const text = std.fmt.bufPrint(&id_buf, "{d}", .{ws.id}) catch continue;
         const region_start = x0;
         // Half the gap on each side, so there's no dead zone between numbers
         // — same bounds for the hover highlight as for the click region.
-        const hover_start = region_start - @divTrunc(WORKSPACE_GAP, 2);
-        const hover_end = region_start + textPixelWidth(font, text) + @divTrunc(WORKSPACE_GAP, 2);
+        const hover_start = region_start - @divTrunc(workspace_gap, 2);
+        const hover_end = region_start + textPixelWidth(font, text) + @divTrunc(workspace_gap, 2);
         _ = drawHoverHighlight(pixels, buf_width, buf_height, hover_start, hover_end, pointer_x);
         var i: usize = 0;
         while (nextUtf8Codepoint(text, &i)) |cp| {
             x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, color, 0, buf_width);
         }
         click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .switch_workspace = ws.id });
-        x0 += WORKSPACE_GAP;
+        x0 += workspace_gap;
     }
     return x0;
 }
@@ -1947,7 +3288,7 @@ fn drawMprisControls(
         // lookup drawGlyphAt makes right after, so no extra rasterizing.
         const advance = if (font.glyph(btn.icon)) |g| g.advance_x else |_| 0;
         _ = drawHoverHighlight(pixels, buf_width, buf_height, region_start - 2, region_start + advance + 2, pointer_x);
-        x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, btn.icon, TEXT_COLOR, 0, buf_width);
+        x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, btn.icon, current_config.appearance.text_color, 0, buf_width);
         click_regions.add(@intCast(region_start - 2), @intCast(x0 + 2), .{ .mpris_control = btn.action });
         x0 += MPRIS_CONTROL_GAP;
     }
@@ -1986,7 +3327,7 @@ fn drawMpris(pixels: [*]u32, buf_width: u32, buf_height: u32, font: *font_mod.Fo
         var x0 = copy_start;
         var i: usize = 0;
         while (nextUtf8Codepoint(mpris_text, &i)) |cp| {
-            x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, TEXT_COLOR, window_start, x_limit);
+            x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, window_start, x_limit);
         }
     }
 }
@@ -1996,10 +3337,56 @@ fn drawMpris(pixels: [*]u32, buf_width: u32, buf_height: u32, font: *font_mod.Fo
 /// each item individually). Registers a click region per launcher button;
 /// the clock itself isn't clickable here (real config's clock#1 opens
 /// gnome-calendar on click — skipped for now).
+const MAX_CENTER_SEGMENTS = 16;
+
+/// One drawable piece of the center group — either a pinned launcher button
+/// (clickable, `command` set) or the clock text (not clickable, `command`
+/// null). `gap_after` is the horizontal space to leave after this segment
+/// before the next one.
+const CenterSegment = struct {
+    label: []const u8,
+    command: ?[:0]const u8 = null,
+    gap_after: i64 = 0,
+};
+
+const CenterSegments = struct {
+    items: [MAX_CENTER_SEGMENTS]CenterSegment = undefined,
+    len: usize = 0,
+};
+
+/// Expands `current_config.modules.center` (in config order) into a flat
+/// list of drawable segments — the single source of truth both the width-
+/// measuring pass (`centerGroupWidth`) and the actual draw pass
+/// (`drawCenterGroup`) consume, so the two can never drift out of the
+/// pixel-identical sync `centerGroupStartX`'s doc comment warns about.
+fn composeCenterSegments(time_text: []const u8) CenterSegments {
+    var result: CenterSegments = .{};
+    for (current_config.modules.center) |entry| {
+        if (!entry.enabled) continue;
+        switch (entry.kind) {
+            .clock => {
+                if (result.len < result.items.len) {
+                    result.items[result.len] = .{ .label = time_text, .command = null, .gap_after = 0 };
+                    result.len += 1;
+                }
+            },
+            .launchers => {
+                for (current_config.launchers) |btn| {
+                    if (result.len >= result.items.len) break;
+                    result.items[result.len] = .{ .label = btn.label, .command = btn.command, .gap_after = LAUNCHER_GAP };
+                    result.len += 1;
+                }
+            },
+            else => {}, // not a valid center-group module kind; ignore defensively
+        }
+    }
+    return result;
+}
+
 fn centerGroupWidth(font: *font_mod.Font, time_text: []const u8) i64 {
+    const segs = composeCenterSegments(time_text);
     var total: i64 = 0;
-    for (CENTER_LAUNCHERS) |btn| total += textPixelWidth(font, btn.label) + LAUNCHER_GAP;
-    total += textPixelWidth(font, time_text);
+    for (segs.items[0..segs.len]) |seg| total += textPixelWidth(font, seg.label) + seg.gap_after;
     return total;
 }
 
@@ -2021,23 +3408,26 @@ fn drawCenterGroup(
 ) void {
     const y0: i64 = baselineY(buf_height, font);
     var x0: i64 = centerGroupStartX(buf_width, font, time_text);
+    const segs = composeCenterSegments(time_text);
 
-    for (CENTER_LAUNCHERS) |btn| {
-        const region_start = x0;
-        const hover_start = region_start - @divTrunc(LAUNCHER_GAP, 2);
-        const hover_end = region_start + textPixelWidth(font, btn.label) + @divTrunc(LAUNCHER_GAP, 2);
-        _ = drawHoverHighlight(pixels, buf_width, buf_height, hover_start, hover_end, pointer_x);
-        var i: usize = 0;
-        while (nextUtf8Codepoint(btn.label, &i)) |cp| {
-            x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, TEXT_COLOR, 0, buf_width);
+    for (segs.items[0..segs.len]) |seg| {
+        if (seg.command) |cmd| {
+            const region_start = x0;
+            const hover_start = region_start - @divTrunc(LAUNCHER_GAP, 2);
+            const hover_end = region_start + textPixelWidth(font, seg.label) + @divTrunc(LAUNCHER_GAP, 2);
+            _ = drawHoverHighlight(pixels, buf_width, buf_height, hover_start, hover_end, pointer_x);
+            var i: usize = 0;
+            while (nextUtf8Codepoint(seg.label, &i)) |cp| {
+                x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
+            }
+            click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .spawn = cmd });
+        } else {
+            var i: usize = 0;
+            while (nextUtf8Codepoint(seg.label, &i)) |cp| {
+                x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
+            }
         }
-        click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .spawn = btn.command });
-        x0 += LAUNCHER_GAP;
-    }
-
-    var i: usize = 0;
-    while (nextUtf8Codepoint(time_text, &i)) |cp| {
-        x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, TEXT_COLOR, 0, buf_width);
+        x0 += seg.gap_after;
     }
 }
 
@@ -2075,7 +3465,8 @@ fn drawRightAligned(
     return region_start;
 }
 
-/// Fills a full-height rect between `x_start`/`x_end` with HOVER_COLOR when
+/// Fills a full-height rect between `x_start`/`x_end` with the configured
+/// hover color when
 /// `pointer_x` falls inside it — the same treatment the popup menu already
 /// gives its hovered row, applied to the bar's own buttons. Callers draw
 /// this *before* their glyphs so text/icons land on top. Returns whether it
@@ -2087,7 +3478,7 @@ fn drawHoverHighlight(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: 
     var y: u32 = 0;
     while (y < buf_height) : (y += 1) {
         var x = xs;
-        while (x < xe) : (x += 1) pixels[y * buf_width + x] = HOVER_COLOR;
+        while (x < xe) : (x += 1) pixels[y * buf_width + x] = current_config.appearance.hover_color;
     }
     return true;
 }
@@ -2142,14 +3533,20 @@ fn drawTrayIconEndingAt(pixels: [*]u32, buf_width: u32, buf_height: u32, x_end: 
     return x0;
 }
 
-/// Draws "modules-right" in its real array order, right-to-left from the
-/// bar's edge: custom/power, then the group/tray-expander drawer (a "▾"
-/// toggle; expanded reveals custom/pacman, custom/waypaper, a polled
-/// wireplumber volume reading, and any tray icons), then custom/weather.
-/// `drawer_anim` is 0 (fully collapsed) to 1 (fully expanded), animated
-/// over a few frames by the caller — drawn (and clickable) any time it's
-/// above 0, fading toward the bar's background color as it goes, so
-/// expanding/collapsing is a quick fade rather than an instant on/off.
+/// Draws `current_config.modules.right` in config order, right-to-left from
+/// the bar's edge — today's default order reproduces the original
+/// hardcoded sequence exactly: custom/power, then the group/tray-expander
+/// drawer (a "▾" toggle; expanded reveals custom/pacman, custom/waypaper, a
+/// polled wireplumber volume reading, and any tray icons), then
+/// custom/weather. An entry with `in_drawer == true` is only drawn while
+/// `drawer_anim > 0` (0 = fully collapsed, 1 = fully expanded, animated
+/// over a few frames by the caller), fading toward the bar's background
+/// color as it goes, so expanding/collapsing is a quick fade rather than an
+/// instant on/off. `first` tracks whether anything has been drawn yet in
+/// this pass, since only the very first drawn item skips the leading
+/// LAUNCHER_GAP that every subsequent one gets — this generalizes the
+/// original code's fixed "gap before every call except the first" pattern
+/// to an arbitrary enabled/disabled subset.
 fn drawRightGroup(
     pixels: [*]u32,
     buf_width: u32,
@@ -2165,53 +3562,157 @@ fn drawRightGroup(
 ) void {
     const y0: i64 = baselineY(buf_height, font);
     var x_end: i64 = @as(i64, @intCast(buf_width)) - RIGHT_MARGIN;
+    var first = true;
+    var custom_script_draw_index: usize = 0;
+    const text_color = current_config.appearance.text_color;
+    const drawer_color = lerpColor(current_config.appearance.bg_color, text_color, drawer_anim);
 
-    x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, POWER_BUTTON.label, TEXT_COLOR, .{ .spawn = POWER_BUTTON.command }, pointer_x, click_regions);
-    x_end -= LAUNCHER_GAP;
+    for (current_config.modules.right) |entry| {
+        if (!entry.enabled) continue;
+        if (entry.in_drawer and drawer_anim <= 0.0) continue;
+        // Unlike the original hardcoded modules (which each had a fixed
+        // in-drawer-or-not identity baked into which call site drew them),
+        // these six can be placed in or out of the drawer via config, so
+        // their color is resolved from entry.in_drawer instead of being
+        // hardcoded per-kind.
+        const color = if (entry.in_drawer) drawer_color else text_color;
 
-    x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, DRAWER_TOGGLE_LABEL, TEXT_COLOR, .toggle_drawer, pointer_x, click_regions);
-
-    if (drawer_anim > 0.0) {
-        const drawer_color = lerpColor(BG_COLOR, TEXT_COLOR, drawer_anim);
-
-        // Volume icon tiers match wireplumber's real "default" format-icons
-        // array (low/medium/high, U+F026/F027/F028).
-        const vol_pct = std.fmt.parseInt(u32, volume_text, 10) catch 0;
-        const vol_icon: []const u8 = if (vol_pct >= 67) "\u{f028}" else if (vol_pct >= 34) "\u{f027}" else "\u{f026}";
-        var vol_buf: [24]u8 = undefined;
-        const vol_label = std.fmt.bufPrint(&vol_buf, "{s} {s}", .{ vol_icon, volume_text }) catch vol_icon;
-        x_end -= LAUNCHER_GAP;
-        x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, vol_label, drawer_color, null, pointer_x, click_regions);
-
-        x_end -= LAUNCHER_GAP;
-        x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, WAYPAPER_BUTTON.label, drawer_color, .{ .spawn = WAYPAPER_BUTTON.command }, pointer_x, click_regions);
-
-        // custom/pacman's real format is "<big>ᗧ</big> {}" (Pac-Man glyph +
-        // count, no "UPD" text) — that exact character (U+15E7) isn't in
-        // this Nerd Font, so an Arch Linux logo glyph stands in instead
-        // (pacman being Arch's package manager, at least in the same spirit).
-        var pac_buf: [24]u8 = undefined;
-        const pac_label = std.fmt.bufPrint(&pac_buf, "\u{f303} {s}", .{pacman_text}) catch "\u{f303}";
-        x_end -= LAUNCHER_GAP;
-        x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, pac_label, drawer_color, null, pointer_x, click_regions);
-
-        // tray — icon-only items, no text label; skipped entirely if an
-        // item hasn't gotten its first successful icon fetch yet.
-        for (tray.items[0..tray.item_count], 0..) |item, i| {
-            if (!item.has_icon) continue;
-            x_end -= LAUNCHER_GAP;
-            const icon_left = drawTrayIconEndingAt(pixels, buf_width, buf_height, x_end, &item.pixels, drawer_anim, pointer_x);
-            click_regions.addWithRight(@intCast(icon_left - 2), @intCast(x_end + 2), .{ .activate_tray = i }, .{ .context_menu_tray = i });
-            x_end = icon_left;
+        switch (entry.kind) {
+            .power => {
+                if (!first) x_end -= LAUNCHER_GAP;
+                first = false;
+                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, POWER_BUTTON.label, text_color, .{ .spawn = POWER_BUTTON.command }, pointer_x, click_regions);
+            },
+            .drawer_toggle => {
+                if (!first) x_end -= LAUNCHER_GAP;
+                first = false;
+                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, DRAWER_TOGGLE_LABEL, text_color, .toggle_drawer, pointer_x, click_regions);
+            },
+            .volume => {
+                if (!first) x_end -= LAUNCHER_GAP;
+                first = false;
+                // Volume icon tiers match wireplumber's real "default"
+                // format-icons array (low/medium/high, U+F026/F027/F028).
+                const vol_pct = std.fmt.parseInt(u32, volume_text, 10) catch 0;
+                const vol_icon: []const u8 = if (vol_pct >= 67) "\u{f028}" else if (vol_pct >= 34) "\u{f027}" else "\u{f026}";
+                var vol_buf: [24]u8 = undefined;
+                const vol_label = std.fmt.bufPrint(&vol_buf, "{s} {s}", .{ vol_icon, volume_text }) catch vol_icon;
+                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, vol_label, drawer_color, null, pointer_x, click_regions);
+            },
+            .waypaper => {
+                if (!first) x_end -= LAUNCHER_GAP;
+                first = false;
+                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, WAYPAPER_BUTTON.label, drawer_color, .{ .spawn = WAYPAPER_BUTTON.command }, pointer_x, click_regions);
+            },
+            .pacman => {
+                if (!first) x_end -= LAUNCHER_GAP;
+                first = false;
+                // custom/pacman's real format is "<big>ᗧ</big> {}" (Pac-Man
+                // glyph + count, no "UPD" text) — that exact character
+                // (U+15E7) isn't in this Nerd Font, so an Arch Linux logo
+                // glyph stands in instead (pacman being Arch's package
+                // manager, at least in the same spirit).
+                var pac_buf: [24]u8 = undefined;
+                const pac_label = std.fmt.bufPrint(&pac_buf, "\u{f303} {s}", .{pacman_text}) catch "\u{f303}";
+                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, pac_label, drawer_color, null, pointer_x, click_regions);
+            },
+            .tray => {
+                // icon-only items, no text label; skipped entirely if an
+                // item hasn't gotten its first successful icon fetch yet.
+                for (tray.items[0..tray.item_count], 0..) |item, i| {
+                    if (!item.has_icon) continue;
+                    if (!first) x_end -= LAUNCHER_GAP;
+                    first = false;
+                    const icon_left = drawTrayIconEndingAt(pixels, buf_width, buf_height, x_end, &item.pixels, drawer_anim, pointer_x);
+                    click_regions.addWithRight(@intCast(icon_left - 2), @intCast(x_end + 2), .{ .activate_tray = i }, .{ .context_menu_tray = i });
+                    x_end = icon_left;
+                }
+            },
+            .weather => {
+                // No click region: the real config only wires up a
+                // right-click (format-alt-click), which this scaffold
+                // doesn't distinguish from left-click yet.
+                if (weather_text.len > 0) {
+                    if (!first) x_end -= LAUNCHER_GAP;
+                    first = false;
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, weather_text, text_color, null, pointer_x, click_regions);
+                }
+            },
+            .cpu => {
+                if (!first) x_end -= LAUNCHER_GAP;
+                first = false;
+                var cpu_buf: [24]u8 = undefined;
+                const cpu_label = std.fmt.bufPrint(&cpu_buf, "\u{f2db} {d}%", .{sys_stats.cpu_pct}) catch "\u{f2db}";
+                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, cpu_label, color, null, pointer_x, click_regions);
+            },
+            .ram => {
+                if (!first) x_end -= LAUNCHER_GAP;
+                first = false;
+                var ram_buf: [24]u8 = undefined;
+                const ram_label = std.fmt.bufPrint(&ram_buf, "\u{f538} {d}%", .{sys_stats.ram_pct}) catch "\u{f538}";
+                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, ram_label, color, null, pointer_x, click_regions);
+            },
+            .disk => {
+                if (!first) x_end -= LAUNCHER_GAP;
+                first = false;
+                var disk_buf: [24]u8 = undefined;
+                const disk_label = std.fmt.bufPrint(&disk_buf, "\u{f0a0} {d}%", .{disk_pct}) catch "\u{f0a0}";
+                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, disk_label, color, null, pointer_x, click_regions);
+            },
+            .battery => {
+                if (battery_state.found) {
+                    if (!first) x_end -= LAUNCHER_GAP;
+                    first = false;
+                    var bat_buf: [24]u8 = undefined;
+                    const bat_icon: []const u8 = if (battery_state.charging) "\u{f0e7}" else "\u{f240}";
+                    const bat_label = std.fmt.bufPrint(&bat_buf, "{s} {d}%", .{ bat_icon, battery_state.capacity }) catch bat_icon;
+                    x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, bat_label, color, null, pointer_x, click_regions);
+                }
+            },
+            .cpu_temp => {
+                if (cpu_temp_state.found) {
+                    if (!first) x_end -= LAUNCHER_GAP;
+                    first = false;
+                    var temp_buf: [24]u8 = undefined;
+                    const celsius = @divTrunc(cpu_temp_state.millidegrees_c, 1000);
+                    const temp_label = std.fmt.bufPrint(&temp_buf, "\u{f2c9} {d}\u{00b0}C", .{celsius}) catch "\u{f2c9}";
+                    x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, temp_label, color, null, pointer_x, click_regions);
+                }
+            },
+            .network => {
+                const mode = entry.mode orelse "speed";
+                var ssid_buf: [40]u8 = undefined;
+                const value: []const u8 = if (std.mem.eql(u8, mode, "ssid"))
+                    parseSsid(net_ssid.text(), &ssid_buf)
+                else
+                    net_speed_state.text();
+                if (value.len > 0) {
+                    if (!first) x_end -= LAUNCHER_GAP;
+                    first = false;
+                    var net_buf: [48]u8 = undefined;
+                    const net_label = std.fmt.bufPrint(&net_buf, "\u{f1eb} {s}", .{value}) catch "\u{f1eb}";
+                    x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, net_label, color, null, pointer_x, click_regions);
+                }
+            },
+            .custom_script => {
+                defer custom_script_draw_index += 1;
+                if (custom_script_draw_index < custom_script_count) {
+                    const text = custom_scripts[custom_script_draw_index].text();
+                    if (text.len > 0) {
+                        if (!first) x_end -= LAUNCHER_GAP;
+                        first = false;
+                        var script_buf: [96]u8 = undefined;
+                        const label = entry.label orelse "";
+                        const script_label = if (label.len > 0)
+                            std.fmt.bufPrint(&script_buf, "{s}: {s}", .{ label, text }) catch text
+                        else
+                            text;
+                        x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, script_label, color, null, pointer_x, click_regions);
+                    }
+                }
+            },
+            .workspaces, .mpris, .clock, .launchers => {}, // not valid in the right group; ignore defensively
         }
-    }
-
-    // custom/weather. No click region: the real config only wires up a
-    // right-click (format-alt-click), which this scaffold doesn't
-    // distinguish from left-click yet.
-    if (weather_text.len > 0) {
-        x_end -= LAUNCHER_GAP;
-        _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, weather_text, TEXT_COLOR, null, pointer_x, click_regions);
     }
 }
 
@@ -2225,8 +3726,13 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.shm = registry.bind(g.name, wl.Shm, 1) catch return;
             } else if (std.mem.eql(u8, iface, "zwlr_layer_shell_v1")) {
                 globals.layer_shell = registry.bind(g.name, zwlr.LayerShellV1, 4) catch return;
-            } else if (std.mem.eql(u8, iface, "wl_output") and globals.output == null) {
-                globals.output = registry.bind(g.name, wl.Output, 4) catch return;
+            } else if (std.mem.eql(u8, iface, "wl_output")) {
+                if (globals.output_count >= globals.outputs.len) return; // MAX_OUTPUTS reached; ignore the rest
+                const output = registry.bind(g.name, wl.Output, 4) catch return;
+                globals.outputs[globals.output_count] = .{ .output = output };
+                const info = &globals.outputs[globals.output_count];
+                globals.output_count += 1;
+                output.setListener(*OutputInfo, outputListener, info);
             } else if (std.mem.eql(u8, iface, "wl_seat")) {
                 const seat = registry.bind(g.name, wl.Seat, 7) catch return;
                 globals.seat = seat;
@@ -2258,12 +3764,38 @@ fn seatListener(_: *wl.Seat, event: wl.Seat.Event, globals: *Globals) void {
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 
-fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, bar: *Bar) void {
+/// There is exactly ONE wl_pointer object for the whole client (confirmed:
+/// wl.Seat.getPointer() is called once in main(), regardless of how many
+/// Bar surfaces exist) — its .enter/.leave events carry which surface the
+/// pointer just entered/left, but .motion/.button don't repeat that, so this
+/// listener has to remember which Bar (by index into a shared slice) is
+/// currently focused and route subsequent events to it. `current` is that
+/// remembered index; null means the pointer isn't over any of our surfaces.
+const BarRouter = struct {
+    bars: []Bar,
+    current: ?usize = null,
+};
+
+fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) void {
     switch (event) {
         .enter => |e| {
-            // A single wl_pointer only ever focuses one surface at a time —
-            // remember which one (bar vs. an open popup) so motion/button
-            // below route to the right place.
+            // Match the entered surface against every bar's own surface AND
+            // its (at most one, at a time) open popup surface — a single
+            // wl_pointer only ever focuses one surface at a time, same
+            // reasoning the single-bar version already relied on, just
+            // scanning across N candidate bars instead of assuming one.
+            const found: ?usize = blk: {
+                for (router.bars, 0..) |*b, i| {
+                    if (b.surface == e.surface) break :blk i;
+                    if (b.popup) |*pm| {
+                        if (pm.surface == e.surface) break :blk i;
+                    }
+                }
+                break :blk null;
+            };
+            router.current = found;
+            const bar = &router.bars[found orelse return]; // entered a surface we don't own — shouldn't happen
+
             bar.pointer_over_popup = if (bar.popup) |*pm| e.surface == pm.surface else false;
             if (bar.pointer_over_popup) {
                 bar.popup.?.pointer_x = e.surface_x.toInt();
@@ -2279,6 +3811,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, bar: *Bar) void {
             }
         },
         .leave => {
+            const bar = &router.bars[router.current orelse return];
             if (bar.pointer_over_popup) {
                 if (bar.popup) |*pm| {
                     pm.pointer_x = -1;
@@ -2291,8 +3824,14 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, bar: *Bar) void {
                     std.debug.print("draw failed: {}\n", .{err});
                 };
             }
+            // The pointer just left the only surface we knew it was over —
+            // Wayland always sends leave for the old surface before enter
+            // for a new one, so there's no "which bar is it now" to track
+            // until the next .enter arrives.
+            router.current = null;
         },
         .motion => |e| {
+            const bar = &router.bars[router.current orelse return];
             if (bar.pointer_over_popup) {
                 if (bar.popup) |*pm| {
                     pm.pointer_x = e.surface_x.toInt();
@@ -2317,6 +3856,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, bar: *Bar) void {
             }
         },
         .button => |e| {
+            const bar = &router.bars[router.current orelse return];
             bar.last_pointer_serial = e.serial;
             if (e.state != .pressed) return;
 
@@ -2394,7 +3934,7 @@ fn layerSurfaceListener(
         .configure => |cfg| {
             layer_surface.ackConfigure(cfg.serial);
             bar.width = if (cfg.width > 0) cfg.width else 1;
-            bar.height = if (cfg.height > 0) cfg.height else BAR_HEIGHT;
+            bar.height = if (cfg.height > 0) cfg.height else current_config.appearance.bar_height;
             bar.configured = true;
             drawAndCommit(bar) catch |err| {
                 std.debug.print("draw failed: {}\n", .{err});
@@ -2432,16 +3972,46 @@ fn drawAndCommit(bar: *Bar) !void {
 
     const pixels: [*]u32 = @ptrCast(@alignCast(data.ptr));
     const pixel_count = size / 4;
+    // Only the fill's alpha varies with bg_opacity_percent — text/icons/
+    // border keep their own configured (always-opaque) colors, so lowering
+    // this fades the background through to whatever's behind the bar
+    // (blurred, if the "simpbar" Hyprland layer rule is set up) rather than
+    // fading the whole bar's contents uniformly.
+    const bg_alpha: u32 = (@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100) << 24;
+    const bg_fill: u32 = bg_alpha | (current_config.appearance.bg_color & 0x00FFFFFF);
     var i: usize = 0;
-    while (i < pixel_count) : (i += 1) pixels[i] = BG_COLOR;
+    while (i < pixel_count) : (i += 1) pixels[i] = bg_fill;
 
-    // window#waybar's top border — the edge facing the desktop, since the
-    // bar itself is anchored to the bottom of the screen.
-    const border_rows = @min(BORDER_PX, bar.height);
+    // Four independent border edges (originally just window#waybar's
+    // top-only border-width: 2px 0px 0px 0px). Which edge "faces the
+    // desktop" flips with `position`, but these are plain per-side widths,
+    // not auto-selected based on anchor — the user can combine them
+    // however they like. Clamped so top+bottom can't exceed bar.height and
+    // left+right can't exceed bar.width (top/left take priority on an
+    // impossible combination, same "first configured wins" spirit as
+    // everything else that clamps rather than errors).
+    const bc = current_config.appearance.border_color;
+    const top_px = @min(current_config.appearance.border_top_px, bar.height);
+    const bottom_px = @min(current_config.appearance.border_bottom_px, bar.height - top_px);
+    const left_px = @min(current_config.appearance.border_left_px, bar.width);
+    const right_px = @min(current_config.appearance.border_right_px, bar.width - left_px);
+
     var row: u32 = 0;
-    while (row < border_rows) : (row += 1) {
+    while (row < top_px) : (row += 1) {
         var col: u32 = 0;
-        while (col < bar.width) : (col += 1) pixels[row * bar.width + col] = BORDER_COLOR;
+        while (col < bar.width) : (col += 1) pixels[row * bar.width + col] = bc;
+    }
+    row = bar.height - bottom_px;
+    while (row < bar.height) : (row += 1) {
+        var col: u32 = 0;
+        while (col < bar.width) : (col += 1) pixels[row * bar.width + col] = bc;
+    }
+    row = 0;
+    while (row < bar.height) : (row += 1) {
+        var col: u32 = 0;
+        while (col < left_px) : (col += 1) pixels[row * bar.width + col] = bc;
+        col = bar.width - right_px;
+        while (col < bar.width) : (col += 1) pixels[row * bar.width + col] = bc;
     }
 
     bar.click_regions.clear();
@@ -2454,39 +4024,46 @@ fn drawAndCommit(bar: *Bar) !void {
     drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.pointer_x, &bar.click_regions);
 
     const workspaces_end_x = drawWorkspaces(pixels, bar.width, bar.height, bar.font, bar.workspaces.list.items, bar.pointer_x, &bar.click_regions);
-    // bar.mpris.text() is "PLAYER|STATUS|ARTIST - TITLE" (MPRIS_SCRIPT) —
-    // split off the player so clicks on the controls below can target it
-    // specifically via spawnPlayerctlCommand; the "STATUS|ARTIST - TITLE"
-    // remainder is what formatMprisText already expects.
-    const mpris_raw = bar.mpris.text();
-    const status_and_track = blk: {
-        const sep = std.mem.indexOfScalar(u8, mpris_raw, '|') orelse {
-            bar.mpris_player_len = 0;
-            break :blk "";
+    // Config-gated as a whole block (not just the draw calls at the end):
+    // nothing after this depends on mpris's screen position the way the
+    // right-to-left chain depends on drawRightAligned's return value, so
+    // skipping the entire block when disabled is safe — no other module's
+    // layout needs mpris's state either way.
+    if (isModuleEnabled(current_config.modules.left, .mpris)) {
+        // bar.mpris.text() is "PLAYER|STATUS|ARTIST - TITLE" (MPRIS_SCRIPT) —
+        // split off the player so clicks on the controls below can target it
+        // specifically via spawnPlayerctlCommand; the "STATUS|ARTIST - TITLE"
+        // remainder is what formatMprisText already expects.
+        const mpris_raw = bar.mpris.text();
+        const status_and_track = blk: {
+            const sep = std.mem.indexOfScalar(u8, mpris_raw, '|') orelse {
+                bar.mpris_player_len = 0;
+                break :blk "";
+            };
+            const player = mpris_raw[0..sep];
+            bar.mpris_player_len = @min(player.len, bar.mpris_player_buf.len);
+            @memcpy(bar.mpris_player_buf[0..bar.mpris_player_len], player[0..bar.mpris_player_len]);
+            break :blk mpris_raw[sep + 1 ..];
         };
-        const player = mpris_raw[0..sep];
-        bar.mpris_player_len = @min(player.len, bar.mpris_player_buf.len);
-        @memcpy(bar.mpris_player_buf[0..bar.mpris_player_len], player[0..bar.mpris_player_len]);
-        break :blk mpris_raw[sep + 1 ..];
-    };
-    const playing = std.mem.startsWith(u8, status_and_track, "Playing|");
-    var mpris_buf: [64]u8 = undefined;
-    const mpris_text = formatMprisText(status_and_track, &mpris_buf);
-    // Restart the scroll from the beginning whenever the track (or
-    // play/pause status, since that's part of the same string) actually
-    // changes — but not on every redraw, which would happen constantly
-    // during the animation itself and never let it progress.
-    if (!std.mem.eql(u8, bar.mpris_prev_buf[0..bar.mpris_prev_len], mpris_text)) {
-        bar.mpris_scroll_step = 0;
-        @memcpy(bar.mpris_prev_buf[0..mpris_text.len], mpris_text);
-        bar.mpris_prev_len = mpris_text.len;
+        const playing = std.mem.startsWith(u8, status_and_track, "Playing|");
+        var mpris_buf: [64]u8 = undefined;
+        const mpris_text = formatMprisText(status_and_track, &mpris_buf);
+        // Restart the scroll from the beginning whenever the track (or
+        // play/pause status, since that's part of the same string) actually
+        // changes — but not on every redraw, which would happen constantly
+        // during the animation itself and never let it progress.
+        if (!std.mem.eql(u8, bar.mpris_prev_buf[0..bar.mpris_prev_len], mpris_text)) {
+            bar.mpris_scroll_step = 0;
+            @memcpy(bar.mpris_prev_buf[0..mpris_text.len], mpris_text);
+            bar.mpris_prev_len = mpris_text.len;
+        }
+        const center_start_x = centerGroupStartX(bar.width, bar.font, time_text);
+        const mpris_start_x = if (mpris_text.len > 0)
+            drawMprisControls(pixels, bar.width, bar.height, bar.font, workspaces_end_x, playing, bar.pointer_x, &bar.click_regions)
+        else
+            workspaces_end_x;
+        drawMpris(pixels, bar.width, bar.height, bar.font, mpris_start_x, center_start_x - LAUNCHER_GAP, mpris_text, bar.mpris_scroll_step);
     }
-    const center_start_x = centerGroupStartX(bar.width, bar.font, time_text);
-    const mpris_start_x = if (mpris_text.len > 0)
-        drawMprisControls(pixels, bar.width, bar.height, bar.font, workspaces_end_x, playing, bar.pointer_x, &bar.click_regions)
-    else
-        workspaces_end_x;
-    drawMpris(pixels, bar.width, bar.height, bar.font, mpris_start_x, center_start_x - LAUNCHER_GAP, mpris_text, bar.mpris_scroll_step);
     var volume_buf: [16]u8 = undefined;
     const volume_text = parseVolumePercent(bar.volume.text(), &volume_buf);
     var weather_buf: [32]u8 = undefined;
@@ -2504,6 +4081,37 @@ fn drawAndCommit(bar: *Bar) !void {
         bar.pointer_x,
         &bar.click_regions,
     );
+
+    // Corner rounding — the very last drawing step, so it clips everything
+    // (background, borders, every module) rather than just the background
+    // fill. Standard corner-circle technique: for each corner's radius×radius
+    // pixel box, zero out (fully transparent, not just recolored — the SHM
+    // buffer is argb8888 with no opaque-region hint set, so alpha=0 really
+    // does cut the pixel away rather than just changing its RGB) whichever
+    // pixels fall outside that corner's rounding circle. Squared-distance
+    // comparison avoids a sqrt per pixel.
+    const radius = @min(current_config.appearance.corner_radius_px, @min(bar.width, bar.height) / 2);
+    if (radius > 0) {
+        const r_i: i32 = @intCast(radius);
+        const r_sq: i32 = r_i * r_i;
+        var cy: u32 = 0;
+        while (cy < radius) : (cy += 1) {
+            var cx: u32 = 0;
+            while (cx < radius) : (cx += 1) {
+                // Circle center sits one pixel inside the radius box's inner
+                // corner (radius-1), matching the usual pixel-center-at-
+                // integer-coordinate convention for a discrete rounded rect.
+                const dx: i32 = @as(i32, @intCast(cx)) - (r_i - 1);
+                const dy: i32 = @as(i32, @intCast(cy)) - (r_i - 1);
+                if (dx * dx + dy * dy > r_sq) {
+                    pixels[cy * bar.width + cx] = 0; // top-left
+                    pixels[cy * bar.width + (bar.width - 1 - cx)] = 0; // top-right
+                    pixels[(bar.height - 1 - cy) * bar.width + cx] = 0; // bottom-left
+                    pixels[(bar.height - 1 - cy) * bar.width + (bar.width - 1 - cx)] = 0; // bottom-right
+                }
+            }
+        }
+    }
 
     const pool = try bar.shm.createPool(fd, @intCast(size));
     defer pool.destroy();

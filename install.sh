@@ -430,6 +430,11 @@ run_spinner "Installing simpbar-welcome to /usr/bin" \
     || die "Failed to install the simpbar-welcome binary to /usr/bin."
 ok "simpbar-welcome built and installed to /usr/bin/simpbar-welcome"
 
+run_spinner "Installing simpbar-config to /usr/bin" \
+    sudo install -Dm755 ~/.local/share/simpbar/simpbar/zig-out/bin/simpbar-config /usr/bin/simpbar-config \
+    || die "Failed to install the simpbar-config binary to /usr/bin."
+ok "simpbar-config built and installed to /usr/bin/simpbar-config"
+
 # Enable the pipewire audio stack as user services so pavucontrol has
 # something to control without needing a reboot/relogin first.
 PIPEWIRE_UNITS=(pipewire.socket pipewire-pulse.socket wireplumber.service)
@@ -1201,6 +1206,18 @@ Categories=Settings;
 StartupNotify=true
 WELCOMEDESKTOPEOF
 
+cat > ~/.local/share/applications/simpbar-config.desktop <<'CONFIGDESKTOPEOF'
+[Desktop Entry]
+Type=Application
+Name=Simpbar Config
+Comment=Configure simpbar's appearance, module layout, and desktop shortcuts
+Exec=simpbar-config
+Icon=preferences-desktop-display-symbolic
+Terminal=false
+Categories=Settings;
+StartupNotify=true
+CONFIGDESKTOPEOF
+
 cat > ~/.config/systemd/user/simpbar-welcome.service <<EOF
 [Unit]
 Description=Simpbar Welcome (first-login popup)
@@ -1305,6 +1322,9 @@ if [ -e ~/.config/systemd/user/swaybg.service ]; then
 fi
 if [ -x /usr/bin/simpbar ]; then
     ok "simpbar built and installed to /usr/bin/simpbar (source in ~/.local/share/simpbar/simpbar)"
+fi
+if [ -x /usr/bin/simpbar-config ]; then
+    ok "simpbar-config installed to /usr/bin/simpbar-config — configure the bar's appearance, modules, and shortcuts anytime from rofi/nwg-drawer, or run 'simpbar-config'"
 fi
 ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"
