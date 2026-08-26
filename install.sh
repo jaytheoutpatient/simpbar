@@ -334,7 +334,12 @@ fi
 # shells out to) — all official-repo, no AUR needed. pacman-contrib
 # (checkupdates) and wireplumber (wpctl) were already here for other
 # reasons but simpbar's pacman-update-count and volume widgets need them too.
-PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl gnome-calendar mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze)
+# grim + slurp + wl-clipboard + libnotify + gawk cover the screenshot binds
+# in hyprland.lua (region/window/fullscreen capture, clipboard copy via
+# wl-copy, notify-send for the toast, and awk to parse `hyprctl activewindow`
+# for the window-only capture). gawk ships in Arch's base group already on
+# almost every install, but it's listed explicitly rather than assumed.
+PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl gnome-calendar mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk)
 PACMAN_PKGS+=("${GPU_PKGS[@]}")
 
 prompt_choice FILE_MANAGER_CHOICE 1 "Which file manager would you like to use?" \
@@ -1393,6 +1398,9 @@ printf '  %sSUPER + Space%s            = Open Rofi\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + E%s                = Open %s\n' "$C_CYAN" "$C_RESET" "$FILE_MANAGER_NAME"
 printf '  %sSUPER + Q%s                = Exit the application\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + [1-0]%s            = Switch workspaces\n' "$C_CYAN" "$C_RESET"
+printf '  %sPrint%s                     = Screenshot: region\n' "$C_CYAN" "$C_RESET"
+printf '  %sSUPER + Print%s             = Screenshot: active window\n' "$C_CYAN" "$C_RESET"
+printf '  %sSUPER + SHIFT + Print%s     = Screenshot: full screen\n' "$C_CYAN" "$C_RESET"
 printf '\n%sTo change your keybindings or set your monitor resolution, edit the config with:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %snvim ~/.config/hypr/hyprland.lua%s\n' "$C_CYAN" "$C_RESET"
 printf '\n%sEnjoy your new home & workflow! :)%s\n' "$C_GREEN$C_BOLD" "$C_RESET"

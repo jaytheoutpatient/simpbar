@@ -282,16 +282,51 @@ hl.bind(mainMod .. " + right", hl.dsp.focus({ direction = "right" }))
 hl.bind(mainMod .. " + up", hl.dsp.focus({ direction = "up" }))
 hl.bind(mainMod .. " + down", hl.dsp.focus({ direction = "down" }))
 
-hl.bind("SUPER + SHIFT + Print", function()
-	local filename = screenshotDir .. "/screenshot-" .. os.date("%Y-%m-%d_%H-%M-%S") .. ".png"
-	hl.exec_cmd('grim - | tee "' .. filename .. '" | wl-copy')
-	hl.notify("Screenshot saved & copied!", 5000, "screenshot")
+-- Screenshots (grim + slurp) — saved to ~/Pictures/Screenshots and copied to
+-- the clipboard via wl-copy. Defined here (rather than down by the window
+-- rules, where a screenshotDir local used to live) so these binds can
+-- actually see it as an upvalue instead of falling through to a global.
+local screenshotDir = os.getenv("HOME") .. "/Pictures/Screenshots"
+os.execute("mkdir -p " .. screenshotDir)
+
+local function screenshotFilename()
+	return screenshotDir .. "/screenshot-" .. os.date("%Y-%m-%d_%H-%M-%S") .. ".png"
+end
+
+-- Print = region select
+hl.bind("Print", function()
+	local filename = screenshotFilename()
+	hl.exec_cmd(
+		'slurp -w 0 | xargs -I {} sh -c \'grim -g "{}" - | tee "' .. filename .. '" | wl-copy\'; '
+			.. 'notify-send -i "'
+			.. filename
+			.. '" "Screenshot" "Region screenshot saved & copied!"'
+	)
 end)
 
-hl.bind("Print", function()
-	-- Region select
+-- mainMod + Print = active window only
+hl.bind(mainMod .. " + Print", function()
+	local filename = screenshotFilename()
 	hl.exec_cmd(
-		'slurp -w 0 | xargs -I {} sh -c \'grim -g "{}" - | tee "/screenshot-$(date +%Y-%m-%d_%H-%M-%S).png" | wl-copy\''
+		'geom=$(hyprctl activewindow | awk \'/at:/{split($2,a,",");printf "%s,%s ",a[1],a[2]} /size:/{split($2,s,",");printf "%sx%s",s[1],s[2]}\'); '
+			.. 'grim -g "$geom" - | tee "'
+			.. filename
+			.. '" | wl-copy; '
+			.. 'notify-send -i "'
+			.. filename
+			.. '" "Screenshot" "Window screenshot saved & copied!"'
+	)
+end)
+
+-- mainMod + SHIFT + Print = full screen
+hl.bind(mainMod .. " + SHIFT + Print", function()
+	local filename = screenshotFilename()
+	hl.exec_cmd(
+		'grim - | tee "'
+			.. filename
+			.. '" | wl-copy; notify-send -i "'
+			.. filename
+			.. '" "Screenshot" "Full screen screenshot saved & copied!"'
 	)
 end)
 
@@ -359,19 +394,6 @@ local calendarRule = hl.window_rule({
 	float = true, -- optional
 	size = { 400, 500 }, -- optional, tweak as you like
 })
-local screenshotDir = os.getenv("HOME") .. "/Pictures/Screenshots"
-os.execute("mkdir -p " .. screenshotDir)
-
-local function takeScreenshot(geometry)
-	local filename = screenshotDir .. "/screenshot-" .. os.date("%Y-%m-%d_%H-%M-%S") .. ".png"
-	local cmd = "grim"
-	if geometry then
-		cmd = cmd .. ' -g "' .. geometry .. '"'
-	end
-	cmd = cmd .. ' - | tee "' .. filename .. '" | wl-copy'
-	hl.exec_cmd(cmd)
-	hl.notify("Screenshot saved & copied to clipboard!", 5000, "dialog-information")
-end
 local suppressMaximizeRule = hl.window_rule({
 	-- Ignore maximize requests from all apps. You'll probably like this.
 	name = "suppress-maximize-events",
