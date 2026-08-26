@@ -334,8 +334,22 @@ fi
 # shells out to) — all official-repo, no AUR needed. pacman-contrib
 # (checkupdates) and wireplumber (wpctl) were already here for other
 # reasons but simpbar's pacman-update-count and volume widgets need them too.
-PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl gnome-calendar nautilus mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer)
+PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl gnome-calendar mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze)
 PACMAN_PKGS+=("${GPU_PKGS[@]}")
+
+prompt_choice FILE_MANAGER_CHOICE 1 "Which file manager would you like to use?" \
+    "Nautilus" "Nemo" "Dolphin"
+case "$FILE_MANAGER_CHOICE" in
+    2) FILE_MANAGER_NAME="Nemo";    FILE_MANAGER_BIN="nemo";    PACMAN_PKGS+=(nemo) ;;
+    3) FILE_MANAGER_NAME="Dolphin"; FILE_MANAGER_BIN="dolphin"; PACMAN_PKGS+=(dolphin) ;;
+    *) FILE_MANAGER_NAME="Nautilus"; FILE_MANAGER_BIN="nautilus"; PACMAN_PKGS+=(nautilus) ;;
+esac
+
+# hyprland.lua (copied to ~/.config/hypr in Step 2) hardcodes its
+# fileManager variable to nautilus — point it at whichever one was chosen.
+if [ -e ~/.config/hypr/hyprland.lua ]; then
+    sed -i "s/^local fileManager = \".*\"/local fileManager = \"$FILE_MANAGER_BIN\"/" ~/.config/hypr/hyprland.lua
+fi
 
 prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
 [ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
@@ -973,6 +987,32 @@ else
     warn "gsettings not found — select the Bibata cursor theme manually in nwg-look"
 fi
 
+# qt6ct is the Qt6 settings app; QT_QPA_PLATFORMTHEME=qt6ct (set in
+# hypr/hyprland.lua) is what makes Qt6 apps actually read its config instead
+# of falling back to their own default style. breeze ships both the Breeze
+# widget style and the BreezeDark.colors scheme qt6ct points at below.
+BREEZE_DARK_SCHEME="/usr/share/color-schemes/BreezeDark.colors"
+if pacman -Qq qt6ct >/dev/null 2>&1 && pacman -Qq breeze >/dev/null 2>&1; then
+    if [ -e "$BREEZE_DARK_SCHEME" ]; then
+        mkdir -p ~/.config/qt6ct
+        if [ -e ~/.config/qt6ct/qt6ct.conf ]; then
+            warn "~/.config/qt6ct/qt6ct.conf already exists — leaving your existing qt6ct config alone"
+        else
+            cat > ~/.config/qt6ct/qt6ct.conf <<EOF
+[Appearance]
+style=Breeze
+color_scheme_path=$BREEZE_DARK_SCHEME
+custom_palette=true
+EOF
+            ok "qt6ct set to use the Breeze Dark color scheme"
+        fi
+    else
+        warn "BreezeDark.colors not found under /usr/share/color-schemes — select Breeze Dark manually in qt6ct"
+    fi
+else
+    warn "qt6ct or breeze isn't installed — skipping Qt6 theme setup"
+fi
+
 # ── Step 5: choose a browser ─────────────────────────────────────────
 step "Choosing a browser"
 
@@ -1246,7 +1286,8 @@ run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfir
 # ── Step 7: done ────────────────────────────────────────────────────
 step "Done"
 ok "Full system updated (pacman -Syu)"
-ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, gnome-calendar, nautilus, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility, nwg-drawer installed (pacman)"
+ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, gnome-calendar, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility, nwg-drawer installed (pacman)"
+ok "$FILE_MANAGER_NAME installed and bound to SUPER + E"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 if pacman -Qq cliphist >/dev/null 2>&1; then
     ok "cliphist installed (bind a key to it yourself, e.g. in hyprland.lua)"
@@ -1349,7 +1390,7 @@ printf '\n%sKeybindings:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %sSUPER%s                    = Windows key\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + Enter%s            = Open terminal\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + Space%s            = Open Rofi\n' "$C_CYAN" "$C_RESET"
-printf '  %sSUPER + E%s                = Open Nautilus\n' "$C_CYAN" "$C_RESET"
+printf '  %sSUPER + E%s                = Open %s\n' "$C_CYAN" "$C_RESET" "$FILE_MANAGER_NAME"
 printf '  %sSUPER + Q%s                = Exit the application\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + [1-0]%s            = Switch workspaces\n' "$C_CYAN" "$C_RESET"
 printf '\n%sTo change your keybindings or set your monitor resolution, edit the config with:%s\n' "$C_BOLD" "$C_RESET"
