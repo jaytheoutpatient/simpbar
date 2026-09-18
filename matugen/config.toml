@@ -1,6 +1,7 @@
 # matugen — Material You colorscheme generator, wired into simpbar + a whole
 # desktop: simpbar, hyprland, foot terminal, GTK (nautilus/nemo), Qt/qt6ct
-# (dolphin), Vesktop & Equibop Discord clients, Zen Browser, and Steam skins.
+# (dolphin), Vesktop & Equibop Discord clients, Zen Browser, Steam skins, and
+# the swaync notification center.
 #
 # Two ways to use this:
 #
@@ -118,3 +119,14 @@ post_hook = "sh -c 'python3 \"$HOME/.config/matugen/zen-enable-pref.py\" \"$HOME
 [templates.steam]
 input_path = "~/.config/matugen/templates/steam-theme.css"
 output_path = "~/.steam/steam/skins/matugen/steamui/themes/matugen.css"
+
+# ═══════════════════════════ swaync ═══════════════════════════
+# Renders the notification center's whole style.css from the MD3 dark palette
+# (same layout/design as the Dracula default, MD3 colors swapped in place).
+# config.json ships cssPriority = "user", so this file wins over swaync's
+# bundled style.css. Live-applies via --reload-css; no-ops when not running so
+# a wallpaper change from a cron/systemd context can't abort the run.
+[templates.swaync]
+input_path = "~/.config/matugen/templates/swaync-style.css"
+output_path = "~/.config/swaync/style.css"
+post_hook = "sh -c 'swaync-client --reload-css 2>/dev/null || true'"
