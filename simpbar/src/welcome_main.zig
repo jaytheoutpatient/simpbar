@@ -13,6 +13,9 @@
 
 const std = @import("std");
 const gtk = @import("welcome_gtk.zig");
+const logging = @import("logging.zig");
+
+pub const panic = std.debug.FullPanic(logging.panicHandler);
 
 const gpa = std.heap.c_allocator;
 
@@ -257,6 +260,7 @@ fn markShown() void {
     _ = mkdir(g_simpbar_config_dir, 0o755);
     const fd = open(g_first_run_marker_path, O_CREAT, 0o644);
     if (fd >= 0) _ = close(fd);
+    logging.step("first-run marker written to {s}", .{g_first_run_marker_path});
 }
 
 // ---------------------------------------------------------------------
@@ -267,9 +271,15 @@ fn markShown() void {
 /// /usr/bin/env, detached via the standard double-fork (mirrors
 /// spawnDetached/spawnPlayerctlCommand in the bar's main.zig).
 fn launchArgv(argv: []const [:0]const u8) void {
-    if (argv.len == 0 or argv.len > 14) return;
+    if (argv.len == 0 or argv.len > 14) {
+        logging.warn("launch: bad argv (len {d})", .{argv.len});
+        return;
+    }
     const pid = libc_proc.fork();
-    if (pid < 0) return;
+    if (pid < 0) {
+        logging.warn("launch: fork failed for {s}", .{argv[0]});
+        return;
+    }
     if (pid == 0) {
         const pid2 = libc_proc.fork();
         if (pid2 == 0) {
@@ -293,14 +303,21 @@ fn launchArgv(argv: []const [:0]const u8) void {
 /// "is this hung" detection without needing wall-clock bookkeeping across
 /// the whole read. Caller frees the returned slice with gpa.
 fn runCaptured(argv: []const [:0]const u8, timeout_ms: i32) ?[]u8 {
-    if (argv.len == 0 or argv.len > 14) return null;
+    if (argv.len == 0 or argv.len > 14) {
+        logging.warn("runCaptured: bad argv (len {d})", .{argv.len});
+        return null;
+    }
     var fds: [2]c_int = undefined;
-    if (pipe(&fds) != 0) return null;
+    if (pipe(&fds) != 0) {
+        logging.warn("runCaptured: pipe failed for {s}", .{argv[0]});
+        return null;
+    }
     const read_fd = fds[0];
     const write_fd = fds[1];
 
     const pid = libc_proc.fork();
     if (pid < 0) {
+        logging.warn("runCaptured: fork failed for {s}", .{argv[0]});
         _ = close(read_fd);
         _ = close(write_fd);
         return null;
@@ -533,6 +550,7 @@ fn fetchArchUpdates(list: *UpdateList) void {
         // installed+available package lists and prints the delta.
         const output = runCaptured(&[_][:0]const u8{ "apt", "list", "--upgradable" }, 30000) orelse {
             list.ok = false;
+            logging.warn("update check: apt list --upgradable failed", .{});
             return;
         };
         defer gpa.free(output);
@@ -542,10 +560,12 @@ fn fetchArchUpdates(list: *UpdateList) void {
     }
     if (!commandExists("checkupdates")) {
         list.ok = false;
+        logging.warn("update check: checkupdates not installed", .{});
         return;
     }
     const output = runCaptured(&[_][:0]const u8{"checkupdates"}, 30000) orelse {
         list.ok = false;
+        logging.warn("update check: checkupdates failed or timed out", .{});
         return;
     };
     defer gpa.free(output);
@@ -566,6 +586,7 @@ fn fetchAurUpdates(list: *UpdateList) void {
     };
     const output = runCaptured(&[_][:0]const u8{ h, "-Qua" }, 60000) orelse {
         list.ok = false;
+        logging.warn("update check: {s} -Qua failed or timed out", .{h});
         return;
     };
     defer gpa.free(output);
@@ -582,10 +603,12 @@ fn fetchFlatpakUpdates(list: *UpdateList) void {
         gpa.free(o);
     } else {
         list.ok = false;
+        logging.warn("update check: flatpak update --appstream failed or timed out", .{});
         return;
     }
     const output = runCaptured(&[_][:0]const u8{ "flatpak", "remote-ls", "--updates", "--columns=application,version", "flathub" }, 30000) orelse {
         list.ok = false;
+        logging.warn("update check: flatpak remote-ls --updates failed or timed out", .{});
         return;
     };
     defer gpa.free(output);
@@ -598,9 +621,11 @@ fn fetchFlatpakUpdates(list: *UpdateList) void {
 }
 
 fn updateCheckThreadFn(result: *UpdateCheckResult) void {
+    logging.step("update check thread started", .{});
     fetchArchUpdates(&result.arch);
     fetchAurUpdates(&result.aur);
     fetchFlatpakUpdates(&result.flatpak);
+    logging.step("update check done: {d} arch, {d} aur, {d} flatpak", .{ result.arch.count, result.aur.count, result.flatpak.count });
     _ = gtk.g_idle_add(&onUpdateCheckIdle, result);
 }
 
@@ -1240,13 +1265,18 @@ fn onCheckUpdatesClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     setGroupMessage(&g_flatpak_rows, "Checking\u{2026}");
     setStatusLabel("Checking\u{2026}");
 
-    const result = gpa.create(UpdateCheckResult) catch return;
+    const result = gpa.create(UpdateCheckResult) catch |err| {
+        logging.err("update check: out of memory: {s}", .{@errorName(err)});
+        return;
+    };
     result.* = .{};
-    const t = std.Thread.spawn(.{}, updateCheckThreadFn, .{result}) catch {
+    const t = std.Thread.spawn(.{}, updateCheckThreadFn, .{result}) catch |err| {
+        logging.err("update check: could not spawn thread: {s}", .{@errorName(err)});
         gpa.destroy(result);
         return;
     };
     t.detach();
+    logging.step("update check dispatched", .{});
 }
 
 fn onUpdateCheckIdle(data: ?*anyopaque) callconv(.c) c_int {
@@ -1460,15 +1490,30 @@ fn onAppActivate(app: *gtk.GApplication, _: ?*anyopaque) callconv(.c) void {
         g_window = buildWindow(@ptrCast(app));
     }
     gtk.gtk_window_present(@ptrCast(g_window.?));
+    logging.step("window shown", .{});
 }
 
-pub fn main() !void {
+pub fn main() void {
+    logging.init("simpbar-welcome");
+    realMain() catch |err| {
+        logging.err("fatal: {s}", .{@errorName(err)});
+        logging.crash("fatal error: {s}", .{@errorName(err)});
+        logging.dumpCurrentStack();
+        std.process.exit(1);
+    };
+}
+
+fn realMain() !void {
+    logging.step("starting up", .{});
     resolvePaths();
     applyDistroDefaults();
+    logging.step("distro detected: {s}", .{if (g_distro == .debian) "debian" else "arch"});
     g_autostart_mode = detectAutostartMode();
+    logging.step("autostart mode: {s}", .{if (g_autostart_mode) "enabled" else "manual"});
 
     const app = gtk.adw_application_new(APP_ID, 0);
     _ = gtk.g_signal_connect_data(@ptrCast(app), "activate", @ptrCast(&onAppActivate), null, null, 0);
     const code = gtk.g_application_run(@ptrCast(app), 0, null);
+    logging.step("gtk main loop exited with code {d}", .{code});
     exit(code);
 }

@@ -10,6 +10,9 @@ const dbus = @import("dbus.zig");
 const font_mod = @import("font.zig");
 const icontheme = @import("icontheme.zig");
 const dbusmenu = @import("dbusmenu.zig");
+const logging = @import("logging.zig");
+
+pub const panic = std.debug.FullPanic(logging.panicHandler);
 
 // Linux reuses O_CLOEXEC's bit position for every *_CLOEXEC flag regardless
 // of which call it's combined with (SOCK_CLOEXEC, TFD_CLOEXEC, ...) — one
@@ -162,7 +165,7 @@ const Workspaces = struct {
         };
         @memcpy(self.sock_path_buf[0..sock_path.len], sock_path);
         self.refresh() catch |err| {
-            std.debug.print("workspaces: initial refresh failed: {}\n", .{err});
+            logging.warn("workspaces: initial refresh failed: {}", .{err});
         };
         return self;
     }
@@ -750,7 +753,7 @@ fn tryApplyMatugenColors(allocator: std.mem.Allocator, appearance: *Appearance) 
         // not something worth logging at the INFO level every reload — only
         // a read that shouldn't plausibly fail is worth a line.
         if (err != error.OpenFailed) {
-            std.debug.print("config: could not read {s}: {}\n", .{ matugen_json_path, err });
+            logging.warn("config: could not read {s}: {}", .{ matugen_json_path, err });
         }
         return false;
     };
@@ -758,7 +761,7 @@ fn tryApplyMatugenColors(allocator: std.mem.Allocator, appearance: *Appearance) 
     const colors = std.json.parseFromSliceLeaky(JsonMatugenColors, allocator, bytes, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
-        std.debug.print("config: could not parse {s}: {} — keeping config.json colors\n", .{ matugen_json_path, err });
+        logging.warn("config: could not parse {s}: {} — keeping config.json colors", .{ matugen_json_path, err });
         return false;
     };
 
@@ -782,7 +785,7 @@ fn tryApplyMatugenColors(allocator: std.mem.Allocator, appearance: *Appearance) 
 fn mergeMatugenColor(appearance: *Appearance, comptime field: []const u8, value: ?[]const u8) ?u8 {
     const hex = value orelse return 1;
     const parsed = parseHexColor(hex) catch {
-        std.debug.print("config: bad matugen color {s}=\"{s}\" — keeping config.json colors\n", .{ field, hex });
+        logging.warn("config: bad matugen color {s}=\"{s}\" — keeping config.json colors", .{ field, hex });
         return null;
     };
     @field(appearance, field) = parsed;
@@ -880,19 +883,19 @@ fn loadConfigFromFile() ?Config {
     const allocator = config_arenas[next_index].allocator();
 
     const bytes = readFileAlloc(allocator, config_json_path) catch |err| {
-        std.debug.print("config: could not read {s}: {}\n", .{ config_json_path, err });
+        logging.warn("config: could not read {s}: {}", .{ config_json_path, err });
         return null;
     };
 
     const parsed = std.json.parseFromSliceLeaky(JsonConfig, allocator, bytes, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
-        std.debug.print("config: could not parse {s}: {}\n", .{ config_json_path, err });
+        logging.warn("config: could not parse {s}: {}", .{ config_json_path, err });
         return null;
     };
 
     var appearance = parseAppearance(parsed.appearance) orelse {
-        std.debug.print("config: bad color value in {s}\n", .{config_json_path});
+        logging.warn("config: bad color value in {s}", .{config_json_path});
         return null;
     };
 
@@ -902,7 +905,7 @@ fn loadConfigFromFile() ?Config {
     // load — tryApplyMatugenColors returns false and we keep the
     // config.json colors (defaultConfig path never triggers here).
     if (std.mem.eql(u8, parsed.appearance.auto_theme, "matugen") and tryApplyMatugenColors(allocator, &appearance)) {
-        std.debug.print("config: applied matugen colors from {s}\n", .{matugen_json_path});
+        logging.step("config: applied matugen colors from {s}", .{matugen_json_path});
     }
 
     config_arena_active = next_index;
@@ -1094,11 +1097,11 @@ const Tray = struct {
     fn init(gpa: std.mem.Allocator) Tray {
         var self = Tray{ .gpa = gpa };
         var conn = dbus.Connection.connect() catch |err| {
-            std.debug.print("tray: dbus connect failed: {}\n", .{err});
+            logging.warn("tray: dbus connect failed: {}", .{err});
             return self;
         };
         requestWatcherName(&conn) catch |err| {
-            std.debug.print("tray: could not become StatusNotifierWatcher: {}\n", .{err});
+            logging.warn("tray: could not become StatusNotifierWatcher: {}", .{err});
             conn.close();
             return self;
         };
@@ -1143,7 +1146,7 @@ const Tray = struct {
     fn onReadable(self: *Tray) void {
         const c: *dbus.Connection = if (self.conn) |*conn| conn else return;
         const msg = c.readMessage(std.heap.page_allocator) catch |err| {
-            std.debug.print("tray: dbus connection lost: {}\n", .{err});
+            logging.warn("tray: dbus connection lost: {}", .{err});
             c.close();
             self.conn = null;
             return;
@@ -1183,9 +1186,9 @@ const Tray = struct {
                 // silently dropped, as both were before this) likely killed
                 // registration before it ever started.
                 if (std.mem.eql(u8, member, "Get")) {
-                    self.handleGetProperty(c, &msg) catch |err| std.debug.print("tray: Get failed: {}\n", .{err});
+                    self.handleGetProperty(c, &msg) catch |err| logging.err("tray: Get failed: {}", .{err});
                 } else {
-                    self.handleGetAllProperties(c, &msg) catch |err| std.debug.print("tray: GetAll failed: {}\n", .{err});
+                    self.handleGetAllProperties(c, &msg) catch |err| logging.err("tray: GetAll failed: {}", .{err});
                 }
             } else {
                 const sender = msg.sender orelse return;
@@ -1223,7 +1226,7 @@ const Tray = struct {
         self.addItem(sender, item_path);
 
         c.send(.method_return, .{ .reply_serial = msg.serial, .destination = sender }, .{}) catch |err| {
-            std.debug.print("tray: failed to ack registration: {}\n", .{err});
+            logging.warn("tray: failed to ack registration: {}", .{err});
         };
     }
 
@@ -1354,7 +1357,7 @@ const Tray = struct {
             .member = member,
             .destination = item.busName(),
         }, .{ .bytes = body.items, .signature = "ii" }) catch |err| {
-            std.debug.print("tray: {s} failed: {}\n", .{ member, err });
+            logging.warn("tray: {s} failed: {}", .{ member, err });
         };
     }
 
@@ -1568,7 +1571,7 @@ fn popupXdgSurfaceListener(xdg_surface: *xdg.Surface, event: xdg.Surface.Event, 
             xdg_surface.ackConfigure(cfg.serial);
             var pm = &(bar.popup orelse return);
             pm.configured = true;
-            drawPopup(bar) catch |err| std.debug.print("popup draw failed: {}\n", .{err});
+            drawPopup(bar) catch |err| logging.err("popup draw failed: {}", .{err});
         },
     }
 }
@@ -1770,15 +1773,27 @@ fn applyLayerGeometry(bar: *Bar) void {
 fn drawAllBars(bars: []Bar) void {
     for (bars) |*b| {
         drawAndCommit(b) catch |err| {
-            std.debug.print("draw failed: {}\n", .{err});
+            logging.err("draw failed: {}", .{err});
         };
     }
 }
 
-pub fn main() !void {
+pub fn main() void {
+    logging.init("simpbar");
+    realMain() catch |err| {
+        logging.err("fatal: {s}", .{@errorName(err)});
+        logging.crash("fatal error: {s}", .{@errorName(err)});
+        logging.dumpCurrentStack();
+        std.process.exit(1);
+    };
+}
+
+fn realMain() !void {
+    logging.step("starting up", .{});
     resolveConfigPaths();
     current_config = loadConfig();
     writePidfile();
+    logging.step("config loaded from {s}", .{config_json_path});
 
     var gpa_state = std.heap.DebugAllocator(.{}){};
     defer _ = gpa_state.deinit();
@@ -1792,7 +1807,7 @@ pub fn main() !void {
             // actually a font file, ...) shouldn't take the whole bar down —
             // fall back to the built-in default, matching every other
             // "never let a bad config value crash the bar" convention here.
-            std.debug.print("font: could not load {s}: {} — falling back to {s}\n", .{ path_z, err, font_mod.FONT_PATH });
+            logging.warn("font: could not load {s}: {} — falling back to {s}", .{ path_z, err, font_mod.FONT_PATH });
             break :blk try font_mod.Font.init(gpa, font_mod.FONT_PATH, FONT_PIXEL_SIZE);
         };
     };
@@ -2006,7 +2021,7 @@ pub fn main() !void {
     posix.sigaddset(&sigusr1_mask, .USR1);
     posix.sigprocmask(posix.SIG.BLOCK, &sigusr1_mask, null);
     const sigusr1_fd = posix.signalfd(-1, &sigusr1_mask, std.os.linux.SFD.CLOEXEC) catch |err| blk: {
-        std.debug.print("signalfd(SIGUSR1) failed, live config reload disabled: {}\n", .{err});
+        logging.warn("signalfd(SIGUSR1) failed, live config reload disabled: {}", .{err});
         break :blk -1;
     };
     defer if (sigusr1_fd >= 0) {
@@ -2156,7 +2171,7 @@ pub fn main() !void {
             var drain_buf: [4096]u8 = undefined;
             _ = posix.read(hypr_event_fd, &drain_buf) catch {};
             workspaces.refresh() catch |err| {
-                std.debug.print("workspaces refresh failed: {}\n", .{err});
+                logging.warn("workspaces refresh failed: {}", .{err});
             };
             drawAllBars(bars[0..bar_count]);
         }
@@ -2241,7 +2256,7 @@ pub fn main() !void {
                 }
                 if (needs_redraw) {
                     drawAndCommit(b) catch |err| {
-                        std.debug.print("draw failed: {}\n", .{err});
+                        logging.err("draw failed: {}", .{err});
                     };
                 }
             }
@@ -2261,7 +2276,7 @@ pub fn main() !void {
             for (bars[0..bar_count]) |*b| {
                 if (b.drawer_anim > 0.0) {
                     drawAndCommit(b) catch |err| {
-                        std.debug.print("draw failed: {}\n", .{err});
+                        logging.err("draw failed: {}", .{err});
                     };
                 }
             }
@@ -2282,7 +2297,7 @@ pub fn main() !void {
                 const geometry_changed = !std.mem.eql(u8, old_position, cfg.appearance.position) or
                     old_bar_height != cfg.appearance.bar_height;
                 current_config = cfg;
-                std.debug.print("config: reloaded {s}\n", .{config_json_path});
+                logging.step("config: reloaded {s}", .{config_json_path});
 
                 // Closes a previously-known gap: bar_height (and now
                 // position) used to only take effect on the next bar
@@ -2309,10 +2324,10 @@ pub fn main() !void {
                             app_font.deinit();
                             app_font = new_font;
                         } else |err| {
-                            std.debug.print("font: could not load {s}: {} — keeping current font\n", .{ path_z, err });
+                            logging.warn("font: could not load {s}: {} — keeping current font", .{ path_z, err });
                         }
                     } else {
-                        std.debug.print("font: path too long, keeping current font\n", .{});
+                        logging.warn("font: path too long, keeping current font", .{});
                     }
                 }
 
@@ -2347,7 +2362,7 @@ pub fn main() !void {
 
                 drawAllBars(bars[0..bar_count]);
             } else {
-                std.debug.print("config: reload failed, keeping previous config\n", .{});
+                logging.warn("config: reload failed, keeping previous config", .{});
             }
         }
         if (poll_fds[15].revents & posix.POLL.IN != 0) {
@@ -2992,7 +3007,7 @@ fn initCustomScripts() void {
     for (current_config.modules.right) |entry| {
         if (entry.kind != .custom_script) continue;
         if (custom_script_count >= MAX_CUSTOM_SCRIPTS) {
-            std.debug.print("config: more than {d} custom_script entries, ignoring the rest\n", .{MAX_CUSTOM_SCRIPTS});
+            logging.warn("config: more than {d} custom_script entries, ignoring the rest", .{MAX_CUSTOM_SCRIPTS});
             break;
         }
         const command = entry.command orelse continue;
@@ -3945,7 +3960,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                 // button (e.g. the pointer didn't move but focus/workspace
                 // did) needs this same as motion does below.
                 drawAndCommit(bar) catch |err| {
-                    std.debug.print("draw failed: {}\n", .{err});
+                    logging.err("draw failed: {}", .{err});
                 };
             }
         },
@@ -3960,7 +3975,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
             } else {
                 bar.pointer_x = -1;
                 drawAndCommit(bar) catch |err| { // clears any lingering hover highlight
-                    std.debug.print("draw failed: {}\n", .{err});
+                    logging.err("draw failed: {}", .{err});
                 };
             }
             // The pointer just left the only surface we knew it was over —
@@ -3989,7 +4004,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                 const new_region = bar.click_regions.hitTest(bar.pointer_x);
                 if (old_region != new_region) {
                     drawAndCommit(bar) catch |err| {
-                        std.debug.print("draw failed: {}\n", .{err});
+                        logging.err("draw failed: {}", .{err});
                     };
                 }
             }
@@ -4035,7 +4050,7 @@ fn handleAction(bar: *Bar, action: Action) void {
             var cmd_buf: [64]u8 = undefined;
             const cmd = std.fmt.bufPrint(&cmd_buf, "dispatch hl.dsp.focus({{ workspace = {d} }})", .{id}) catch return;
             bar.workspaces.dispatchCommand(cmd) catch |err| {
-                std.debug.print("workspace switch failed: {}\n", .{err});
+                logging.err("workspace switch failed: {}", .{err});
             };
         },
         .spawn => |command| spawnDetached(command),
@@ -4047,7 +4062,7 @@ fn handleAction(bar: *Bar, action: Action) void {
             // depending purely on timer timing for the first frame.
             bar.drawer_expanded = !bar.drawer_expanded;
             drawAndCommit(bar) catch |err| {
-                std.debug.print("draw failed: {}\n", .{err});
+                logging.err("draw failed: {}", .{err});
             };
         },
         .activate_tray => |index| bar.tray.activate(index),
@@ -4076,7 +4091,7 @@ fn layerSurfaceListener(
             bar.height = if (cfg.height > 0) cfg.height else current_config.appearance.bar_height;
             bar.configured = true;
             drawAndCommit(bar) catch |err| {
-                std.debug.print("draw failed: {}\n", .{err});
+                logging.err("draw failed: {}", .{err});
             };
         },
         .closed => {
@@ -4168,7 +4183,7 @@ fn drawAndCommit(bar: *Bar) !void {
 
     var time_buf: [16]u8 = undefined; // "DD - HH:MM"
     const time_text = currentTimeText(&time_buf) catch |err| blk: {
-        std.debug.print("clock render failed: {}\n", .{err});
+        logging.err("clock render failed: {}", .{err});
         break :blk "";
     };
     drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.pointer_x, &bar.click_regions);

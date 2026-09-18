@@ -1019,19 +1019,34 @@ fi
 FISH_PATH=$(command -v fish) || true
 
 # The bar's pinned-app launchers, wallpaper picker + restore, and the
-# background update checker come from the downloaded simpbar repo (they're
-# distro-aware — azote/waypaper for wallpapers on Debian/Arch, apt/pacman
+# background update checker come from the downloaded simpbar repo (distro-aware
 # for updates). Desktop entries + the logo.png asset end up next to them.
+# The wallpaper button points at the wallpaper switcher (downloaded in Step 4)
+# rather than an azote/waypaper GUI.
 mkdir -p ~/.local/share/applications ~/.config/systemd/user
 
 sudo install -Dm755 ~/.local/share/simpbar/simpbar-check-updates  /usr/bin/simpbar-check-updates
 sudo install -Dm755 ~/.local/share/simpbar/simpbar-launch-browser /usr/bin/simpbar-launch-browser
 sudo install -Dm755 ~/.local/share/simpbar/simpbar-launch-discord /usr/bin/simpbar-launch-discord
-sudo install -Dm755 ~/.local/share/simpbar/simpbar-wallpaper      /usr/bin/simpbar-wallpaper
 sudo install -Dm755 ~/.local/share/simpbar/simpbar-restore-wallpaper /usr/bin/simpbar-restore-wallpaper
+
+# The wallpaper button uses the rofi picker -> swaybg + matugen switcher from
+# ~/wallpaper-switcher, falling back to azote if it isn't installed. Written
+# inline so a freshly downloaded archive always ships the same wrapper.
+sudo tee /usr/bin/simpbar-wallpaper >/dev/null <<'WALLPAPERWRAPEOF'
+#!/bin/bash
+# simpbar-wallpaper — the bar's "change wallpaper" button. Runs the rofi
+# picker -> swaybg + matugen switcher from ~/wallpaper-switcher (installed by
+# the installers); falls back to azote if the switcher isn't there.
+if [ -x "$HOME/wallpaper-switcher/wallpaper_switcher.sh" ]; then
+    exec "$HOME/wallpaper-switcher/wallpaper_switcher.sh"
+fi
+exec azote "$@"
+WALLPAPERWRAPEOF
+sudo chmod +x /usr/bin/simpbar-wallpaper
 cp ~/.local/share/simpbar/simpbar-welcome.desktop ~/.local/share/applications/
 cp ~/.local/share/simpbar/simpbar-config.desktop   ~/.local/share/applications/
-ok "Pinned-app launchers (browser, Discord), wallpaper picker + restore, update checker, and .desktop entries installed"
+ok "Pinned-app launchers (browser, Discord), wallpaper switcher + restore, update checker, and .desktop entries installed"
 
 cat > ~/.config/systemd/user/simpbar-update-checker.service <<'CHECKERSVCEOF'
 [Unit]
@@ -1169,6 +1184,33 @@ AZOTERESTORESVCEOF
     ok "azote-restore.service enabled — the wallpaper you pick in azote comes back each session (swaybg's default until azote picks one)"
 else
     warn "azote/restore script not available — skipping azote-restore.service (azote still picks wallpapers on demand)"
+fi
+
+# The wallpaper switcher that the bar's wallpaper button execs lives in its
+# own repo (rofi picker -> swaybg + matugen, wallpapers under
+# ~/wallpaper-switcher/wallpaper). Pull it in so a fresh install gets the
+# picker + images; simpbar-wallpaper falls back to azote if this never lands.
+if [ -d ~/wallpaper-switcher ]; then
+    ok "~/wallpaper-switcher already exists — leaving your existing copy alone"
+else
+    mkdir -p ~/wallpaper-switcher
+    run_spinner "Downloading the wallpaper switcher" \
+        curl -fL -o /tmp/wallpaper-switcher.zip https://github.com/k4ahr/wallpaper-switcher/archive/refs/heads/main.zip \
+        || warn "Could not download the wallpaper switcher — the wallpaper button will fall back to azote"
+    if [ -f /tmp/wallpaper-switcher.zip ]; then
+        unzip -o /tmp/wallpaper-switcher.zip -d /tmp/wallpaper-switcher-temp >/dev/null 2>&1 \
+            || true
+        rm -f /tmp/wallpaper-switcher.zip
+        if [ -d /tmp/wallpaper-switcher-temp/wallpaper-switcher-main ]; then
+            rm -rf ~/wallpaper-switcher
+            cp -r /tmp/wallpaper-switcher-temp/wallpaper-switcher-main ~/wallpaper-switcher
+            chmod +x ~/wallpaper-switcher/wallpaper_switcher.sh 2>/dev/null || true
+            ok "Wallpaper switcher placed in ~/wallpaper-switcher — the bar's wallpaper button uses it"
+        else
+            warn "Downloaded archive was missing the wallpaper switcher — the wallpaper button will fall back to azote"
+        fi
+        rm -rf /tmp/wallpaper-switcher-temp
+    fi
 fi
 
 # matugen — the Material You colorscheme generator simpbar reads for

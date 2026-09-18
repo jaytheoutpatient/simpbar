@@ -1,8 +1,11 @@
 #!/bin/bash
-# simpbar-wallpaper — opens the distro's wallpaper picker: azote where
-# waypaper isn't packaged (Debian-family, install-debian.sh), otherwise
-# waypaper (Arch/AUR, install.sh). Both are GTK front-ends to swaybg, so a
-# single script keeps the same bar/welcome buttons working on either family.
+# simpbar-wallpaper — the bar's "change wallpaper" button. Runs the rofi
+# picker -> swaybg + matugen switcher from ~/wallpaper-switcher (installed by
+# the installers); falls back to the distro's GTK picker (azote on Debian,
+# waypaper on Arch) if the switcher isn't there.
+if [ -x "$HOME/wallpaper-switcher/wallpaper_switcher.sh" ]; then
+    exec "$HOME/wallpaper-switcher/wallpaper_switcher.sh"
+fi
 if command -v azote >/dev/null 2>&1; then
     exec azote "$@"
 fi

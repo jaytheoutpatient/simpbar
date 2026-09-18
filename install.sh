@@ -983,6 +983,34 @@ else
     warn "No downloaded wallpaper or swaybg not installed — skipping swaybg service setup"
 fi
 
+# The wallpaper switcher that the bar's wallpaper button execs lives in its
+# own repo (rofi picker -> swaybg + matugen, wallpapers under
+# ~/wallpaper-switcher/wallpaper). Pull it in so a fresh install gets the
+# picker + images; simpbar-wallpaper falls back to waypaper if this never
+# lands.
+if [ -d ~/wallpaper-switcher ]; then
+    ok "~/wallpaper-switcher already exists — leaving your existing copy alone"
+else
+    mkdir -p ~/wallpaper-switcher
+    run_spinner "Downloading the wallpaper switcher" \
+        curl -fL -o /tmp/wallpaper-switcher.zip https://github.com/k4ahr/wallpaper-switcher/archive/refs/heads/main.zip \
+        || warn "Could not download the wallpaper switcher — the wallpaper button will fall back to waypaper"
+    if [ -f /tmp/wallpaper-switcher.zip ]; then
+        unzip -o /tmp/wallpaper-switcher.zip -d /tmp/wallpaper-switcher-temp >/dev/null 2>&1 \
+            || true
+        rm -f /tmp/wallpaper-switcher.zip
+        if [ -d /tmp/wallpaper-switcher-temp/wallpaper-switcher-main ]; then
+            rm -rf ~/wallpaper-switcher
+            cp -r /tmp/wallpaper-switcher-temp/wallpaper-switcher-main ~/wallpaper-switcher
+            chmod +x ~/wallpaper-switcher/wallpaper_switcher.sh 2>/dev/null || true
+            ok "Wallpaper switcher placed in ~/wallpaper-switcher — the bar's wallpaper button uses it"
+        else
+            warn "Downloaded archive was missing the wallpaper switcher — the wallpaper button will fall back to waypaper"
+        fi
+        rm -rf /tmp/wallpaper-switcher-temp
+    fi
+fi
+
 # matugen — the Material You colorscheme generator simpbar reads for
 # wallpaper-based auto-theming. It renders its simpbar template to
 # ~/.config/simpbar/matugen.json, which the bar merges in on reload;
@@ -1383,9 +1411,10 @@ sudo chmod +x /usr/bin/simpbar-check-updates
 
 # Pinned-app launchers for the bar — browser and Discord client are both
 # user-chosen at install time, so these try known binaries in order and
-# launch whichever's actually installed. simpbar-wallpaper picks the distro's
-# wallpaper front-end (waypaper here; azote is used where waypaper isn't
-# packaged, e.g. the Debian edition of this installer).
+# launch whichever's actually installed. simpbar-wallpaper runs the rofi
+# picker -> swaybg + matugen switcher from ~/wallpaper-switcher (downloaded in
+# Step 5), falling back to the distro's GTK picker (waypaper here; azote where
+# waypaper isn't packaged, e.g. the Debian edition of this installer).
 sudo tee /usr/bin/simpbar-launch-browser >/dev/null <<'BROWSERWRAPEOF'
 #!/bin/bash
 # simpbar-launch-browser — checks ~/.config/simpbar/browser-choice first (set
@@ -1430,10 +1459,12 @@ sudo chmod +x /usr/bin/simpbar-launch-discord
 
 sudo tee /usr/bin/simpbar-wallpaper >/dev/null <<'WALLPAPERWRAPEOF'
 #!/bin/bash
-# simpbar-wallpaper — opens the distro's wallpaper picker: azote where
-# waypaper isn't packaged (Debian-family, install-debian.sh), otherwise
-# waypaper (Arch/AUR, install.sh). Both are GTK front-ends to swaybg, so a
-# single script keeps the same bar/welcome buttons working on either family.
+# simpbar-wallpaper — the bar's "change wallpaper" button. Runs the rofi
+# picker -> swaybg + matugen switcher from ~/wallpaper-switcher (installed by
+# the installers); falls back to the distro's GTK picker if it isn't there.
+if [ -x "$HOME/wallpaper-switcher/wallpaper_switcher.sh" ]; then
+    exec "$HOME/wallpaper-switcher/wallpaper_switcher.sh"
+fi
 if command -v azote >/dev/null 2>&1; then
     exec azote "$@"
 fi

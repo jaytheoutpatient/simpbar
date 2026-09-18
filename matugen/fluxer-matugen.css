@@ -1,0 +1,276 @@
+/**
+ * @name Matugen
+ * @description Material You Fluxer theme (matugen, wallpaper-driven). MD3 dark scheme.
+ * @author matugen
+ * @version 1.0.0
+ */
+
+/*
+ * NOTE: This file is a matugen template.
+ * matugen replaces the Material You tokens (e.g. colors.primary.dark.hex)
+ * throughout this file on every wallpaper change. Files:
+ *   template:  ~/simpbar/matugen/fluxer-matugen.css
+ *   output:    ~/.config/fluxer/matugen.css
+ * Applying: Fluxer has no theme directory and no auto-reload, so after a
+ * wallpaper change re-apply the rendered file manually:
+ *   - stable client:  User Settings > Look & Feel > Custom Theme Tokens >
+ *                     Custom CSS Overrides  → paste the whole file
+ *   - canary client:  User Settings > Look & Feel > Theme Studio > Quick CSS >
+ *                     Import CSS  → select ~/.config/fluxer/matugen.css
+ *
+ * Variable set mirrors the Catppuccin Fluxer template (MIT, scarcekoi/fluxer);
+ * all colors come from the Material You MD3 dark scheme. Status/accent colors
+ * keep the recognizable semantics used across the rest of this desktop
+ * (online/idle fixed, danger/error = MD3 error, brand = primary).
+ */
+
+:root {
+    /* ── Background scale ──────────────────────────────────────────────────
+     * MD3 elevation ladder, darkest → lightest:
+     * lowest (content bg) → low (panels) → container (raised) → high (hover)
+     * → highest (focus/alt)                                              */
+    --background-primary: {{ colors.surface_container_lowest.dark.hex }};
+    --background-secondary: {{ colors.surface_container_low.dark.hex }};
+    --background-secondary-lighter: {{ colors.surface_container.dark.hex }};
+    --background-secondary-alt: {{ colors.surface_container_high.dark.hex }};
+    --background-tertiary: {{ colors.surface_container.dark.hex }};
+    --background-channel-header: {{ colors.surface_container_low.dark.hex }};
+    --guild-list-foreground: {{ colors.surface_container.dark.hex }};
+    --background-header-secondary: {{ colors.surface_container_lowest.dark.hex }};
+    --background-header-primary: {{ colors.surface_container.dark.hex }};
+    --background-textarea: {{ colors.surface_container_low.dark.hex }};
+    --background-header-primary-hover: {{ colors.surface_container_high.dark.hex }};
+
+    /* ── Text scale ────────────────────────────────────────────────────────
+     * primary = brightest body, secondary = variant, muted tiers = outline   */
+    --text-tertiary-secondary: {{ colors.outline.dark.hex }};
+    --text-tertiary-muted: {{ colors.outline.dark.hex }};
+    --text-tertiary: {{ colors.on_surface_variant.dark.hex }};
+    --text-primary-muted: {{ colors.on_surface_variant.dark.hex }};
+    --text-chat-muted: {{ colors.on_surface_variant.dark.hex }};
+    --text-secondary: {{ colors.on_surface_variant.dark.hex }};
+    --text-chat: {{ colors.on_surface.dark.hex }};
+    --text-primary: {{ colors.on_surface.dark.hex }};
+
+    /* ── Panel controls ────────────────────────────────────────────────── */
+    --panel-control-bg: {{ colors.surface_container_lowest.dark.hex }};
+    --panel-control-border: {{ colors.outline.dark.hex }};
+    --panel-control-divider: {{ colors.outline.dark.hex }};
+    --panel-control-highlight: {{ colors.outline.dark.hex }};
+
+    /* ── Interactive states ────────────────────────────────────────────── */
+    --background-modifier-hover: color-mix(in srgb, {{ colors.surface_container_high.dark.hex }} 80%, transparent);
+    --background-modifier-selected: {{ colors.surface_container.dark.hex }};
+    --background-modifier-accent: {{ colors.surface_container_high.dark.hex }};
+    --background-modifier-accent-focus: {{ colors.surface_container_highest.dark.hex }};
+
+    /* ── Control buttons ───────────────────────────────────────────────── */
+    --control-button-normal-bg: transparent;
+    --control-button-hover-bg: {{ colors.surface_container_low.dark.hex }};
+    --control-button-active-bg: {{ colors.surface_container_lowest.dark.hex }};
+    --control-button-danger-text: {{ colors.error.dark.hex }};
+    --control-button-danger-hover-bg: {{ colors.error.dark.hex }};
+
+    /* ── Brand / accent ────────────────────────────────────────────────── */
+    --brand-primary: {{ colors.primary.dark.hex }};
+    --brand-secondary: {{ colors.primary.dark.hex }};
+    --brand-primary-light: color-mix(in srgb, {{ colors.primary.dark.hex }} 70%, #ffffff);
+    --brand-primary-fill: {{ colors.surface_container.dark.hex }};
+
+    /* ── Status ──────────────────────────────────────────────────────────
+     * Keep the recognizable semantics used across the desktop: fixed online
+     * green / idle amber, MD3 error for dnd/danger, outline for offline.    */
+    --status-online: #23a55a;
+    --status-idle: #f0b232;
+    --status-dnd: {{ colors.error.dark.hex }};
+    --status-offline: {{ colors.outline.dark.hex }};
+    --status-danger: {{ colors.error.dark.hex }};
+    --text-warning: #f0b232;
+    --plutonium-icon: {{ colors.tertiary.dark.hex }};
+    --text-link: {{ colors.primary.dark.hex }};
+    --text-on-brand-primary: {{ colors.on_primary.dark.hex }};
+    --text-code: {{ colors.on_surface_variant.dark.hex }};
+    --text-selection: color-mix(in srgb, {{ colors.primary.dark.hex }} 35%, transparent);
+    --text-feedback-positive: #23a55a;
+
+    /* ── Mentions / markup ─────────────────────────────────────────────── */
+    --markup-mention-border: color-mix(in srgb, {{ colors.on_surface.dark.hex }} 30%, transparent);
+    --markup-everyone-text: {{ colors.tertiary.dark.hex }};
+    --markup-everyone-fill: color-mix(in srgb, {{ colors.tertiary.dark.hex }} 18%, transparent);
+    --markup-everyone-border: color-mix(in srgb, {{ colors.tertiary.dark.hex }} 30%, transparent);
+    --markup-here-text: #f0b232;
+    --markup-here-fill: color-mix(in srgb, #f0b232 18%, transparent);
+    --markup-here-border: color-mix(in srgb, #f0b232 30%, transparent);
+
+    /* ── Buttons ───────────────────────────────────────────────────────── */
+    --button-primary-fill: {{ colors.primary.dark.hex }};
+    --button-primary-active-fill: color-mix(in srgb, {{ colors.primary.dark.hex }} 85%, #000000);
+    --button-primary-text: {{ colors.on_primary.dark.hex }};
+    --button-secondary-fill: color-mix(in srgb, {{ colors.on_surface.dark.hex }} 10%, transparent);
+    --button-secondary-active-fill: color-mix(in srgb, {{ colors.on_surface.dark.hex }} 15%, transparent);
+    --button-secondary-text: {{ colors.on_surface.dark.hex }};
+    --button-danger-fill: {{ colors.error.dark.hex }};
+    --button-danger-active-fill: color-mix(in srgb, {{ colors.error.dark.hex }} 85%, #000000);
+    --button-danger-text: {{ colors.on_error.dark.hex }};
+    --button-danger-outline-border: 1px solid {{ colors.error.dark.hex }};
+    --button-danger-outline-text: {{ colors.error.dark.hex }};
+    --button-danger-outline-active-fill: color-mix(in srgb, {{ colors.error.dark.hex }} 90%, #000000);
+    --button-ghost-text: {{ colors.on_surface.dark.hex }};
+    --button-inverted-fill: {{ colors.surface_container.dark.hex }};
+    --button-inverted-text: {{ colors.on_surface.dark.hex }};
+    --button-outline-border: 1px solid color-mix(in srgb, {{ colors.on_surface.dark.hex }} 30%, transparent);
+    --button-outline-text: {{ colors.on_surface.dark.hex }};
+    --button-outline-active-fill: color-mix(in srgb, {{ colors.on_surface.dark.hex }} 15%, transparent);
+    --button-outline-active-border: 1px solid color-mix(in srgb, {{ colors.on_surface.dark.hex }} 40%, transparent);
+
+    /* ── Code / borders ────────────────────────────────────────────────── */
+    --bg-code: {{ colors.surface_container.dark.hex }};
+    --bg-code-block: {{ colors.surface_container_low.dark.hex }};
+    --border-color: {{ colors.surface_container_high.dark.hex }};
+    --border-color-hover: {{ colors.surface_container_highest.dark.hex }};
+    --border-color-focus: {{ colors.primary.dark.hex }};
+
+    /* ── Alerts ────────────────────────────────────────────────────────── */
+    --accent-purple: {{ colors.tertiary.dark.hex }};
+    --alert-note-color: {{ colors.primary.dark.hex }};
+    --alert-tip-color: #23a55a;
+    --alert-important-color: {{ colors.tertiary.dark.hex }};
+    --alert-warning-color: #f0b232;
+    --alert-caution-color: {{ colors.error.dark.hex }};
+
+    /* ── Shadows / effects ─────────────────────────────────────────────── */
+    --shadow-sm: 0 1px 2px color-mix(in srgb, {{ colors.shadow.dark.hex }} 10%, transparent);
+    --shadow-md: 0 2px 4px color-mix(in srgb, {{ colors.shadow.dark.hex }} 15%, transparent), 0 1px 2px color-mix(in srgb, {{ colors.shadow.dark.hex }} 10%, transparent);
+    --shadow-lg: 0 4px 8px color-mix(in srgb, {{ colors.shadow.dark.hex }} 15%, transparent), 0 2px 4px color-mix(in srgb, {{ colors.shadow.dark.hex }} 10%, transparent);
+    --shadow-xl: 0 10px 20px color-mix(in srgb, {{ colors.shadow.dark.hex }} 15%, transparent), 0 4px 8px color-mix(in srgb, {{ colors.shadow.dark.hex }} 10%, transparent);
+    --spoiler-overlay-color: color-mix(in srgb, {{ colors.shadow.dark.hex }} 20%, transparent);
+    --spoiler-overlay-hover-color: color-mix(in srgb, {{ colors.shadow.dark.hex }} 30%, transparent);
+
+    /* ── Scrollbars / focus ────────────────────────────────────────────── */
+    --scrollbar-thumb-bg: color-mix(in srgb, {{ colors.outline.dark.hex }} 40%, transparent);
+    --scrollbar-thumb-bg-hover: color-mix(in srgb, {{ colors.outline.dark.hex }} 70%, transparent);
+    --focus-primary: {{ colors.primary.dark.hex }};
+}
+
+/* ── Code blocks (highlight.js override) ──────────────────────────────────── */
+
+.hljs {
+  color: {{ colors.on_surface_variant.dark.hex }};
+  background: {{ colors.surface_container_lowest.dark.hex }};
+}
+.hljs-doctag,
+.hljs-keyword,
+.hljs-meta .hljs-keyword,
+.hljs-template-tag,
+.hljs-template-variable,
+.hljs-type,
+.hljs-variable.language_ {
+  color: {{ colors.error.dark.hex }};
+}
+.hljs-title,
+.hljs-title.class_,
+.hljs-title.class_.inherited__,
+.hljs-title.function_ {
+  color: {{ colors.tertiary.dark.hex }};
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-literal,
+.hljs-meta,
+.hljs-number,
+.hljs-operator,
+.hljs-variable,
+.hljs-selector-attr,
+.hljs-selector-class,
+.hljs-selector-id {
+  color: {{ colors.primary.dark.hex }};
+}
+.hljs-regexp,
+.hljs-string,
+.hljs-meta .hljs-string {
+  color: {{ colors.secondary.dark.hex }};
+}
+.hljs-built_in,
+.hljs-symbol {
+  color: {{ colors.secondary.dark.hex }};
+}
+.hljs-comment,
+.hljs-code,
+.hljs-formula {
+  color: {{ colors.outline.dark.hex }};
+}
+.hljs-name,
+.hljs-quote,
+.hljs-selector-tag,
+.hljs-selector-pseudo {
+  color: {{ colors.on_surface_variant.dark.hex }};
+}
+.hljs-subst {
+  color: {{ colors.on_surface_variant.dark.hex }};
+}
+.hljs-section {
+  color: {{ colors.primary.dark.hex }};
+}
+.hljs-bullet {
+  color: #f0b232;
+}
+.hljs-emphasis {
+  color: {{ colors.on_surface_variant.dark.hex }};
+}
+.hljs-strong {
+  color: {{ colors.on_surface_variant.dark.hex }};
+}
+.hljs-addition {
+  color: #23a55a;
+  background-color: color-mix(in srgb, #23a55a 15%, transparent);
+}
+.hljs-deletion {
+  color: {{ colors.error.dark.hex }};
+  background-color: color-mix(in srgb, {{ colors.error.dark.hex }} 15%, transparent);
+}
+
+/* ── Component fixups (kept from the Catppuccin Fluxer template) ──────────── */
+
+[class*="VoiceCallView.module__root"] {
+  background-color: {{ colors.surface_container_lowest.dark.hex }};
+}
+
+[class*="MobileDownloadNagbar.module__platformIcon"],
+[class*="Divider.module__unreadBadge"],
+[class*="Messages.module__newMessagesBarText"],
+[class*="Messages.module__newMessagesBarAction"],
+[class*="ToggleButton.module__active"],
+[class^="PricingCard.module__cardPricePopular"],
+[class^="PricingCard.module__cardTitlePopular"],
+[class^="PricingCard.module__cardPeriodPopular"],
+[class^="PricingCard.module__badge"] {
+  color: {{ colors.on_primary.dark.hex }};
+}
+
+[class*="RadioGroup.module__group"] {
+  --radio-dot-fill: {{ colors.on_primary.dark.hex }};
+}
+
+[class*="Switch.module__switchThumb"],
+[class^="PricingCard.module__popularBadge"] {
+  background-color: {{ colors.on_primary.dark.hex }};
+}
+
+[class*="NativeTitlebar.module__closeButton"]:hover {
+  background-color: {{ colors.error.dark.hex }};
+  color: {{ colors.on_error.dark.hex }};
+}
+
+[class*="ScrollIndicatorOverlay.module__indicator"],
+[class*="ScrollIndicatorOverlay.module__indicatorBrand"] {
+  background-color: {{ colors.surface_container_high.dark.hex }};
+  color: {{ colors.on_surface.dark.hex }};
+}
+
+[class*="module__clickableItemSelected"] [class*="clickableItemIcon"] {
+  color: {{ colors.on_primary.dark.hex }} !important;
+}
+
+[class^="PlutoniumContent.module__icon"] {
+  color: {{ colors.tertiary.dark.hex }};
+}

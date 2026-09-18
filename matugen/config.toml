@@ -1,6 +1,6 @@
 # matugen — Material You colorscheme generator, wired into simpbar + a whole
 # desktop: simpbar, hyprland, foot terminal, GTK (nautilus/nemo), Qt/qt6ct
-# (dolphin), Vesktop & Equibop Discord clients, Zen Browser, Steam skins, and
+# (dolphin), Vesktop & Equibop Discord clients, the Fluxer chat client, Zen
 # the swaync notification center.
 #
 # Two ways to use this:
@@ -74,6 +74,15 @@ input_path = "~/.config/matugen/templates/equibop-matugen.css"
 output_path = "~/.config/equibop/themes/matugen.theme.css"
 post_hook = "sh -c 'python3 \"$HOME/.config/matugen/enable-theme.py\" \"$HOME/.config/equibop/settings/settings.json\" matugen.theme.css'"
 
+# ═══════════════════════════ Fluxer ═══════════════════════════
+# Renders an MD3 token set for the Fluxer chat client. Fluxer has no theme
+# directory and no auto-reload, so after each wallpaper change re-apply it
+# manually: stable → Settings > Look & Feel > Custom Theme Tokens > Custom CSS
+# Overrides (paste the file); canary → Theme Studio > Quick CSS > Import CSS.
+[templates.fluxer]
+input_path = "~/.config/matugen/templates/fluxer-matugen.css"
+output_path = "~/.config/fluxer/matugen.css"
+
 # ═══════════════════════════ Foot ═══════════════════════════
 # Renders the 16-color palette. foot.ini pulls it in with:
 #     include=~/.config/foot/colors.ini
@@ -111,14 +120,51 @@ input_path = "~/.config/matugen/templates/zen-userchrome.css"
 output_path = "~/.config/zen/1zf1flh5.Default (release)/chrome/userChrome.css"
 post_hook = "sh -c 'python3 \"$HOME/.config/matugen/zen-enable-pref.py\" \"$HOME/.config/zen/1zf1flh5.Default (release)/prefs.js\"'"
 
-# ═══════════════════════════ Steam ═══════════════════════════
-# Renders an MD3 CSS skin under ~/.steam/steam/skins/matugen/. Steam's modern
-# client can't load custom CSS on its own — you must install a patcher
-# (Millennium, https://github.com/OpenSteamClient/Millennium) for the skin to
-# take effect. See the generated file's header.
-[templates.steam]
-input_path = "~/.config/matugen/templates/steam-theme.css"
-output_path = "~/.steam/steam/skins/matugen/steamui/themes/matugen.css"
+# ═══════════════════════ Steam (Millennium) ═══════════════════════
+# Renders a complete Millennium skin to ~/.steam/steam/millennium/themes/
+# matugen/ — the directory Millennium 3 watches. Select it once in
+# Settings → Themes and every wallpaper change recolors Steam.
+#   • steam-skin.json      → the skin manifest (Millennium looks for this)
+#   • steam-md3.css        → MD3 palette, injected into every window
+#   • steam-*.css          → per-window rules (library/friends/overlay/etc.)
+# No patcher beyond Millennium is needed; see skin.json for the window → css
+# mapping. If your install uses steamui/skins instead of millennium/themes,
+# only the output paths below change.
+[templates.steam-skin-json]
+input_path = "~/.config/matugen/templates/steam-skin.json"
+output_path = "~/.steam/steam/millennium/themes/matugen/skin.json"
+
+[templates.steam-md3]
+input_path = "~/.config/matugen/templates/steam-md3.css"
+output_path = "~/.steam/steam/millennium/themes/matugen/steam-md3.css"
+
+[templates.steam-libraryroot]
+input_path = "~/.config/matugen/templates/steam-libraryroot.css"
+output_path = "~/.steam/steam/millennium/themes/matugen/steam-libraryroot.css"
+
+[templates.steam-friends]
+input_path = "~/.config/matugen/templates/steam-friends.css"
+output_path = "~/.steam/steam/millennium/themes/matugen/steam-friends.css"
+
+[templates.steam-overlay]
+input_path = "~/.config/matugen/templates/steam-overlay.css"
+output_path = "~/.steam/steam/millennium/themes/matugen/steam-overlay.css"
+
+[templates.steam-notifications]
+input_path = "~/.config/matugen/templates/steam-notifications.css"
+output_path = "~/.steam/steam/millennium/themes/matugen/steam-notifications.css"
+
+[templates.steam-bigpicture]
+input_path = "~/.config/matugen/templates/steam-bigpicture.css"
+output_path = "~/.steam/steam/millennium/themes/matugen/steam-bigpicture.css"
+
+[templates.steam-menu]
+input_path = "~/.config/matugen/templates/steam-menu.css"
+output_path = "~/.steam/steam/millennium/themes/matugen/steam-menu.css"
+
+[templates.steam-webkit]
+input_path = "~/.config/matugen/templates/steam-webkit.css"
+output_path = "~/.steam/steam/millennium/themes/matugen/steam-webkit.css"
 
 # ═══════════════════════════ swaync ═══════════════════════════
 # Renders the notification center's whole style.css from the MD3 dark palette

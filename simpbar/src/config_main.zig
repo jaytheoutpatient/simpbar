@@ -25,6 +25,9 @@ const gtk = @import("welcome_gtk.zig");
 const hg = @import("hypr_gtk.zig");
 const hypr = @import("hyprland.zig");
 const hypr_pages = @import("hypr_pages.zig");
+const logging = @import("logging.zig");
+
+pub const panic = std.debug.FullPanic(logging.panicHandler);
 
 extern "c" fn exit(code: c_int) noreturn;
 
@@ -476,7 +479,7 @@ const ModuleGroup = struct {
 
     fn load(self: *ModuleGroup, src: []const ModuleEntry) void {
         if (src.len > self.rows.len) {
-            std.debug.print("config: more than {d} modules in one group, dropping the rest\n", .{self.rows.len});
+            logging.warn("config: more than {d} modules in one group, dropping the rest", .{self.rows.len});
         }
         self.len = @min(src.len, self.rows.len);
         for (0..self.len) |i| {
@@ -642,7 +645,7 @@ const LauncherGroup = struct {
 
     fn load(self: *LauncherGroup, src: []const LauncherButton) void {
         if (src.len > self.rows.len) {
-            std.debug.print("config: more than {d} launchers, dropping the rest\n", .{self.rows.len});
+            logging.warn("config: more than {d} launchers, dropping the rest", .{self.rows.len});
         }
         self.len = @min(src.len, self.rows.len);
         for (0..self.len) |i| {
@@ -680,6 +683,7 @@ fn loadConfigFromDisk() void {
     if (config_loaded) return;
     config_loaded = true;
     resolvePaths();
+    logging.step("config: loading {s}", .{config_json_path});
 
     const allocator = config_arena.allocator();
     var parsed: JsonConfig = .{};
@@ -687,11 +691,11 @@ fn loadConfigFromDisk() void {
         parsed = std.json.parseFromSliceLeaky(JsonConfig, allocator, bytes, .{
             .ignore_unknown_fields = true,
         }) catch |err| blk: {
-            std.debug.print("config: could not parse {s}: {} (using defaults)\n", .{ config_json_path, err });
+            logging.warn("config: could not parse {s}: {} (using defaults)", .{ config_json_path, err });
             break :blk JsonConfig{};
         };
     } else |err| {
-        std.debug.print("config: could not read {s}: {} (using defaults)\n", .{ config_json_path, err });
+        logging.warn("config: could not read {s}: {} (using defaults)", .{ config_json_path, err });
     }
 
     const j = parsed.appearance;
@@ -903,17 +907,17 @@ fn buildConfigJson() ![]u8 {
 
 fn signalBar() void {
     const text = readFileAll(pidfile_path) orelse {
-        std.debug.print("config: no pidfile at {s} (bar not running?)\n", .{pidfile_path});
+        logging.warn("config: no pidfile at {s} (bar not running?)", .{pidfile_path});
         return;
     };
     defer gpa.free(text);
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     const pid = std.fmt.parseInt(c_int, trimmed, 10) catch {
-        std.debug.print("config: unreadable pid in {s}\n", .{pidfile_path});
+        logging.warn("config: unreadable pid in {s}", .{pidfile_path});
         return;
     };
     if (std.c.kill(pid, .USR1) != 0) {
-        std.debug.print("config: kill(SIGUSR1) on pid {d} failed (bar not running?)\n", .{pid});
+        logging.warn("config: kill(SIGUSR1) on pid {d} failed (bar not running?)", .{pid});
     }
 }
 
@@ -989,12 +993,12 @@ fn onRestartBarClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
 
 fn saveAndSignal() void {
     const bytes = buildConfigJson() catch |err| {
-        std.debug.print("config: failed to build config.json: {}\n", .{err});
+        logging.err("config: failed to build config.json: {}", .{err});
         return;
     };
     defer gpa.free(bytes);
     if (!writeFileAll(config_json_path, bytes)) {
-        std.debug.print("config: failed to write {s}\n", .{config_json_path});
+        logging.err("config: failed to write {s}", .{config_json_path});
         return;
     }
     signalBar();
@@ -1138,7 +1142,7 @@ fn onMatugenTypeChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaqu
     if (writeFileAll(matugen_type_path, live_matugen_type)) {
         launchDetached(&.{"simpbar-matugen"});
     } else {
-        std.debug.print("config: could not write {s}\n", .{matugen_type_path});
+        logging.err("config: could not write {s}", .{matugen_type_path});
     }
 }
 
@@ -1777,7 +1781,7 @@ fn onIconEntryChanged(buffer: *gtk.GtkEntryBuffer, _: *gtk.GParamSpec, _: ?*anyo
 fn onPinToBarClicked(_: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
     const ss: *const SessionShortcut = @ptrCast(@alignCast(user_data.?));
     if (!live_launchers.append(ss.name(), ss.exec(), ss.icon())) {
-        std.debug.print("shortcuts: launcher list is full ({d} max), not pinning\n", .{MAX_LAUNCHERS});
+        logging.warn("shortcuts: launcher list is full ({d} max), not pinning", .{MAX_LAUNCHERS});
         return;
     }
     saveAndSignal();
@@ -1819,7 +1823,7 @@ fn onCreateShortcutClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void 
     const name = entryText(name_entry);
     const exec = entryText(exec_entry);
     if (name.len == 0 or exec.len == 0) {
-        std.debug.print("shortcuts: Name and Exec are both required, not creating\n", .{});
+        logging.warn("shortcuts: Name and Exec are both required, not creating", .{});
         return;
     }
     const comment = if (g_comment_entry) |e| entryText(e) else "";
@@ -1830,22 +1834,22 @@ fn onCreateShortcutClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void 
     const slug = slugify(name, &slug_buf);
     var path_buf: [512]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}.desktop", .{ applications_dir, slug }) catch {
-        std.debug.print("shortcuts: slug too long, not creating\n", .{});
+        logging.warn("shortcuts: slug too long, not creating", .{});
         return;
     };
 
     const contents = buildDesktopFile(name, comment, exec, icon) catch |err| {
-        std.debug.print("shortcuts: failed to build .desktop contents: {}\n", .{err});
+        logging.err("shortcuts: failed to build .desktop contents: {}", .{err});
         return;
     };
     defer gpa.free(contents);
     if (!writeFileAll(path, contents)) {
-        std.debug.print("shortcuts: failed to write {s}\n", .{path});
+        logging.err("shortcuts: failed to write {s}", .{path});
         return;
     }
 
     if (session_shortcuts_len >= session_shortcuts.len) {
-        std.debug.print("shortcuts: {d} created this session already, not tracking any more (file was still written)\n", .{session_shortcuts.len});
+        logging.warn("shortcuts: {d} created this session already, not tracking any more (file was still written)", .{session_shortcuts.len});
         return;
     }
     const ss = &session_shortcuts[session_shortcuts_len];
@@ -2355,11 +2359,24 @@ fn onAppActivate(app: *gtk.GApplication, _: ?*anyopaque) callconv(.c) void {
         g_window = buildWindow(@ptrCast(app));
     }
     gtk.gtk_window_present(@ptrCast(g_window.?));
+    logging.step("window shown", .{});
 }
 
-pub fn main() !void {
+pub fn main() void {
+    logging.init("simpbar-config");
+    realMain() catch |err| {
+        logging.err("fatal: {s}", .{@errorName(err)});
+        logging.crash("fatal error: {s}", .{@errorName(err)});
+        logging.dumpCurrentStack();
+        std.process.exit(1);
+    };
+}
+
+fn realMain() !void {
+    logging.step("starting up", .{});
     const app = gtk.adw_application_new(APP_ID, 0);
     _ = gtk.g_signal_connect_data(@ptrCast(app), "activate", @ptrCast(&onAppActivate), null, null, 0);
     const code = gtk.g_application_run(@ptrCast(app), 0, null);
+    logging.step("gtk main loop exited with code {d}", .{code});
     exit(code);
 }
