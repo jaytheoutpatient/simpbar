@@ -22,6 +22,9 @@
 
 const std = @import("std");
 const gtk = @import("welcome_gtk.zig");
+const hg = @import("hypr_gtk.zig");
+const hypr = @import("hyprland.zig");
+const hypr_pages = @import("hypr_pages.zig");
 
 extern "c" fn exit(code: c_int) noreturn;
 
@@ -135,7 +138,7 @@ const CENTER_LAUNCHERS = [_]LauncherButton{
     .{ .label = "\u{f07c} Files", .command = "nautilus" },
     .{ .label = "\u{f120} Term", .command = "foot" },
     .{ .label = "\u{f1b6} Steam", .command = "steam" },
-    .{ .label = "\u{f013} HyprMod", .command = "hyprmod" },
+    .{ .label = "\u{f013} Config", .command = "simpbar-config" },
     .{ .label = "\u{f118} Welcome", .command = "simpbar-welcome" },
 };
 
@@ -2215,8 +2218,15 @@ fn buildModulesPage() *gtk.GtkBox {
 
 const PAGE_NAMES = [_][:0]const u8{ "Appearance", "Modules", "Shortcuts" };
 const PAGE_ICONS = [_][:0]const u8{ "applications-graphics-symbolic", "view-list-symbolic", "user-bookmarks-symbolic" };
+const BAR_COUNT = PAGE_NAMES.len;
 
-var g_sidebar_rows: [PAGE_NAMES.len]*gtk.GtkListBoxRow = undefined;
+// "Bar" pages + Hyprland pages, in sidebar order. The two header rows
+// ("Bar" / "Hyprland") are inserted between them at build time.
+const SB_NAMES = PAGE_NAMES ++ hypr_pages.pages.names;
+const SB_ICONS = PAGE_ICONS ++ hypr_pages.pages.icons;
+const SB_COUNT = SB_NAMES.len;
+
+var g_sidebar_rows: [SB_COUNT]*gtk.GtkListBoxRow = undefined;
 var g_content_stack: ?*gtk.GtkStack = null;
 var g_window: ?*gtk.AdwApplicationWindow = null;
 
@@ -2224,13 +2234,41 @@ fn onSidebarRowSelected(_: *gtk.GtkListBox, row: ?*gtk.GtkListBoxRow, _: ?*anyop
     const r = row orelse return;
     for (g_sidebar_rows, 0..) |sr, i| {
         if (sr == r) {
-            gtk.gtk_stack_set_visible_child_name(g_content_stack.?, PAGE_NAMES[i]);
+            gtk.gtk_stack_set_visible_child_name(g_content_stack.?, SB_NAMES[i]);
             return;
         }
     }
 }
 
+fn addSidebarRow(sidebar_list: *gtk.GtkListBox, name: [:0]const u8, icon: [:0]const u8, selectable: bool, index: usize) void {
+    const row = gtk.gtk_list_box_row_new();
+    hg.gtk_list_box_row_set_selectable(row, if (selectable) 1 else 0);
+    if (!selectable) {
+        gtk.gtk_widget_add_css_class(@ptrCast(row), "dim-label");
+    }
+    const row_box = gtk.gtk_box_new(gtk.ORIENTATION_HORIZONTAL, 12);
+    gtk.gtk_widget_set_margin_top(@ptrCast(row_box), if (selectable) 8 else 4);
+    gtk.gtk_widget_set_margin_bottom(@ptrCast(row_box), if (selectable) 8 else 4);
+    gtk.gtk_widget_set_margin_start(@ptrCast(row_box), 12);
+    gtk.gtk_widget_set_margin_end(@ptrCast(row_box), 12);
+    if (selectable and icon.len != 0) {
+        gtk.gtk_box_append(row_box, @ptrCast(gtk.gtk_image_new_from_icon_name(icon)));
+    }
+    const label = gtk.gtk_label_new(name);
+    gtk.gtk_label_set_xalign(label, 0);
+    gtk.gtk_box_append(row_box, @ptrCast(label));
+    gtk.gtk_list_box_row_set_child(row, @ptrCast(row_box));
+    gtk.gtk_list_box_append(sidebar_list, @ptrCast(row));
+    if (selectable) g_sidebar_rows[index] = row;
+}
+
+fn onReloadClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    _ = hypr.reloadHyprland();
+}
+
 fn buildWindow(app: *anyopaque) *gtk.AdwApplicationWindow {
+    hypr_pages.init();
+
     const window = gtk.adw_application_window_new(app);
     gtk.gtk_window_set_title(@ptrCast(window), "Simpbar Config");
     // Widened from the original 700 — Nerd Font family names ("JetBrainsMonoNL
@@ -2244,7 +2282,7 @@ fn buildWindow(app: *anyopaque) *gtk.AdwApplicationWindow {
     gtk.gtk_widget_add_css_class(@ptrCast(sidebar_list), "navigation-sidebar");
     gtk.gtk_list_box_set_selection_mode(sidebar_list, gtk.SELECTION_SINGLE);
 
-    const pages = [_]*gtk.GtkBox{
+    const bar_pages = [_]*gtk.GtkBox{
         buildAppearancePage(),
         buildModulesPage(),
         buildShortcutsPage(),
@@ -2256,26 +2294,26 @@ fn buildWindow(app: *anyopaque) *gtk.AdwApplicationWindow {
     gtk.gtk_widget_set_hexpand(@ptrCast(content_stack), 1);
     g_content_stack = content_stack;
 
-    for (PAGE_NAMES, 0..) |name, i| {
-        const row = gtk.gtk_list_box_row_new();
-        const row_box = gtk.gtk_box_new(gtk.ORIENTATION_HORIZONTAL, 12);
-        gtk.gtk_widget_set_margin_top(@ptrCast(row_box), 8);
-        gtk.gtk_widget_set_margin_bottom(@ptrCast(row_box), 8);
-        gtk.gtk_widget_set_margin_start(@ptrCast(row_box), 12);
-        gtk.gtk_widget_set_margin_end(@ptrCast(row_box), 12);
-        gtk.gtk_box_append(row_box, @ptrCast(gtk.gtk_image_new_from_icon_name(PAGE_ICONS[i])));
-        const label = gtk.gtk_label_new(name);
-        gtk.gtk_label_set_xalign(label, 0);
-        gtk.gtk_box_append(row_box, @ptrCast(label));
-        gtk.gtk_list_box_row_set_child(row, @ptrCast(row_box));
-        gtk.gtk_list_box_append(sidebar_list, @ptrCast(row));
-        g_sidebar_rows[i] = row;
+    addSidebarRow(sidebar_list, "Bar", "", false, SB_COUNT);
+    for (0..BAR_COUNT) |i| {
+        addSidebarRow(sidebar_list, PAGE_NAMES[i], PAGE_ICONS[i], true, i);
+    }
+    addSidebarRow(sidebar_list, "Hyprland", "", false, SB_COUNT);
+    for (BAR_COUNT..SB_COUNT) |i| {
+        addSidebarRow(sidebar_list, SB_NAMES[i], SB_ICONS[i], true, i);
+    }
 
+    const hypr_widgets = hypr_pages.pages.widgets();
+    var page_widgets: [SB_COUNT]*gtk.GtkBox = undefined;
+    for (bar_pages, 0..) |p, i| page_widgets[i] = p;
+    for (hypr_widgets, 0..) |p, i| page_widgets[BAR_COUNT + i] = p;
+
+    for (SB_NAMES, 0..) |name, i| {
         const scrolled = gtk.gtk_scrolled_window_new();
         gtk.gtk_scrolled_window_set_policy(scrolled, gtk.POLICY_NEVER, gtk.POLICY_AUTOMATIC);
         gtk.gtk_widget_set_vexpand(@ptrCast(scrolled), 1);
         gtk.gtk_widget_set_hexpand(@ptrCast(scrolled), 1);
-        gtk.gtk_scrolled_window_set_child(scrolled, @ptrCast(pages[i]));
+        gtk.gtk_scrolled_window_set_child(scrolled, @ptrCast(page_widgets[i]));
         _ = gtk.gtk_stack_add_named(content_stack, @ptrCast(scrolled), name);
     }
 
@@ -2287,15 +2325,20 @@ fn buildWindow(app: *anyopaque) *gtk.AdwApplicationWindow {
     const sidebar_page = gtk.adw_navigation_page_new(@ptrCast(sidebar_toolbar), "Simpbar Config");
     gtk.adw_navigation_split_view_set_sidebar(split_view, sidebar_page);
 
+
+    const content_header_bar = gtk.adw_header_bar_new();
+    const reload_btn = gtk.gtk_button_new_with_label("Reload Hyprland");
+    _ = gtk.g_signal_connect_data(@ptrCast(reload_btn), "clicked", @ptrCast(&onReloadClicked), null, null, 0);
+    hg.adw_header_bar_pack_end(content_header_bar, @ptrCast(reload_btn));
     const content_toolbar = gtk.adw_toolbar_view_new();
-    gtk.adw_toolbar_view_add_top_bar(content_toolbar, @ptrCast(gtk.adw_header_bar_new()));
+    gtk.adw_toolbar_view_add_top_bar(content_toolbar, @ptrCast(content_header_bar));
     gtk.adw_toolbar_view_set_content(content_toolbar, @ptrCast(content_stack));
     const content_page = gtk.adw_navigation_page_new(@ptrCast(content_toolbar), "");
     gtk.adw_navigation_split_view_set_content(split_view, content_page);
 
     gtk.adw_application_window_set_content(window, @ptrCast(split_view));
 
-    gtk.gtk_list_box_select_row(sidebar_list, gtk.gtk_list_box_get_row_at_index(sidebar_list, 0));
+    gtk.gtk_list_box_select_row(sidebar_list, gtk.gtk_list_box_get_row_at_index(sidebar_list, 1));
 
     return window;
 }

@@ -80,12 +80,12 @@ The chosen scheme type lives in `~/.config/simpbar/matugen-type` (a simpbar-owne
 **Extras**
 - OBS Studio and a video editor (Kdenlive, Shotcut, or Flowblade), both optional
 - cliphist (clipboard history), grim + slurp + xdg-desktop-portal-hyprland (screenshots/screen-share)
-- HyprMod — a native GTK4/libadwaita settings app for tweaking Hyprland itself (keybinds, monitors, animations, window rules) without touching `hyprland.lua` by hand
+- Hyprland settings built into **Simpbar Config** — a native GTK4/libadwaita manager for keybinds, monitors, animations, window/workspace/layer rules, autostart, and environment, without hand-editing `hyprland.lua`
 - Chaotic-AUR set up automatically for faster package installs
 - A background update checker (systemd timer, runs every 6h) that notifies you when there's a new Arch/AUR update or a new commit on this repo
 
 **Pinned apps in the bar**
-simpbar ships with quick-launch icons next to the menu button: Browser, Discord, Files (Nautilus), Terminal, Steam, HyprMod, and Simpbar Welcome. Browser and Discord are smart about it — whichever one you actually installed is what launches by default, and you can change your mind later from the Welcome app without needing to touch any config directly.
+simpbar ships with quick-launch icons next to the menu button: Browser, Discord, Files (Nautilus), Terminal, Steam, Config (Hyprland settings), and Simpbar Welcome. Browser and Discord are smart about it — whichever one you actually installed is what launches by default, and you can change your mind later from the Welcome app without needing to touch any config directly.
 
 ## Simpbar Welcome
 
@@ -94,11 +94,26 @@ A small GTK4 + libadwaita app that pops up once on first login (and is always re
 - **Welcome** — quick intro, plus a "Launch on startup" switch (toggles whether the app opens automatically each login)
 - **Setup**
   - Update Simpbar & Arch Linux in one click, or just check for updates now
-  - Quick launchers for the wallpaper picker (azote on Debian, waypaper on Arch), nwg-look, HyprMod, and pavucontrol
+  - Quick launchers for the wallpaper picker (azote on Debian, waypaper on Arch), nwg-look, the Hyprland settings (simpbar-config), and pavucontrol
   - Install or remove text editors (Neovim/Gedit/Kate/Zed/VS Code)
   - Set which browser and Discord client the bar's pinned buttons should launch
 - **Keybindings** — the list below, always at hand
 - **About** — links to this repo, issues, and a contact email for bugs/suggestions
+
+## Simpbar Config
+
+Simpbar Config is the app in the "Tweak Hyprland settings" card: a sidebar of nine
+Hyprland pages (General, Monitors, Animations, Keybinds, Window Rules, Workspace
+Rules, Layer Rules, Autostart, Environment) sitting next to the original bar
+pages (Appearance, Modules, Shortcuts).
+
+- Settings are saved to `~/.config/simpbar/hyprland.json` (the source of truth).
+- Each change regenerates `~/.config/hypr/hyprland-simpbar.lua` and both files are
+  written atomically, then Hyprland is reloaded automatically.
+- `hyprland-simpbar.lua` is loaded from `hyprland.lua` via an idempotent
+  `pcall(require, "hyprland-simpbar")` line — the first app run adds it if missing,
+  and install.sh adds it to fresh configs, so a manual `hyprland.lua` stays yours.
+- Hit the header-bar **Reload Hyprland** button to re-apply from disk at any time.
 
 ## Keybindings
 
@@ -123,4 +138,4 @@ Don't forget to reboot once the install finishes (`systemctl reboot`) so everyth
 
 The Beginning of the install script is thanks to **Ryzendew**.
 
-The HyprMod Developer **BlueManCZ**.
+The Hyprland-settings experience is inspired by **HyprMod** by **BlueManCZ**.

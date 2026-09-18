@@ -349,7 +349,7 @@ const CENTER_LAUNCHERS = [_]LauncherButton{
     .{ .label = "\u{f07c} Files", .command = "nautilus" }, // fa-folder-open
     .{ .label = "\u{f120} Term", .command = "foot" }, // fa-terminal
     .{ .label = "\u{f1b6} Steam", .command = "steam" }, // fa-steam
-    .{ .label = "\u{f013} HyprMod", .command = "hyprmod" }, // fa-cog
+    .{ .label = "\u{f013} Config", .command = "simpbar-config" }, // fa-cog
     .{ .label = "\u{f118} Welcome", .command = "simpbar-welcome" }, // fa-smile-o
 };
 
@@ -449,9 +449,11 @@ const Appearance = struct {
     /// config field.
     position: []const u8,
     /// Rounds all 4 corners by this many px, applied as the very last step
-    /// of every draw (after background/borders/every module), by zeroing
-    /// out (fully transparent, not just recolored) whichever corner pixels
-    /// fall outside each corner's rounding circle. 0 = today's square
+    /// of every draw (after background/borders/every module): pixels outside
+    /// each corner's rounding circle are zeroed out (fully transparent, not
+    /// just recolored), and the border band just inside that circle is
+    /// repainted in border_color so the straight borders curve around the
+    /// corner instead of ending at the radius box. 0 = today's square
     /// corners. Clamped at draw time to at most half the shorter of
     /// bar.width/bar.height, since a bigger radius makes the corner math
     /// degenerate.
@@ -4083,6 +4085,17 @@ fn layerSurfaceListener(
     }
 }
 
+/// Squared radius of the inner edge of a rounded corner's border band: the
+/// corner circle radius `r`, shrunk by that corner's border thickness (the
+/// thicker of its two adjacent sides). Returns r² unchanged when both sides
+/// are 0px, so the corner gets no band and stays pure clipped. Only the
+/// squared value is needed — drawAndCommit compares squared distances.
+fn sqShrunkRadius(r: i32, side_a_px: u32, side_b_px: u32) i32 {
+    const thickness: i32 = @intCast(@max(side_a_px, side_b_px));
+    const inner = @max(r - thickness, 0);
+    return inner * inner;
+}
+
 /// Allocate an anonymous shared-memory buffer, fill it with a solid color,
 /// attach it to the surface, and commit. This is the whole "renderer" for
 /// now — text/module drawing replaces the fill loop later.
@@ -4222,15 +4235,30 @@ fn drawAndCommit(bar: *Bar) !void {
     // Corner rounding — the very last drawing step, so it clips everything
     // (background, borders, every module) rather than just the background
     // fill. Standard corner-circle technique: for each corner's radius×radius
-    // pixel box, zero out (fully transparent, not just recolored — the SHM
+    // pixel box, pixels falling outside that corner's rounding circle are the
+    // one part of the bar that genuinely isn't part of the rounded rectangle,
+    // so they're zeroed (fully transparent, not just recolored — the SHM
     // buffer is argb8888 with no opaque-region hint set, so alpha=0 really
-    // does cut the pixel away rather than just changing its RGB) whichever
-    // pixels fall outside that corner's rounding circle. Squared-distance
-    // comparison avoids a sqrt per pixel.
+    // does cut the pixel away rather than just changing its RGB). Pixels just
+    // *inside* the circle are the rounded corner's border, but the straight
+    // borders were only drawn as rectangles above — so those are recolored to
+    // border_color, letting each side's border curve around its corner
+    // instead of stopping dead at the radius box. The band is as thick as the
+    // thicker of the corner's two adjacent border widths so it never reads
+    // thinner than the straight border running into it; a corner with 0px on
+    // both adjacent sides gets no band (pure clipping, old behavior).
+    // Squared-distance comparisons avoid a sqrt per pixel.
     const radius = @min(current_config.appearance.corner_radius_px, @min(bar.width, bar.height) / 2);
     if (radius > 0) {
         const r_i: i32 = @intCast(radius);
         const r_sq: i32 = r_i * r_i;
+        // Inner edge of each corner's border band: the circle shrunk by that
+        // corner's border thickness (max of its two adjacent sides). Clamped
+        // at 0, and equal to r_sq when both sides are 0px (i.e. no band).
+        const inner_tl_sq = sqShrunkRadius(r_i, current_config.appearance.border_top_px, current_config.appearance.border_left_px);
+        const inner_tr_sq = sqShrunkRadius(r_i, current_config.appearance.border_top_px, current_config.appearance.border_right_px);
+        const inner_bl_sq = sqShrunkRadius(r_i, current_config.appearance.border_bottom_px, current_config.appearance.border_left_px);
+        const inner_br_sq = sqShrunkRadius(r_i, current_config.appearance.border_bottom_px, current_config.appearance.border_right_px);
         var cy: u32 = 0;
         while (cy < radius) : (cy += 1) {
             var cx: u32 = 0;
@@ -4240,11 +4268,21 @@ fn drawAndCommit(bar: *Bar) !void {
                 // integer-coordinate convention for a discrete rounded rect.
                 const dx: i32 = @as(i32, @intCast(cx)) - (r_i - 1);
                 const dy: i32 = @as(i32, @intCast(cy)) - (r_i - 1);
-                if (dx * dx + dy * dy > r_sq) {
-                    pixels[cy * bar.width + cx] = 0; // top-left
-                    pixels[cy * bar.width + (bar.width - 1 - cx)] = 0; // top-right
-                    pixels[(bar.height - 1 - cy) * bar.width + cx] = 0; // bottom-left
-                    pixels[(bar.height - 1 - cy) * bar.width + (bar.width - 1 - cx)] = 0; // bottom-right
+                const d_sq = dx * dx + dy * dy;
+                const tl = cy * bar.width + cx;
+                const tr = cy * bar.width + (bar.width - 1 - cx);
+                const bl = (bar.height - 1 - cy) * bar.width + cx;
+                const br = (bar.height - 1 - cy) * bar.width + (bar.width - 1 - cx);
+                if (d_sq > r_sq) {
+                    pixels[tl] = 0;
+                    pixels[tr] = 0;
+                    pixels[bl] = 0;
+                    pixels[br] = 0;
+                } else {
+                    if (d_sq > inner_tl_sq) pixels[tl] = bc;
+                    if (d_sq > inner_tr_sq) pixels[tr] = bc;
+                    if (d_sq > inner_bl_sq) pixels[bl] = bc;
+                    if (d_sq > inner_br_sq) pixels[br] = bc;
                 }
             }
         }

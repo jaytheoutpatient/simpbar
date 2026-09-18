@@ -703,10 +703,10 @@ var SETUP_ACTIONS = [_]SetupAction{
     },
     .{
         .title = "Tweak Hyprland settings",
-        .subtitle = "Opens HyprMod \u{2014} keybinds, monitors, animations, window rules, and " ++
-            "more, with a live preview. Writes to its own config, doesn't touch hyprland.lua directly.",
+        .subtitle = "Opens Simpbar Config \u{2014} keybinds, monitors, animations, window rules, " ++
+            "and more. Saves to ~/.config/simpbar/hyprland.json and reloads Hyprland live.",
         .icon = "preferences-desktop-display-symbolic",
-        .argv = &[_][:0]const u8{"hyprmod"},
+        .argv = &[_][:0]const u8{"simpbar-config"},
     },
     .{
         .title = "Adjust audio devices and volumes",

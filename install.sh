@@ -804,7 +804,7 @@ FOOTEOF
 fi
 
 # wlogout, waypaper & protonplus are AUR-only — need an AUR helper
-AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme hyprmod game-devices-udev zafiro-icon-theme)
+AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme game-devices-udev zafiro-icon-theme)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 [ "$INSTALL_FALCOND" -eq 1 ] && AUR_PKGS+=(falcond falcond-gui)
@@ -1448,8 +1448,8 @@ fi
 if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
     ok "Bibata Modern Classic cursor installed and applied"
 fi
-if pacman -Qq hyprmod >/dev/null 2>&1; then
-    ok "HyprMod installed (GTK4 settings app for Hyprland — writes only to its own hyprland-gui.conf)"
+if [ -e ~/.config/hypr/hyprland-simpbar.lua ]; then
+    ok "Hyprland settings active — simpbar-config manages hyprland-simpbar.lua (first run bootstrapped it into hyprland.lua via pcall)"
 fi
 if pacman -Qq game-devices-udev >/dev/null 2>&1; then
     ok "game-devices-udev installed — Xbox/PlayStation/generic controllers get proper permissions"

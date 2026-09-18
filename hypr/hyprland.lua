@@ -441,3 +441,9 @@ hl.window_rule({
 	size = { 900, 700 },
 	float = true,
 })
+
+-- Load the simpbar-config Hyprland settings (keybinds, monitors, animations,
+-- window rules, etc.). Managed by the Simpbar Config app — it recreates this
+-- file from ~/.config/simpbar/hyprland.json whenever you change a setting.
+-- pcall keeps this config valid if the file is ever missing.
+pcall(require, "hyprland-simpbar")

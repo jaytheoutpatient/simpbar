@@ -340,7 +340,7 @@ step "Installing packages"
 # ttf-jetbrains-mono-nerd → not packaged (downloaded in Step 4), nwg-drawer →
 # not packaged (rofi is the launcher), bazaar → not packaged, waypaper →
 # azote (both are "pick a wallpaper" front-ends to swaybg), and the
-# pacman/AUR-only items from the Arch list (zafiro, dracula, hyprmod,
+# pacman/AUR-only items from the Arch list (zafiro, dracula,
 # protonplus, bazaar, nwg-drawer, heroic, discord) are handled
 # below where they have a real Debian package or a manual/flatpak path.
 APT_PKGS=(
@@ -1341,7 +1341,7 @@ fi
 if [ -e ~/.config/systemd/user/simpbar-update-checker.timer ]; then
     ok "Update checker enabled — notifies on new apt package updates or new commits on the simpbar repo (checks every 6h)"
 fi
-ok "Not on Debian: waypaper (azote + swaybg.service replace it), dracula-gtk-theme, zafiro-icon-theme, hyprmod, protonplus, game-devices-udev, falcond, bazaar, nwg-drawer (AUR-only or re-named) — skipped with their closest apt/flatpak equivalents where listed above"
+ok "Not on Debian: waypaper (azote + swaybg.service replace it), dracula-gtk-theme, zafiro-icon-theme, protonplus, game-devices-udev, falcond, bazaar, nwg-drawer (AUR-only or re-named) — skipped with their closest apt/flatpak equivalents where listed above"
 if [ -n "$BROWSER_NAME" ]; then
     ok "$BROWSER_NAME installed from its official repo"
 else
