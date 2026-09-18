@@ -359,6 +359,7 @@ APT_PKGS=(
     qt6ct breeze libnotify-bin
     wlogout steam-devices libvulkan1 libgl1-mesa-dri
     bibata-cursor-theme
+    kdeconnect
 )
 # 'noto-fonts' is the Arch name; drop anything apt doesn't know from the
 # desired set rather than failing the whole install over one stale name.
@@ -1445,7 +1446,7 @@ run_spinner "Updating the full system (apt full-upgrade)" sudo env DEBIAN_FRONTE
 step "Done"
 ok "Full system updated (apt full-upgrade)"
 ok "simpbar, simpbar-welcome, simpbar-config built with zig $ZIG_VER and installed to /usr/bin"
-ok "libfreetype-dev, libgdk-pixbuf-2.0-dev, libwayland-dev, wayland-protocols, libgtk-4-dev, libadwaita-1-dev, libglib2.0-dev, playerctl, gnome-calendar, mate-polkit, swaybg, azote, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, steam-devices, sway-notification-center, rofi, flatpak, nwg-look, pavucontrol, pipewire, pipewire-pulse, wireplumber, gnome-disk-utility, wlogout, libnotify-bin installed (apt)"
+ok "libfreetype-dev, libgdk-pixbuf-2.0-dev, libwayland-dev, wayland-protocols, libgtk-4-dev, libadwaita-1-dev, libglib2.0-dev, playerctl, gnome-calendar, mate-polkit, swaybg, azote, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, steam-devices, sway-notification-center, rofi, flatpak, nwg-look, pavucontrol, pipewire, pipewire-pulse, wireplumber, gnome-disk-utility, wlogout, libnotify-bin, kdeconnect installed (apt)"
 ok "JetBrainsMono Nerd Font installed to /usr/share/fonts/TTF"
 ok "$FILE_MANAGER_NAME installed and bound to SUPER + E"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"

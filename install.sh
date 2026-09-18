@@ -350,7 +350,7 @@ fi
 # wl-copy, notify-send for the toast, and awk to parse `hyprctl activewindow`
 # for the window-only capture). gawk ships in Arch's base group already on
 # almost every install, but it's listed explicitly rather than assumed.
-PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl gnome-calendar mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk)
+PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl gnome-calendar mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect)
 PACMAN_PKGS+=("${GPU_PKGS[@]}")
 
 prompt_choice FILE_MANAGER_CHOICE 1 "Which file manager would you like to use?" \
@@ -1556,7 +1556,7 @@ run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfir
 # ── Step 7: done ────────────────────────────────────────────────────
 step "Done"
 ok "Full system updated (pacman -Syu)"
-ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, gnome-calendar, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility, nwg-drawer installed (pacman)"
+ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, gnome-calendar, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, pipewire, gnome-disk-utility, nwg-drawer, kdeconnect installed (pacman)"
 ok "$FILE_MANAGER_NAME installed and bound to SUPER + E"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 if pacman -Qq cliphist >/dev/null 2>&1; then
