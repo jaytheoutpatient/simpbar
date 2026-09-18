@@ -1,21 +1,21 @@
-# matugen — Material You colorscheme generator, wired into simpbar.
+# matugen — Material You colorscheme generator, wired into simpbar + a whole
+# desktop: simpbar, hyprland, foot terminal, GTK (nautilus/nemo), Qt/qt6ct
+# (dolphin), Vesktop & Equibop Discord clients, Zen Browser, and Steam skins.
 #
 # Two ways to use this:
 #
 #   1) Fresh setup (what the installers do): put THIS file at
-#      ~/.config/matugen/config.toml and the template at
-#      ~/.config/matugen/templates/simpbar.json (from the repo's matugen/
+#      ~/.config/matugen/config.toml and the templates at
+#      ~/.config/matugen/templates/ (all files from the repo's matugen/
 #      folder), then run:  matugen image /path/to/wallpaper.jpg
 #
-#   2) Existing matugen config: don't clobber it — just merge the single
-#      [templates.simpbar] block at the bottom of this file (plus its
-#      template file) into your ~/.config/matugen/config.toml. Everything
-#      above that block is optional policy; only the template block matters.
+#   2) Existing matugen config: don't clobber it — just merge the
+#      [templates.X] blocks (plus their template files) into your
+#      ~/.config/matugen/config.toml. Everything above is optional policy;
+#      only the template blocks matter.
 #
-# simpbar reads the generated ~/.config/simpbar/matugen.json automatically
-# while its auto_theme setting is on (Simpbar Config → Appearance →
-# "Auto-theme with matugen", ON by default) and live-reloads via SIGUSR1.
-# Turn that switch off when you want to keep your hand-picked colors.
+# Every template here renders the Material You DARK scheme (matugen -m dark,
+# the default). Light mode would need a second set of templates.
 
 [config]
 version_check = false
@@ -27,13 +27,6 @@ version_check = false
 fallback_color = "#80CBC4"
 prefer = "closest-to-fallback"
 
-# NOTE on the color scheme type: matugen 4.x does NOT read a `type` key from
-# this file (verified against 4.2.0 — it's CLI-only, `matugen --type …`).
-# simpbar instead keeps the chosen scheme in ~/.config/simpbar/matugen-type,
-# which simpbar-config's "Matugen color scheme" dropdown writes and
-# simpbar-matugen passes through as `--type`. Don't add `type` here; it would
-# silently do nothing.
-
 # The wallpaper itself is owned by waypaper (Arch) / azote (Debian) + swaybg
 # on this setup — matugen only recolors things, it must never set the
 # wallpaper. set = false + a no-op command keeps it that way (matugen 4.x
@@ -42,13 +35,86 @@ prefer = "closest-to-fallback"
 set = false
 command = "true"
 
-# The simpbar template — renders the ten colors this bar draws into
-# ~/.config/simpbar/matugen.json (simpbar merges and applies whatever the
-# file contains, key by key, missing keys keep config.json's values).
+# ═══════════════════════════ simpbar ═══════════════════════════
+# Renders the ten colors this bar draws into ~/.config/simpbar/matugen.json
+# (simpbar merges and applies whatever the file contains, key by key).
 [templates.simpbar]
 input_path = "~/.config/matugen/templates/simpbar.json"
 output_path = "~/.config/simpbar/matugen.json"
-# Live-reload the running bar after the colors are written. Safe when the
-# bar isn't running — the pidfile check turns the whole thing into a no-op
-# (simpbar writes simpbar.pid at startup, next to config.json).
-post_hook = "sh -c 'if [ -s \"$HOME/.config/simpbar/simpbar.pid\" ]; then kill -USR1 \"$(cat \"$HOME/.config/simpbar/simpbar.pid\")\" 2>/dev/null; fi'"
+# Live-reload the running bar after the colors are written. Uses pgrep (the
+# bar's own pidfile can go stale across restarts); harmless when not running.
+post_hook = "sh -c 'PID=$(pgrep -x simpbar | head -n1); [ -n \"$PID\" ] && kill -USR1 \"$PID\" 2>/dev/null || true'"
+
+# ═══════════════════════════ Hyprland ═══════════════════════════
+# Generates ~/.config/hypr/matugen-colors.lua (exports the MD3 palette and
+# applies Material You borders via hl.config()). hyprland.lua must load it at
+# the END, after hyprland-simpbar so these colors win:
+#     pcall(require, "matugen-colors")
+[templates.hyprland]
+input_path = "~/.config/matugen/templates/hyprland-colors.lua"
+output_path = "~/.config/hypr/matugen-colors.lua"
+# Tolerant: reloads borders/colors when Hyprland is up, no-ops otherwise so a
+# wallpaper change from a cron/systemd context can't abort the whole run.
+post_hook = "sh -c 'hyprctl reload 2>/dev/null || true'"
+
+# ═══════════════════════════ Vesktop ═══════════════════════════
+# Overwrites the already-enabled midnight.theme.css (kept the same name so
+# enabledThemes needs no change). The post_hook re-enables it defensively in
+# case it was ever disabled in the client.
+[templates.vesktop]
+input_path = "~/.config/matugen/templates/vesktop-midnight.css"
+output_path = "~/.config/vesktop/themes/midnight.theme.css"
+post_hook = "sh -c 'python3 \"$HOME/.config/matugen/enable-theme.py\" \"$HOME/.config/vesktop/settings/settings.json\" midnight.theme.css'"
+
+# ═══════════════════════════ Equibop ═══════════════════════════
+# Renders a standalone MD3 theme and enables it in the client's settings.
+[templates.equibop]
+input_path = "~/.config/matugen/templates/equibop-matugen.css"
+output_path = "~/.config/equibop/themes/matugen.theme.css"
+post_hook = "sh -c 'python3 \"$HOME/.config/matugen/enable-theme.py\" \"$HOME/.config/equibop/settings/settings.json\" matugen.theme.css'"
+
+# ═══════════════════════════ Foot ═══════════════════════════
+# Renders the 16-color palette. foot.ini pulls it in with:
+#     include=~/.config/foot/colors.ini
+# (the old [colors-dark] background/foreground block was removed from foot.ini
+# so this file's colors are the ones that apply). New terminals pick it up.
+[templates.foot]
+input_path = "~/.config/matugen/templates/foot-colors.ini"
+output_path = "~/.config/foot/colors.ini"
+
+# ═══════════════════════════ GTK: nautilus & nemo ═══════════════════════════
+# Both gtk-3.0/gtk.css and gtk-4.0/gtk.css `@import 'colors.css';`, so one
+# template feeds both. GTK apps like nautilus refresh via colorreload-gtk-module.
+[templates.gtk3]
+input_path = "~/.config/matugen/templates/gtk-colors.css"
+output_path = "~/.config/gtk-3.0/colors.css"
+
+[templates.gtk4]
+input_path = "~/.config/matugen/templates/gtk-colors.css"
+output_path = "~/.config/gtk-4.0/colors.css"
+
+# ═══════════════════════════ Qt / qt6ct: dolphin ═══════════════════════════
+# Renders the qcolor scheme qt6ct already points at
+# (qt6ct.conf: color_scheme_path=matugen.conf). dolphin + other Qt apps pick
+# it up on their next launch.
+[templates.qt6ct]
+input_path = "~/.config/matugen/templates/qt6ct-colors.conf"
+output_path = "~/.config/qt6ct/colors/matugen.conf"
+
+# ═══════════════════════════ Zen Browser ═══════════════════════════
+# Renders the profile's chrome/userChrome.css and ensures the
+# toolkit.legacyUserProfileCustomizations.stylesheets pref is enabled so the
+# file is actually loaded.
+[templates.zen]
+input_path = "~/.config/matugen/templates/zen-userchrome.css"
+output_path = "~/.config/zen/1zf1flh5.Default (release)/chrome/userChrome.css"
+post_hook = "sh -c 'python3 \"$HOME/.config/matugen/zen-enable-pref.py\" \"$HOME/.config/zen/1zf1flh5.Default (release)/prefs.js\"'"
+
+# ═══════════════════════════ Steam ═══════════════════════════
+# Renders an MD3 CSS skin under ~/.steam/steam/skins/matugen/. Steam's modern
+# client can't load custom CSS on its own — you must install a patcher
+# (Millennium, https://github.com/OpenSteamClient/Millennium) for the skin to
+# take effect. See the generated file's header.
+[templates.steam]
+input_path = "~/.config/matugen/templates/steam-theme.css"
+output_path = "~/.steam/steam/skins/matugen/steamui/themes/matugen.css"
