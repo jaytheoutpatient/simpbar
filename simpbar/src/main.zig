@@ -40,6 +40,10 @@ const RIGHT_MARGIN: i64 = 8;
 // getenv is enough here; no need for std.process's env-map machinery.
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
+// Used to detect which package manager this machine runs (checkupdates →
+// Arch, apt-get → Debian-family), mirroring icontheme.zig's own extern.
+extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
+
 // std.c doesn't expose socket()/connect() publicly in this Zig version
 // (they're kept as private helpers for its own Io implementation), so we
 // bind straight to libc ourselves — same approach as the time/timerfd
@@ -353,8 +357,11 @@ const CENTER_LAUNCHERS = [_]LauncherButton{
 const POWER_BUTTON = LauncherButton{ .label = "\u{f0425}", .command = "wlogout" };
 
 // custom/waypaper, one of the "group/tray-expander" drawer's children.
-// Icon only in the real config, no text.
-const WAYPAPER_BUTTON = LauncherButton{ .label = "\u{f030}", .command = "waypaper" };
+// Icon only in the real config, no text. The module kind is still called
+// "waypaper" for config.json backwards compat; the actual picker it spawns is
+// simpbar-wallpaper, which launches azote on Debian (where waypaper isn't
+// packaged) and waypaper on Arch.
+const WAYPAPER_BUTTON = LauncherButton{ .label = "\u{f030}", .command = "simpbar-wallpaper" };
 
 // Real config's drawer toggle glyph (▾) — doesn't flip direction when
 // expanded like the real one's rotating chevron does, but it's the actual
@@ -570,14 +577,17 @@ fn isModuleEnabled(entries: []const ModuleEntry, kind: ModuleKind) bool {
 
 var config_json_path_buf: [512]u8 = undefined;
 var pidfile_path_buf: [512]u8 = undefined;
+var matugen_path_buf: [512]u8 = undefined;
 var config_json_path: [:0]const u8 = "";
 var pidfile_path: [:0]const u8 = "";
+var matugen_json_path: [:0]const u8 = "";
 
-/// Resolves ~/.config/simpbar/{config.json,simpbar.pid} from $HOME, creating
-/// ~/.config/simpbar first if it doesn't exist yet (best-effort — mkdir's
-/// result is intentionally ignored; if the directory truly can't be created,
-/// the open() calls below will fail instead, and that failure path is
-/// already handled). Mirrors welcome_main.zig's resolvePaths() pattern.
+/// Resolves ~/.config/simpbar/{config.json,simpbar.pid,matugen.json} from
+/// $HOME, creating ~/.config/simpbar first if it doesn't exist yet
+/// (best-effort — mkdir's result is intentionally ignored; if the directory
+/// truly can't be created, the open() calls below will fail instead, and
+/// that failure path is already handled). Mirrors welcome_main.zig's
+/// resolvePaths() pattern.
 fn resolveConfigPaths() void {
     const home = std.mem.span(getenv("HOME") orelse "/root");
     var dir_buf: [480]u8 = undefined;
@@ -585,6 +595,11 @@ fn resolveConfigPaths() void {
     _ = posix.system.mkdir(dir.ptr, 0o755);
     config_json_path = std.fmt.bufPrintZ(&config_json_path_buf, "{s}/config.json", .{dir}) catch "";
     pidfile_path = std.fmt.bufPrintZ(&pidfile_path_buf, "{s}/simpbar.pid", .{dir}) catch "";
+    // The matugen colors file lives under simpbar's own config dir (not
+    // matugen's) so this bar only ever reads from under its own roof. The
+    // post-hook in the shipped matugen template writes it here; simpbar
+    // only ever reads it, matugen only ever writes it.
+    matugen_json_path = std.fmt.bufPrintZ(&matugen_path_buf, "{s}/matugen.json", .{dir}) catch "";
 }
 
 /// Writes this process's PID to ~/.config/simpbar/simpbar.pid so the (future)
@@ -666,6 +681,12 @@ const JsonAppearance = struct {
     corner_radius_px: u32 = 0,
     clock_format: []const u8 = CLOCK_FORMAT_DATE_24H,
     monitor: []const u8 = "",
+    /// "matugen" (default) = when ~/.config/simpbar/matugen.json exists, its
+    /// colors override these hex values (the wallpaper-based auto-theming
+    /// integration). "manual" = ignore matugen.json entirely and always use
+    /// the colors below. Anything unrecognized falls back to "matugen",
+    /// same permissive-fallback spirit as `position`.
+    auto_theme: []const u8 = "matugen",
 };
 
 // JSON-facing shape of "modules" — ModuleEntry's own fields already match
@@ -685,6 +706,86 @@ const JsonConfig = struct {
     modules: JsonModules = .{},
     launchers: []const LauncherButton = &CENTER_LAUNCHERS,
 };
+
+// JSON-facing shape of ~/.config/simpbar/matugen.json — the file matugen
+// renders (from the repo's matugen/simpbar-matugen.json template) whenever
+// it generates a colorscheme, holding just the ten colors this bar draws.
+// Unlike JsonAppearance every field is OPTIONAL: matugen owns this file
+// outright and may add/remove colors across versions or be hand-edited
+// mid-way, so the merge below applies only the keys that are actually
+// present and valid. A deliberately minimal subset of JsonAppearance's
+// color fields — geometry/spacing/font stay in config.json, which matugen
+// never touches (and which is also what simpbar-config writes).
+const JsonMatugenColors = struct {
+    bg_color: ?[]const u8 = null,
+    text_color: ?[]const u8 = null,
+    border_color: ?[]const u8 = null,
+    hover_color: ?[]const u8 = null,
+    workspace_active_color: ?[]const u8 = null,
+    workspace_inactive_color: ?[]const u8 = null,
+    popup_bg_color: ?[]const u8 = null,
+    popup_hover_color: ?[]const u8 = null,
+    popup_separator_color: ?[]const u8 = null,
+    popup_disabled_color: ?[]const u8 = null,
+};
+
+/// Applies the colors matugen wrote to ~/.config/simpbar/matugen.json into
+/// `appearance`, only for whichever keys that file actually spells out.
+/// Returns false — leaving `appearance` completely untouched — on ANY
+/// problem: file missing, unparseable JSON, or an invalid color hex. That
+/// whole-failure gracefulness matters twice over: a missing matugen.json is
+/// the every-day case (no matugen integration set up, or a user who toggled
+/// the bar back to manual colors in simpbar-config), and a corrupt/half-
+/// written file should degrade to the config.json palette, never to a
+/// partially-merged mishmash or a bar that refuses to load. Colors that are
+/// requested here are validated before anything is applied, so a bad value
+/// any position doesn't leave earlier positions half-swapped.
+fn tryApplyMatugenColors(allocator: std.mem.Allocator, appearance: *Appearance) bool {
+    if (matugen_json_path.len == 0) return false;
+
+    const bytes = readFileAlloc(allocator, matugen_json_path) catch |err| {
+        // Missing file is the normal "matugen not in play" case (OpenFailed),
+        // not something worth logging at the INFO level every reload — only
+        // a read that shouldn't plausibly fail is worth a line.
+        if (err != error.OpenFailed) {
+            std.debug.print("config: could not read {s}: {}\n", .{ matugen_json_path, err });
+        }
+        return false;
+    };
+
+    const colors = std.json.parseFromSliceLeaky(JsonMatugenColors, allocator, bytes, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        std.debug.print("config: could not parse {s}: {} — keeping config.json colors\n", .{ matugen_json_path, err });
+        return false;
+    };
+
+    _ = mergeMatugenColor(appearance, "bg_color", colors.bg_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "text_color", colors.text_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "border_color", colors.border_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "hover_color", colors.hover_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "workspace_active_color", colors.workspace_active_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "workspace_inactive_color", colors.workspace_inactive_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "popup_bg_color", colors.popup_bg_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "popup_hover_color", colors.popup_hover_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "popup_separator_color", colors.popup_separator_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "popup_disabled_color", colors.popup_disabled_color) orelse return false;
+
+    return true;
+}
+
+/// Parses one optional matugen color into `appearance` if present; returns
+/// null when the value is present but not a valid "#RRGGBB", so the caller
+/// can bail the whole merge. Returns a dummy non-null otherwise.
+fn mergeMatugenColor(appearance: *Appearance, comptime field: []const u8, value: ?[]const u8) ?u8 {
+    const hex = value orelse return 1;
+    const parsed = parseHexColor(hex) catch {
+        std.debug.print("config: bad matugen color {s}=\"{s}\" — keeping config.json colors\n", .{ field, hex });
+        return null;
+    };
+    @field(appearance, field) = parsed;
+    return 1;
+}
 
 /// Two persistent arenas backing successfully-parsed Configs, used as a
 /// double buffer: `config_arenas[config_arena_active]` backs whatever
@@ -788,10 +889,19 @@ fn loadConfigFromFile() ?Config {
         return null;
     };
 
-    const appearance = parseAppearance(parsed.appearance) orelse {
+    var appearance = parseAppearance(parsed.appearance) orelse {
         std.debug.print("config: bad color value in {s}\n", .{config_json_path});
         return null;
     };
+
+    // Apply matugen's generated palette when both switches are on: the
+    // config.json auto_theme field says "matugen", and there's a valid
+    // matugen.json on disk to read. A failed/absent file never fails the
+    // load — tryApplyMatugenColors returns false and we keep the
+    // config.json colors (defaultConfig path never triggers here).
+    if (std.mem.eql(u8, parsed.appearance.auto_theme, "matugen") and tryApplyMatugenColors(allocator, &appearance)) {
+        std.debug.print("config: applied matugen colors from {s}\n", .{matugen_json_path});
+    }
 
     config_arena_active = next_index;
     return Config{
@@ -2918,9 +3028,36 @@ fn startWeatherFetch(cmd: *PolledCommand) void {
     cmd.startFetch("/usr/bin/env", &argv);
 }
 
+/// True if `path` is a runnable file — the module's executable check for
+/// picking the distro's package-update tool. F_OK (access mode 0) is all
+/// that's needed for /usr/bin binaries (X_OK on a root-owned world-executable
+/// binary is the same result, and 0 avoids any ACL edge cases).
+fn binExists(path: [*:0]const u8) bool {
+    return access(path, 0) == 0;
+}
+
+/// The shell one-liner that counts available package updates for this
+/// machine's distro: checkupdates (pacman-contrib, Arch) when present, else
+/// apt (Debian-family). Writes into `buf` and returns a null-terminated view
+/// of it. apt's header ("Listing...") and "N:" note lines never contain the
+/// "[upgradable from: ...]" marker, so counting marker lines counts exactly
+/// the upgradable packages.
+fn systemUpdateCountShell(buf: []u8) [:0]const u8 {
+    if (binExists("/usr/bin/checkupdates")) {
+        return std.fmt.bufPrintZ(buf, "checkupdates | wc -l", .{}) catch "checkupdates | wc -l";
+    }
+    // The awk counters' braces are literal shell syntax — doubled up here so
+    // fmt doesn't read them as format placeholders ("{c}" would be a char arg).
+    return std.fmt.bufPrintZ(buf, "apt list --upgradable 2>/dev/null | awk '/upgradable from:/{{c++}} END{{print c+0}}'", .{}) catch "apt list --upgradable 2>/dev/null | awk '/upgradable from:/{{c++}} END{{print c+0}}'";
+}
+
 fn startPacmanFetch(cmd: *PolledCommand) void {
-    // Needs a real shell for the pipe (checkupdates | wc -l).
-    var argv = [_:null]?[*:0]const u8{ "sh", "-c", "checkupdates | wc -l", null };
+    // Needs a real shell for the pipe (checkupdates | wc -l). The module is
+    // still called "pacman" in config.json for backwards compat — it's the
+    // "how many system updates are available" counter either way.
+    var shell_buf: [128]u8 = undefined;
+    const shell_cmd = systemUpdateCountShell(&shell_buf);
+    var argv = [_:null]?[*:0]const u8{ "sh", "-c", shell_cmd.ptr, null };
     cmd.startFetch("/bin/sh", &argv);
 }
 

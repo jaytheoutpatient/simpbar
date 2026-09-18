@@ -412,6 +412,14 @@ if [ "$FALCOND_CHOICE" = 1 ]; then
     PACMAN_PKGS+=(scx-scheds scx-tools)
 fi
 
+printf '\n  %smatugen%s is the Material You colorscheme generator simpbar uses for\n' "$C_BOLD" "$C_RESET"
+printf '  auto-theming: pick a wallpaper and it recolors the bar to match it\n'
+printf '  (the bar has an %sAuto-theme with matugen%s toggle in simpbar-config). It\n' "$C_BOLD" "$C_RESET"
+printf '  is AUR-only and compiled from source, so it is the slowest install step.\n'
+prompt_choice MATUGEN_CHOICE 1 "Would you like to install matugen for wallpaper-based auto-theming?" "Yes" "No"
+INSTALL_MATUGEN=0
+[ "$MATUGEN_CHOICE" = 1 ] && INSTALL_MATUGEN=1
+
 printf '  Installing %d packages via pacman:\n    %s\n' "${#PACMAN_PKGS[@]}" "${PACMAN_PKGS[*]}"
 run_spinner "pacman: installing ${#PACMAN_PKGS[@]} packages" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
     || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
@@ -800,6 +808,7 @@ AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme hypr
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 [ "$INSTALL_FALCOND" -eq 1 ] && AUR_PKGS+=(falcond falcond-gui)
+[ "$INSTALL_MATUGEN" -eq 1 ] && AUR_PKGS+=(matugen)
 
 if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
     prompt_choice AUR_CHOICE 1 "No AUR helper found. Install which one?" "yay" "paru" "skip"
@@ -892,7 +901,18 @@ if pacman -Qq waypaper >/dev/null 2>&1; then
     mkdir -p ~/.config/waypaper
     if [ -e ~/.config/waypaper/config.ini ]; then
         warn "~/.config/waypaper/config.ini already exists — leaving your existing waypaper config alone"
+        if [ "$INSTALL_MATUGEN" -eq 1 ]; then
+            printf '  %sNote:%s add %s to waypaper to auto-recolor the bar on each wallpaper change.\n' "$C_BOLD" "$C_RESET" 'post_command = simpbar-matugen "$wallpaper"'
+        fi
     else
+        # waypaper substitutes $wallpaper with the chosen image at runtime; the
+        # literal $wallpaper is preserved by stashing the exact text (the shell
+        # won't re-expand it once the heredoc expands this variable).
+        if [ "$INSTALL_MATUGEN" -eq 1 ]; then
+            MATUGEN_POST_COMMAND='simpbar-matugen "$wallpaper"'
+        else
+            MATUGEN_POST_COMMAND=""
+        fi
         cat > ~/.config/waypaper/config.ini <<EOF
 [Settings]
 language = en
@@ -918,7 +938,7 @@ swww_transition_duration = 2
 swww_transition_fps = 60
 mpvpaper_sound = False
 mpvpaper_options =
-post_command =
+post_command = $MATUGEN_POST_COMMAND
 keybindings = ~/.config/waypaper/keybindings.ini
 EOF
         ok "waypaper set to use ~/Pictures/Wallpaper as its default folder"
@@ -951,6 +971,92 @@ EOF
 else
     warn "No downloaded wallpaper or swaybg not installed — skipping swaybg service setup"
 fi
+
+# matugen — the Material You colorscheme generator simpbar reads for
+# wallpaper-based auto-theming. It renders its simpbar template to
+# ~/.config/simpbar/matugen.json, which the bar merges in on reload;
+# waypaper's post_command above re-runs it whenever the wallpaper changes.
+# matugen never sets the wallpaper itself (the [config.wallpaper] block below
+# keeps set = false), so waypaper stays the sole owner of the wallpaper.
+if [ "$INSTALL_MATUGEN" -eq 1 ]; then
+    if pacman -Qq matugen >/dev/null 2>&1; then
+        mkdir -p ~/.config/matugen/templates
+
+        if [ -e ~/.config/matugen/config.toml ]; then
+            warn "~/.config/matugen/config.toml already exists — leaving your existing matugen config alone"
+        else
+            cat > ~/.config/matugen/config.toml <<'MATUGENCONF'
+# Matugen config for simpbar auto-theming. Writes ~/.config/simpbar/matugen.json,
+# which the bar merges in on every reload (see the "Auto-theme with matugen"
+# toggle in simpbar-config). To merge this into an existing matugen setup
+# instead of copying it wholesale, just add the [templates.simpbar] block to
+# your current ~/.config/matugen/config.toml.
+
+[config]
+# Non-interactive: never prompt for a source color to pick from the image,
+# so wallpaper pickers can run this in the background.
+version_check = false
+# fallback_color + prefer are what make `matugen image …` deterministic —
+# the color closest to this Material-ish teal wins, so no "Multiple source
+# colors found" prompt ever appears. Change it to taste.
+fallback_color = "#80CBC4"
+prefer = "closest-to-fallback"
+
+# simpbar doesn't want matugen touching the wallpaper — waypaper owns that.
+[config.wallpaper]
+set = false
+# matugen 4.2.0 requires this key even with set = false (it only runs when
+# set = true, it just must exist for the config to parse).
+command = "true"
+
+[templates.simpbar]
+input_path = "~/.config/matugen/templates/simpbar.json"
+output_path = "~/.config/simpbar/matugen.json"
+# Reload the running bar (SIGUSR1) right after the colors land. Wrapped in
+# `sh -c '…'` so it works no matter what the user's $SHELL is (fish, zsh,
+# …) — the hook runs through matugen via the login shell. NO-ops if the bar
+# isn't running or never wrote its pidfile.
+post_hook = "sh -c 'if [ -s \"$HOME/.config/simpbar/simpbar.pid\" ]; then kill -USR1 \"$(cat \"$HOME/.config/simpbar/simpbar.pid\")\" 2>/dev/null; fi'"
+MATUGENCONF
+            ok "matugen config placed in ~/.config/matugen/config.toml"
+        fi
+
+        if [ -e ~/.config/matugen/templates/simpbar.json ]; then
+            warn "~/.config/matugen/templates/simpbar.json already exists — leaving your existing template alone"
+        else
+            cat > ~/.config/matugen/templates/simpbar.json <<'MATUGENTPL'
+{
+  "bg_color": "#{{ colors.surface_container_lowest.default.hex_stripped }}",
+  "text_color": "#{{ colors.on_surface.default.hex_stripped }}",
+  "border_color": "#{{ colors.primary.default.hex_stripped }}",
+  "hover_color": "#{{ colors.primary_container.default.hex_stripped }}",
+  "workspace_active_color": "#{{ colors.primary.default.hex_stripped }}",
+  "workspace_inactive_color": "#{{ colors.on_surface_variant.default.hex_stripped }}",
+  "popup_bg_color": "#{{ colors.surface_container.default.hex_stripped }}",
+  "popup_hover_color": "#{{ colors.primary_container.default.hex_stripped }}",
+  "popup_separator_color": "#{{ colors.outline_variant.default.hex_stripped }}",
+  "popup_disabled_color": "#{{ colors.on_surface_variant.default.hex_stripped }}"
+}
+MATUGENTPL
+            ok "matugen template placed in ~/.config/matugen/templates/simpbar.json"
+        fi
+
+        run_spinner "Installing simpbar-matugen to /usr/bin" \
+            sudo install -Dm755 ~/.local/share/simpbar/simpbar-matugen /usr/bin/simpbar-matugen \
+            || warn "Could not install the simpbar-matugen helper to /usr/bin"
+
+        if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
+            run_spinner "Generating the initial matugen scheme from the Bing wallpaper" \
+                /usr/bin/simpbar-matugen "$BING_FILE" \
+                || warn "Could not generate the initial matugen scheme — it'll apply on the next wallpaper change"
+        else
+            warn "No wallpaper available for the initial matugen scheme — the bar keeps its configured colors until you pick a wallpaper"
+        fi
+    else
+        warn "matugen isn't installed — skipping matugen setup (install manually: yay -S matugen)"
+    fi
+fi
+
 # Apply the Dracula GTK theme and the Bibata cursor theme, now that
 # they're actually installed. This uses the same gsettings mechanism
 # nwg-look reads/writes, so it shows up as already selected there too.
@@ -1164,7 +1270,9 @@ sudo chmod +x /usr/bin/simpbar-check-updates
 
 # Pinned-app launchers for the bar — browser and Discord client are both
 # user-chosen at install time, so these try known binaries in order and
-# launch whichever's actually installed.
+# launch whichever's actually installed. simpbar-wallpaper picks the distro's
+# wallpaper front-end (waypaper here; azote is used where waypaper isn't
+# packaged, e.g. the Debian edition of this installer).
 sudo tee /usr/bin/simpbar-launch-browser >/dev/null <<'BROWSERWRAPEOF'
 #!/bin/bash
 # simpbar-launch-browser — checks ~/.config/simpbar/browser-choice first (set
@@ -1206,7 +1314,20 @@ command -v notify-send >/dev/null 2>&1 && \
         "Install one from the Simpbar Welcome app or install script."
 DISCORDWRAPEOF
 sudo chmod +x /usr/bin/simpbar-launch-discord
-ok "Pinned-app launchers (browser, Discord) ready for simpbar"
+
+sudo tee /usr/bin/simpbar-wallpaper >/dev/null <<'WALLPAPERWRAPEOF'
+#!/bin/bash
+# simpbar-wallpaper — opens the distro's wallpaper picker: azote where
+# waypaper isn't packaged (Debian-family, install-debian.sh), otherwise
+# waypaper (Arch/AUR, install.sh). Both are GTK front-ends to swaybg, so a
+# single script keeps the same bar/welcome buttons working on either family.
+if command -v azote >/dev/null 2>&1; then
+    exec azote "$@"
+fi
+exec waypaper "$@"
+WALLPAPERWRAPEOF
+sudo chmod +x /usr/bin/simpbar-wallpaper
+ok "Pinned-app launchers (browser, Discord), wallpaper picker, and update checker ready for simpbar"
 
 
 cat > ~/.config/systemd/user/simpbar-update-checker.service <<'CHECKERSVCEOF'
@@ -1365,6 +1486,9 @@ if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
 fi
 if [ -e ~/.config/systemd/user/swaybg.service ]; then
     ok "swaybg.service enabled — will set the wallpaper automatically each session"
+fi
+if [ "$INSTALL_MATUGEN" -eq 1 ] && [ -e ~/.config/simpbar/matugen.json ]; then
+    ok "matugen auto-theming set up — the bar recolors to each wallpaper (toggle off in simpbar-config anytime)"
 fi
 if [ -x /usr/bin/simpbar ]; then
     ok "simpbar built and installed to /usr/bin/simpbar (source in ~/.local/share/simpbar/simpbar)"

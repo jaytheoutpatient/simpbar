@@ -7,7 +7,7 @@ if [ -r "$PREF_FILE" ]; then
     preferred=$(cat "$PREF_FILE")
     [ -n "$preferred" ] && command -v "$preferred" >/dev/null 2>&1 && exec "$preferred"
 fi
-for bin in brave zen-browser zen vivaldi-stable vivaldi microsoft-edge-stable librewolf firefox; do
+for bin in brave brave-browser zen-browser zen vivaldi-stable vivaldi microsoft-edge-stable microsoft-edge librewolf firefox firefox-esr; do
     if command -v "$bin" >/dev/null 2>&1; then
         exec "$bin"
     fi

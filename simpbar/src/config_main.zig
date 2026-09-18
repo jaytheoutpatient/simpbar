@@ -192,6 +192,9 @@ const JsonAppearance = struct {
     // output name (main.zig falls back to "" if that name isn't currently
     // connected). Matches main.zig's Appearance.monitor exactly.
     monitor: []const u8 = "",
+    // "matugen" (default) or "manual" — see the toggle in the Appearance
+    // tab. Matches main.zig's JsonAppearance.auto_theme exactly.
+    auto_theme: []const u8 = "matugen",
 };
 
 const JsonModules = struct {
@@ -213,8 +216,14 @@ const JsonConfig = struct {
 
 var config_json_path_buf: [512]u8 = undefined;
 var pidfile_path_buf: [512]u8 = undefined;
+var matugen_type_path_buf: [512]u8 = undefined;
 var config_json_path: [:0]const u8 = "";
 var pidfile_path: [:0]const u8 = "";
+// simpbar owns this small state file (NOT matugen's config.toml — matugen
+// 4.2.0 ignores a `type` key there): the chosen scheme is read by
+// /usr/bin/simpbar-matugen and passed to matugen as `--type`. See
+// MATUGEN_TYPE_CHOICES below.
+var matugen_type_path: [:0]const u8 = "";
 
 fn resolvePaths() void {
     const home = std.mem.span(getenv("HOME") orelse "/root");
@@ -223,6 +232,7 @@ fn resolvePaths() void {
     _ = mkdir(dir.ptr, 0o755);
     config_json_path = std.fmt.bufPrintZ(&config_json_path_buf, "{s}/config.json", .{dir}) catch "";
     pidfile_path = std.fmt.bufPrintZ(&pidfile_path_buf, "{s}/simpbar.pid", .{dir}) catch "";
+    matugen_type_path = std.fmt.bufPrintZ(&matugen_type_path_buf, "{s}/matugen-type", .{dir}) catch "";
 }
 
 // ---------------------------------------------------------------------
@@ -428,6 +438,14 @@ var live_font_path: []const u8 = "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Reg
 // so reassigning this outright is always safe, same reasoning as
 // live_font_path above.
 var live_monitor: []const u8 = "";
+// "matugen" or "manual", always a static string literal (never arena-backed),
+// so — like live_position's own note about avoiding self-referential
+// hazards — reassigning this outright on every toggle is always safe.
+var live_auto_theme: []const u8 = "matugen";
+// matugen scheme type (one of MATUGEN_TYPE_CHOICES), always a static literal
+// like live_auto_theme above. Loaded from ~/.config/simpbar/matugen-type;
+// defaults to matugen's own default when that file is absent.
+var live_matugen_type: []const u8 = "scheme-tonal-spot";
 
 // Module lists (Step 6) — each group is a small fixed-capacity mutable
 // array, not a read-only slice into config_arena, since Modules-tab rows
@@ -696,6 +714,20 @@ fn loadConfigFromDisk() void {
     live_position = if (std.mem.eql(u8, j.position, "top")) "top" else "bottom";
     live_clock_format = validClockFormatChoice(j.clock_format);
     live_monitor = j.monitor;
+    live_auto_theme = if (std.mem.eql(u8, j.auto_theme, "manual")) "manual" else "matugen";
+    // Scheme type lives in its own simpbar-owned file (not config.json, not
+    // matugen's config.toml — see matugen_type_path). Ignore anything that
+    // isn't a known matugen --type value rather than handing matugen junk.
+    if (readFileAll(matugen_type_path)) |raw| {
+        defer gpa.free(raw);
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        for (MATUGEN_TYPE_CHOICES) |choice| {
+            if (std.mem.eql(u8, choice, trimmed)) {
+                live_matugen_type = choice;
+                break;
+            }
+        }
+    }
 
     live_left.load(parsed.modules.left);
     live_center.load(parsed.modules.center);
@@ -846,6 +878,8 @@ fn buildConfigJson() ![]u8 {
     try appendJsonString(&list, live_clock_format);
     try list.appendSlice(gpa, ",\"monitor\":");
     try appendJsonString(&list, live_monitor);
+    try list.appendSlice(gpa, ",\"auto_theme\":");
+    try appendJsonString(&list, live_auto_theme);
 
     try list.appendSlice(gpa, "},\"modules\":{\"left\":");
     try appendModuleGroup(&list, &live_left);
@@ -1045,6 +1079,84 @@ fn onClockFormatChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaqu
     const idx = gtk.adw_combo_row_get_selected(row);
     if (idx < CLOCK_FORMAT_CHOICES.len) live_clock_format = CLOCK_FORMAT_CHOICES[idx];
     saveAndSignal();
+}
+
+/// Toggles the bar's matugen auto-theming (appearance.auto_theme). While
+/// ON, bar colors come from matugen's ~/.config/simpbar/matugen.json (which
+/// the wallpaper hook regenerates) and override the color pickers below,
+/// which stay editable but dormant — this switch is the on/off knob. ON
+/// with no matugen.json present just leaves the picker colors in charge, so
+/// the default state is harmless for anyone without matugen set up.
+fn onAutoThemeChanged(sw: *gtk.GtkSwitch, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    live_auto_theme = if (gtk.gtk_switch_get_active(sw) != 0) "matugen" else "manual";
+    saveAndSignal();
+}
+
+fn buildAutoThemeRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Auto-theme with matugen");
+    gtk.adw_action_row_set_subtitle(row, "Recolor the bar from the wallpaper via matugen as soon as it generates a scheme (and on every wallpaper change). Turning this off uses the colors below instead.");
+    gtk.adw_action_row_set_icon_name(row, "applications-graphics-symbolic");
+
+    const sw = gtk.gtk_switch_new();
+    gtk.gtk_switch_set_active(sw, if (std.mem.eql(u8, live_auto_theme, "matugen")) 1 else 0);
+    gtk.gtk_widget_set_valign(@ptrCast(sw), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(sw), "notify::active", @ptrCast(&onAutoThemeChanged), null, null, 0);
+
+    gtk.adw_action_row_add_suffix(row, @ptrCast(sw));
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+// matugen's own `--type` values (from `matugen --help`'s possible values).
+// The bar never interprets these — simpbar-matugen passes the chosen one to
+// matugen, which derives the palette the bar then merges in. Values must stay
+// byte-for-byte in sync with matugen; labels are just what the user reads.
+const MATUGEN_TYPE_CHOICES = [_][]const u8{
+    "scheme-tonal-spot", "scheme-content",     "scheme-expressive", "scheme-fidelity",
+    "scheme-fruit-salad", "scheme-monochrome", "scheme-neutral",   "scheme-rainbow",
+    "scheme-vibrant",    "scheme-smart",
+};
+const MATUGEN_TYPE_LABELS = [_][*:0]const u8{
+    "Tonal spot (default)", "Content", "Expressive", "Fidelity",
+    "Fruit salad",          "Monochrome", "Neutral", "Rainbow",
+    "Vibrant",              "Smart",
+};
+
+/// Persists the chosen scheme to ~/.config/simpbar/matugen-type and runs the
+/// helper (which re-renders matugen.json with `matugen --type <scheme>` and
+/// SIGUSR1-reloads the bar via matugen's post_hook) so the change shows up
+/// right away instead of waiting for the next wallpaper switch. Independent
+/// of the auto-theme switch: it only visibly matters while that's ON, but
+/// picking a scheme needn't flip it.
+fn onMatugenTypeChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx >= MATUGEN_TYPE_CHOICES.len) return;
+    live_matugen_type = MATUGEN_TYPE_CHOICES[idx];
+    if (writeFileAll(matugen_type_path, live_matugen_type)) {
+        launchDetached(&.{"simpbar-matugen"});
+    } else {
+        std.debug.print("config: could not write {s}\n", .{matugen_type_path});
+    }
+}
+
+fn buildMatugenTypeRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Matugen color scheme");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "The Material You palette matugen derives from the wallpaper. Changing this regenerates the scheme immediately.");
+
+    var buf: [MATUGEN_TYPE_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (MATUGEN_TYPE_LABELS, 0..) |label, i| buf[i] = label;
+    buf[MATUGEN_TYPE_LABELS.len] = null;
+    gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+
+    var selected_idx: c_uint = 0;
+    for (MATUGEN_TYPE_CHOICES, 0..) |choice, i| {
+        if (std.mem.eql(u8, choice, live_matugen_type)) selected_idx = @intCast(i);
+    }
+    gtk.adw_combo_row_set_selected(row, selected_idx);
+    _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onMatugenTypeChanged), null, null, 0);
+
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
 }
 
 fn buildClockFormatRow(group: *gtk.AdwPreferencesGroup) void {
@@ -1464,6 +1576,12 @@ fn buildAppearancePage() *gtk.GtkBox {
     gtk.gtk_widget_set_margin_bottom(@ptrCast(outer), 24);
     gtk.gtk_widget_set_margin_start(@ptrCast(outer), 24);
     gtk.gtk_widget_set_margin_end(@ptrCast(outer), 24);
+
+    const theming_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(theming_group, "Theming");
+    buildAutoThemeRow(theming_group);
+    buildMatugenTypeRow(theming_group);
+    gtk.gtk_box_append(outer, @ptrCast(theming_group));
 
     const bar_group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(bar_group, "Bar Colors");

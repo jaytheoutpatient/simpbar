@@ -128,6 +128,78 @@ fn commandExists(name: []const u8) bool {
     return false;
 }
 
+// ---------------------------------------------------------------------
+// Runtime distro support (Arch vs Debian-family)
+// ---------------------------------------------------------------------
+//
+// This one binary is installed on both Arch and Debian systems, and the two
+// distros fundamentally disagree on the important bits here (package
+// manager, update-list format, which packages even exist). Everything
+// distro-sensitive keys off the single `g_distro` value detected once at
+// startup — the two paths are kept parallel, never merged, so either side
+// stays individually readable.
+
+const Distro = enum { arch, debian };
+
+var g_distro: Distro = .arch;
+
+fn detectDistro() Distro {
+    if (commandExists("pacman")) return .arch;
+    return .debian;
+}
+
+/// The Debian/Arch rename for packages whose names differ between the two
+/// (everything in the pins/editors lists that's actually available via apt
+/// uses the same name on both — firefox is the one real exception, where
+/// Debian ships the ESR build under its own name).
+fn systemPkgName(pkg: []const u8) []const u8 {
+    if (g_distro == .debian and std.mem.eql(u8, pkg, "firefox")) return "firefox-esr";
+    return pkg;
+}
+
+/// The base "install this system package" command for the detected distro.
+fn buildSystemInstallCmd(buf: []u8, pkg: []const u8) []const u8 {
+    if (g_distro == .debian) {
+        return std.fmt.bufPrint(buf, "sudo apt install -y --no-install-recommends {s}", .{systemPkgName(pkg)}) catch "";
+    }
+    return std.fmt.bufPrint(buf, "sudo pacman -S --noconfirm --needed {s}", .{pkg}) catch "";
+}
+
+/// For items that exist only in the Arch/AUR world, run a *helpful* message
+/// on Debian instead of an apt command or a bare AUR-name mention — the
+/// install-debian.sh script (or the official site) is where those actually
+/// get installed from. Falls back to a generic note for anything unknown.
+fn debianManualHint(buf: []u8, pkg: []const u8) []const u8 {
+    const hints = [_]struct { pkg: []const u8, text: []const u8 }{
+        .{ .pkg = "brave-bin", .text = "Install Brave from its official repo/.deb (brave.com/download)" },
+        .{ .pkg = "zen-browser-bin", .text = "Download Zen Browser from zen-browser.app (.deb)" },
+        .{ .pkg = "vivaldi", .text = "Download Vivaldi from vivaldi.com (adds its own apt repo)" },
+        .{ .pkg = "microsoft-edge-stable-bin", .text = "Install Microsoft Edge from Microsoft's apt repo" },
+        .{ .pkg = "librewolf-bin", .text = "Install LibreWolf from its apt repo (librewolf.net)" },
+        .{ .pkg = "heroic-games-launcher-bin", .text = "Install Heroic Games Launcher via Flatpak" },
+        .{ .pkg = "discord", .text = "Install Discord from discord.com (official .deb)" },
+        .{ .pkg = "vesktop-bin", .text = "Vesktop is AUR-only \u{2014} use Discord's official .deb" },
+        .{ .pkg = "equibop-bin", .text = "Equibop is AUR-only \u{2014} use Discord's official .deb" },
+    };
+    for (hints) |h| {
+        if (std.mem.eql(u8, pkg, h.pkg)) return std.fmt.bufPrint(buf, "echo \"{s}\"", .{h.text}) catch "";
+    }
+    return std.fmt.bufPrint(buf, "echo \"Not packaged for Debian \u{2014} install {s} manually (see install-debian.sh)\"", .{pkg}) catch "";
+}
+
+/// The launcher binary for a pinned app, distro-adjusted: the preference is
+/// written to ~/.config/simpbar/*-choice and simpbar-launch-* execs it, so it
+/// must be a real binary name on the running system.
+fn pinBinaryName(binary: []const u8) []const u8 {
+    if (g_distro == .debian) {
+        if (std.mem.eql(u8, binary, "brave")) return "brave-browser";
+        if (std.mem.eql(u8, binary, "vivaldi-stable")) return "vivaldi";
+        if (std.mem.eql(u8, binary, "microsoft-edge-stable")) return "microsoft-edge";
+        if (std.mem.eql(u8, binary, "firefox")) return "firefox-esr";
+    }
+    return binary;
+}
+
 fn detectAutostartMode() bool {
     const data = readFileAll("/proc/self/cmdline") orelse return false;
     defer gpa.free(data);
@@ -279,6 +351,16 @@ fn runCaptured(argv: []const [:0]const u8, timeout_ms: i32) ?[]u8 {
 }
 
 fn buildInstallCmd(buf: []u8, pkg: [:0]const u8, needs_aur: bool) []const u8 {
+    if (g_distro == .debian) {
+        // On Debian there's no AUR equivalent — needs_aur means the package
+        // isn't in any Debian repo (and discord, flag below, is likewise a
+        // manual .deb install there), so say how to install it explicitly
+        // instead of running apt against a package that doesn't exist.
+        if (needs_aur or std.mem.eql(u8, pkg, "discord")) {
+            return debianManualHint(buf, pkg);
+        }
+        return buildSystemInstallCmd(buf, pkg);
+    }
     if (needs_aur) {
         return std.fmt.bufPrint(
             buf,
@@ -288,7 +370,7 @@ fn buildInstallCmd(buf: []u8, pkg: [:0]const u8, needs_aur: bool) []const u8 {
             .{ pkg, pkg, pkg },
         ) catch "";
     }
-    return std.fmt.bufPrint(buf, "sudo pacman -S --noconfirm --needed {s}", .{pkg}) catch "";
+    return buildSystemInstallCmd(buf, pkg);
 }
 
 // ---------------------------------------------------------------------
@@ -325,6 +407,23 @@ const UpdateCheckResult = struct {
     flatpak: UpdateList = .{},
 };
 
+/// Raw "pkgname", "old version", "new version" of one updatable package into
+/// the next free slot of an UpdateList — both distros' tools boil down to the
+/// same "name + old \u{2192} new" display, they just print the pieces in
+/// different formats. Returns false if the entry was dropped (bad fields or
+/// the list is full).
+fn addUpdateEntry(list: *UpdateList, name: []const u8, old_ver: []const u8, new_ver: []const u8) bool {
+    if (list.count >= MAX_UPDATE_ENTRIES) return false;
+    if (name.len == 0 or old_ver.len == 0 or new_ver.len == 0) return false;
+    const entry = &list.entries[list.count];
+    if (name.len >= entry.name.len) return false;
+    @memcpy(entry.name[0..name.len], name);
+    entry.name_len = name.len;
+    const info = std.fmt.bufPrint(&entry.info, "{s} \u{2192} {s}", .{ old_ver, new_ver }) catch return false;
+    entry.info_len = info.len;
+    return true;
+}
+
 /// Parses a "pkgname oldver -> newver" line (checkupdates/yay/paru format).
 fn parsePkgUpdateLine(line: []const u8, list: *UpdateList) bool {
     const arrow = std.mem.indexOf(u8, line, "->") orelse return false;
@@ -343,15 +442,39 @@ fn parsePkgUpdateLine(line: []const u8, list: *UpdateList) bool {
     const sp = split_at orelse return false;
     const name = std.mem.trim(u8, left[0..sp], " \t\r");
     const old_ver = std.mem.trim(u8, left[sp + 1 ..], " \t\r");
-    if (name.len == 0 or old_ver.len == 0 or new_ver.len == 0) return false;
+    return addUpdateEntry(list, name, old_ver, new_ver);
+}
 
-    const entry = &list.entries[list.count];
-    if (name.len >= entry.name.len) return false;
-    @memcpy(entry.name[0..name.len], name);
-    entry.name_len = name.len;
-    const info = std.fmt.bufPrint(&entry.info, "{s} \u{2192} {s}", .{ old_ver, new_ver }) catch return false;
-    entry.info_len = info.len;
-    return true;
+/// Parses one `apt list --upgradable` line, e.g.
+/// "firefox/sid 128.0-1 amd64 [upgradable from: 127.0-1]". Rejects APT's
+/// "Listing..." header line and "N:" note lines, which are not packages.
+fn parseAptUpdateLine(raw: []const u8, list: *UpdateList) bool {
+    const line = std.mem.trim(u8, raw, " \t\r");
+    if (line.len == 0) return false;
+    if (std.mem.startsWith(u8, line, "Listing")) return false;
+    if (std.mem.startsWith(u8, line, "N:")) return false;
+
+    const slash = std.mem.indexOfScalar(u8, line, '/') orelse return false;
+    const name = line[0..slash];
+
+    // Format: "pkg/suite <newver> <arch> [upgradable from: <oldver>]".
+    // First token after the name is the suite (sid/stable/...), second is
+    // the new version.
+    var it = std.mem.tokenizeAny(u8, line[slash + 1 ..], " \t");
+    _ = it.next() orelse return false; // suite
+    const new_ver = it.next() orelse return false;
+
+    // new_ver is a sub-slice of `line`; index back into line for the rest
+    // (the version, arch, and "[upgradable from: <old>]" tail that follows).
+    const new_start = @intFromPtr(new_ver.ptr) - @intFromPtr(line.ptr);
+    const rest = line[new_start + new_ver.len ..];
+    const marker = "upgradable from:";
+    const up = std.mem.indexOf(u8, rest, marker) orelse return false;
+    const tail = rest[up + marker.len ..];
+    var end: usize = 0;
+    while (end < tail.len and tail[end] != ']') : (end += 1) {}
+    const old_ver = std.mem.trim(u8, tail[0..end], " \t");
+    return addUpdateEntry(list, name, old_ver, new_ver);
 }
 
 fn fillListFromLines(list: *UpdateList, output: []const u8) void {
@@ -359,6 +482,16 @@ fn fillListFromLines(list: *UpdateList, output: []const u8) void {
     while (lines.next()) |line| {
         if (list.count >= MAX_UPDATE_ENTRIES) break;
         if (parsePkgUpdateLine(line, list)) list.count += 1;
+    }
+}
+
+/// fillListFromLines, but parsing apt's "pkg/... newver ... [upgradable from: ...]"
+/// output format instead of checkupdates' "pkg old -> new".
+fn fillListFromAptLines(list: *UpdateList, output: []const u8) void {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (list.count >= MAX_UPDATE_ENTRIES) break;
+        if (parseAptUpdateLine(line, list)) list.count += 1;
     }
 }
 
@@ -395,6 +528,18 @@ fn parseFlatpakLine(raw_line: []const u8, list: *UpdateList) bool {
 }
 
 fn fetchArchUpdates(list: *UpdateList) void {
+    if (g_distro == .debian) {
+        // apt list --upgradable needs no root and mutates nothing; reads the
+        // installed+available package lists and prints the delta.
+        const output = runCaptured(&[_][:0]const u8{ "apt", "list", "--upgradable" }, 30000) orelse {
+            list.ok = false;
+            return;
+        };
+        defer gpa.free(output);
+        list.ok = true;
+        fillListFromAptLines(list, output);
+        return;
+    }
     if (!commandExists("checkupdates")) {
         list.ok = false;
         return;
@@ -479,7 +624,38 @@ const SetupAction = struct {
     icon: [:0]const u8,
     argv: []const [:0]const u8,
 };
-const SETUP_ACTIONS = [_]SetupAction{
+
+// Debian-side variants of the Arch-flavored setup actions below — swapped
+// into SETUP_ACTIONS[0..2] at startup on Debian systems (applyDistroDefaults).
+const DEBIAN_UPDATE_ACTION = SetupAction{
+    .title = "Update Debian Linux",
+    .subtitle = "Runs a plain system update (sudo apt update && sudo apt full-upgrade -y) \u{2014} no config/script " ++
+        "refresh, just your packages. Opens in a terminal for the password prompt.",
+    .icon = "system-software-update-symbolic",
+    .argv = &[_][:0]const u8{ "foot", "-e", "bash", "-lc", "sudo apt update && sudo DEBIAN_FRONTEND=noninteractive apt full-upgrade -y; echo; read -p 'Press Enter to close...'" },
+};
+const DEBIAN_UPDATE_SIMPBAR_ACTION = SetupAction{
+    .title = "Update Simpbar and Debian Linux",
+    .subtitle = "Runs a full system update, then re-fetches the latest install script " ++
+        "and configs from GitHub. Opens in a terminal \u{2014} asks a few of the same " ++
+        "setup questions again as part of the refresh.",
+    .icon = "software-update-available-symbolic",
+    .argv = &[_][:0]const u8{
+        "foot", "-e", "bash", "-lc",
+        "sudo apt update && sudo DEBIAN_FRONTEND=noninteractive apt full-upgrade -y; echo; " ++
+            "curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install-debian.sh | bash; echo; read -p 'Press Enter to close...'",
+    },
+};
+const DEBIAN_CHECK_UPDATES_ACTION = SetupAction{
+    .title = "Check for updates now",
+    .subtitle = "Checks for APT package updates and new commits on the simpbar " ++
+        "repo, and sends a notification if it finds anything. Runs " ++
+        "automatically every few hours in the background too.",
+    .icon = "view-refresh-symbolic",
+    .argv = &[_][:0]const u8{"simpbar-check-updates"},
+};
+
+var SETUP_ACTIONS = [_]SetupAction{
     .{
         .title = "Update Arch Linux",
         .subtitle = "Runs a plain system update (sudo pacman -Syu) \u{2014} no config/script " ++
@@ -515,9 +691,9 @@ const SETUP_ACTIONS = [_]SetupAction{
     },
     .{
         .title = "Pick a wallpaper",
-        .subtitle = "Opens waypaper, pointed at ~/Pictures/Wallpaper by default.",
+        .subtitle = "Opens azote on Debian or waypaper on Arch, pointed at ~/Pictures/Wallpaper by default.",
         .icon = "preferences-desktop-wallpaper-symbolic",
-        .argv = &[_][:0]const u8{"waypaper"},
+        .argv = &[_][:0]const u8{"simpbar-wallpaper"},
     },
     .{
         .title = "Customize GTK theme, icons and cursor",
@@ -540,19 +716,34 @@ const SETUP_ACTIONS = [_]SetupAction{
     },
 };
 
-const EASYEFFECTS_ARGV = [_][:0]const u8{
+const EASYEFFECTS_ARGV_ARCH = [_][:0]const u8{
     "foot", "-e", "bash", "-lc",
     "sudo pacman -S --noconfirm --needed easyeffects calf lsp-plugins-lv2 mda.lv2 x42-plugins-lv2 zam-plugins-lv2; echo; read -p 'Press Enter to close...'",
 };
+// The same plugin packs under their Debian package names (calf → calf-plugins,
+// lsp-plugins-lv2 → lsp-plugins, mda.lv2 → mda-lv2, x42-plugins-lv2 →
+// x42-plugins, zam-plugins-lv2 → zam-plugins).
+const EASYEFFECTS_ARGV_DEBIAN = [_][:0]const u8{
+    "foot", "-e", "bash", "-lc",
+    "sudo apt install -y --no-install-recommends easyeffects calf-plugins lsp-plugins mda-lv2 x42-plugins zam-plugins; echo; read -p 'Press Enter to close...'",
+};
+var EASYEFFECTS_ARGV = EASYEFFECTS_ARGV_ARCH;
 
-const REMOVE_NEOVIM_ARGV = [_][:0]const u8{
+const REMOVE_NEOVIM_ARGV_ARCH = [_][:0]const u8{
     "foot", "-e", "bash", "-lc",
     "sudo pacman -Rns --noconfirm neovim; " ++
         "rm -rf ~/.config/nvim ~/.local/share/nvim ~/.local/state/nvim ~/.cache/nvim; " ++
         "echo; read -p 'Press Enter to close...'",
 };
+const REMOVE_NEOVIM_ARGV_DEBIAN = [_][:0]const u8{
+    "foot", "-e", "bash", "-lc",
+    "sudo apt-get purge -y neovim; " ++
+        "rm -rf ~/.config/nvim ~/.local/share/nvim ~/.local/state/nvim ~/.cache/nvim; " ++
+        "echo; read -p 'Press Enter to close...'",
+};
+var REMOVE_NEOVIM_ARGV = REMOVE_NEOVIM_ARGV_ARCH;
 
-const APPLY_ALL_UPDATES_ARGV = [_][:0]const u8{
+const APPLY_ALL_UPDATES_ARGV_ARCH = [_][:0]const u8{
     "foot", "-e", "bash", "-lc",
     "sudo pacman -Syu --noconfirm; " ++
         "if command -v yay >/dev/null; then yay -Sua --noconfirm; " ++
@@ -560,6 +751,28 @@ const APPLY_ALL_UPDATES_ARGV = [_][:0]const u8{
         "command -v flatpak >/dev/null && flatpak update -y; " ++
         "echo; read -p 'Press Enter to close...'",
 };
+const APPLY_ALL_UPDATES_ARGV_DEBIAN = [_][:0]const u8{
+    "foot", "-e", "bash", "-lc",
+    "sudo apt update && sudo DEBIAN_FRONTEND=noninteractive apt full-upgrade -y; " ++
+        "command -v flatpak >/dev/null && flatpak update -y; " ++
+        "echo; read -p 'Press Enter to close...'",
+};
+var APPLY_ALL_UPDATES_ARGV = APPLY_ALL_UPDATES_ARGV_ARCH;
+
+/// Picks the Debian variants of the Arch-flavored launch commands/actions
+/// above on a Debian system. Must run before any UI is built (the rows and
+/// update groups read these once). Arch is the default and untouched.
+fn applyDistroDefaults() void {
+    g_distro = detectDistro();
+    if (g_distro == .debian) {
+        SETUP_ACTIONS[0] = DEBIAN_UPDATE_ACTION;
+        SETUP_ACTIONS[1] = DEBIAN_UPDATE_SIMPBAR_ACTION;
+        SETUP_ACTIONS[2] = DEBIAN_CHECK_UPDATES_ACTION;
+        EASYEFFECTS_ARGV = EASYEFFECTS_ARGV_DEBIAN;
+        REMOVE_NEOVIM_ARGV = REMOVE_NEOVIM_ARGV_DEBIAN;
+        APPLY_ALL_UPDATES_ARGV = APPLY_ALL_UPDATES_ARGV_DEBIAN;
+    }
+}
 
 const GRAPHICS_OPTIONS = [_][:0]const u8{ "GIMP", "Inkscape", "Krita" };
 const GRAPHICS_PACKAGES = [_][:0]const u8{ "gimp", "inkscape", "krita" };
@@ -689,16 +902,20 @@ var g_discord_row: ?*gtk.AdwComboRow = null;
 fn onGraphicsInstallClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     const idx = gtk.adw_combo_row_get_selected(g_graphics_row.?);
     if (idx >= GRAPHICS_PACKAGES.len) return;
-    var buf: [256]u8 = undefined;
-    const script = std.fmt.bufPrintZ(&buf, "sudo pacman -S --noconfirm --needed {s}; echo; read -p 'Press Enter to close...'", .{GRAPHICS_PACKAGES[idx]}) catch return;
+    var cmd_buf: [256]u8 = undefined;
+    const install_cmd = buildSystemInstallCmd(&cmd_buf, GRAPHICS_PACKAGES[idx]);
+    var buf: [400]u8 = undefined;
+    const script = std.fmt.bufPrintZ(&buf, "{s}; echo; read -p 'Press Enter to close...'", .{install_cmd}) catch return;
     launchArgv(&[_][:0]const u8{ "foot", "-e", "bash", "-lc", script });
 }
 
 fn onVideoPlayerInstallClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     const idx = gtk.adw_combo_row_get_selected(g_video_row.?);
     if (idx >= VIDEO_PLAYER_PACKAGES.len) return;
-    var buf: [256]u8 = undefined;
-    const script = std.fmt.bufPrintZ(&buf, "sudo pacman -S --noconfirm --needed {s}; echo; read -p 'Press Enter to close...'", .{VIDEO_PLAYER_PACKAGES[idx]}) catch return;
+    var cmd_buf: [256]u8 = undefined;
+    const install_cmd = buildSystemInstallCmd(&cmd_buf, VIDEO_PLAYER_PACKAGES[idx]);
+    var buf: [400]u8 = undefined;
+    const script = std.fmt.bufPrintZ(&buf, "{s}; echo; read -p 'Press Enter to close...'", .{install_cmd}) catch return;
     launchArgv(&[_][:0]const u8{ "foot", "-e", "bash", "-lc", script });
 }
 
@@ -719,7 +936,7 @@ fn onBrowserPinApplyClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void
     var cmd_buf: [300]u8 = undefined;
     const install_cmd = buildInstallCmd(&cmd_buf, info.pkg, info.needs_aur);
     var buf: [500]u8 = undefined;
-    const script = std.fmt.bufPrintZ(&buf, "{s}; mkdir -p \"$HOME/.config/simpbar\" && echo {s} > \"$HOME/.config/simpbar/browser-choice\"; echo; read -p 'Press Enter to close...'", .{ install_cmd, info.binary }) catch return;
+    const script = std.fmt.bufPrintZ(&buf, "{s}; mkdir -p \"$HOME/.config/simpbar\" && echo {s} > \"$HOME/.config/simpbar/browser-choice\"; echo; read -p 'Press Enter to close...'", .{ install_cmd, pinBinaryName(info.binary) }) catch return;
     launchArgv(&[_][:0]const u8{ "foot", "-e", "bash", "-lc", script });
 }
 
@@ -730,7 +947,7 @@ fn onDiscordPinApplyClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void
     var cmd_buf: [300]u8 = undefined;
     const install_cmd = buildInstallCmd(&cmd_buf, info.pkg, info.needs_aur);
     var buf: [500]u8 = undefined;
-    const script = std.fmt.bufPrintZ(&buf, "{s}; mkdir -p \"$HOME/.config/simpbar\" && echo {s} > \"$HOME/.config/simpbar/discord-choice\"; echo; read -p 'Press Enter to close...'", .{ install_cmd, info.binary }) catch return;
+    const script = std.fmt.bufPrintZ(&buf, "{s}; mkdir -p \"$HOME/.config/simpbar\" && echo {s} > \"$HOME/.config/simpbar/discord-choice\"; echo; read -p 'Press Enter to close...'", .{ install_cmd, pinBinaryName(info.binary) }) catch return;
     launchArgv(&[_][:0]const u8{ "foot", "-e", "bash", "-lc", script });
 }
 
@@ -963,6 +1180,8 @@ fn buildAboutPage() *gtk.GtkBox {
 var g_check_button: ?*gtk.GtkButton = null;
 var g_apply_button: ?*gtk.GtkButton = null;
 var g_spinner: ?*gtk.GtkSpinner = null;
+var g_status_label: ?*gtk.GtkLabel = null;
+var g_status_buf: [64]u8 = undefined;
 
 const GroupRows = struct {
     group: ?*gtk.AdwPreferencesGroup = null,
@@ -1006,6 +1225,12 @@ fn populateGroup(gr: *GroupRows, list: *UpdateList, empty_message: [:0]const u8)
     }
 }
 
+/// One-line summary of the last update check, shown next to the spinner on
+/// the Updates page ("N updates available" / "Everything is up to date.").
+fn setStatusLabel(text: [:0]const u8) void {
+    if (g_status_label) |label| gtk.gtk_label_set_text(label, text.ptr);
+}
+
 fn onCheckUpdatesClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     gtk.gtk_widget_set_sensitive(@ptrCast(g_check_button.?), 0);
     gtk.gtk_widget_set_sensitive(@ptrCast(g_apply_button.?), 0);
@@ -1013,6 +1238,7 @@ fn onCheckUpdatesClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     setGroupMessage(&g_arch_rows, "Checking\u{2026}");
     setGroupMessage(&g_aur_rows, "Checking\u{2026}");
     setGroupMessage(&g_flatpak_rows, "Checking\u{2026}");
+    setStatusLabel("Checking\u{2026}");
 
     const result = gpa.create(UpdateCheckResult) catch return;
     result.* = .{};
@@ -1031,11 +1257,11 @@ fn onUpdateCheckIdle(data: ?*anyopaque) callconv(.c) c_int {
     if (result.arch.ok) {
         populateGroup(&g_arch_rows, &result.arch, "Everything up to date.");
     } else {
-        setGroupMessage(&g_arch_rows, "Could not check \u{2014} is pacman-contrib installed?");
+        setGroupMessage(&g_arch_rows, if (g_distro == .debian) "Could not check for apt updates." else "Could not check \u{2014} is pacman-contrib installed?");
     }
 
     if (result.aur.ok) {
-        populateGroup(&g_aur_rows, &result.aur, "Everything up to date, or no AUR helper installed.");
+        populateGroup(&g_aur_rows, &result.aur, if (g_distro == .debian) "Not applicable on Debian." else "Everything up to date, or no AUR helper installed.");
     } else {
         setGroupMessage(&g_aur_rows, "Could not check AUR updates.");
     }
@@ -1048,6 +1274,12 @@ fn onUpdateCheckIdle(data: ?*anyopaque) callconv(.c) c_int {
 
     const total = result.arch.count + result.aur.count + result.flatpak.count;
     gtk.gtk_widget_set_sensitive(@ptrCast(g_apply_button.?), @intFromBool(total > 0));
+
+    var status: [:0]const u8 = "Everything is up to date.";
+    if (total > 0) {
+        status = std.fmt.bufPrintZ(&g_status_buf, "{d} update(s) available", .{total}) catch "Updates available";
+    }
+    setStatusLabel(status);
 
     gpa.destroy(result);
     return 0; // G_SOURCE_REMOVE
@@ -1074,12 +1306,20 @@ fn buildUpdatesPage() *gtk.GtkBox {
     const spinner = gtk.gtk_spinner_new();
     gtk.gtk_box_append(button_row, @ptrCast(spinner));
     g_spinner = spinner;
+
+    const status_label = gtk.gtk_label_new(null);
+    gtk.gtk_label_set_xalign(status_label, 0);
+    gtk.gtk_widget_set_valign(@ptrCast(status_label), gtk.ALIGN_CENTER);
+    gtk.gtk_box_append(button_row, @ptrCast(status_label));
+    g_status_label = status_label;
+    setStatusLabel("Click \"Check for Updates\" above to scan.");
+
     gtk.gtk_box_append(box, @ptrCast(button_row));
 
     const arch_group = gtk.adw_preferences_group_new();
-    gtk.adw_preferences_group_set_title(arch_group, "Arch Linux packages");
+    gtk.adw_preferences_group_set_title(arch_group, if (g_distro == .debian) "APT packages" else "Arch Linux packages");
     const aur_group = gtk.adw_preferences_group_new();
-    gtk.adw_preferences_group_set_title(aur_group, "AUR packages");
+    gtk.adw_preferences_group_set_title(aur_group, if (g_distro == .debian) "AUR packages (Arch only)" else "AUR packages");
     const flatpak_group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(flatpak_group, "Flatpak apps");
     g_arch_rows.group = arch_group;
@@ -1224,6 +1464,7 @@ fn onAppActivate(app: *gtk.GApplication, _: ?*anyopaque) callconv(.c) void {
 
 pub fn main() !void {
     resolvePaths();
+    applyDistroDefaults();
     g_autostart_mode = detectAutostartMode();
 
     const app = gtk.adw_application_new(APP_ID, 0);

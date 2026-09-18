@@ -1,8 +1,8 @@
 #!/bin/bash
-# simpbar-check-updates — checks for Arch/AUR package updates and new
-# commits on the simpbar GitHub repo, and fires a desktop notification
-# (via notify-send / swaync) if either is found. Safe to run repeatedly
-# and safe with no network (just does nothing that turn).
+# simpbar-check-updates — checks for system package updates (Arch/AUR or apt)
+# and new commits on the simpbar GitHub repo, and fires a desktop notification
+# (via notify-send / swaync) if either is found. Safe to run repeatedly and
+# safe with no network (just does nothing that turn).
 
 CACHE_DIR="$HOME/.cache/simpbar"
 COMMIT_CACHE="$CACHE_DIR/last-commit-sha"
@@ -10,10 +10,16 @@ mkdir -p "$CACHE_DIR"
 
 MESSAGES=()
 
-# Official repo updates — checkupdates syncs its own temp db, no root needed.
+# Official repo updates — checkupdates (Arch, syncs its own temp db) when
+# present, else apt (Debian-family). apt needs no root and just reads the
+# current package lists; the "[upgradable from: ...]" marker only appears on
+# real package lines, so counting them counts exactly the updatable packages.
 if command -v checkupdates >/dev/null 2>&1; then
     PKG_COUNT=$(checkupdates 2>/dev/null | wc -l)
     [ "$PKG_COUNT" -gt 0 ] && MESSAGES+=("$PKG_COUNT Arch package update(s) available")
+elif command -v apt-get >/dev/null 2>&1; then
+    PKG_COUNT=$(apt list --upgradable 2>/dev/null | awk '/upgradable from:/{c++} END{print c+0}')
+    [ "$PKG_COUNT" -gt 0 ] && MESSAGES+=("$PKG_COUNT APT update(s) available")
 fi
 
 # AUR updates, if a helper is available.

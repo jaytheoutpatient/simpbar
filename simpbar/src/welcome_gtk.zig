@@ -106,6 +106,7 @@ pub extern "c" fn gtk_image_set_pixel_size(self: *GtkImage, pixel_size: c_int) v
 
 // GtkLabel
 pub extern "c" fn gtk_label_new(str: ?[*:0]const u8) *GtkLabel;
+pub extern "c" fn gtk_label_set_text(self: *GtkLabel, str: [*:0]const u8) void;
 pub extern "c" fn gtk_label_set_justify(self: *GtkLabel, jtype: c_int) void;
 pub extern "c" fn gtk_label_set_wrap(self: *GtkLabel, wrap: c_int) void;
 pub extern "c" fn gtk_label_set_xalign(self: *GtkLabel, xalign: f32) void;

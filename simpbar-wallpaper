@@ -1,0 +1,9 @@
+#!/bin/bash
+# simpbar-wallpaper — opens the distro's wallpaper picker: azote where
+# waypaper isn't packaged (Debian-family, install-debian.sh), otherwise
+# waypaper (Arch/AUR, install.sh). Both are GTK front-ends to swaybg, so a
+# single script keeps the same bar/welcome buttons working on either family.
+if command -v azote >/dev/null 2>&1; then
+    exec azote "$@"
+fi
+exec waypaper "$@"

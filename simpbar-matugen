@@ -1,0 +1,90 @@
+#!/bin/bash
+# simpbar-matugen — regenerate matugen's Material You colorscheme for a
+# wallpaper so simpbar (and anything else you've wired into matugen's
+# config.toml) recolors to match. With an explicit image path it runs matugen
+# on that image; with no argument it finds the current wallpaper the same way
+# each installer wires its picker:
+#
+#   1. waypaper's ~/.config/waypaper/config.ini (Arch)
+#   2. azote's restore script ~/.azotebg-hyprland / ~/.azotebg (Debian)
+#   3. the most recent ~/Pictures/Wallpaper/bing-*.jpg (the login default)
+#
+# The scheme type (tonal-spot, monochrome, fruit-salad, …) comes from
+# ~/.config/simpbar/matugen-type, which simpbar-config's "Matugen color
+# scheme" dropdown writes; absent/unrecognized falls back to matugen's own
+# default. Either way matugen itself never sets the wallpaper (its config.toml
+# ships with set = false); the pickers own that.
+#
+# Everything runs with set -e so a missing image/file/matugen exits non-zero
+# instead of half-applying a scheme.
+
+set -e
+
+IMG=""
+if [ -n "$1" ]; then
+    IMG="$1"
+else
+    # 1. waypaper config: "wallpaper = /path/to/image" (installer writes a
+    #    full path there; strip optional surrounding quotes and any CR).
+    WPCFG="$HOME/.config/waypaper/config.ini"
+    if [ -r "$WPCFG" ]; then
+        IMG="$(sed -n 's/^[[:space:]]*wallpaper[[:space:]]*=[[:space:]]*//p' "$WPCFG" | head -n1 | tr -d '\r')"
+        IMG="${IMG%\"}"; IMG="${IMG#\"}"
+        IMG="${IMG%\'}"; IMG="${IMG#\'}"
+    fi
+
+    # 2. azote's restore script(s) — one swaybg line per output; grab the path
+    #    after the first "-i". Handles single-/double-quoted paths (spaces
+    #    included) and bare one-token paths.
+    if [ -z "$IMG" ]; then
+        for f in "$HOME/.azotebg-hyprland" "$HOME/.azotebg"; do
+            [ -f "$f" ] || continue
+            IMG="$(grep -m1 -oE -- "-i ('[^']*'|\"[^\"]*\"|[^ ]+)" "$f" | sed -E 's/^-i +//; s/^["'"'"']//; s/["'"'"']$//')"
+            [ -n "$IMG" ] && break
+        done
+    fi
+
+    # 3. fall back to the newest Bing download from install time (matches the
+    #    swaybg.service default), so a scheme can be generated before a
+    #    wallpaper has been picked in waypaper/azote.
+    if [ -z "$IMG" ]; then
+        for f in "$HOME"/Pictures/Wallpaper/bing-*.jpg; do
+            [ -f "$f" ] && IMG="$f"
+        done
+    fi
+fi
+
+if [ -z "$IMG" ]; then
+    echo "simpbar-matugen: no wallpaper given and none found (waypaper config, azote restore script, or ~/Pictures/Wallpaper/bing-*.jpg)" >&2
+    exit 1
+fi
+if [ ! -f "$IMG" ]; then
+    echo "simpbar-matugen: wallpaper file not found: $IMG" >&2
+    exit 1
+fi
+
+# matugen may live in ~/.cargo/bin (e.g. the Debian installer's `cargo
+# install matugen`) where a systemd user service's restricted PATH won't
+# find it — try the cargo bin dir explicitly before giving up.
+if command -v matugen >/dev/null 2>&1; then
+    MATUGEN_BIN="$(command -v matugen)"
+elif [ -x "$HOME/.cargo/bin/matugen" ]; then
+    MATUGEN_BIN="$HOME/.cargo/bin/matugen"
+else
+    echo "simpbar-matugen: matugen isn't installed or isn't on your PATH" >&2
+    exit 1
+fi
+
+# Scheme type chosen in simpbar-config. Validate against matugen's known
+# values so a stale/hand-edited file can't make matugen error out.
+TYPE="scheme-tonal-spot"
+TYPE_FILE="$HOME/.config/simpbar/matugen-type"
+if [ -r "$TYPE_FILE" ]; then
+    read -r TYPE < "$TYPE_FILE" || true
+fi
+case "$TYPE" in
+    scheme-tonal-spot|scheme-content|scheme-expressive|scheme-fidelity|scheme-fruit-salad|scheme-monochrome|scheme-neutral|scheme-rainbow|scheme-vibrant|scheme-smart) ;;
+    *) TYPE="scheme-tonal-spot" ;;
+esac
+
+exec "$MATUGEN_BIN" -t "$TYPE" image "$IMG"

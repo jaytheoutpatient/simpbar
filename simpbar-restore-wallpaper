@@ -1,0 +1,13 @@
+#!/bin/bash
+# simpbar-restore-wallpaper — restores the wallpaper azote last set, run on
+# login. Azote writes its own restore script to ~/.azotebg-hyprland (v1.12.0+,
+# Hyprland/Sway) or ~/.azotebg (older versions) the first time it applies a
+# picture; exec whichever exists so the last azote pick survives reboots.
+# Does nothing (and exits cleanly) until azote has actually set a wallpaper,
+# so swaybg's default stays up until then.
+if [ -x "$HOME/.azotebg-hyprland" ]; then
+    exec "$HOME/.azotebg-hyprland"
+fi
+if [ -x "$HOME/.azotebg" ]; then
+    exec "$HOME/.azotebg"
+fi

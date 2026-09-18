@@ -1,0 +1,54 @@
+# matugen — Material You colorscheme generator, wired into simpbar.
+#
+# Two ways to use this:
+#
+#   1) Fresh setup (what the installers do): put THIS file at
+#      ~/.config/matugen/config.toml and the template at
+#      ~/.config/matugen/templates/simpbar.json (from the repo's matugen/
+#      folder), then run:  matugen image /path/to/wallpaper.jpg
+#
+#   2) Existing matugen config: don't clobber it — just merge the single
+#      [templates.simpbar] block at the bottom of this file (plus its
+#      template file) into your ~/.config/matugen/config.toml. Everything
+#      above that block is optional policy; only the template block matters.
+#
+# simpbar reads the generated ~/.config/simpbar/matugen.json automatically
+# while its auto_theme setting is on (Simpbar Config → Appearance →
+# "Auto-theme with matugen", ON by default) and live-reloads via SIGUSR1.
+# Turn that switch off when you want to keep your hand-picked colors.
+
+[config]
+version_check = false
+# Keep `matugen image` fully non-interactive — the wallpaper-picker hook
+# (waypaper/azote) runs it in the background with no terminal, and without an
+# explicit fallback + preference matugen stops to ask which source color to
+# use. closest-to-fallback keeps the picked color near the neutral teal
+# fallback below; change both to taste.
+fallback_color = "#80CBC4"
+prefer = "closest-to-fallback"
+
+# NOTE on the color scheme type: matugen 4.x does NOT read a `type` key from
+# this file (verified against 4.2.0 — it's CLI-only, `matugen --type …`).
+# simpbar instead keeps the chosen scheme in ~/.config/simpbar/matugen-type,
+# which simpbar-config's "Matugen color scheme" dropdown writes and
+# simpbar-matugen passes through as `--type`. Don't add `type` here; it would
+# silently do nothing.
+
+# The wallpaper itself is owned by waypaper (Arch) / azote (Debian) + swaybg
+# on this setup — matugen only recolors things, it must never set the
+# wallpaper. set = false + a no-op command keeps it that way (matugen 4.x
+# requires the command field to parse even when set is false).
+[config.wallpaper]
+set = false
+command = "true"
+
+# The simpbar template — renders the ten colors this bar draws into
+# ~/.config/simpbar/matugen.json (simpbar merges and applies whatever the
+# file contains, key by key, missing keys keep config.json's values).
+[templates.simpbar]
+input_path = "~/.config/matugen/templates/simpbar.json"
+output_path = "~/.config/simpbar/matugen.json"
+# Live-reload the running bar after the colors are written. Safe when the
+# bar isn't running — the pidfile check turns the whole thing into a no-op
+# (simpbar writes simpbar.pid at startup, next to config.json).
+post_hook = "sh -c 'if [ -s \"$HOME/.config/simpbar/simpbar.pid\" ]; then kill -USR1 \"$(cat \"$HOME/.config/simpbar/simpbar.pid\")\" 2>/dev/null; fi'"
