@@ -11,6 +11,7 @@ const font_mod = @import("font.zig");
 const icontheme = @import("icontheme.zig");
 const dbusmenu = @import("dbusmenu.zig");
 const logging = @import("logging.zig");
+const gpu = @import("gpu.zig");
 
 pub const panic = std.debug.FullPanic(logging.panicHandler);
 
@@ -475,6 +476,17 @@ const Appearance = struct {
     /// SIGUSR1 — creating/destroying Wayland surfaces at runtime is a much
     /// bigger, riskier change than anything else this config drives live.
     monitor: []const u8,
+    /// How the finished framebuffer is presented to the compositor. "gpu"
+    /// (default today) = EGL/GLES2 textured blit through a wl_egl_window
+    /// (src/gpu.zig); "shm" = the original shared-memory memfd + wl_shm path.
+    /// Anything unrecognized falls back to "gpu" (the default), same
+    /// permissive-fallback spirit as every other config field. Best effort:
+    /// if  EGL can't be initialized at runtime (e.g. a compositor without a
+    /// GPU path), the bar silently falls back to "shm" for that bar rather
+    /// than failing to render. Takes effect on the next bar restart — like
+    /// `monitor`, this is a per-surface policy, so it isn't switched live via
+    /// SIGUSR1.
+    renderer: []const u8,
 };
 
 // Curated clock-format presets (not a full strftime-style parser — matches
@@ -544,6 +556,7 @@ fn defaultConfig() Config {
             .corner_radius_px = 0,
             .clock_format = CLOCK_FORMAT_DATE_24H,
             .monitor = "",
+            .renderer = "gpu",
         },
         .modules = .{
             .left = &DEFAULT_LEFT,
@@ -686,6 +699,7 @@ const JsonAppearance = struct {
     corner_radius_px: u32 = 0,
     clock_format: []const u8 = CLOCK_FORMAT_DATE_24H,
     monitor: []const u8 = "",
+    renderer: []const u8 = "gpu",
     /// "matugen" (default) = when ~/.config/simpbar/matugen.json exists, its
     /// colors override these hex values (the wallpaper-based auto-theming
     /// integration). "manual" = ignore matugen.json entirely and always use
@@ -850,6 +864,9 @@ fn parseAppearance(j: JsonAppearance) ?Appearance {
         // step (after outputs are discovered) is what falls back to ""
         // behavior for a name that doesn't match any connected output.
         .monitor = j.monitor,
+        // "shm" is honored; anything else (including an explicit "gpu")
+        // maps to the default "gpu" renderer.
+        .renderer = if (std.mem.eql(u8, j.renderer, "shm")) "shm" else "gpu",
     };
 }
 
@@ -1715,6 +1732,7 @@ const Globals = struct {
 const Bar = struct {
     shm: *wl.Shm,
     surface: *wl.Surface,
+    display: *wl.Display, // needed to init the EGL GPU renderer on first gpu draw
     layer_surface: *zwlr.LayerSurfaceV1,
     workspaces: *Workspaces,
     weather: *PolledCommand,
@@ -1741,6 +1759,18 @@ const Bar = struct {
     mpris_player_buf: [128]u8 = undefined,
     mpris_player_len: usize = 0,
     popup: ?PopupMenu = null,
+    /// GPU renderer, lazily initialized on the first draw when use_gpu is
+    /// true (needs bar.width/bar.height, which aren't known until the
+    /// compositor's first configure event). null = not initialized yet, or
+    /// gpu_disabled is set and we've permanently fallen back to shm.
+    gpu: ?gpu.Renderer = null,
+    /// True once EGL init/present has failed for this bar, so we stop
+    /// retrying GPU on every redraw and silently use the shm path (same
+    /// permissive-fallback spirit as every other config field).
+    gpu_disabled: bool = false,
+    /// Renderer chosen at bar creation from current_config.appearance.renderer
+    /// ("gpu"/"shm"). Fixed for the bar's lifetime, like `monitor`.
+    use_gpu: bool,
 };
 
 /// (Re-)applies the layer-shell anchor/size/exclusive-zone/margin from
@@ -1936,6 +1966,7 @@ fn realMain() !void {
         bars[bar_count] = .{
             .shm = shm,
             .surface = surface,
+            .display = display,
             .layer_surface = layer_surface,
             .workspaces = &workspaces,
             .weather = &weather,
@@ -1948,6 +1979,7 @@ fn realMain() !void {
             .wm_base = globals.wm_base,
             .seat = globals.seat,
             .height = current_config.appearance.bar_height,
+            .use_gpu = std.mem.eql(u8, current_config.appearance.renderer, "gpu"),
         };
         layer_surface.setListener(*Bar, layerSurfaceListener, &bars[bar_count]);
         bar_count += 1;
@@ -4111,32 +4143,12 @@ fn sqShrunkRadius(r: i32, side_a_px: u32, side_b_px: u32) i32 {
     return inner * inner;
 }
 
-/// Allocate an anonymous shared-memory buffer, fill it with a solid color,
-/// attach it to the surface, and commit. This is the whole "renderer" for
-/// now — text/module drawing replaces the fill loop later.
-fn drawAndCommit(bar: *Bar) !void {
-    const stride = bar.width * 4; // ARGB8888
-    const size: usize = @as(usize, stride) * bar.height;
-
-    const fd = try posix.memfd_create("simpbar-buffer", 0);
-    defer _ = posix.system.close(fd);
-    switch (posix.errno(posix.system.ftruncate(fd, @intCast(size)))) {
-        .SUCCESS => {},
-        else => return error.FTruncateFailed,
-    }
-
-    const data = try posix.mmap(
-        null,
-        size,
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .SHARED },
-        fd,
-        0,
-    );
-    defer posix.munmap(data);
-
-    const pixels: [*]u32 = @ptrCast(@alignCast(data.ptr));
-    const pixel_count = size / 4;
+/// Rasterizes one frame into `pixels` (ARGB8888, bar.width×bar.height) — the
+/// shared CPU drawing step used by both presenters below. Background fill,
+/// borders, every module, and corner rounding all draw here first; only the
+/// final buffer hand-off to the compositor differs (shm vs gpu).
+fn paintFrame(bar: *Bar, pixels: [*]u32) void {
+    const pixel_count: usize = @as(usize, bar.width) * bar.height;
     // Only the fill's alpha varies with bg_opacity_percent — text/icons/
     // border keep their own configured (always-opaque) colors, so lowering
     // this fades the background through to whatever's behind the bar
@@ -4302,6 +4314,35 @@ fn drawAndCommit(bar: *Bar) !void {
             }
         }
     }
+}
+
+/// Shared-memory presenter: allocate an anonymous memfd buffer, paint the
+/// frame into it, then hand it to the compositor as a wl_shm argb8888
+/// buffer. This is the original renderer (no GPU involved), used when
+/// `renderer` is "shm" or the GPU path has fallen back.
+fn drawShmAndCommit(bar: *Bar) !void {
+    const stride = bar.width * 4; // ARGB8888
+    const size: usize = @as(usize, stride) * bar.height;
+
+    const fd = try posix.memfd_create("simpbar-buffer", 0);
+    defer _ = posix.system.close(fd);
+    switch (posix.errno(posix.system.ftruncate(fd, @intCast(size)))) {
+        .SUCCESS => {},
+        else => return error.FTruncateFailed,
+    }
+
+    const data = try posix.mmap(
+        null,
+        size,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .SHARED },
+        fd,
+        0,
+    );
+    defer posix.munmap(data);
+
+    const pixels: [*]u32 = @ptrCast(@alignCast(data.ptr));
+    paintFrame(bar, pixels);
 
     const pool = try bar.shm.createPool(fd, @intCast(size));
     defer pool.destroy();
@@ -4318,4 +4359,41 @@ fn drawAndCommit(bar: *Bar) !void {
     bar.surface.attach(buffer, 0, 0);
     bar.surface.damageBuffer(0, 0, @intCast(bar.width), @intCast(bar.height));
     bar.surface.commit();
+}
+
+/// Paints the current frame and hands it to the compositor through whichever
+/// renderer is configured: "gpu" (EGL/GLES2 blit, src/gpu.zig) or "shm" (the
+/// original shared-memory path). GPU is best-effort — init or present
+/// failures log once and permanently fall back to shm for that bar, so a
+/// compositor without a GPU path just gets the old renderer instead of a
+/// dead bar.
+fn drawAndCommit(bar: *Bar) !void {
+    if (bar.use_gpu) {
+        if (bar.gpu == null and !bar.gpu_disabled) {
+            bar.gpu = gpu.Renderer.init(std.heap.page_allocator, bar.display, bar.surface, bar.width, bar.height) catch |err| blk: {
+                logging.warn("gpu: EGL init failed ({}); falling back to shared memory", .{err});
+                bar.gpu_disabled = true;
+                break :blk null;
+            };
+        }
+        if (bar.gpu) |*g| {
+            g.ensurePixels(bar.width, bar.height) catch |err| {
+                logging.err("gpu: buffer resize failed ({}); falling back to shared memory", .{err});
+                g.deinit();
+                bar.gpu = null;
+                bar.gpu_disabled = true;
+                return drawShmAndCommit(bar);
+            };
+            paintFrame(bar, g.pixels.ptr);
+            g.present() catch |err| {
+                logging.err("gpu: present failed ({}); falling back to shared memory", .{err});
+                g.deinit();
+                bar.gpu = null;
+                bar.gpu_disabled = true;
+                return drawShmAndCommit(bar);
+            };
+            return;
+        }
+    }
+    return drawShmAndCommit(bar);
 }

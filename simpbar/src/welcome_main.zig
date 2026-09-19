@@ -1494,7 +1494,7 @@ fn onAppActivate(app: *gtk.GApplication, _: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn main() void {
-    logging.init("simpbar-welcome");
+    logging.init("simpbar");
     realMain() catch |err| {
         logging.err("fatal: {s}", .{@errorName(err)});
         logging.crash("fatal error: {s}", .{@errorName(err)});

@@ -44,6 +44,11 @@ pub fn build(b: *Build) !void {
     exe_mod.linkSystemLibrary("wayland-client", .{});
     exe_mod.linkSystemLibrary("freetype2", .{}); // real Nerd Font/Unicode glyph rendering (src/font.zig)
     exe_mod.linkSystemLibrary("gdk-pixbuf-2.0", .{}); // tray icon-name -> PNG/SVG decode (src/icontheme.zig)
+    // GPU renderer (src/gpu.zig): EGL 1.5 + GLES2 + wl_egl_window for the
+    // "gpu" presenter, replacing the wl_shm memfd path when configured.
+    exe_mod.linkSystemLibrary("EGL", .{});
+    exe_mod.linkSystemLibrary("GLESv2", .{});
+    exe_mod.linkSystemLibrary("wayland-egl", .{}); // wl_egl_window_* used by zig-wayland's EglWindow bound directly
     // gdk-pixbuf.h pulls in GLib headers that Zig's translate-c can't parse
     // directly (G_GNUC_BEGIN_IGNORE_DEPRECATIONS expands to back-to-back
     // _Pragma(...) invocations translate-c chokes on) — src/gdkpixbuf_shim.c

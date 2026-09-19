@@ -176,3 +176,11 @@ output_path = "~/.steam/steam/millennium/themes/matugen/steam-webkit.css"
 input_path = "~/.config/matugen/templates/swaync-style.css"
 output_path = "~/.config/swaync/style.css"
 post_hook = "sh -c 'swaync-client --reload-css 2>/dev/null || true'"
+
+# ═══════════════════════════ wlogout ═══════════════════════════
+# Renders the power menu's style to ~/.config/wlogout/style.css, which wlogout
+# checks before /etc/wlogout/style.css. No live reload — close and reopen
+# wlogout (the bar's power button) to see the new colors.
+[templates.wlogout]
+input_path = "~/.config/matugen/templates/wlogout-style.css"
+output_path = "~/.config/wlogout/style.css"

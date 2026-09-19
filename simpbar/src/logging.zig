@@ -3,7 +3,10 @@
 //!
 //! Every category is written to its own file under
 //! `$HOME/.config/simpbar-config/logs/<binary>/`, one line per event, so
-//! chasing a bug means opening just the stream that matches it:
+//! chasing a bug means opening just the stream that matches it. The base
+//! directory can be overridden with the `SIMPBAR_LOG_DIR` environment
+//! variable (set by the installers to `~/Documents/simpbar-logs/`):
+//! when that's set, logs go to `$SIMPBAR_LOG_DIR/<binary>/` instead.
 //!
 //!   trace.log    every step / lifecycle event ("track every step" log)
 //!   warning.log  recoverable problems that don't stop the program
@@ -109,6 +112,10 @@ const SEEK_END: c_int = 2;
 
 var g_log_dir_buf: [600]u8 = undefined;
 var g_log_dir: [:0]const u8 = "";
+// The log base (SIMPBAR_LOG_DIR override or ~/.config/simpbar-config/logs),
+// kept separately so `scoped()` can derive sibling folders like <base>/gpu/.
+var g_log_base_buf: [600]u8 = undefined;
+var g_log_base: [:0]const u8 = "";
 var g_proc_tag: []const u8 = "simpbar";
 var g_pid: c_int = 0;
 var g_ready = false;
@@ -139,31 +146,117 @@ const Spinlock = struct {
 
 var g_lock: Spinlock = .{};
 
+/// A named log channel: every event goes to `<base>/<dir>/<file>.log` (e.g.
+/// the bar calls `logging.i` with "gpu" so the GPU renderer logs land in
+/// `<base>/gpu/`). The process-wide default scope is what `logging.step`/
+/// `warn`/`err`/`crash` write to; extra scopes share its lock and stderr
+/// mirror but keep their own files.
+pub const Scope = struct {
+    /// Owned scratch for the scope's dir string. `dir` points into this, so a
+    /// Scope must live wherever it was wired (never return it by value after
+    /// `scoped()`). Unused for the default process scope, which points at
+    /// g_log_dir instead.
+    dir_buf: [600]u8 = undefined,
+    dir: [:0]const u8 = "",
+    tag: []const u8 = "simpbar",
+
+    pub fn step(self: Scope, comptime fmt: []const u8, args: anytype) void {
+        self.emit(.trace, fmt, args);
+    }
+    pub fn warn(self: Scope, comptime fmt: []const u8, args: anytype) void {
+        self.emit(.warning, fmt, args);
+    }
+    pub fn err(self: Scope, comptime fmt: []const u8, args: anytype) void {
+        self.emit(.err, fmt, args);
+    }
+    pub fn crash(self: Scope, comptime fmt: []const u8, args: anytype) void {
+        self.emit(.crash, fmt, args);
+    }
+
+    fn emit(self: Scope, level: Level, comptime fmt: []const u8, args: anytype) void {
+        if (!g_ready) {
+            // Not initialized (or init failed): still mirror to stderr so the
+            // old terminal behavior is preserved even for startup messages.
+            std.debug.print(fmt ++ "\n", args);
+            return;
+        }
+
+        var body_buf: [8192]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf, fmt, args) catch "(log message too long)";
+        const line = buildLine(self.tag, level, body);
+
+        // Mirror to stderr, exactly like the std.debug.print calls this replaced.
+        _ = writeAll(2, line);
+
+        g_lock.lock();
+        defer g_lock.unlock();
+        switch (level) {
+            .crash => appendCrashRaw(line),
+            else => {
+                // A scope whose dir failed to build (e.g. scoped() before
+                // init) still mirrors to stderr; only file-log when we have a
+                // real directory.
+                if (self.dir.len == 0) return;
+                switch (level) {
+                    .trace => appendRotated(self.dir, TRACE_FILE, line),
+                    .warning => appendRotated(self.dir, WARNING_FILE, line),
+                    .err => appendRotated(self.dir, ERROR_FILE, line),
+                    .crash => unreachable,
+                }
+            },
+        }
+    }
+};
+
+/// The process-wide default scope: what the plain `logging.step`/`warn`/
+/// `err`/`crash` wrappers write to. Repointed at `<base>/<proc>/` by init().
+var g_default_scope: Scope = .{};
+
 // --- public API ----------------------------------------------------------
 
 /// Initializes logging for `proc_name` (one of "simpbar", "simpbar-welcome",
-/// "simpbar-config") and creates `$HOME/.config/simpbar-config/logs/<proc>/`.
-/// Best-effort: any failure quietly disables file logging.
+/// "simpbar-config") and creates `<base>/<proc>/`. The base is
+/// `$HOME/.config/simpbar-config/logs` unless the SIMPBAR_LOG_DIR env var is
+/// set. Best-effort: any failure quietly disables file logging.
 pub fn init(proc_name: []const u8) void {
     g_proc_tag = proc_name;
     g_pid = getpid();
 
     const home = std.mem.sliceTo(getenv("HOME") orelse "/root", 0);
 
-    // Build each parent dir on its own stack buffer (g_log_dir is reserved for
-    // the final per-proc dir, which every later log line depends on) and mkdir
-    // immediately — failures are ignored because parents usually pre-exist.
+    // The log base dir defaults to `$HOME/.config/simpbar-config/logs`, but
+    // the installers set SIMPBAR_LOG_DIR to `~/Documents/simpbar-logs/` —
+    // honor that override verbatim when present so all three binaries log to
+    // one easy-to-find place.
     var parent_buf: [600]u8 = undefined;
-    const d0 = std.fmt.bufPrintZ(&parent_buf, "{s}/.config", .{home}) catch null;
-    if (d0) |d| _ = mkdir(d.ptr, 0o755);
-    const d1 = std.fmt.bufPrintZ(&parent_buf, "{s}/.config/simpbar-config", .{home}) catch null;
-    if (d1) |d| _ = mkdir(d.ptr, 0o755);
-    const logs_dir = std.fmt.bufPrintZ(&parent_buf, "{s}{s}", .{ home, LOG_DIR_REL }) catch null;
-    if (logs_dir) |d| _ = mkdir(d.ptr, 0o755);
+    const base_override = std.mem.sliceTo(getenv("SIMPBAR_LOG_DIR") orelse "", 0);
+    const base: [:0]const u8 = if (base_override.len > 0) blk: {
+        break :blk std.fmt.bufPrintZ(&parent_buf, "{s}", .{base_override}) catch return;
+    } else blk: {
+        // Build each parent dir on its own stack buffer (g_log_dir is reserved
+        // for the final per-proc dir, which every later log line depends on)
+        // and mkdir immediately — failures are ignored because parents usually
+        // pre-exist.
+        const d0 = std.fmt.bufPrintZ(&parent_buf, "{s}/.config", .{home}) catch null;
+        if (d0) |d| _ = mkdir(d.ptr, 0o755);
+        const d1 = std.fmt.bufPrintZ(&parent_buf, "{s}/.config/simpbar-config", .{home}) catch null;
+        if (d1) |d| _ = mkdir(d.ptr, 0o755);
+        break :blk std.fmt.bufPrintZ(&parent_buf, "{s}{s}", .{ home, LOG_DIR_REL }) catch return;
+    };
+_ = mkdir(base.ptr, 0o755);
 
-    const dir = std.fmt.bufPrintZ(&g_log_dir_buf, "{s}{s}/{s}", .{ home, LOG_DIR_REL, proc_name }) catch return;
+    // Keep a copy of the base dir (init's `base` points at a stack buffer) so
+    // `scoped()` can build per-component folders like <base>/gpu/ later.
+    const base_len = @min(base.len, g_log_base_buf.len - 1);
+    @memcpy(g_log_base_buf[0..base_len], base[0..base_len]);
+    g_log_base_buf[base_len] = 0;
+    g_log_base = g_log_base_buf[0..base_len :0];
+
+    const dir = std.fmt.bufPrintZ(&g_log_dir_buf, "{s}/{s}", .{ base, proc_name }) catch return;
     g_log_dir = dir;
+    g_proc_tag = proc_name;
     _ = mkdir(dir.ptr, 0o755);
+    g_default_scope = .{ .dir = g_log_dir, .tag = g_proc_tag };
 
     // crash.log is the one file that must sit on a live fd; rotate it if it
     // outgrew its cap in a previous run, then open it for the whole process.
@@ -188,26 +281,41 @@ pub fn deinit() void {
 /// Every-step log: lifecycle transitions, module fetches, reloads, ... the
 /// dominate-the-trace stream for "what did the program just do".
 pub fn step(comptime fmt: []const u8, args: anytype) void {
-    emit(.trace, fmt, args);
+    g_default_scope.step(fmt, args);
 }
 
 /// Recoverable problem: a fallback was used, a fetch failed and will retry,
 /// a value was outside expectations, ...
 pub fn warn(comptime fmt: []const u8, args: anytype) void {
-    emit(.warning, fmt, args);
+    g_default_scope.warn(fmt, args);
 }
 
 /// A failure that made a specific operation fail (a file wasn't written, a
 /// draw/refresh failed, a D-Bus call errored).
 pub fn err(comptime fmt: []const u8, args: anytype) void {
-    emit(.err, fmt, args);
+    g_default_scope.err(fmt, args);
 }
 
 /// A fatal problem: logs to crash.log (and stderr) without showing a stack
 /// trace for the current frame. Used for top-level `main()` errors which call
 /// `logTopLevelCrash`/`dumpCurrentStack` next.
 pub fn crash(comptime fmt: []const u8, args: anytype) void {
-    emit(.crash, fmt, args);
+    g_default_scope.crash(fmt, args);
+}
+
+/// Points `self` at a scope that writes to `<base>/<name>/` — e.g. the bar
+/// calls `logging.scoped(&gpu_log, "gpu")` so the GPU renderer's lines land
+/// in `<base>/gpu/` instead of the bar's own folder. `self` keeps the buffer
+/// alive (a scope is self-referential, so it can't be copied by value after
+/// wiring). Falls back to a stderr-only scope if the logger isn't up or the
+/// directory can't be created.
+pub fn scoped(self: *Scope, name: []const u8) void {
+    self.* = .{ .tag = name };
+    if (g_ready and g_log_base.len > 0) {
+        const dir = std.fmt.bufPrintZ(&self.dir_buf, "{s}/{s}", .{ g_log_base, name }) catch return;
+        _ = mkdir(dir.ptr, 0o755);
+        self.dir = self.dir_buf[0..dir.len :0];
+    }
 }
 
 /// Where every root's `pub const panic = std.debug.FullPanic(logging.panicHandler);`
@@ -262,26 +370,18 @@ pub fn dumpCurrentStack() void {
 
 // --- internals -----------------------------------------------------------
 
-fn emit(level: Level, comptime fmt: []const u8, args: anytype) void {
-    if (!g_ready) {
-        // Not initialized (or init failed): still mirror to stderr so the
-        // old terminal behavior is preserved even for startup messages.
-        std.debug.print(fmt ++ "\n", args);
-        return;
-    }
-
-    var body_buf: [8192]u8 = undefined;
-    const body = std.fmt.bufPrint(&body_buf, fmt, args) catch "(log message too long)";
-
-    // <timestamp> [pid <pid>] [<proc>] [<LEVEL>] <body>\n
+/// Formats one `<timestamp> [pid <pid>] [<tag>] [<LEVEL>] <body>` line. The
+/// returned slice borrows stack memory — callers must write it (and drop it)
+/// before returning.
+fn buildLine(tag: []const u8, level: Level, body: []const u8) []const u8 {
     var ts_buf: [32]u8 = undefined;
     const ts = formatTimestamp(&ts_buf);
     var line_buf: [64 + 8192]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "{s} [pid {d}] [{s}] [{s}] {s}\n", .{
-        ts, g_pid, g_proc_tag, level.name(), body,
+        ts, g_pid, tag, level.name(), body,
     }) catch blk: {
         const bare = std.fmt.bufPrint(&line_buf, "[pid {d}] [{s}] [{s}] {s}\n", .{
-            g_pid, g_proc_tag, level.name(), body,
+            g_pid, tag, level.name(), body,
         }) catch {
             const short: []const u8 = level.name();
             const n = @min(short.len, line_buf.len);
@@ -290,25 +390,14 @@ fn emit(level: Level, comptime fmt: []const u8, args: anytype) void {
         };
         break :blk bare;
     };
-
-    // Mirror to stderr, exactly like the std.debug.print calls this replaced.
-    _ = writeAll(2, line);
-
-    g_lock.lock();
-    defer g_lock.unlock();
-    switch (level) {
-        .trace => appendRotated(TRACE_FILE, line),
-        .warning => appendRotated(WARNING_FILE, line),
-        .err => appendRotated(ERROR_FILE, line),
-        .crash => appendCrashRaw(line),
-    }
+    return line;
 }
 
-/// Appends a line to `<logdir>/<base>`, rotating to `<base>.old` first if the
+/// Appends a line to `<dir>/<base>`, rotating to `<base>.old` first if the
 /// current file has outgrown MAX_LOG_SIZE.
-fn appendRotated(comptime base: []const u8, line: []const u8) void {
+fn appendRotated(dir: [:0]const u8, comptime base: []const u8, line: []const u8) void {
     var full_buf: [600 + 16]u8 = undefined;
-    const full = std.fmt.bufPrintZ(&full_buf, "{s}/{s}", .{ g_log_dir, base }) catch return;
+    const full = std.fmt.bufPrintZ(&full_buf, "{s}/{s}", .{ dir, base }) catch return;
     if (logTooBig(full.ptr)) rotateLogFile(full.ptr);
     const fd = open(full.ptr, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o644);
     if (fd < 0) return;

@@ -1346,6 +1346,32 @@ else
     ok "fastfetch added to fish config"
 fi
 
+# Simpbar's logs live in ~/Documents/simpbar-logs — create the folder now and
+# export SIMPBAR_LOG_DIR from the login + interactive shells so the bar,
+# simpbar-welcome, and simpbar-config launched under Hyprland all write there
+# (the app falls back to ~/.config/simpbar-config/logs when it isn't set).
+SIMPBAR_ENV_LINE='export SIMPBAR_LOG_DIR="$HOME/Documents/simpbar-logs"'
+SIMPBAR_ENV_FISH='set -gx SIMPBAR_LOG_DIR "$HOME/Documents/simpbar-logs"'
+mkdir -p ~/Documents/simpbar-logs
+for profile in ~/.profile ~/.bashrc; do
+    touch "$profile"
+    if grep -q 'SIMPBAR_LOG_DIR' "$profile" 2>/dev/null; then
+        ok "SIMPBAR_LOG_DIR already exported in $profile"
+    else
+        printf '\n%s\n' "$SIMPBAR_ENV_LINE" >> "$profile"
+        ok "SIMPBAR_LOG_DIR exported in $profile"
+    fi
+done
+mkdir -p ~/.config/fish
+touch ~/.config/fish/config.fish
+if grep -q 'set -gx SIMPBAR_LOG_DIR' ~/.config/fish/config.fish 2>/dev/null; then
+    ok "SIMPBAR_LOG_DIR already exported in fish config"
+else
+    printf '\n%s\n' "$SIMPBAR_ENV_FISH" >> ~/.config/fish/config.fish
+    ok "SIMPBAR_LOG_DIR exported in fish config"
+fi
+ok "simpbar logs will be written to ~/Documents/simpbar-logs"
+
 FISH_PATH=$(command -v fish) || true
 
 # logo.png for the Simpbar Welcome app (GTK4 + libadwaita) — the app itself
