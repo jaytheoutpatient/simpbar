@@ -2047,7 +2047,7 @@ const MODULE_ROW_DATA_KEY = "simpbar-module-row";
 /// on why that's safe here). Boxes it in a G_TYPE_POINTER GValue; GTK
 /// copies the GValue into the content provider it creates, so the local
 /// `value` going out of scope when this returns is fine.
-fn onModuleDragPrepare(_: *gtk.GtkDragSource, _: f64, _: f64, user_data: ?*anyopaque) callconv(.c) ?*gtk.GdkContentProvider {
+fn onModuleDragPrepare(_: *gtk.GtkDragSource, user_data: ?*anyopaque) callconv(.c) ?*gtk.GdkContentProvider {
     const row_ptr = user_data orelse return null;
     var value: gtk.GValue = .{};
     _ = gtk.g_value_init(&value, gtk.G_TYPE_POINTER);

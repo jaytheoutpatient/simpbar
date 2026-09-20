@@ -155,13 +155,13 @@ fn onTextChanged(buffer: *gtk.GtkEntryBuffer, _: *gtk.GParamSpec, user_data: ?*a
     _ = hypr.saveAll();
 }
 
-fn onIntChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+fn onIntChanged(spin: *gtk.GtkSpinButton, user_data: ?*anyopaque) callconv(.c) void {
     const v: *i32 = @ptrCast(@alignCast(user_data.?));
     v.* = gtk.gtk_spin_button_get_value_as_int(spin);
     _ = hypr.saveAll();
 }
 
-fn onFloatChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+fn onFloatChanged(spin: *gtk.GtkSpinButton, user_data: ?*anyopaque) callconv(.c) void {
     const v: *f64 = @ptrCast(@alignCast(user_data.?));
     v.* = hg.gtk_spin_button_get_value(spin);
     _ = hypr.saveAll();
