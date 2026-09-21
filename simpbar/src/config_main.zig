@@ -26,6 +26,7 @@ const hg = @import("hypr_gtk.zig");
 const hypr = @import("hyprland.zig");
 const hypr_pages = @import("hypr_pages.zig");
 const logging = @import("logging.zig");
+const desktop_entries = @import("desktop_entries.zig");
 
 pub const panic = std.debug.FullPanic(logging.panicHandler);
 
@@ -86,6 +87,7 @@ const ModuleKind = enum {
     battery,
     custom_script,
     cpu_temp,
+    cava,
 };
 
 // Every ModuleKind valid in the "right" group per main.zig's drawRightGroup
@@ -98,6 +100,21 @@ const RIGHT_MODULE_KINDS = [_]ModuleKind{
     .power,     .drawer_toggle, .volume,  .waypaper,      .pacman,
     .tray,      .weather,       .cpu,     .ram,           .network,
     .disk,      .battery,       .custom_script, .cpu_temp,
+    .cava,
+};
+
+// The kind set shared by the Left and Center groups. main.zig now draws
+// both groups in config order for these four (the center composes them into
+// centered segments; the left walks them as an ordered chain), so either
+// group can accept any of them — the reason Left can host clock/launchers
+// and Center can host workspaces/mpris. Right-group dynamic kinds
+// (RIGHT_MODULE_KINDS) intentionally can't land in left/center, and these
+// four can't land in right: the bar has no left-anchored renderer for a
+// right-aligned module like volume, and no right-aligned renderer for a
+// left-anchored workspaces — permitting such a drop would recreate the
+// "moves in the GUI but the bar silently ignores it" trap.
+const LEFT_CENTER_MODULE_KINDS = [_]ModuleKind{
+    .workspaces, .mpris, .clock, .launchers,
 };
 
 const ModuleEntry = struct {
@@ -115,6 +132,11 @@ const LauncherButton = struct {
     label: []const u8,
     command: [:0]const u8,
     icon: ?[]const u8 = null,
+    /// How this launcher renders in the bar: "label" (name only), "both"
+    /// (name + icon, the default), or "icon" (icon only). Curated string
+    /// choice shared with main.zig's renderer; anything unrecognized falls
+    /// back to "both".
+    display: []const u8 = "both",
 };
 
 const DEFAULT_LEFT = [_]ModuleEntry{
@@ -126,6 +148,7 @@ const DEFAULT_CENTER = [_]ModuleEntry{
     .{ .kind = .clock, .enabled = true },
 };
 const DEFAULT_RIGHT = [_]ModuleEntry{
+    .{ .kind = .cava, .enabled = true },
     .{ .kind = .power, .enabled = true },
     .{ .kind = .drawer_toggle, .enabled = true },
     .{ .kind = .volume, .enabled = true, .in_drawer = true },
@@ -173,6 +196,7 @@ const JsonAppearance = struct {
     text_color: []const u8 = "#DCDCDC",
     border_color: []const u8 = "#454545",
     hover_color: []const u8 = "#3A3A3A",
+    cava_color: []const u8 = "#DCDCDC",
     workspace_active_color: []const u8 = "#DCDCDC",
     workspace_inactive_color: []const u8 = "#505050",
     popup_bg_color: []const u8 = "#262626",
@@ -390,7 +414,7 @@ fn rgbaToHex(c: gtk.GdkRGBA, buf: []u8) []const u8 {
 // Live in-memory config state
 // ---------------------------------------------------------------------
 
-const ColorField = enum { bg, text, border, hover, ws_active, ws_inactive, popup_bg, popup_hover, popup_separator, popup_disabled };
+const ColorField = enum { bg, text, border, hover, cava, ws_active, ws_inactive, popup_bg, popup_hover, popup_separator, popup_disabled };
 
 const ColorSpec = struct {
     field: ColorField,
@@ -406,6 +430,7 @@ const COLOR_SPECS = [_]ColorSpec{
     .{ .field = .text, .default_hex = "#DCDCDC", .title = "Text", .group = .bar },
     .{ .field = .border, .default_hex = "#454545", .title = "Border", .group = .bar },
     .{ .field = .hover, .default_hex = "#3A3A3A", .title = "Hover Highlight", .group = .bar },
+    .{ .field = .cava, .default_hex = "#DCDCDC", .title = "Audio Visualizer (cava)", .group = .bar },
     .{ .field = .ws_active, .default_hex = "#DCDCDC", .title = "Active Workspace", .group = .bar },
     .{ .field = .ws_inactive, .default_hex = "#505050", .title = "Inactive Workspace", .group = .bar },
     .{ .field = .popup_bg, .default_hex = "#262626", .title = "Popup Background", .group = .popup },
@@ -566,6 +591,39 @@ const ModuleGroup = struct {
         self.fixupPointers();
     }
 
+    /// Removes and returns the row at `idx`, shifting everything after it
+    /// down by one — the half of a cross-group drag where the source group
+    /// gives up the row. Returns the full row by value so the caller can
+    /// hand it to the destination group's insertAt (a ModuleRow's
+    /// self-referential label/command slices travel with the struct; the
+    /// destination's fixupPointers then re-points them at ITS OWN copy of
+    /// the buffers, exactly as load() does for a fresh module).
+    fn removeAt(self: *ModuleGroup, idx: usize) ?ModuleRow {
+        if (idx >= self.len) return null;
+        const removed = self.rows[idx];
+        var k = idx;
+        while (k + 1 < self.len) : (k += 1) self.rows[k] = self.rows[k + 1];
+        self.len -= 1;
+        self.fixupPointers();
+        return removed;
+    }
+
+    /// Inserts `row` at index `idx` (clamped to len; appends when idx >=
+    /// len), shifting everything at and after it up by one. No-op returns
+    /// false if the group is already full. The inserted row's slices are
+    /// re-pointed at this group's own buffer copy by fixupPointers — the
+    /// insertion-side half of a cross-group drag.
+    fn insertAt(self: *ModuleGroup, idx_in: usize, row: ModuleRow) bool {
+        if (self.len >= self.rows.len) return false;
+        const idx = @min(idx_in, self.len);
+        var k = self.len;
+        while (k > idx) : (k -= 1) self.rows[k] = self.rows[k - 1];
+        self.rows[idx] = row;
+        self.len += 1;
+        self.fixupPointers();
+        return true;
+    }
+
     /// Finds `ptr`'s index within this group's OWN rows array, or null if
     /// it belongs to a different group (a cross-group drag, rejected — see
     /// onModuleDrop) or is stale (points past the current .len).
@@ -598,6 +656,24 @@ var live_right: ModuleGroup = .{};
 // current address at call time.
 const MAX_LAUNCHERS = 32;
 
+/// Per-launcher bar rendering choice (the Shortcuts tab's Pinned Launchers
+/// dropdown): name only, name + icon, or icon only. The value round-trips
+/// through config.json's launcher `display` field, which main.zig's
+/// renderer interprets the same way — the labels here are what the dropdown
+/// shows, and index order matches DISPLAY_CHOICES.
+const DISPLAY_CHOICES = [_][]const u8{ "label", "both", "icon" };
+const DISPLAY_LABELS = [_][*:0]const u8{ "Name", "Name + icon", "Icon" };
+
+/// Maps a launcher's stored `display` value to its DISPLAY_CHOICES index
+/// (unrecognized → "both"). Mirrors main.zig's permissive, default-falling
+/// handling of curated string config fields.
+fn displayIndex(display: []const u8) c_uint {
+    for (DISPLAY_CHOICES, 0..) |choice, i| {
+        if (std.mem.eql(u8, display, choice)) return @intCast(i);
+    }
+    return 1; // "both"
+}
+
 const LauncherRow = struct {
     label_buf: [MAX_ROW_TEXT]u8 = undefined,
     label_len: usize = 0,
@@ -609,13 +685,22 @@ const LauncherRow = struct {
     icon_buf: [MAX_ROW_TEXT]u8 = undefined,
     icon_len: usize = 0,
     has_icon: bool = false,
+    // DISPLAY_CHOICES index ("label"/"both"/"icon") — stored by index so the
+    // whole struct stays a plain value copy (no slice ownership to fix up),
+    // and 1 ("both") is the default for rows that never had a choice.
+    display_idx: usize = 1,
 
     fn button(self: *const LauncherRow) LauncherButton {
         return .{
             .label = self.label_buf[0..self.label_len],
             .command = self.command_buf[0..self.command_len :0],
             .icon = if (self.has_icon) self.icon_buf[0..self.icon_len] else null,
+            .display = DISPLAY_CHOICES[self.display_idx],
         };
+    }
+
+    fn setDisplay(self: *LauncherRow, idx: c_uint) void {
+        if (idx < DISPLAY_CHOICES.len) self.display_idx = idx;
     }
 };
 
@@ -653,20 +738,43 @@ const LauncherGroup = struct {
             self.setLabel(i, src[i].label);
             self.setCommand(i, src[i].command);
             if (src[i].icon) |ic| self.setIcon(i, ic);
+            self.rows[i].setDisplay(displayIndex(src[i].display));
         }
     }
 
     /// Appends a new pinned launcher (Shortcuts tab's "Pin to Bar"). Returns
     /// false (no-op) once MAX_LAUNCHERS is reached.
-    fn append(self: *LauncherGroup, label: []const u8, command: []const u8, icon: ?[]const u8) bool {
+    fn append(self: *LauncherGroup, label: []const u8, command: []const u8, icon: ?[]const u8, display_idx: c_uint) bool {
         if (self.len >= self.rows.len) return false;
         const i = self.len;
         self.rows[i] = .{};
         self.setLabel(i, label);
         self.setCommand(i, command);
         if (icon) |ic| self.setIcon(i, ic);
+        self.rows[i].setDisplay(display_idx);
         self.len += 1;
         return true;
+    }
+
+    /// True if any pinned launcher already runs the same command — the "Pin
+    /// to Bar" flow should never create duplicates (a retried click on the
+    /// same app, two .desktop files wrapping the same Exec, ...).
+    fn hasCommand(self: *const LauncherGroup, command: []const u8) bool {
+        for (self.rows[0..self.len]) |*row| {
+            if (std.mem.eql(u8, row.button().command, command)) return true;
+        }
+        return false;
+    }
+
+    /// Removes the launcher at index i, sliding all later rows down. Unpin
+    /// button on the Shortcuts tab's Pinned Launchers list.
+    fn removeAt(self: *LauncherGroup, i: usize) void {
+        if (i >= self.len) return;
+        self.len -= 1;
+        for (i..self.len) |k| {
+            self.rows[k] = self.rows[k + 1];
+        }
+        self.rows[self.len] = .{}; // drop the stale duplicate
     }
 };
 
@@ -702,7 +810,8 @@ fn loadConfigFromDisk() void {
     const hexes = [_][]const u8{
         j.bg_color,                    j.text_color,
         j.border_color,                j.hover_color,
-        j.workspace_active_color,      j.workspace_inactive_color,
+        j.cava_color,                  j.workspace_active_color,
+        j.workspace_inactive_color,
         j.popup_bg_color,              j.popup_hover_color,
         j.popup_separator_color,       j.popup_disabled_color,
     };
@@ -739,6 +848,8 @@ fn loadConfigFromDisk() void {
     live_left.load(parsed.modules.left);
     live_center.load(parsed.modules.center);
     live_right.load(parsed.modules.right);
+    live_left.ensureKindsPresent(&LEFT_CENTER_MODULE_KINDS);
+    live_center.ensureKindsPresent(&LEFT_CENTER_MODULE_KINDS);
     live_right.ensureKindsPresent(&RIGHT_MODULE_KINDS);
     live_launchers.load(parsed.launchers);
 }
@@ -822,6 +933,8 @@ fn appendLauncherButton(list: *std.ArrayList(u8), b: LauncherButton) !void {
     try appendJsonString(list, b.command);
     try list.appendSlice(gpa, ",\"icon\":");
     try appendJsonOptString(list, b.icon);
+    try list.appendSlice(gpa, ",\"display\":");
+    try appendJsonString(list, b.display);
     try list.append(gpa, '}');
 }
 
@@ -849,6 +962,7 @@ fn buildConfigJson() ![]u8 {
             .text => "text_color",
             .border => "border_color",
             .hover => "hover_color",
+            .cava => "cava_color",
             .ws_active => "workspace_active_color",
             .ws_inactive => "workspace_inactive_color",
             .popup_bg => "popup_bg_color",
@@ -1778,12 +1892,29 @@ fn onIconEntryChanged(buffer: *gtk.GtkEntryBuffer, _: *gtk.GParamSpec, _: ?*anyo
     gtk.gtk_image_set_from_icon_name(image, buf[0..n :0].ptr);
 }
 
+fn onRemoveLauncherClicked(_: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
+    const row_ptr: *const LauncherRow = @ptrCast(@alignCast(user_data.?));
+    // The row's address inside the fixed live_launchers array IS its index —
+    // pointer subtraction is stable across repopulations (the array never
+    // reallocates), which a captured index would not be.
+    const idx = (@intFromPtr(row_ptr) - @intFromPtr(&live_launchers.rows[0])) / @sizeOf(LauncherRow);
+    if (idx >= live_launchers.len) return;
+    live_launchers.removeAt(idx);
+    populatePinnedLaunchers();
+    saveAndSignal();
+}
+
 fn onPinToBarClicked(_: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
     const ss: *const SessionShortcut = @ptrCast(@alignCast(user_data.?));
-    if (!live_launchers.append(ss.name(), ss.exec(), ss.icon())) {
+    if (live_launchers.hasCommand(ss.exec())) {
+        logging.warn("shortcuts: this app is already pinned ({s}), not duplicating", .{ss.exec()});
+        return;
+    }
+    if (!live_launchers.append(ss.name(), ss.exec(), ss.icon(), 1)) {
         logging.warn("shortcuts: launcher list is full ({d} max), not pinning", .{MAX_LAUNCHERS});
         return;
     }
+    populatePinnedLaunchers();
     saveAndSignal();
 }
 
@@ -1873,6 +2004,165 @@ fn onCreateShortcutClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void 
     if (g_icon_entry) |e| setEntryText(gtk.gtk_entry_get_buffer(e), "");
 }
 
+// Installed Applications picker — "Pin to Bar" with real app icons.
+//
+// Enumerates every pinnable .desktop file (desktop_entries.zig) once at page
+// build and renders each as a row with its freedesktop icon + a Pin button,
+// reusing SessionShortcut as the row's backing storage (same label/exec/icon
+// buffers; onPinToBarClicked already reads exactly those fields). Pinning
+// saves the field-code-stripped Exec and the theme Icon= name, so the bar
+// renders the real app icon next to the label instead of a nerd-font glyph.
+const MAX_INSTALLED_APPS = 256;
+
+var installed_apps: [MAX_INSTALLED_APPS]SessionShortcut = undefined;
+var installed_apps_len: usize = 0;
+var g_apps_listbox: ?*gtk.GtkListBox = null;
+var g_pinned_listbox: ?*gtk.GtkListBox = null;
+
+fn fillInstalledApp(row: *SessionShortcut, entry: desktop_entries.DesktopEntry) void {
+    row.* = .{};
+    row.name_len = @min(entry.name.len, row.name_buf.len);
+    @memcpy(row.name_buf[0..row.name_len], entry.name[0..row.name_len]);
+    row.exec_len = @min(entry.exec.len, row.exec_buf.len);
+    @memcpy(row.exec_buf[0..row.exec_len], entry.exec[0..row.exec_len]);
+    if (entry.icon.len > 0) {
+        row.icon_len = @min(entry.icon.len, row.icon_buf.len);
+        @memcpy(row.icon_buf[0..row.icon_len], entry.icon[0..row.icon_len]);
+        row.has_icon = true;
+    }
+}
+
+/// One row of the Shortcuts tab's "Pinned Launchers" list: a live_launchers
+/// row mirrored in the GUI with an Unpin suffix button plus a per-launcher
+/// display-mode dropdown (Name / Name + icon / Icon). populatePinnedLaunchers()
+/// rebuilds the whole list after any pin/unpin, so a captured index would
+/// dangle — the Unpin button and dropdown's user_data are instead the row's
+/// own stable address inside the fixed live_launchers array.
+fn addPinnedLauncherRow(i: usize) void {
+    const listbox = g_pinned_listbox orelse return;
+    const row = gtk.adw_action_row_new();
+    const lrow = &live_launchers.rows[i];
+    const lbtn = lrow.button();
+
+    var title_buf: [MAX_ROW_TEXT + 1]u8 = undefined;
+    const n = @min(lbtn.label.len, MAX_ROW_TEXT);
+    @memcpy(title_buf[0..n], lbtn.label[0..n]);
+    title_buf[n] = 0;
+    gtk.adw_preferences_row_set_title(@ptrCast(row), title_buf[0..n :0]);
+
+    var exec_buf: [MAX_ROW_TEXT + 1]u8 = undefined;
+    const m = @min(lbtn.command.len, MAX_ROW_TEXT);
+    @memcpy(exec_buf[0..m], lbtn.command[0..m]);
+    exec_buf[m] = 0;
+    gtk.adw_action_row_set_subtitle(row, exec_buf[0..m :0].ptr);
+
+    if (lbtn.icon) |ic| {
+        var icon_z_buf: [MAX_ROW_TEXT + 1]u8 = undefined;
+        const k = @min(ic.len, MAX_ROW_TEXT);
+        @memcpy(icon_z_buf[0..k], ic[0..k]);
+        icon_z_buf[k] = 0;
+        const image = gtk.gtk_image_new_from_icon_name(icon_z_buf[0..k :0]);
+        gtk.gtk_image_set_pixel_size(image, 28);
+        gtk.adw_action_row_add_prefix(row, @ptrCast(image));
+    }
+
+    var labels: [DISPLAY_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (DISPLAY_LABELS, 0..) |label, li| labels[li] = label;
+    labels[DISPLAY_LABELS.len] = null;
+    const dd = gtk.gtk_drop_down_new_from_strings(&labels) orelse {
+        const unpin_button = gtk.gtk_button_new_with_label("Unpin");
+        gtk.gtk_widget_set_valign(@ptrCast(unpin_button), gtk.ALIGN_CENTER);
+        _ = gtk.g_signal_connect_data(@ptrCast(unpin_button), "clicked", @ptrCast(&onRemoveLauncherClicked), @ptrCast(lrow), null, 0);
+        gtk.adw_action_row_add_suffix(row, @ptrCast(unpin_button));
+        gtk.gtk_list_box_append(listbox, @ptrCast(row));
+        return;
+    };
+    gtk.gtk_drop_down_set_selected(dd, @intCast(lrow.display_idx));
+    gtk.gtk_widget_set_valign(@ptrCast(dd), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(dd), "notify::selected", @ptrCast(&onLauncherDisplayChanged), @ptrCast(lrow), null, 0);
+    gtk.adw_action_row_add_suffix(row, @ptrCast(dd));
+
+    const unpin_button = gtk.gtk_button_new_with_label("Unpin");
+    gtk.gtk_widget_set_valign(@ptrCast(unpin_button), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(unpin_button), "clicked", @ptrCast(&onRemoveLauncherClicked), @ptrCast(lrow), null, 0);
+    gtk.adw_action_row_add_suffix(row, @ptrCast(unpin_button));
+
+    gtk.gtk_list_box_append(listbox, @ptrCast(row));
+}
+
+/// The per-launcher display-mode dropdown changed on a Pinned Launchers
+/// row. `user_data` is the row's stable address in the live_launchers array
+/// (same convention as onRemoveLauncherClicked); the selected index maps
+/// straight onto DISPLAY_CHOICES, so this just stores it and persists.
+fn onLauncherDisplayChanged(dd: *gtk.GtkDropDown, _: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
+    const lrow: *LauncherRow = @ptrCast(@alignCast(user_data.?));
+    lrow.setDisplay(gtk.gtk_drop_down_get_selected(dd));
+    saveAndSignal();
+}
+
+fn populatePinnedLaunchers() void {
+    const listbox = g_pinned_listbox orelse return;
+    gtk.gtk_list_box_remove_all(listbox);
+    for (0..live_launchers.len) |i| addPinnedLauncherRow(i);
+}
+
+fn addInstalledAppRow(a: *SessionShortcut) void {
+    const listbox = g_apps_listbox orelse return;
+    const row = gtk.adw_action_row_new();
+    // Title/subtitle want zero-terminated strings; a's buffers aren't
+    // sentinel-terminated, so route through scratch copies (same pattern as
+    // addSessionShortcutRow / setEntryText).
+    var title_buf: [MAX_ROW_TEXT + 1]u8 = undefined;
+    const n = @min(a.name().len, MAX_ROW_TEXT);
+    @memcpy(title_buf[0..n], a.name()[0..n]);
+    title_buf[n] = 0;
+    gtk.adw_preferences_row_set_title(@ptrCast(row), title_buf[0..n :0]);
+    if (a.exec().len > 0) {
+        var exec_buf: [MAX_ROW_TEXT + 1]u8 = undefined;
+        const m = @min(a.exec().len, MAX_ROW_TEXT);
+        @memcpy(exec_buf[0..m], a.exec()[0..m]);
+        exec_buf[m] = 0;
+        gtk.adw_action_row_set_subtitle(row, exec_buf[0..m :0].ptr);
+    }
+
+    var icon_z_buf: [MAX_ROW_TEXT + 1]u8 = undefined;
+    const icon_z: [:0]const u8 = if (a.icon()) |ic| blk: {
+        const k = @min(ic.len, MAX_ROW_TEXT);
+        @memcpy(icon_z_buf[0..k], ic[0..k]);
+        icon_z_buf[k] = 0;
+        break :blk icon_z_buf[0..k :0];
+    } else "application-x-executable";
+    const image = gtk.gtk_image_new_from_icon_name(icon_z);
+    gtk.gtk_image_set_pixel_size(image, 28);
+    gtk.adw_action_row_add_prefix(row, @ptrCast(image));
+
+    const pin_button = gtk.gtk_button_new_with_label("Pin");
+    gtk.gtk_widget_set_valign(@ptrCast(pin_button), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(pin_button), "clicked", @ptrCast(&onPinToBarClicked), @ptrCast(a), null, 0);
+    gtk.adw_action_row_add_suffix(row, @ptrCast(pin_button));
+
+    gtk.gtk_list_box_append(listbox, @ptrCast(row));
+}
+
+fn populateInstalledApps() void {
+    var entries: std.ArrayList(desktop_entries.DesktopEntry) = .empty;
+    defer entries.deinit(gpa);
+    // gpa (the process default allocator) is fine here: every parsed string
+    // is only read to copy into the stable SessionShortcut buffers above,
+    // then the whole list is freed at once.
+    desktop_entries.enumerateInstalledApps(gpa, &entries) catch |err| {
+        logging.warn("apps: failed to enumerate installed applications: {}", .{err});
+        return;
+    };
+    for (entries.items) |entry| {
+        if (installed_apps_len >= installed_apps.len) break;
+        const a = &installed_apps[installed_apps_len];
+        fillInstalledApp(a, entry);
+        installed_apps_len += 1;
+        addInstalledAppRow(a);
+    }
+}
+
 fn addShortcutFormEntry(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, width: c_int) *gtk.GtkEntry {
     const row = gtk.adw_action_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(row), title);
@@ -1928,6 +2218,18 @@ fn buildShortcutsPage() *gtk.GtkBox {
     gtk.gtk_box_append(outer, @ptrCast(form_group));
     gtk.gtk_box_append(outer, @ptrCast(create_row));
 
+    const pinned_heading = gtk.gtk_label_new("Pinned Launchers");
+    gtk.gtk_widget_add_css_class(@ptrCast(pinned_heading), "heading");
+    gtk.gtk_label_set_xalign(pinned_heading, 0);
+    gtk.gtk_widget_set_margin_top(@ptrCast(pinned_heading), 12);
+    gtk.gtk_box_append(outer, @ptrCast(pinned_heading));
+
+    const pinned_listbox = gtk.gtk_list_box_new();
+    gtk.gtk_widget_add_css_class(@ptrCast(pinned_listbox), "boxed-list");
+    g_pinned_listbox = pinned_listbox;
+    gtk.gtk_box_append(outer, @ptrCast(pinned_listbox));
+    populatePinnedLaunchers();
+
     const list_heading = gtk.gtk_label_new("Shortcuts (this session)");
     gtk.gtk_widget_add_css_class(@ptrCast(list_heading), "heading");
     gtk.gtk_label_set_xalign(list_heading, 0);
@@ -1938,6 +2240,18 @@ fn buildShortcutsPage() *gtk.GtkBox {
     gtk.gtk_widget_add_css_class(@ptrCast(listbox), "boxed-list");
     g_shortcuts_listbox = listbox;
     gtk.gtk_box_append(outer, @ptrCast(listbox));
+
+    const apps_heading = gtk.gtk_label_new("Installed Applications");
+    gtk.gtk_widget_add_css_class(@ptrCast(apps_heading), "heading");
+    gtk.gtk_label_set_xalign(apps_heading, 0);
+    gtk.gtk_widget_set_margin_top(@ptrCast(apps_heading), 12);
+    gtk.gtk_box_append(outer, @ptrCast(apps_heading));
+
+    const apps_listbox = gtk.gtk_list_box_new();
+    gtk.gtk_widget_add_css_class(@ptrCast(apps_listbox), "boxed-list");
+    g_apps_listbox = apps_listbox;
+    gtk.gtk_box_append(outer, @ptrCast(apps_listbox));
+    populateInstalledApps();
 
     return outer;
 }
@@ -1976,6 +2290,7 @@ fn moduleKindDisplayName(kind: ModuleKind) [:0]const u8 {
         .battery => "Battery",
         .custom_script => "Custom Script",
         .cpu_temp => "CPU Temperature",
+        .cava => "Audio Visualizer",
     };
 }
 
@@ -2033,6 +2348,12 @@ const GroupCtx = struct {
     group: *ModuleGroup,
     listbox: *gtk.GtkListBox,
     reorderable: bool,
+    /// The module kinds this group may hold — with cross-group drag, a drop
+    /// whose source kind the destination can't legally render is rejected
+    /// (rather than persisted and silently ignored by the bar). Left and
+    /// Center both allow LEFT_CENTER_MODULE_KINDS; Right allows
+    /// RIGHT_MODULE_KINDS.
+    allowed: []const ModuleKind,
 };
 var left_ctx: GroupCtx = undefined;
 var center_ctx: GroupCtx = undefined;
@@ -2055,21 +2376,38 @@ fn onModuleDragPrepare(_: *gtk.GtkDragSource, user_data: ?*anyopaque) callconv(.
     return gtk.gdk_content_provider_new_for_value(&value);
 }
 
+/// Returns the GroupCtx whose group owns `row`, scanning the three live
+/// groups — the drop handler needs the SOURCE group's ctx (to removeAt from
+/// its array and rebuild its listbox) even though the signal only carries
+/// the destination's. Null when the pointer is stale (from before a rebuild)
+/// or belongs to some other widget's data.
+fn groupCtxOwning(row: *const ModuleRow) ?*GroupCtx {
+    const candidates = [_]*GroupCtx{ &left_ctx, &center_ctx, &right_ctx };
+    for (candidates) |c| {
+        if (c.group.indexOf(row) != null) return c;
+    }
+    return null;
+}
+
 /// GtkDropTarget "drop" — real signature verified against the installed
 /// Gtk-4.0.gir (gboolean (GtkDropTarget*, const GValue*, gdouble x,
-/// gdouble y, gpointer)). `user_data` is this listbox's GroupCtx.
+/// gdouble y, gpointer)). `user_data` is this listbox's GroupCtx (the
+/// DESTINATION of the drag). Supports both within-group reordering (the
+/// existing moveRow path, source == destination) and cross-group moves:
+/// the source row is located among all three groups, its kind checked
+/// against the destination's allowed set, then removeAt+insertAt transfers
+/// it (both affected listboxes rebuilt, config saved + bar signaled). A
+/// drop whose kind the destination group can't render is rejected outright
+/// — persisting it would let the bar silently ignore it.
 fn onModuleDrop(_: *gtk.GtkDropTarget, value: *const gtk.GValue, _: f64, y: f64, user_data: ?*anyopaque) callconv(.c) c_int {
     const ctx: *GroupCtx = @ptrCast(@alignCast(user_data.?));
     const raw = gtk.g_value_get_pointer(value) orelse return 0;
     const source_row: *ModuleRow = @ptrCast(@alignCast(raw));
 
-    // Reject drags that didn't originate from THIS group's own array (a
-    // cross-group drop, or a stale pointer from before a rebuild) — v1
-    // only supports reordering within a group, matching the config
-    // schema's separate left/center/right JSON arrays.
-    const from = ctx.group.indexOf(source_row) orelse return 0;
+    const src_ctx = groupCtxOwning(source_row) orelse return 0;
 
-    var to: usize = ctx.group.len - 1; // dropping below the last row = move to end
+    // Destination insertion index: dropping below the last row appends.
+    var to: usize = ctx.group.len;
     if (gtk.gtk_list_box_get_row_at_y(ctx.listbox, @intFromFloat(y))) |target_widget| {
         if (gtk.g_object_get_data(@ptrCast(target_widget), MODULE_ROW_DATA_KEY)) |tp| {
             const target_row: *ModuleRow = @ptrCast(@alignCast(tp));
@@ -2077,11 +2415,49 @@ fn onModuleDrop(_: *gtk.GtkDropTarget, value: *const gtk.GValue, _: f64, y: f64,
         }
     }
 
-    if (from != to) {
-        ctx.group.moveRow(from, to);
-        rebuildGroupListBox(ctx);
-        saveAndSignal();
+    if (src_ctx == ctx) {
+        // Same-group reorder — existing behavior. Drop on a row = land at
+        // that row's index; below the last row = move to the end.
+        const from = src_ctx.group.indexOf(source_row) orelse return 0;
+        if (to >= src_ctx.group.len) to = src_ctx.group.len - 1;
+        if (from != to) {
+            src_ctx.group.moveRow(from, to);
+            rebuildGroupListBox(src_ctx);
+            saveAndSignal();
+        }
+        return 1;
     }
+
+    // Cross-group: the source kind must be drawable by the destination
+    // group. Left and Center share LEFT_CENTER_MODULE_KINDS; Right only
+    // takes RIGHT_MODULE_KINDS — anything else (e.g. volume → left, or
+    // workspaces → right) is a placement the bar can't render, so it's
+    // rejected rather than persisted into config.json to be silently
+    // ignored.
+    const kind = source_row.entry.kind;
+    var allowed = false;
+    for (ctx.allowed) |k| {
+        if (k == kind) {
+            allowed = true;
+            break;
+        }
+    }
+    if (!allowed) {
+        logging.warn("config: {s} can't be moved here — this group doesn't render it", .{moduleKindDisplayName(kind)});
+        return 0;
+    }
+
+    const from = src_ctx.group.indexOf(source_row) orelse return 0;
+    const removed = src_ctx.group.removeAt(from) orelse return 0;
+    if (!ctx.group.insertAt(to, removed)) {
+        // Destination full — put the row back where it came from and abort.
+        _ = src_ctx.group.insertAt(from, removed);
+        logging.warn("config: destination group is full (max {d} modules), move rejected", .{MAX_MODULES});
+        return 0;
+    }
+    rebuildGroupListBox(src_ctx);
+    rebuildGroupListBox(ctx);
+    saveAndSignal();
     return 1;
 }
 
@@ -2127,12 +2503,9 @@ fn addModuleRow(listbox: *gtk.GtkListBox, row: *ModuleRow, reorderable: bool) vo
     // Whole-row dragging (rather than a dedicated handle) is a deliberate
     // v1 simplification — GTK4's drag threshold means a plain click still
     // reaches the switch/entry children fine, only a real drag gesture
-    // triggers reordering.
-    //
-    // Not attached at all when `!reorderable` (the Left group — see the
-    // doc comment on addModuleGroupSection's `reorderable` parameter for
-    // why): a row that looks draggable but silently does nothing on drop
-    // is worse than a row that plainly isn't draggable.
+    // triggers reordering. Every module row is a drag source now (all three
+    // groups are both drag sources and drop targets since cross-group
+    // moves landed).
     gtk.g_object_set_data(@ptrCast(arow), MODULE_ROW_DATA_KEY, @ptrCast(row));
     if (reorderable) {
         const drag_source = gtk.gtk_drag_source_new();
@@ -2155,19 +2528,13 @@ fn rebuildGroupListBox(ctx: *GroupCtx) void {
     }
 }
 
-/// `reorderable` is false for the Left group specifically: main.zig's left
-/// chain draws workspaces and mpris via a fixed left-to-right handoff
-/// (drawWorkspaces returns an end-x that mpris's controls/ticker consume as
-/// their own start-x, and the mpris ticker's scroll window is itself bounded
-/// by where the center group starts — it has no fixed "width" the way a
-/// launcher button does, so it can't just trade places with workspaces the
-/// way two Right-group modules can). Only enable/disable is actually
-/// config-driven for Left today, not order, so offering drag-and-drop there
-/// would let a user "successfully" reorder rows in the GUI while the bar
-/// silently ignored it — confirmed exactly that during live testing. Center
-/// and Right both iterate their module list in array order with no such
-/// positional coupling, so they stay fully reorderable.
-fn addModuleGroupSection(outer: *gtk.GtkBox, title: [:0]const u8, mgroup: *ModuleGroup, ctx: *GroupCtx, reorderable: bool) void {
+/// Builds one group's section in the Modules tab: a heading, a boxed-list,
+/// a drop target (every group is one now — Left/Right/Center all accept
+/// cross-group drops), and one draggable row per module. `allowed` is the
+/// set of module kinds this group can legally hold (see GroupCtx.allowed);
+/// drops of any other kind are rejected by onModuleDrop, so a drop can
+/// never land in a group where main.zig has no renderer for it.
+fn addModuleGroupSection(outer: *gtk.GtkBox, title: [:0]const u8, mgroup: *ModuleGroup, ctx: *GroupCtx, allowed: []const ModuleKind) void {
     const heading = gtk.gtk_label_new(title);
     gtk.gtk_widget_add_css_class(@ptrCast(heading), "heading");
     gtk.gtk_label_set_xalign(heading, 0);
@@ -2175,27 +2542,22 @@ fn addModuleGroupSection(outer: *gtk.GtkBox, title: [:0]const u8, mgroup: *Modul
 
     const listbox = gtk.gtk_list_box_new();
     gtk.gtk_widget_add_css_class(@ptrCast(listbox), "boxed-list");
-    if (reorderable) {
-        // Give the listbox a generous minimum height regardless of how few
-        // rows it holds — a short group is an easy-to-overshoot drop target
-        // since GtkDropTarget only fires "drop" while the pointer is still
-        // over the widget it's attached to. Padding the listbox's own
-        // minimum size out to a fixed floor gives every reorderable group a
-        // comparably forgiving drop zone without needing to move the drop
-        // target onto a different (larger) widget and translate coordinates
-        // between them.
-        gtk.gtk_widget_set_size_request(@ptrCast(listbox), -1, 160);
-    }
-    ctx.* = .{ .group = mgroup, .listbox = listbox, .reorderable = reorderable };
+    // Give every listbox a generous minimum height regardless of how few
+    // rows it holds — a short group is an easy-to-overshoot drop target
+    // since GtkDropTarget only fires "drop" while the pointer is still
+    // over the widget it's attached to. Padding the listbox's own minimum
+    // size out to a fixed floor gives every group a comparably forgiving
+    // drop zone without needing to move the drop target onto a different
+    // (larger) widget and translate coordinates between them.
+    gtk.gtk_widget_set_size_request(@ptrCast(listbox), -1, 160);
+    ctx.* = .{ .group = mgroup, .listbox = listbox, .reorderable = true, .allowed = allowed };
 
-    if (reorderable) {
-        const drop_target = gtk.gtk_drop_target_new(gtk.G_TYPE_POINTER, gtk.GDK_ACTION_MOVE);
-        _ = gtk.g_signal_connect_data(@ptrCast(drop_target), "drop", @ptrCast(&onModuleDrop), @ptrCast(ctx), null, 0);
-        gtk.gtk_widget_add_controller(@ptrCast(listbox), @ptrCast(drop_target));
-    }
+    const drop_target = gtk.gtk_drop_target_new(gtk.G_TYPE_POINTER, gtk.GDK_ACTION_MOVE);
+    _ = gtk.g_signal_connect_data(@ptrCast(drop_target), "drop", @ptrCast(&onModuleDrop), @ptrCast(ctx), null, 0);
+    gtk.gtk_widget_add_controller(@ptrCast(listbox), @ptrCast(drop_target));
 
     for (0..mgroup.len) |i| {
-        addModuleRow(listbox, &mgroup.rows[i], reorderable);
+        addModuleRow(listbox, &mgroup.rows[i], true);
     }
     gtk.gtk_box_append(outer, @ptrCast(listbox));
 }
@@ -2209,9 +2571,9 @@ fn buildModulesPage() *gtk.GtkBox {
     gtk.gtk_widget_set_margin_start(@ptrCast(outer), 24);
     gtk.gtk_widget_set_margin_end(@ptrCast(outer), 24);
 
-    addModuleGroupSection(outer, "Left", &live_left, &left_ctx, false);
-    addModuleGroupSection(outer, "Center", &live_center, &center_ctx, true);
-    addModuleGroupSection(outer, "Right", &live_right, &right_ctx, true);
+    addModuleGroupSection(outer, "Left", &live_left, &left_ctx, &LEFT_CENTER_MODULE_KINDS);
+    addModuleGroupSection(outer, "Center", &live_center, &center_ctx, &LEFT_CENTER_MODULE_KINDS);
+    addModuleGroupSection(outer, "Right", &live_right, &right_ctx, &RIGHT_MODULE_KINDS);
 
     return outer;
 }

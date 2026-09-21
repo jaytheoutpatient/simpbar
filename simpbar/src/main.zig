@@ -12,6 +12,7 @@ const icontheme = @import("icontheme.zig");
 const dbusmenu = @import("dbusmenu.zig");
 const logging = @import("logging.zig");
 const gpu = @import("gpu.zig");
+const desktop_entries = @import("desktop_entries.zig");
 
 pub const panic = std.debug.FullPanic(logging.panicHandler);
 
@@ -36,10 +37,92 @@ fn setCloexec(fd: posix.fd_t) void {
 const MARGIN_SIDE: i32 = 0;
 
 const WORKSPACE_LEFT_MARGIN: i64 = 8;
+/// Blank space enforced between the end of one left/center-capable module
+/// and the start of the next, inside the center group — cross-group drag
+/// can join any two module kinds there (workspaces beside clock, mpris
+/// beside launchers, etc.), and without a guaranteed module→module gap the
+/// last segment of one runs straight into the first of the next. Segments
+/// also carry their own intra-module gaps (workspace_gap between pills,
+/// LAUNCHER_GAP between launcher buttons).
+const MODULE_GAP: i64 = 12;
 
 // Spacing for the custom/* launcher buttons and custom/power.
 const LAUNCHER_GAP: i64 = 16;
 const RIGHT_MARGIN: i64 = 8;
+
+// --- pinned-launcher app icons -------------------------------------------
+//
+// A launcher button with a non-null `icon` in config.json (typically an
+// app picked from simpbar-config's Installed Applications list) renders a
+// real themed icon next to its label instead of only the nerd-font glyph.
+// The icon name/path is resolved + decoded ONCE per button (config reloads
+// via SIGUSR1 invalidate the cache) into a fixed inline buffer, mirroring
+// how TrayItem keeps its icons — no heap churn on every draw, and the GPU
+// presenter uploads the finished frame just like any other pixel.
+const MAX_LAUNCHERS: usize = 32;
+const LAUNCHER_ICON_SIZE: u32 = 16;
+const LAUNCHER_ICON_TEXT_GAP: i64 = 5;
+
+const LauncherIconCache = struct {
+    pixels: [LAUNCHER_ICON_SIZE * LAUNCHER_ICON_SIZE]u32 = [_]u32{0} ** (LAUNCHER_ICON_SIZE * LAUNCHER_ICON_SIZE),
+    has_icon: bool = false,
+    resolved: bool = false,
+};
+
+var launcher_icons: [MAX_LAUNCHERS]LauncherIconCache = undefined;
+
+/// Write end of the SIGUSR1 self-pipe (see the signal setup in realMain);
+/// -1 until the pipe is created. Written from a signal handler, so it must
+/// remain set for the process lifetime.
+var g_sigusr1_write_fd: posix.fd_t = -1;
+
+/// SIGUSR1 live-reload relay: the kernel may deliver the signal to any
+/// thread (the bar hosts several libc thread-pool threads spawned outside
+/// our control), so this handler only performs the async-signal-safe write()
+/// to the self-pipe; the event loop drains the pipe and does the reload.
+fn relaySIGUSR1(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+    _ = sig;
+    _ = info;
+    _ = ctx;
+    if (g_sigusr1_write_fd >= 0) {
+        const b = [_]u8{0x1};
+        _ = posix.system.write(g_sigusr1_write_fd, &b, b.len);
+    }
+}
+
+/// Re-resolves every launcher icon on the next draw. Called after the
+/// config changes (startup load and every successful SIGUSR1 reload), since
+/// launchers are positional — index i in the config maps to cache slot i.
+fn invalidateLauncherIcons() void {
+    for (0..launcher_icons.len) |i| launcher_icons[i].resolved = false;
+}
+
+/// Decodes the icon for every not-yet-resolved launcher button into the
+/// inline cache. Each slot is resolved at most once per config load: a null
+/// or unresolvable icon marks the slot resolved-but-without-icon so the
+/// missing-icon case doesn't retry gdk-pixbuf on every frame.
+fn ensureLauncherIcons() void {
+    for (current_config.launchers, 0..) |btn, i| {
+        if (i >= launcher_icons.len) break;
+        const cache = &launcher_icons[i];
+        if (cache.resolved) continue;
+        cache.resolved = true;
+        cache.has_icon = false;
+        @memset(cache.pixels[0..], 0);
+
+        const icon = btn.icon orelse continue;
+        if (icon.len == 0) continue;
+        var path_buf: [512]u8 = undefined;
+        const path_slice = icontheme.resolveIconPath(icon, &path_buf) orelse continue;
+        var path_z_buf: [520]u8 = undefined;
+        @memcpy(path_z_buf[0..path_slice.len], path_slice);
+        path_z_buf[path_slice.len] = 0;
+        const decoded = icontheme.decodeIcon(std.heap.page_allocator, path_z_buf[0..path_slice.len :0], LAUNCHER_ICON_SIZE) catch continue;
+        defer std.heap.page_allocator.free(decoded.pixels);
+        icontheme.copyIntoIconBuffer(decoded, &cache.pixels, LAUNCHER_ICON_SIZE);
+        cache.has_icon = true;
+    }
+}
 
 // getenv is enough here; no need for std.process's env-map machinery.
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -337,7 +420,27 @@ const LauncherButton = struct {
     // carried through config for forward-compat with an icon-aware GUI/
     // pinning flow added in a later step.
     icon: ?[]const u8 = null,
+    /// How this launcher renders in the bar: "label" (app name only),
+    /// "both" (name + icon, the default), or "icon" (icon only — falls back
+    /// to the name when no icon decodes, so the button is never invisible).
+    /// Curated string matching config_main.zig's DISPLAY_CHOICES; anything
+    /// unrecognized renders as "both".
+    display: []const u8 = "both",
 };
+
+const LAUNCHER_DISPLAY_LABEL = "label";
+const LAUNCHER_DISPLAY_BOTH = "both";
+const LAUNCHER_DISPLAY_ICON = "icon";
+
+/// Resolves a launcher's `display` mode against the curated string choices
+/// (permissive: unknown → "both", same spirit as every other curated config
+/// field). Shared by the left chain and the center group's compose pass so
+/// both render a given launcher identically.
+fn launcherDisplayMode(display: []const u8) enum { label, both, icon } {
+    if (std.mem.eql(u8, display, LAUNCHER_DISPLAY_LABEL)) return .label;
+    if (std.mem.eql(u8, display, LAUNCHER_DISPLAY_ICON)) return .icon;
+    return .both;
+}
 
 // The custom/* launcher buttons from ~/.config/waybar/config's
 // "modules-center", minus their icons (our font is uppercase-only for now).
@@ -400,6 +503,7 @@ const ModuleKind = enum {
     battery,
     custom_script,
     cpu_temp,
+    cava,
 };
 
 /// One entry in a left/center/right module list. Flat + all-optional
@@ -428,6 +532,7 @@ const Appearance = struct {
     popup_hover_color: u32,
     popup_separator_color: u32,
     popup_disabled_color: u32,
+    cava_color: u32,
     bar_height: u32,
     /// Four independent edges (px), replacing the old single top-only
     /// border_px — which edge "faces the desktop" flips with `position`, but
@@ -544,6 +649,7 @@ fn defaultConfig() Config {
             .popup_hover_color = 0xFF3A3A3A,
             .popup_separator_color = 0xFF444444,
             .popup_disabled_color = 0xFF707070,
+            .cava_color = 0xFFDCDCDC,
             .bar_height = 28,
             .border_top_px = 2, // window#waybar border-width: 2px 0px 0px 0px
             .border_bottom_px = 0,
@@ -687,6 +793,7 @@ const JsonAppearance = struct {
     popup_hover_color: []const u8 = "#3A3A3A",
     popup_separator_color: []const u8 = "#444444",
     popup_disabled_color: []const u8 = "#707070",
+    cava_color: []const u8 = "#DCDCDC",
     bar_height: u32 = 28,
     border_top_px: u32 = 2,
     border_bottom_px: u32 = 0,
@@ -746,6 +853,7 @@ const JsonMatugenColors = struct {
     popup_hover_color: ?[]const u8 = null,
     popup_separator_color: ?[]const u8 = null,
     popup_disabled_color: ?[]const u8 = null,
+    cava_color: ?[]const u8 = null,
 };
 
 /// Applies the colors matugen wrote to ~/.config/simpbar/matugen.json into
@@ -789,6 +897,7 @@ fn tryApplyMatugenColors(allocator: std.mem.Allocator, appearance: *Appearance) 
     _ = mergeMatugenColor(appearance, "popup_hover_color", colors.popup_hover_color) orelse return false;
     _ = mergeMatugenColor(appearance, "popup_separator_color", colors.popup_separator_color) orelse return false;
     _ = mergeMatugenColor(appearance, "popup_disabled_color", colors.popup_disabled_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "cava_color", colors.cava_color) orelse return false;
 
     return true;
 }
@@ -847,6 +956,7 @@ fn parseAppearance(j: JsonAppearance) ?Appearance {
         .popup_hover_color = parseHexColor(j.popup_hover_color) catch return null,
         .popup_separator_color = parseHexColor(j.popup_separator_color) catch return null,
         .popup_disabled_color = parseHexColor(j.popup_disabled_color) catch return null,
+        .cava_color = parseHexColor(j.cava_color) catch return null,
         .bar_height = j.bar_height,
         .border_top_px = j.border_top_px,
         .border_bottom_px = j.border_bottom_px,
@@ -1822,6 +1932,7 @@ fn realMain() !void {
     logging.step("starting up", .{});
     resolveConfigPaths();
     current_config = loadConfig();
+    invalidateLauncherIcons();
     writePidfile();
     logging.step("config loaded from {s}", .{config_json_path});
 
@@ -2043,22 +2154,40 @@ fn realMain() !void {
     defer _ = posix.system.close(tray_timer_fd);
     defer _ = posix.system.close(timer_fd);
 
-    // SIGUSR1 live-reload: block the signal (so it queues instead of using
-    // its default terminate disposition) and read it via a signalfd, same
-    // multiplexed-in-poll() shape as every timerfd above. A failure here
-    // (vanishingly unlikely — signalfd() only fails on fd/memory exhaustion)
-    // just means live-reload doesn't work this run; not worth failing
-    // startup over.
-    var sigusr1_mask = posix.sigemptyset();
-    posix.sigaddset(&sigusr1_mask, .USR1);
-    posix.sigprocmask(posix.SIG.BLOCK, &sigusr1_mask, null);
-    const sigusr1_fd = posix.signalfd(-1, &sigusr1_mask, std.os.linux.SFD.CLOEXEC) catch |err| blk: {
-        logging.warn("signalfd(SIGUSR1) failed, live config reload disabled: {}", .{err});
-        break :blk -1;
-    };
-    defer if (sigusr1_fd >= 0) {
-        _ = posix.system.close(sigusr1_fd);
-    };
+    // SIGUSR1 live-reload: a process-wide sigaction handler writes a byte to
+    // a self-pipe that's multiplexed into poll() alongside every timerfd, so
+    // a reload is triggered by the event loop exactly like any other event.
+    // This is deliberately NOT the signalfd+sigprocmask pattern: sigprocmask
+    // only affects the *calling* thread, while the bar hosts several libc
+    // thread-pool threads (simdjson, blake3, ...) spawned outside our control
+    // that never inherit that mask — delivering SIGUSR1 to one of them ran
+    // SIGUSR1's default *terminate* disposition and silently killed the bar
+    // on every config save. Signal disposition is process-wide, so a handler
+    // can't be dodged by the kernel picking a non-blocking thread. A failure
+    // here (fd/memory exhaustion) is still non-fatal: reload just becomes a
+    // no-op for this run.
+    var sigusr1_pipe: [2]posix.fd_t = .{ -1, -1 };
+    if (std.c.pipe(&sigusr1_pipe) == 0) {
+        setCloexec(sigusr1_pipe[0]);
+        setCloexec(sigusr1_pipe[1]);
+        // F_SETFL for O_NONBLOCK: the drain below must never block the event
+        // loop on an empty pipe (F.GETFL's value 3 is NOT F_SETFL — that
+        // mistake quietly returned the flags without applying them).
+        _ = std.c.fcntl(sigusr1_pipe[0], posix.F.SETFL, @as(c_int, 0o4000));
+        g_sigusr1_write_fd = sigusr1_pipe[1];
+        const act = posix.Sigaction{
+            .handler = .{ .sigaction = relaySIGUSR1 },
+            .mask = posix.sigemptyset(),
+            .flags = posix.SA.SIGINFO,
+        };
+        posix.sigaction(.USR1, &act, null);
+    } else {
+        logging.warn("SIGUSR1 self-pipe failed, live config reload disabled", .{});
+    }
+    const sigusr1_fd = sigusr1_pipe[0];
+    defer {
+        if (sigusr1_fd >= 0) _ = posix.system.close(sigusr1_fd);
+    }
 
     // New modules (Step 3): cpu/ram share one timer; battery/disk/network
     // each get their own; network's "ssid" mode additionally needs a
@@ -2123,6 +2252,10 @@ fn realMain() !void {
         if (custom_script_timer_fds[i] >= 0) _ = posix.system.close(custom_script_timer_fds[i]);
         if (custom_scripts[i].pending_fd >= 0) _ = posix.system.close(custom_scripts[i].pending_fd);
     };
+    defer {
+        if (cava_state.pending_fd >= 0) _ = posix.system.close(cava_state.pending_fd);
+    }
+    if (findRightEntry(.cava) != null) startCavaFetch();
 
     // Main event loop: multiplex the Wayland display fd (compositor events),
     // a 1s timerfd (clock ticks), and the Hyprland event socket (workspace
@@ -2159,10 +2292,13 @@ fn realMain() !void {
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [26] custom_scripts[2].pending_fd, refreshed below
         .{ .fd = custom_script_timer_fds[3], .events = posix.POLL.IN, .revents = 0 }, // [27]
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [28] custom_scripts[3].pending_fd, refreshed below
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [29] cava visualizer pipe, refreshed below
     };
     comptime {
         if (MAX_CUSTOM_SCRIPTS != 4) @compileError("poll_fds' custom-script slots [21..28] are hand-unrolled for MAX_CUSTOM_SCRIPTS == 4; update both if that changes");
     }
+
+    var second_count: i64 = 0;
 
     while (true) {
         // Flush any outstanding requests (e.g. from the last commit) before
@@ -2178,6 +2314,7 @@ fn realMain() !void {
         poll_fds[24].fd = custom_scripts[1].pending_fd;
         poll_fds[26].fd = custom_scripts[2].pending_fd;
         poll_fds[28].fd = custom_scripts[3].pending_fd;
+        poll_fds[29].fd = cava_state.pending_fd;
 
         _ = try posix.poll(&poll_fds, -1);
 
@@ -2193,6 +2330,16 @@ fn realMain() !void {
             // (returns 0). Piggyback on this once-a-second tick instead of
             // reaping exactly at EOF, so it's retried until it succeeds.
             reapChildren();
+            second_count += 1;
+            // A dead/vacant cava visualizer is retried on a slow timer rather
+            // than wedged: cava can exit on its own (audio sink dropped) and
+            // the initial spawn above can race the pulseaudio socket appearing.
+            if (cava_state.pending_fd < 0 and findRightEntry(.cava) != null and
+                (second_count - cava_state.dead_since_tick) >= CAVA_RESPAWN_SECONDS)
+            {
+                cava_state.dead_since_tick = second_count;
+                startCavaFetch();
+            }
             drawAllBars(bars[0..bar_count]);
         }
         if (poll_fds[2].revents & posix.POLL.IN != 0) {
@@ -2314,8 +2461,13 @@ fn realMain() !void {
             }
         }
         if (poll_fds[14].revents & posix.POLL.IN != 0) {
-            var siginfo: std.os.linux.signalfd_siginfo = undefined;
-            _ = posix.read(sigusr1_fd, std.mem.asBytes(&siginfo)) catch {};
+            // Drain the SIGUSR1 self-pipe. Multiple quick reloads coalesce
+            // into a single reload below — fine for live config edits.
+            var sig_buf: [64]u8 = undefined;
+            while (true) {
+                const n = posix.read(sigusr1_fd, sig_buf[0..]) catch 0;
+                if (n <= 0) break; // drained (0 counts as fine too, defensive)
+            }
             // Unlike the startup load, a reload NEVER falls back to
             // defaultConfig() — a config.json that's momentarily missing or
             // malformed (mid-edit, a bad hand-edit, a GUI bug) should leave
@@ -2329,6 +2481,7 @@ fn realMain() !void {
                 const geometry_changed = !std.mem.eql(u8, old_position, cfg.appearance.position) or
                     old_bar_height != cfg.appearance.bar_height;
                 current_config = cfg;
+                invalidateLauncherIcons();
                 logging.step("config: reloaded {s}", .{config_json_path});
 
                 // Closes a previously-known gap: bar_height (and now
@@ -2449,6 +2602,17 @@ fn realMain() !void {
                 }
             }
         }
+        if (poll_fds[29].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+            // cava never EOFs on its own — any EOF/HUP here means the daemon
+            // died, and the respawn-on-tick logic above brings it back. A
+            // frame (or several batched frames) meanwhile is the equalizer's
+            // own ~30fps refresh slot, independent of the 1s clock tick.
+            switch (readCavaAvailable()) {
+                .frame => drawAllBars(bars[0..bar_count]),
+                .eof => cava_state.dead_since_tick = second_count,
+                .none => {},
+            }
+        }
     }
 }
 
@@ -2555,6 +2719,152 @@ const PolledCommand = struct {
         return false;
     }
 };
+
+// --- cava audio visualizer (right-group module) --------------------------
+//
+// The bar spawns `cava` once at startup, piping its stdout straight into an
+// fd the poll() loop watches — a LONG-LIVED process unlike weather/pacman/
+// custom-script (which run-to-EOF then restart on a timer), so it gets its
+// own reader instead of PolledCommand's one-shot parser. cava's raw ascii
+// output (per ~/.config/simpbar/cava.conf's [output] section: integer values
+// 0..ascii_max_range separated by ';', one full frame per '\n') updates a
+// small bar array; whenever a whole frame arrives the bar redraws, giving the
+// equalizer its own frame rate independent of the 1s clock tick. If the
+// daemon dies (cava exits, crashes, frees the audio sink) it's respawned on a
+// slow timer rather than hammering fork/exec. The geometry constants mirror
+// the shipped cava.conf so the two can't silently drift out of agreement;
+// deviating from that file only changes how the equalizer looks, never how
+// the bar parses (unknown/extra values are ignored defensively).
+
+const CAVA_BARS: usize = 24; // [general] bars in ~/.config/simpbar/cava.conf
+const CAVA_REFERENCE_MAX: u32 = 1000; // [output] ascii_max_range
+const CAVA_BAR_WIDTH: i64 = 1; // [general] bar_width
+const CAVA_BAR_GAP: i64 = 1; // [general] bar_spacing
+const CAVA_RESPAWN_SECONDS: i64 = 5; // wait between a dead cava and a respawn
+
+const CavaState = struct {
+    pending_fd: posix.fd_t = -1,
+    read_buf: [512]u8 = undefined,
+    read_len: usize = 0,
+    bars: [CAVA_BARS]u32 = [_]u32{0} ** CAVA_BARS,
+    bar_count: usize = CAVA_BARS,
+    has_data: bool = false,
+    dead_since_tick: i64 = std.math.minInt(i64),
+};
+
+var cava_state: CavaState = .{};
+
+fn closeCava() void {
+    if (cava_state.pending_fd >= 0) _ = posix.system.close(cava_state.pending_fd);
+    cava_state.pending_fd = -1;
+    cava_state.read_len = 0;
+}
+
+/// Forks/execs `cava -p ~/.config/simpbar/cava.conf` with the child's stdout
+/// on a pipe this bar keeps, mirroring PolledCommand.startFetch's plumbing
+/// (who owns which end, CLOEXEC on read_fd, dying child = exit 127).
+fn startCavaFetch() void {
+    if (cava_state.pending_fd >= 0) return;
+    const home = std.mem.span(getenv("HOME") orelse return);
+    var conf_buf: [512]u8 = undefined;
+    if (home.len >= conf_buf.len) return;
+    const conf = std.fmt.bufPrint(&conf_buf, "{s}/.config/simpbar/cava.conf", .{home}) catch return;
+    var conf_z_buf: [512]u8 = undefined;
+    if (conf.len >= conf_z_buf.len) return;
+    @memcpy(conf_z_buf[0..conf.len], conf);
+    conf_z_buf[conf.len] = 0;
+    var argv = [_:null]?[*:0]const u8{ "env", "cava", "-p", conf_z_buf[0..conf.len :0].ptr, null };
+
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return;
+    const read_fd = pipe_fds[0];
+    const write_fd = pipe_fds[1];
+    setCloexec(read_fd);
+
+    const pid = libc_proc.fork();
+    if (pid < 0) {
+        _ = posix.system.close(read_fd);
+        _ = posix.system.close(write_fd);
+        return;
+    }
+    if (pid == 0) {
+        _ = std.c.dup2(write_fd, 1);
+        _ = posix.system.close(write_fd);
+        _ = posix.system.close(read_fd);
+        _ = std.c.execve("/usr/bin/env", &argv, std.c.environ);
+        std.c._exit(127);
+    }
+    _ = posix.system.close(write_fd);
+    cava_state.pending_fd = read_fd;
+}
+
+/// Applies one ';'-separated frame's worth of bar values (0..ascii_max_range)
+/// to cava_state.bars. Tokens that aren't plain integers are skipped instead
+/// of aborting the frame — a value that changed width mid-stream shouldn't
+/// hollow the equalizer out.
+fn parseCavaFrame(line: []const u8) void {
+    var it = std.mem.splitScalar(u8, line, ';');
+    var idx: usize = 0;
+    while (it.next()) |tok| : (idx += 1) {
+        if (tok.len == 0) continue;
+        if (idx >= cava_state.bar_count) break;
+        const v = std.fmt.parseInt(u32, tok, 10) catch continue;
+        cava_state.bars[idx] = @min(v, CAVA_REFERENCE_MAX);
+    }
+    cava_state.has_data = true;
+}
+
+/// Drains whatever the cava pipe has buffered, applying the LAST complete
+/// frame seen (cava batches several frames per read at 30fps — the newest
+/// values are the ones that belong on screen). Closes the pipe on EOF/HUP and
+/// reports it so the caller can schedule a respawn.
+const CavaReadResult = enum { none, frame, eof };
+
+fn readCavaAvailable() CavaReadResult {
+    var got_frame = false;
+    while (true) {
+        var chunk: [512]u8 = undefined;
+        const n = posix.read(cava_state.pending_fd, &chunk) catch {
+            closeCava();
+            return .eof;
+        };
+        if (n == 0) {
+            closeCava();
+            return if (got_frame) .frame else .eof;
+        }
+        // Append into the staging buffer, parsed from the front as lines
+        // complete, keeping only the trailing partial line for next time.
+        const free = cava_state.read_buf.len - cava_state.read_len;
+        const copy_len = @min(n, free);
+        @memcpy(cava_state.read_buf[cava_state.read_len..][0..copy_len], chunk[0..copy_len]);
+        cava_state.read_len += copy_len;
+        // A single line can saturate the staging buffer only if it's far
+        // longer than CAVA_BARS's printed width could ever be; drop the
+        // head so a pathological frame can't wedge the reader forever.
+        if (free == 0) {
+            const drop = cava_state.read_buf.len / 2;
+            std.mem.copyForwards(u8, cava_state.read_buf[0 .. cava_state.read_len - drop], cava_state.read_buf[drop..cava_state.read_len]);
+            cava_state.read_len -= drop;
+        }
+        var line_start: usize = 0;
+        const staged = cava_state.read_buf[0..cava_state.read_len];
+        while (std.mem.indexOfScalarPos(u8, staged, line_start, '\n')) |nl| {
+            parseCavaFrame(staged[line_start..nl]);
+            got_frame = true;
+            line_start = nl + 1;
+        }
+        if (line_start > 0) {
+            std.mem.copyForwards(u8, cava_state.read_buf[0 .. cava_state.read_len - line_start], staged[line_start..]);
+            cava_state.read_len -= line_start;
+        }
+        // The loop keeps reading until the pipe is momentarily empty (each
+        // poll wakeup is expected to carry several frames), so only return
+        // once a read yields less than the full chunk or hits 0.
+        if (n < chunk.len) {
+            return if (got_frame) .frame else .none;
+        }
+    }
+}
 
 // --- new modules: cpu/ram/battery/disk/network/custom-script --------------
 //
@@ -3403,23 +3713,25 @@ fn baselineY(buf_height: u32, font: *const font_mod.Font) i64 {
 /// `click_regions` for this frame.
 /// Returns the x position just past the last workspace drawn, so
 /// `drawMpris` (next in "modules-left") can continue from there.
+/// Draws the numbered workspace pills starting at `x0_start` (not a fixed
+/// margin — the left group is now order-driven, so workspaces can live at
+/// any position in the chain), returning the x after the last number. The
+/// caller gates on module enabled/placement; this only draws and registers
+/// click regions.
 fn drawWorkspaces(
     pixels: [*]u32,
     buf_width: u32,
     buf_height: u32,
     font: *font_mod.Font,
     workspaces: []const Workspace,
+    x0_start: i64,
     pointer_x: i32,
     click_regions: *ClickRegions,
 ) i64 {
-    // If disabled via config, don't draw or register click regions, but
-    // still hand back a sane starting x for the mpris chain that follows.
-    if (!isModuleEnabled(current_config.modules.left, .workspaces)) return WORKSPACE_LEFT_MARGIN;
-
     const y0: i64 = baselineY(buf_height, font);
     const workspace_gap = current_config.appearance.workspace_gap;
 
-    var x0: i64 = WORKSPACE_LEFT_MARGIN;
+    var x0: i64 = x0_start;
     var id_buf: [8]u8 = undefined;
     for (workspaces) |ws| {
         const color = if (ws.active) current_config.appearance.workspace_active_color else current_config.appearance.workspace_inactive_color;
@@ -3518,21 +3830,144 @@ fn drawMpris(pixels: [*]u32, buf_width: u32, buf_height: u32, font: *font_mod.Fo
     }
 }
 
+/// Draws the left group as an ordered chain in config order — the waybar
+/// "modules-left" model where every left/center-capable module contributes
+/// its own fixed width left-to-right (mpris is the exception: a filling
+/// ticker with no intrinsic width, drawn last among left entries exactly as
+/// the original hardcoded workspaces→mpris handoff did, since a scroll
+/// window can't occupy a determinate slot). Workspaces/clock/launchers are
+/// each drawn at the running pen x and advance it; anything after mpris in
+/// the left config order is honored but drawn beyond the ticker window's
+/// right edge (a degenerate placement the GUI still allows, rendered
+/// defensively rather than dropped). RIGHT-only module kinds are ignored —
+/// the config GUI won't place them in left, and the renderer has no
+/// left-anchored drawing for them.
+fn drawLeftGroup(
+    pixels: [*]u32,
+    buf_width: u32,
+    buf_height: u32,
+    font: *font_mod.Font,
+    workspaces: []const Workspace,
+    time_text: []const u8,
+    mpris_text: []const u8,
+    mpris_playing: bool,
+    mpris_scroll_step: i64,
+    center_start_x: i64,
+    pointer_x: i32,
+    click_regions: *ClickRegions,
+) void {
+    const y0: i64 = baselineY(buf_height, font);
+    var x0: i64 = WORKSPACE_LEFT_MARGIN;
+    var any_drawn = false;
+    for (current_config.modules.left) |entry| {
+        if (!entry.enabled) continue;
+        // Guaranteed module→module padding (mirroring the center group's
+        // boundary gap): whatever pen the previous module's own trailing gap
+        // left, the next module still starts MODULE_GAP after it, so a drag
+        // that rejoins any two kinds (clock flush after launchers was a
+        // 0-gap collision before) can never sit them flush against each
+        // other.
+        if (any_drawn) x0 += MODULE_GAP;
+        switch (entry.kind) {
+            .workspaces => {
+                x0 = drawWorkspaces(pixels, buf_width, buf_height, font, workspaces, x0, pointer_x, click_regions);
+            },
+            .clock => {
+                // Static text, identical treatment to the center's clock
+                // segment (not clickable here either).
+                var i: usize = 0;
+                while (nextUtf8Codepoint(time_text, &i)) |cp| {
+                    x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
+                }
+            },
+            .launchers => {
+                // Every pinned launcher, left-aligned from the running pen —
+                // rendered per its display mode (name-only, name + icon, or
+                // icon-only — the per-launcher choice the config GUI stores
+                // in `display`). Icon-only falls back to the name when no
+                // icon decodes, so the button stays clickable/visible, and
+                // name-only skips the icon entirely. Either way: icon (if
+                // drawn), label (if drawn), hover highlight, spawn click.
+                for (current_config.launchers, 0..) |btn, li| {
+                    const mode = launcherDisplayMode(btn.display);
+                    const has_icon = li < launcher_icons.len and launcher_icons[li].has_icon;
+                    const draw_icon = has_icon and mode != .label;
+                    const draw_label = mode != .icon or !has_icon;
+                    const icon_w: i64 = if (draw_icon) @as(i64, LAUNCHER_ICON_SIZE) + LAUNCHER_ICON_TEXT_GAP else 0;
+                    const label_w = (if (draw_label) textPixelWidth(font, btn.label) else 0) + icon_w;
+                    const region_start = x0;
+                    const hover_start = region_start - @divTrunc(LAUNCHER_GAP, 2);
+                    const hover_end = region_start + label_w + @divTrunc(LAUNCHER_GAP, 2);
+                    _ = drawHoverHighlight(pixels, buf_width, buf_height, hover_start, hover_end, pointer_x);
+                    if (draw_icon and li < launcher_icons.len) {
+                        drawLauncherIcon(pixels, buf_width, buf_height, x0, &launcher_icons[li]);
+                        x0 += icon_w;
+                    }
+                    if (draw_label) {
+                        var i: usize = 0;
+                        while (nextUtf8Codepoint(btn.label, &i)) |cp| {
+                            x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
+                        }
+                    }
+                    click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .spawn = btn.command });
+                    x0 += LAUNCHER_GAP;
+                }
+            },
+            .mpris => {
+                // Controls then a ticker filling the space up to the center
+                // group's left edge (original behavior; see fn doc comment).
+                if (mpris_text.len > 0) {
+                    x0 = drawMprisControls(pixels, buf_width, buf_height, font, x0, mpris_playing, pointer_x, click_regions);
+                }
+                drawMpris(pixels, buf_width, buf_height, font, x0, center_start_x - LAUNCHER_GAP, mpris_text, mpris_scroll_step);
+            },
+            else => {}, // RIGHT-only kind in left: no left-anchored render for it
+        }
+        any_drawn = true;
+    }
+}
+
 /// Draws the launcher buttons + clock as one centered group, matching
 /// waybar's "modules-center" (the whole group is centered together, not
 /// each item individually). Registers a click region per launcher button;
 /// the clock itself isn't clickable here (real config's clock#1 opens
 /// gnome-calendar on click — skipped for now).
-const MAX_CENTER_SEGMENTS = 16;
+// Center holds a centered whole block, so every left/center-capable module
+// kind that may now live there composes into drawable segments: launcher
+// buttons and clock text (the original two), plus workspace number pills
+// and the mpris track label once cross-group drag lets them be placed in
+// center. Cap is generous because workspaces contribute one segment each.
+const MAX_CENTER_SEGMENTS = 48;
 
-/// One drawable piece of the center group — either a pinned launcher button
-/// (clickable, `command` set) or the clock text (not clickable, `command`
-/// null). `gap_after` is the horizontal space to leave after this segment
-/// before the next one.
+/// One drawable piece of the center group. Kinds:
+/// - launcher button: `command` set, `icon_w`/`launcher_idx` when it has an
+///   app icon. Clickable (spawn).
+/// - clock text / mpris track label: `command` null, `ws_id` null. Not
+///   clickable.
+/// - workspace pill: `ws_id` set (= workspace number), with per-workspace
+///   active coloring, hover highlight, and a switch_workspace click region
+///   exactly like the left chain's workspaces. The id digits are stored in
+///   the segment's own `label_buf` (the compose() output must outlive the
+///   local framebuffer that formatted them), so `label` always points at
+///   self-owned storage.
+/// `gap_after` is the horizontal space to leave after this segment before
+/// the next one.
 const CenterSegment = struct {
     label: []const u8,
+    label_buf: [8]u8 = undefined,
     command: ?[:0]const u8 = null,
     gap_after: i64 = 0,
+    /// Non-zero when this launcher renders a decoded app icon before its
+    /// label — the icon's width plus the icon→text gap. Drives both the
+    /// measuring pass and the draw pass through the same compose() output.
+    icon_w: i64 = 0,
+    /// Index into launcher_icons[] hashing the decoded icon for this
+    /// segment (only meaningful when `icon_w` is non-zero).
+    launcher_idx: usize = 0,
+    /// Non-null when this is a workspace number pill rather than a launcher
+    /// or plain-text segment.
+    ws_id: ?i32 = null,
+    ws_active: bool = false,
 };
 
 const CenterSegments = struct {
@@ -3545,42 +3980,94 @@ const CenterSegments = struct {
 /// measuring pass (`centerGroupWidth`) and the actual draw pass
 /// (`drawCenterGroup`) consume, so the two can never drift out of the
 /// pixel-identical sync `centerGroupStartX`'s doc comment warns about.
-fn composeCenterSegments(time_text: []const u8) CenterSegments {
-    var result: CenterSegments = .{};
+/// Cross-group drag lets any left/center-capable module kind live here now,
+/// so beyond the original clock + launchers this also emits workspace
+/// pills (colored, clickable) and a static mpris track label.
+fn composeCenterSegments(out: *CenterSegments, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8) void {
+    out.* = .{};
+    var emitted_any = false;
     for (current_config.modules.center) |entry| {
         if (!entry.enabled) continue;
+        // Module-boundary padding: the segment that closed the previous
+        // module always gets at least MODULE_GAP of trailing space, so two
+        // modules never collide no matter which kinds a cross-group drag
+        // joined (workspace pills leave workspace_gap between themselves,
+        // launcher buttons LAUNCHER_GAP, but the module→module handoff needs
+        // the full gap regardless of what either module is).
+        if (emitted_any and out.len > 0 and out.items[out.len - 1].gap_after < MODULE_GAP) {
+            out.items[out.len - 1].gap_after = MODULE_GAP;
+        }
+        const len_before = out.len;
         switch (entry.kind) {
             .clock => {
-                if (result.len < result.items.len) {
-                    result.items[result.len] = .{ .label = time_text, .command = null, .gap_after = 0 };
-                    result.len += 1;
+                if (out.len < out.items.len) {
+                    out.items[out.len] = .{ .label = time_text, .command = null, .gap_after = MODULE_GAP };
+                    out.len += 1;
                 }
             },
             .launchers => {
-                for (current_config.launchers) |btn| {
-                    if (result.len >= result.items.len) break;
-                    result.items[result.len] = .{ .label = btn.label, .command = btn.command, .gap_after = LAUNCHER_GAP };
-                    result.len += 1;
+                for (current_config.launchers, 0..) |btn, i| {
+                    if (out.len >= out.items.len) break;
+                    const mode = launcherDisplayMode(btn.display);
+                    const has_icon = i < launcher_icons.len and launcher_icons[i].has_icon;
+                    const draw_icon = has_icon and mode != .label;
+                    const draw_label = mode != .icon or !has_icon;
+                    out.items[out.len] = .{
+                        .label = if (draw_label) btn.label else "",
+                        .command = btn.command,
+                        .gap_after = LAUNCHER_GAP,
+                        .icon_w = if (draw_icon) @as(i64, LAUNCHER_ICON_SIZE) + LAUNCHER_ICON_TEXT_GAP else 0,
+                        .launcher_idx = i,
+                    };
+                    out.len += 1;
                 }
             },
-            else => {}, // not a valid center-group module kind; ignore defensively
+            .workspaces => {
+                // Id digits are formatted directly into `out`'s OWN segment's
+                // label_buf — the caller's CenterSegments backs the array, so
+                // the slice points at stable memory that survives this call.
+                // (The old version formatted into a function-local `seg` and
+                // copied the struct, which copied the label_buf bytes but not
+                // the pointer — every segment's `label` aliased the same dead
+                // stack slot, so every pill showed the last workspace number.)
+                for (workspaces) |ws| {
+                    if (out.len >= out.items.len) break;
+                    var seg = &out.items[out.len];
+                    seg.* = .{ .label = "", .gap_after = current_config.appearance.workspace_gap };
+                    seg.ws_id = ws.id;
+                    seg.ws_active = ws.active;
+                    seg.label = std.fmt.bufPrint(&seg.label_buf, "{d}", .{ws.id}) catch "";
+                    out.len += 1;
+                }
+            },
+            .mpris => {
+                if (mpris_text.len > 0 and out.len < out.items.len) {
+                    // mpris in center is a static label (no ticker/controls)
+                    // — a centered block can't afford the left chain's
+                    // unbounded rightward scrolling.
+                    out.items[out.len] = .{ .label = mpris_text, .command = null, .gap_after = MODULE_GAP };
+                    out.len += 1;
+                }
+            },
+            else => {}, // not a center-capable module kind; ignore defensively
         }
+        if (out.len > len_before) emitted_any = true;
     }
-    return result;
 }
 
-fn centerGroupWidth(font: *font_mod.Font, time_text: []const u8) i64 {
-    const segs = composeCenterSegments(time_text);
+fn centerGroupWidth(font: *font_mod.Font, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8) i64 {
+    var segs: CenterSegments = .{};
+    composeCenterSegments(&segs, time_text, workspaces, mpris_text);
     var total: i64 = 0;
-    for (segs.items[0..segs.len]) |seg| total += textPixelWidth(font, seg.label) + seg.gap_after;
+    for (segs.items[0..segs.len]) |seg| total += seg.icon_w + textPixelWidth(font, seg.label) + seg.gap_after;
     return total;
 }
 
 /// x position of the center group's left edge — the boundary drawMpris
 /// must stay clear of (it grows rightward from the workspaces and would
 /// otherwise run into this pixel-for-pixel identical calculation).
-fn centerGroupStartX(buf_width: u32, font: *font_mod.Font, time_text: []const u8) i64 {
-    return @divTrunc(@as(i64, @intCast(buf_width)) - centerGroupWidth(font, time_text), 2);
+fn centerGroupStartX(buf_width: u32, font: *font_mod.Font, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8) i64 {
+    return @divTrunc(@as(i64, @intCast(buf_width)) - centerGroupWidth(font, time_text, workspaces, mpris_text), 2);
 }
 
 fn drawCenterGroup(
@@ -3589,31 +4076,78 @@ fn drawCenterGroup(
     buf_height: u32,
     font: *font_mod.Font,
     time_text: []const u8,
+    workspaces: []const Workspace,
+    mpris_text: []const u8,
     pointer_x: i32,
     click_regions: *ClickRegions,
 ) void {
     const y0: i64 = baselineY(buf_height, font);
-    var x0: i64 = centerGroupStartX(buf_width, font, time_text);
-    const segs = composeCenterSegments(time_text);
+    var x0: i64 = centerGroupStartX(buf_width, font, time_text, workspaces, mpris_text);
+    var segs: CenterSegments = .{};
+    composeCenterSegments(&segs, time_text, workspaces, mpris_text);
 
     for (segs.items[0..segs.len]) |seg| {
-        if (seg.command) |cmd| {
+        if (seg.ws_id) |ws_id| {
+            const workspace_gap = current_config.appearance.workspace_gap;
+            const color = if (seg.ws_active) current_config.appearance.workspace_active_color else current_config.appearance.workspace_inactive_color;
             const region_start = x0;
-            const hover_start = region_start - @divTrunc(LAUNCHER_GAP, 2);
-            const hover_end = region_start + textPixelWidth(font, seg.label) + @divTrunc(LAUNCHER_GAP, 2);
+            const hover_start = region_start - @divTrunc(workspace_gap, 2);
+            const hover_end = region_start + textPixelWidth(font, seg.label) + @divTrunc(workspace_gap, 2);
             _ = drawHoverHighlight(pixels, buf_width, buf_height, hover_start, hover_end, pointer_x);
+            var i: usize = 0;
+            while (nextUtf8Codepoint(seg.label, &i)) |cp| {
+                x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, color, 0, buf_width);
+            }
+            click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .switch_workspace = ws_id });
+        } else if (seg.command) |cmd| {
+            const region_start = x0;
+            const label_w = seg.icon_w + textPixelWidth(font, seg.label);
+            const hover_start = region_start - @divTrunc(LAUNCHER_GAP, 2);
+            const hover_end = region_start + label_w + @divTrunc(LAUNCHER_GAP, 2);
+            _ = drawHoverHighlight(pixels, buf_width, buf_height, hover_start, hover_end, pointer_x);
+            if (seg.icon_w > 0 and seg.launcher_idx < launcher_icons.len) {
+                drawLauncherIcon(pixels, buf_width, buf_height, x0, &launcher_icons[seg.launcher_idx]);
+                x0 += seg.icon_w;
+            }
             var i: usize = 0;
             while (nextUtf8Codepoint(seg.label, &i)) |cp| {
                 x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
             }
             click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .spawn = cmd });
         } else {
+            if (seg.icon_w > 0 and seg.launcher_idx < launcher_icons.len) {
+                drawLauncherIcon(pixels, buf_width, buf_height, x0, &launcher_icons[seg.launcher_idx]);
+                x0 += seg.icon_w;
+            }
             var i: usize = 0;
             while (nextUtf8Codepoint(seg.label, &i)) |cp| {
                 x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
             }
         }
         x0 += seg.gap_after;
+    }
+}
+
+/// Blits a launcher's decoded app icon (a LAUNCHER_ICON_SIZE square, row-0
+/// at top) with its left edge at `x0`, vertically centered, alpha-blended
+/// against the bar's background the same way the tray path blends its icons
+/// (dst is always opaque here, so coverage-weighted RGB is exact).
+fn drawLauncherIcon(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, cache: *const LauncherIconCache) void {
+    const y0 = @divTrunc(@as(i64, @intCast(buf_height)) - LAUNCHER_ICON_SIZE, 2);
+    for (0..LAUNCHER_ICON_SIZE) |iy| {
+        for (0..LAUNCHER_ICON_SIZE) |ix| {
+            const src = cache.pixels[iy * LAUNCHER_ICON_SIZE + ix];
+            const coverage: u8 = @intCast((src >> 24) & 0xFF);
+            if (coverage == 0) continue;
+            const px = x0 + @as(i64, @intCast(ix));
+            const py = y0 + @as(i64, @intCast(iy));
+            if (px < 0 or py < 0) continue;
+            const pxu: usize = @intCast(px);
+            const pyu: usize = @intCast(py);
+            if (pxu >= buf_width or pyu >= buf_height) continue;
+            const idx = pyu * buf_width + pxu;
+            pixels[idx] = blendPixel(pixels[idx], src, coverage);
+        }
     }
 }
 
@@ -3719,6 +4253,43 @@ fn drawTrayIconEndingAt(pixels: [*]u32, buf_width: u32, buf_height: u32, x_end: 
     return x0;
 }
 
+/// Draws the cava equalizer's bars ending at `x_end` (right-aligned like
+/// every right-group module), returning the new left edge. Each bar is
+/// CAVA_BAR_WIDTH px wide, spaced CAVA_BAR_GAP, inside the border band's
+/// inner rectangle, always growing upward from the bar's lower usable edge
+/// — the classic equalizer look, identical whether the bar sits at the top
+/// or bottom of the screen.
+fn drawCavaEqualizer(pixels: [*]u32, buf_width: u32, buf_height: u32, x_end: i64) i64 {
+    const top_px = @min(current_config.appearance.border_top_px, buf_height);
+    const bottom_px = @min(current_config.appearance.border_bottom_px, buf_height - top_px);
+    const usable_top: i64 = @as(i64, @intCast(top_px));
+    const usable_bottom: i64 = @as(i64, @intCast(buf_height)) - @as(i64, @intCast(bottom_px));
+    const max_h = usable_bottom - usable_top;
+    if (max_h <= 0) return x_end;
+    const color = current_config.appearance.cava_color;
+
+    var x = x_end - @as(i64, @intCast(cava_state.bar_count)) * (CAVA_BAR_WIDTH + CAVA_BAR_GAP);
+    for (0..cava_state.bar_count) |i| {
+        const h = @max(1, @divTrunc(@as(i64, @intCast(cava_state.bars[i])) * max_h, @as(i64, CAVA_REFERENCE_MAX)));
+        const y0: i64 = usable_bottom - h;
+        var dx: i64 = 0;
+        while (dx < CAVA_BAR_WIDTH) : (dx += 1) {
+            const px = x + dx;
+            if (px < 0 or px >= buf_width) continue;
+            var dy: i64 = 0;
+            while (dy < h) : (dy += 1) {
+                const py = y0 + dy;
+                if (py < 0 or py >= buf_height) continue;
+                pixels[@as(usize, @intCast(py)) * buf_width + @as(usize, @intCast(px))] = color;
+            }
+        }
+        x += CAVA_BAR_WIDTH + CAVA_BAR_GAP;
+    }
+    // Left edge of the whole equalizer — what the next right-group module
+    // docks against.
+    return x_end - @as(i64, @intCast(cava_state.bar_count)) * (CAVA_BAR_WIDTH + CAVA_BAR_GAP);
+}
+
 /// Draws `current_config.modules.right` in config order, right-to-left from
 /// the bar's edge — today's default order reproduces the original
 /// hardcoded sequence exactly: custom/power, then the group/tray-expander
@@ -3795,11 +4366,11 @@ fn drawRightGroup(
                 first = false;
                 // custom/pacman's real format is "<big>ᗧ</big> {}" (Pac-Man
                 // glyph + count, no "UPD" text) — that exact character
-                // (U+15E7) isn't in this Nerd Font, so an Arch Linux logo
-                // glyph stands in instead (pacman being Arch's package
-                // manager, at least in the same spirit).
+                // (U+15E7) isn't in this Nerd Font, so a Debian logo glyph
+                // stands in instead (pacman being the package manager Debian
+                // actually ships with).
                 var pac_buf: [24]u8 = undefined;
-                const pac_label = std.fmt.bufPrint(&pac_buf, "\u{f303} {s}", .{pacman_text}) catch "\u{f303}";
+                const pac_label = std.fmt.bufPrint(&pac_buf, "\u{f306} {s}", .{pacman_text}) catch "\u{f306}";
                 x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, pac_label, drawer_color, null, pointer_x, click_regions);
             },
             .tray => {
@@ -3895,6 +4466,18 @@ fn drawRightGroup(
                             text;
                         x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, script_label, color, null, pointer_x, click_regions);
                     }
+                }
+            },
+            .cava => {
+                // Audio-reactive equalizer fed by the cava pipe (see the
+                // cava section above). No click region — same "visualizer is
+                // not interactive" stance as weather. Anchored opposite the
+                // bar's screen edge: grow from the bottom on a top bar, from
+                // the top on a bottom bar.
+                if (cava_state.has_data) {
+                    if (!first) x_end -= LAUNCHER_GAP;
+                    first = false;
+                    x_end = drawCavaEqualizer(pixels, buf_width, buf_height, x_end);
                 }
             },
             .workspaces, .mpris, .clock, .launchers => {}, // not valid in the right group; ignore defensively
@@ -4159,6 +4742,10 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     var i: usize = 0;
     while (i < pixel_count) : (i += 1) pixels[i] = bg_fill;
 
+    // Decode any pinned-launcher icons that haven't been resolved since the
+    // last config load, before any width measuring or drawing consults them.
+    ensureLauncherIcons();
+
     // Four independent border edges (originally just window#waybar's
     // top-only border-width: 2px 0px 0px 0px). Which edge "faces the
     // desktop" flips with `position`, but these are plain per-side widths,
@@ -4198,19 +4785,16 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
         logging.err("clock render failed: {}", .{err});
         break :blk "";
     };
-    drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.pointer_x, &bar.click_regions);
-
-    const workspaces_end_x = drawWorkspaces(pixels, bar.width, bar.height, bar.font, bar.workspaces.list.items, bar.pointer_x, &bar.click_regions);
-    // Config-gated as a whole block (not just the draw calls at the end):
-    // nothing after this depends on mpris's screen position the way the
-    // right-to-left chain depends on drawRightAligned's return value, so
-    // skipping the entire block when disabled is safe — no other module's
-    // layout needs mpris's state either way.
-    if (isModuleEnabled(current_config.modules.left, .mpris)) {
-        // bar.mpris.text() is "PLAYER|STATUS|ARTIST - TITLE" (MPRIS_SCRIPT) —
-        // split off the player so clicks on the controls below can target it
-        // specifically via spawnPlayerctlCommand; the "STATUS|ARTIST - TITLE"
-        // remainder is what formatMprisText already expects.
+    // mpris is a left/center-capable kind now, so its text is resolved once
+    // for whichever group holds it (bar.mpris.text() is
+    // "PLAYER|STATUS|ARTIST - TITLE" — split off the player so clicks on
+    // the controls can target it specifically via spawnPlayerctlCommand;
+    // the "STATUS|ARTIST - TITLE" remainder is what formatMprisText
+    // expects). When mpris isn't configured at all, everything below is
+    // left empty and neither group draws anything for it.
+    var mpris_playing = false;
+    var mpris_text: []const u8 = "";
+    if (isModuleEnabled(current_config.modules.left, .mpris) or isModuleEnabled(current_config.modules.center, .mpris)) {
         const mpris_raw = bar.mpris.text();
         const status_and_track = blk: {
             const sep = std.mem.indexOfScalar(u8, mpris_raw, '|') orelse {
@@ -4222,9 +4806,9 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
             @memcpy(bar.mpris_player_buf[0..bar.mpris_player_len], player[0..bar.mpris_player_len]);
             break :blk mpris_raw[sep + 1 ..];
         };
-        const playing = std.mem.startsWith(u8, status_and_track, "Playing|");
+        mpris_playing = std.mem.startsWith(u8, status_and_track, "Playing|");
         var mpris_buf: [64]u8 = undefined;
-        const mpris_text = formatMprisText(status_and_track, &mpris_buf);
+        mpris_text = formatMprisText(status_and_track, &mpris_buf);
         // Restart the scroll from the beginning whenever the track (or
         // play/pause status, since that's part of the same string) actually
         // changes — but not on every redraw, which would happen constantly
@@ -4234,13 +4818,23 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
             @memcpy(bar.mpris_prev_buf[0..mpris_text.len], mpris_text);
             bar.mpris_prev_len = mpris_text.len;
         }
-        const center_start_x = centerGroupStartX(bar.width, bar.font, time_text);
-        const mpris_start_x = if (mpris_text.len > 0)
-            drawMprisControls(pixels, bar.width, bar.height, bar.font, workspaces_end_x, playing, bar.pointer_x, &bar.click_regions)
-        else
-            workspaces_end_x;
-        drawMpris(pixels, bar.width, bar.height, bar.font, mpris_start_x, center_start_x - LAUNCHER_GAP, mpris_text, bar.mpris_scroll_step);
     }
+    const center_start_x = centerGroupStartX(bar.width, bar.font, time_text, bar.workspaces.list.items, mpris_text);
+    drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, bar.pointer_x, &bar.click_regions);
+    drawLeftGroup(
+        pixels,
+        bar.width,
+        bar.height,
+        bar.font,
+        bar.workspaces.list.items,
+        time_text,
+        mpris_text,
+        mpris_playing,
+        bar.mpris_scroll_step,
+        center_start_x,
+        bar.pointer_x,
+        &bar.click_regions,
+    );
     var volume_buf: [16]u8 = undefined;
     const volume_text = parseVolumePercent(bar.volume.text(), &volume_buf);
     var weather_buf: [32]u8 = undefined;

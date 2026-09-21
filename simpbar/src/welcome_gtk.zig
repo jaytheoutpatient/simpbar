@@ -26,6 +26,7 @@ pub const GtkImage = opaque {};
 pub const GtkPicture = opaque {};
 pub const GtkSwitch = opaque {};
 pub const GtkButton = opaque {};
+pub const GtkDropDown = opaque {};
 pub const GtkSpinner = opaque {};
 pub const GtkStringList = opaque {};
 pub const GtkListBox = opaque {};
@@ -127,6 +128,12 @@ pub extern "c" fn gtk_spinner_stop(self: *GtkSpinner) void;
 // GtkStringList
 pub extern "c" fn gtk_string_list_new(strings: ?[*]const ?[*:0]const u8) *GtkStringList;
 
+// GtkDropDown (GTK4's compact dropdown — used as a per-row picker in the
+// Shortcuts tab's Pinned Launchers list for how each launcher renders).
+pub extern "c" fn gtk_drop_down_new_from_strings(strings: ?[*]const ?[*:0]const u8) ?*GtkDropDown;
+pub extern "c" fn gtk_drop_down_set_selected(self: *GtkDropDown, position: c_uint) void;
+pub extern "c" fn gtk_drop_down_get_selected(self: *GtkDropDown) c_uint;
+
 // GtkListBox / GtkListBoxRow
 pub extern "c" fn gtk_list_box_new() *GtkListBox;
 pub extern "c" fn gtk_list_box_append(self: *GtkListBox, child: *anyopaque) void;
@@ -173,6 +180,7 @@ pub extern "c" fn adw_preferences_row_set_title(self: *anyopaque, title: [*:0]co
 pub extern "c" fn adw_action_row_set_subtitle(self: *AdwActionRow, subtitle: [*:0]const u8) void;
 pub extern "c" fn adw_action_row_set_icon_name(self: *AdwActionRow, icon_name: ?[*:0]const u8) void;
 pub extern "c" fn adw_action_row_add_suffix(self: *AdwActionRow, widget: *anyopaque) void;
+pub extern "c" fn adw_action_row_add_prefix(self: *AdwActionRow, widget: *anyopaque) void;
 pub extern "c" fn adw_action_row_set_activatable_widget(self: *AdwActionRow, widget: ?*anyopaque) void;
 
 // AdwComboRow

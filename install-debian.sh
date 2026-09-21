@@ -353,6 +353,7 @@ APT_PKGS=(
     # Hyprland setup
     hyprland foot fastfetch neovim usbutils
     swaybg azote sway-notification-center rofi flatpak nwg-look pavucontrol
+    cava
     pipewire pipewire-pulse wireplumber gnome-disk-utility fish
     grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard
     fonts-noto-core fonts-noto-color-emoji
@@ -373,6 +374,10 @@ for p in "${APT_PKGS[@]}"; do
 done
 APT_PKGS=("${APT_PKGS_AVAIL[@]}")
 APT_PKGS+=("${GPU_PKGS[@]}")
+# The base list and the GPU list both carry libvulkan1/libgl1-mesa-dri (so a
+# multiarch box pulls the :i386 twins) — dedupe so the install line and the
+# verification output stay clean.
+mapfile -t APT_PKGS < <(printf '%s\n' "${APT_PKGS[@]}" | sort -u)
 
 prompt_choice FILE_MANAGER_CHOICE 1 "Which file manager would you like to use?" \
     "Nautilus" "Nemo" "Dolphin"
@@ -449,7 +454,10 @@ run_spinner "apt: installing ${#APT_PKGS[@]} packages" sudo env DEBIAN_FRONTEND=
 
 MISSING_PKGS=()
 for pkg in "${APT_PKGS[@]}"; do
-    dpkg -s "$pkg" >/dev/null 2>&1 || dpkg -s "${pkg/:amd64}" >/dev/null 2>&1 || MISSING_PKGS+=("$pkg")
+    # dpkg-query -W (not dpkg -s) so multiarch systems — where a pkg has both
+    # :amd64 and :i386 installed ("libvulkan1" on a steam system) — don't
+    # error out with "ambiguous package name" and false-positive.
+    dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q 'install ok installed' || MISSING_PKGS+=("$pkg")
 done
 if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
     warn "apt reported success but these packages aren't actually installed: ${MISSING_PKGS[*]}"
@@ -1472,7 +1480,7 @@ run_spinner "Updating the full system (apt full-upgrade)" sudo env DEBIAN_FRONTE
 step "Done"
 ok "Full system updated (apt full-upgrade)"
 ok "simpbar, simpbar-welcome, simpbar-config built with zig $ZIG_VER and installed to /usr/bin"
-ok "libfreetype-dev, libgdk-pixbuf-2.0-dev, libwayland-dev, wayland-protocols, libgtk-4-dev, libadwaita-1-dev, libglib2.0-dev, playerctl, gnome-calendar, mate-polkit, swaybg, azote, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, steam-devices, sway-notification-center, rofi, flatpak, nwg-look, pavucontrol, pipewire, pipewire-pulse, wireplumber, gnome-disk-utility, wlogout, libnotify-bin, kdeconnect installed (apt)"
+ok "libfreetype-dev, libgdk-pixbuf-2.0-dev, libwayland-dev, wayland-protocols, libgtk-4-dev, libadwaita-1-dev, libglib2.0-dev, playerctl, gnome-calendar, mate-polkit, swaybg, azote, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, steam-devices, sway-notification-center, rofi, flatpak, nwg-look, pavucontrol, cava, pipewire, pipewire-pulse, wireplumber, gnome-disk-utility, wlogout, libnotify-bin, kdeconnect installed (apt)"
 ok "JetBrainsMono Nerd Font installed to /usr/share/fonts/TTF"
 ok "$FILE_MANAGER_NAME installed and bound to SUPER + E"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
