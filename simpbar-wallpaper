@@ -23,7 +23,10 @@
 #   --sorting S     favorites | toplist | date_added (default favorites)
 #   --order O       asc | desc (default desc)
 #   --category C    general | anime | nature | people, comma-separated, or
-#                   "any" (default general). Enforced locally -- see below.
+#                   "any". Enforced locally -- see below. Defaults: search ->
+#                   general, random --online -> any (the random feed's general
+#                   rows are almost all SFW, so filtering to them would hide
+#                   what a configured key + --purity unlocks).
 #   --purity P      100 sfw, 110 +questionable, 111 +explicit (default 100).
 #                   Anything but 100 needs your own API key -- see below.
 #   --seed S        shuffle seed; the same seed returns the same page
@@ -963,7 +966,13 @@ cmd_random_online() {
     # api_url and img_url are deliberately distinct names: on the first retry
     # the loop overwrote `url` with the image URL and the next api_get fetched a
     # JPEG, which then failed the "is this JSON" check.
-    local purity="" minres="1920x1080" category="general" arg api_url json
+    # Default to every category rather than general: the random feed's general
+    # rows are almost all SFW (9/9 on page after page), while the sketchy and
+    # explicit rows cluster in anime and people. Filtering to general would
+    # therefore go on serving SFW even after someone configured a key and
+    # purity=110/111 -- hiding exactly what the key unlocks. Purity still gates
+    # the whole thing, so SFW-only defaults are unaffected.
+    local purity="" minres="1920x1080" category="" arg api_url json
     local rec got_id img_url imgext got_cat dest rc=0
     while [ $# -gt 0 ]; do
         arg="$1"

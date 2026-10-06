@@ -102,7 +102,7 @@ simpbar-wallpaper random --online           fetch a random wallhaven.cc wallpape
 
 Useful `search` options: `--category general|anime|nature|people`, `--atleast 1920x1080` (or `any`), `--maxsize 10` in MB, `--sorting favorites|date_added|toplist`, `--purity`, `--page`, `--seed`. `--save`/`--apply` work on `bing` and `search` too.
 
-`random --online` is the one that applies what it downloads — `random` is the verb that means "put something on my screen", so fetching without showing it would just be `fetch` with dice. Everything else leaves your current wallpaper alone.
+`random --online` is the one that applies what it downloads — `random` is the verb that means "put something on my screen", so fetching without showing it would just be `fetch` with dice. Everything else leaves your current wallpaper alone. It draws from **every** category by default, not just `general`: the random feed's `general` rows are almost all SFW (page after page), while sketchy/explicit rows cluster in `anime` and `people`, so filtering to `general` would keep serving SFW even after you configured a key and `purity=110/111` — hiding exactly what the key unlocks. Purity still gates everything, so if you never configure a key it behaves exactly as before; `--category` works if you want to steer it.
 
 **Output is paths, one per line, on stdout**; progress and diagnostics go to stderr. So it composes:
 
