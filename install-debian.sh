@@ -967,18 +967,24 @@ fi
 # (install quickshell, restart, done). rofi remains the launcher here — see the
 # nwg-drawer note above.
 if command -v quickshell >/dev/null 2>&1; then
-    mkdir -p ~/.config/quickshell/appdrawer
+    # Where quickshell actually looks for configs: XDG_CONFIG_HOME when set,
+    # ~/.config otherwise. Hardcoding ~/.config here would install the panel
+    # somewhere quickshell never searches, so on a system with XDG_CONFIG_HOME
+    # pointed elsewhere the drawer would silently never open. AppModel.qml
+    # resolves its own path the same way, so the two always agree.
+    QS_APPDRAWER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/quickshell/appdrawer"
+    mkdir -p "$QS_APPDRAWER_DIR"
     for qml in AppModel.qml AppTile.qml Drawer.qml Icons.qml shell.qml Theme.qml; do
         if [ ! -f "$HOME/.local/share/simpbar/appdrawer/$qml" ]; then
             warn "appdrawer $qml missing from the archive — the drawer may not load (skipped)"
         else
-            cp "$HOME/.local/share/simpbar/appdrawer/$qml" ~/.config/quickshell/appdrawer/$qml
+            cp "$HOME/.local/share/simpbar/appdrawer/$qml" "$QS_APPDRAWER_DIR/$qml"
         fi
     done
-    ok "App drawer QML placed in ~/.config/quickshell/appdrawer"
+    ok "App drawer QML placed in $QS_APPDRAWER_DIR"
 
-    if [ ! -f ~/.config/quickshell/appdrawer/favourites.json ]; then
-        printf '{ "ids": [] }\n' > ~/.config/quickshell/appdrawer/favourites.json
+    if [ ! -f "$QS_APPDRAWER_DIR/favourites.json" ]; then
+        printf '{ "ids": [] }\n' > "$QS_APPDRAWER_DIR/favourites.json"
         ok "App drawer favourites file created (empty — pin apps from the drawer)"
     else
         ok "Existing app drawer favourites kept"
@@ -1009,7 +1015,7 @@ if command -v quickshell >/dev/null 2>&1; then
 else
     warn "quickshell isn't packaged on Debian (it's Arch's \"extra\" repo only), so the app drawer is NOT installed"
     warn "  Everything is staged for later, so enabling it is a few commands once you have quickshell:"
-    warn "    mkdir -p ~/.config/quickshell && cp -r ~/.local/share/simpbar/appdrawer ~/.config/quickshell/appdrawer"
+    warn "    mkdir -p \"\${XDG_CONFIG_HOME:-$HOME/.config}/quickshell\" && cp -r ~/.local/share/simpbar/appdrawer \"\${XDG_CONFIG_HOME:-$HOME/.config}/quickshell/appdrawer\""
     warn "    sudo install -m755 ~/.local/share/simpbar/appdrawer-bin /usr/bin/appdrawer"
     warn "    sudo install -m644 ~/.local/share/simpbar/appdrawer.desktop /usr/share/applications/appdrawer.desktop"
     warn "  Until then the SUPER+Tab bind does nothing and rofi (SUPER+Space) is your launcher."

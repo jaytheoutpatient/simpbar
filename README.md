@@ -64,7 +64,7 @@ It's a [quickshell](https://quickshell.org) panel living in `~/.config/quickshel
 - **Arch**: quickshell is in the official `extra` repo, so the installer pulls it and deploys the panel.
 - **Debian**: quickshell isn't packaged in any suite, and building it isn't a good option — it uses private Qt APIs and must be compiled against the exact Qt version it ships with or it crashes on ABI mismatch. The installer skips the drawer with a warning and leaves rofi as the launcher, but still stages the QML in `~/.local/share/simpbar/appdrawer/` and the toggle script, so installing quickshell yourself is all that's needed afterwards.
 
-Your pinned apps live in `~/.config/quickshell/appdrawer/favourites.json`, which the installer never overwrites once it exists.
+Your pinned apps live in `favourites.json` next to the panel — under `$XDG_CONFIG_HOME/quickshell/appdrawer/` when `XDG_CONFIG_HOME` is set, `~/.config/quickshell/appdrawer/` otherwise. That is the same place quickshell itself searches for configs, so the panel and its state can never drift apart. The installer never overwrites an existing `favourites.json`.
 
 ## Clicking empty bar space
 

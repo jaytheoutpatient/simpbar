@@ -13,6 +13,19 @@ import Quickshell.Io
 Singleton {
     id: root
 
+    // Resolved the way quickshell itself resolves configs: XDG_CONFIG_HOME when
+    // it is set, ~/.config otherwise. Deriving this from HOME alone would put
+    // favourites.json somewhere quickshell never looks, so on a system with
+    // XDG_CONFIG_HOME pointed elsewhere the pinned apps would silently start
+    // from empty. env() returns "" for an unset variable, so the || is a
+    // fallback rather than a null check.
+    //
+    // Note this deliberately does NOT match Theme.qml's matugen.json path, which
+    // is $HOME-based because that is where the bar itself looks.
+    readonly property string cfgDir: (Quickshell.env("XDG_CONFIG_HOME")
+                                      || Quickshell.env("HOME") + "/.config")
+                                  + "/quickshell/appdrawer"
+
     property var apps: ([])
     property bool ready: false
     property int loadTries: 0
@@ -130,9 +143,7 @@ Singleton {
 
     FileView {
         id: favFile
-        // Relative to HOME so the drawer's pinned apps follow whoever runs
-        // the installer; see the note in Theme.qml for the same reason.
-        path: Quickshell.env("HOME") + "/.config/quickshell/appdrawer/favourites.json"
+        path: root.cfgDir + "/favourites.json"
         watchChanges: true
         blockLoading: true
         onFileChanged: reload()
