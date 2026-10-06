@@ -113,7 +113,7 @@ const SEEK_END: c_int = 2;
 var g_log_dir_buf: [600]u8 = undefined;
 var g_log_dir: [:0]const u8 = "";
 // The log base (SIMPBAR_LOG_DIR override or ~/.config/simpbar-config/logs),
-// kept separately so `scoped()` can derive sibling folders like <base>/gpu/.
+// kept separately so `scoped()` can derive sibling folders like <base>/font/.
 var g_log_base_buf: [600]u8 = undefined;
 var g_log_base: [:0]const u8 = "";
 var g_proc_tag: []const u8 = "simpbar";
@@ -146,9 +146,9 @@ const Spinlock = struct {
 
 var g_lock: Spinlock = .{};
 
-/// A named log channel: every event goes to `<base>/<dir>/<file>.log` (e.g.
-/// the bar calls `logging.i` with "gpu" so the GPU renderer logs land in
-/// `<base>/gpu/`). The process-wide default scope is what `logging.step`/
+/// A named log channel: every event goes to `<base>/<dir>/<file>.log` (e.g. a
+/// component calling `logging.scoped(&my_log, "mycomp")` gets its lines in
+/// `<base>/mycomp/`). The process-wide default scope is what `logging.step`/
 /// `warn`/`err`/`crash` write to; extra scopes share its lock and stderr
 /// mirror but keep their own files.
 pub const Scope = struct {
@@ -246,7 +246,7 @@ pub fn init(proc_name: []const u8) void {
 _ = mkdir(base.ptr, 0o755);
 
     // Keep a copy of the base dir (init's `base` points at a stack buffer) so
-    // `scoped()` can build per-component folders like <base>/gpu/ later.
+    // `scoped()` can build per-component folders like <base>/font/ later.
     const base_len = @min(base.len, g_log_base_buf.len - 1);
     @memcpy(g_log_base_buf[0..base_len], base[0..base_len]);
     g_log_base_buf[base_len] = 0;
@@ -303,9 +303,9 @@ pub fn crash(comptime fmt: []const u8, args: anytype) void {
     g_default_scope.crash(fmt, args);
 }
 
-/// Points `self` at a scope that writes to `<base>/<name>/` — e.g. the bar
-/// calls `logging.scoped(&gpu_log, "gpu")` so the GPU renderer's lines land
-/// in `<base>/gpu/` instead of the bar's own folder. `self` keeps the buffer
+/// Points `self` at a scope that writes to `<base>/<name>/` — e.g.
+/// `logging.scoped(&font_log, "font")` keeps the font subsystem's lines in
+/// `<base>/font/` instead of the bar's own folder. `self` keeps the buffer
 /// alive (a scope is self-referential, so it can't be copied by value after
 /// wiring). Falls back to a stderr-only scope if the logger isn't up or the
 /// directory can't be created.

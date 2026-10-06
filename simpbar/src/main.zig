@@ -11,7 +11,6 @@ const font_mod = @import("font.zig");
 const icontheme = @import("icontheme.zig");
 const dbusmenu = @import("dbusmenu.zig");
 const logging = @import("logging.zig");
-const gpu = @import("gpu.zig");
 const desktop_entries = @import("desktop_entries.zig");
 
 pub const panic = std.debug.FullPanic(logging.panicHandler);
@@ -50,6 +49,76 @@ const MODULE_GAP: i64 = 12;
 const LAUNCHER_GAP: i64 = 16;
 const RIGHT_MARGIN: i64 = 8;
 
+/// Minimum on-screen width reserved for a single module, so every module gets
+/// its own space instead of sitting flush against whichever neighbour happens
+/// to be next to it. Content narrower than this is centered inside the cell;
+/// content wider than it (long custom-script output, a long weather string, a
+/// full tray row) keeps its natural width and simply grows its cell — the bar
+/// never truncates a module to fit. The slack becomes padding on BOTH sides,
+/// which is why the reserve helpers below return where to *draw* as well as
+/// where the pen ends up.
+///
+/// Keep this modest: it is a floor for the NARROWEST module, and the slack is
+/// pure padding, so it is paid once per module across the whole bar. The
+/// right group's shortest entries (the "▾" drawer toggle, power) are only
+/// ~10-20px of text, so a large floor inflates that group's width and reads
+/// as empty space rather than separation. Anything above the natural width of
+/// the widest label in a group costs that group extra pixels for no benefit,
+/// so this is best kept just above the widths you actually want separated.
+///
+/// Separation between two adjacent modules is `(CELL - content_w) + MODULE_GAP`,
+/// so this single number walks the whole range: at 4 padding is 0 and modules
+/// sit at the bare MODULE_GAP (12px) apart — effectively the pre-cell layout;
+/// at 64 a pair of narrow modules lands ~36px apart; at 96, ~68px.
+const MODULE_CELL_MIN: i64 = 4;
+
+/// A reserved module cell, kept as three coordinates because the two layout
+/// directions consume it differently: a left-group module draws from
+/// `content_start` rightward, a right-group module (via drawRightAligned)
+/// draws leftward from `content_end`, and `next_pen` — the cell's far edge —
+/// is what the next module reserves from. Advancing the pen to the content's
+/// own edge instead would hand this module's padding to the next module
+/// instead of splitting it around this one, which is the whole point.
+const CellPlacement = struct {
+    content_start: i64,
+    content_end: i64,
+    next_pen: i64,
+};
+
+/// Splits `pad_wanted` in half around a cell's content, capped by the room
+/// actually left before `limit`. A bar too narrow to give every module its
+/// full cell degrades to natural width (the pre-cell layout) rather than
+/// marching over the neighbouring group. Content is never clipped: a module
+/// wider than the room available keeps its real width and overlaps, exactly
+/// as it did before cells existed.
+fn centeredPad(pad_wanted: i64, room: i64) i64 {
+    return @min(@divTrunc(pad_wanted, 2), @max(@divTrunc(room, 2), 0));
+}
+
+/// Left-to-right reservation: `pen` is the cell's LEFT edge, `limit_right`
+/// bounds how far the cell may grow (the center group's start edge).
+fn reserveLeftCell(pen: i64, content_w: i64, limit_right: i64) CellPlacement {
+    const pad = centeredPad(@max(MODULE_CELL_MIN - content_w, 0), limit_right - pen - content_w);
+    return .{
+        .content_start = pen + pad,
+        .content_end = pen + pad + content_w,
+        .next_pen = pen + pad * 2 + content_w,
+    };
+}
+
+/// Right-to-left reservation: `pen` is the cell's RIGHT edge, `limit_left`
+/// bounds how far the cell may grow leftward (the center group's start
+/// edge). drawRightAligned anchors content by its right edge, hence the
+/// asymmetry with reserveLeftCell.
+fn reserveRightCell(pen: i64, content_w: i64, limit_left: i64) CellPlacement {
+    const pad = centeredPad(@max(MODULE_CELL_MIN - content_w, 0), pen - limit_left - content_w);
+    return .{
+        .content_start = pen - pad - content_w,
+        .content_end = pen - pad,
+        .next_pen = pen - pad * 2 - content_w,
+    };
+}
+
 // --- pinned-launcher app icons -------------------------------------------
 //
 // A launcher button with a non-null `icon` in config.json (typically an
@@ -57,7 +126,7 @@ const RIGHT_MARGIN: i64 = 8;
 // real themed icon next to its label instead of only the nerd-font glyph.
 // The icon name/path is resolved + decoded ONCE per button (config reloads
 // via SIGUSR1 invalidate the cache) into a fixed inline buffer, mirroring
-// how TrayItem keeps its icons — no heap churn on every draw, and the GPU
+// how TrayItem keeps its icons — no heap churn on every draw, and the frame
 // presenter uploads the finished frame just like any other pixel.
 const MAX_LAUNCHERS: usize = 32;
 const LAUNCHER_ICON_SIZE: u32 = 16;
@@ -295,6 +364,29 @@ const Workspaces = struct {
         const resp = try hyprctlRequest(self.gpa, self.sockPath(), command);
         self.gpa.free(resp);
     }
+
+    /// Moves to the adjacent EXISTING workspace, in `direction`.
+    ///
+    /// Uses the relative "e±1" form rather than picking a target id out of
+    /// `self.list` ourselves. Doing the arithmetic locally would mean
+    /// reimplementing Hyprland's own rules — skip empty numbers, clamp at the
+    /// ends, honour per-monitor workspace sets, special workspaces — and
+    /// getting any of it wrong fights the compositor. "e+1"/"e-1" is the same
+    /// relative form this desktop already binds its own scroll keys to
+    /// (hyprland.lua: mainMod+mouse_down/up -> focus({workspace="e±1"})), so
+    /// the bar and the keyboard agree on where "next" is by construction.
+    ///
+    /// `direction` is +1 for "forward" (wheel down). It arrives from the
+    /// compositor's axis sign, which is negative for down.
+    fn stepWorkspace(self: *const Workspaces, direction: i32) void {
+        const cmd = if (direction > 0)
+            "dispatch hl.dsp.focus({ workspace = \"e+1\" })"
+        else
+            "dispatch hl.dsp.focus({ workspace = \"e-1\" })";
+        self.dispatchCommand(cmd) catch |err| {
+            logging.err("workspace step ({s}) failed: {}", .{ if (direction > 0) "e+1" else "e-1", err });
+        };
+    }
 };
 
 /// A click-through rectangle (currently horizontal-only, since the whole bar
@@ -311,11 +403,22 @@ const Action = union(enum) {
     mpris_control: MprisControl,
 };
 
+/// What a vertical scroll wheel does over a ClickRegion. Separate from Action
+/// because a scroll has a DIRECTION chosen per event by the compositor, not a
+/// single fixed effect chosen when the region was registered — so the region
+/// names the capability ("step workspaces") and the .axis handler below feeds
+/// it the sign it just received.
+const ScrollAction = enum {
+    /// Step to the adjacent EXISTING workspace, in the scroll direction.
+    step_workspace,
+};
+
 const ClickRegion = struct {
     x_start: i32,
     x_end: i32,
     action: Action, // left click
     right_action: ?Action = null, // right click; most regions don't have one
+    scroll_action: ?ScrollAction = null, // scroll wheel; most regions don't have one
 };
 
 const MAX_CLICK_REGIONS = 32;
@@ -329,12 +432,28 @@ const ClickRegions = struct {
     }
 
     fn add(self: *ClickRegions, x_start: i32, x_end: i32, action: Action) void {
-        self.addWithRight(x_start, x_end, action, null);
+        self.push(x_start, x_end, action, null, null);
     }
 
     fn addWithRight(self: *ClickRegions, x_start: i32, x_end: i32, action: Action, right_action: ?Action) void {
+        self.push(x_start, x_end, action, right_action, null);
+    }
+
+    /// For regions that answer BOTH a click (to that exact workspace) and a
+    /// scroll (to the next/previous one) — the workspace pills.
+    fn addScrollable(self: *ClickRegions, x_start: i32, x_end: i32, action: Action, scroll_action: ScrollAction) void {
+        self.push(x_start, x_end, action, null, scroll_action);
+    }
+
+    fn push(self: *ClickRegions, x_start: i32, x_end: i32, action: Action, right_action: ?Action, scroll_action: ?ScrollAction) void {
         if (self.len >= self.items.len) return; // scaffold-sized; fine for now
-        self.items[self.len] = .{ .x_start = x_start, .x_end = x_end, .action = action, .right_action = right_action };
+        self.items[self.len] = .{
+            .x_start = x_start,
+            .x_end = x_end,
+            .action = action,
+            .right_action = right_action,
+            .scroll_action = scroll_action,
+        };
         self.len += 1;
     }
 
@@ -450,7 +569,6 @@ fn launcherDisplayMode(display: []const u8) enum { label, both, icon } {
 // strings (most of these have no icon at all in the real config — only
 // custom/rofi does; the rest are plain text).
 const CENTER_LAUNCHERS = [_]LauncherButton{
-    .{ .label = "\u{f0c9} Menu", .command = "nwg-drawer" }, // custom/rofi
     .{ .label = "\u{f0ac} Browser", .command = "simpbar-launch-browser" }, // fa-globe
     .{ .label = "\u{f066f} Discord", .command = "simpbar-launch-discord" }, // nf-md-discord
     .{ .label = "\u{f07c} Files", .command = "nautilus" }, // fa-folder-open
@@ -581,17 +699,13 @@ const Appearance = struct {
     /// SIGUSR1 — creating/destroying Wayland surfaces at runtime is a much
     /// bigger, riskier change than anything else this config drives live.
     monitor: []const u8,
-    /// How the finished framebuffer is presented to the compositor. "gpu"
-    /// (default today) = EGL/GLES2 textured blit through a wl_egl_window
-    /// (src/gpu.zig); "shm" = the original shared-memory memfd + wl_shm path.
-    /// Anything unrecognized falls back to "gpu" (the default), same
-    /// permissive-fallback spirit as every other config field. Best effort:
-    /// if  EGL can't be initialized at runtime (e.g. a compositor without a
-    /// GPU path), the bar silently falls back to "shm" for that bar rather
-    /// than failing to render. Takes effect on the next bar restart — like
-    /// `monitor`, this is a per-surface policy, so it isn't switched live via
-    /// SIGUSR1.
-    renderer: []const u8,
+    /// Command run when the user left-clicks bare bar background (any x no
+    /// ClickRegion claims). Empty = the click does nothing, which is the
+    /// behavior of a bar that never had this feature. Lives on the runtime
+    /// Appearance rather than being read from current_config directly because
+    /// loadConfigFromFile rebuilds this struct wholesale from the parsed JSON
+    /// and would otherwise drop the field on every (re)load.
+    empty_click_command: [:0]const u8,
 };
 
 // Curated clock-format presets (not a full strftime-style parser — matches
@@ -662,7 +776,7 @@ fn defaultConfig() Config {
             .corner_radius_px = 0,
             .clock_format = CLOCK_FORMAT_DATE_24H,
             .monitor = "",
-            .renderer = "gpu",
+            .empty_click_command = "",
         },
         .modules = .{
             .left = &DEFAULT_LEFT,
@@ -806,13 +920,27 @@ const JsonAppearance = struct {
     corner_radius_px: u32 = 0,
     clock_format: []const u8 = CLOCK_FORMAT_DATE_24H,
     monitor: []const u8 = "",
-    renderer: []const u8 = "gpu",
     /// "matugen" (default) = when ~/.config/simpbar/matugen.json exists, its
     /// colors override these hex values (the wallpaper-based auto-theming
     /// integration). "manual" = ignore matugen.json entirely and always use
     /// the colors below. Anything unrecognized falls back to "matugen",
     /// same permissive-fallback spirit as `position`.
     auto_theme: []const u8 = "matugen",
+    /// Command run when the user left-clicks bare bar background — any x that
+    /// no ClickRegion claims, i.e. the gaps between modules. Runs through
+    /// `sh -c`, so `$HOME` expands and shell operators work.
+    ///
+    /// Empty (the default) disables the behaviour entirely, leaving the click
+    /// a no-op exactly as before. This is deliberately NOT wired to
+    /// `.toggle_drawer`: that action reveals this bar's own `in_drawer`
+    /// modules (see DRAWER_TOGGLE_LABEL), which is a different feature from
+    /// launching an external menu, and conflating them would make the two
+    /// impossible to enable independently.
+    ///
+    /// Lives here rather than in a new top-level struct because this bar has
+    /// one flat options struct by convention, and adding a sibling would mean
+    /// touching the load/merge plumbing for no benefit.
+    empty_click_command: [:0]const u8 = "",
 };
 
 // JSON-facing shape of "modules" — ModuleEntry's own fields already match
@@ -974,9 +1102,7 @@ fn parseAppearance(j: JsonAppearance) ?Appearance {
         // step (after outputs are discovered) is what falls back to ""
         // behavior for a name that doesn't match any connected output.
         .monitor = j.monitor,
-        // "shm" is honored; anything else (including an explicit "gpu")
-        // maps to the default "gpu" renderer.
-        .renderer = if (std.mem.eql(u8, j.renderer, "shm")) "shm" else "gpu",
+        .empty_click_command = j.empty_click_command,
     };
 }
 
@@ -1842,7 +1968,6 @@ const Globals = struct {
 const Bar = struct {
     shm: *wl.Shm,
     surface: *wl.Surface,
-    display: *wl.Display, // needed to init the EGL GPU renderer on first gpu draw
     layer_surface: *zwlr.LayerSurfaceV1,
     workspaces: *Workspaces,
     weather: *PolledCommand,
@@ -1863,24 +1988,19 @@ const Bar = struct {
     last_pointer_serial: u32 = 0,
     drawer_expanded: bool = false, // target state, flipped instantly on click
     drawer_anim: f32 = 0.0, // 0=collapsed..1=expanded, eased toward drawer_expanded each tick
+    /// Running total of vertical scroll distance accumulated over the hovered
+    /// region, in Wayland surface units. Crosses WORKSPACE_SCROLL_STEP to fire
+    /// one step; the remainder is kept so continuous scroll keeps flowing
+    /// instead of needing a fresh full notch every time. Zeroed whenever the
+    /// pointer moves off a scrollable region (see the .axis handler), so
+    /// partial scroll can't carry across modules.
+    scroll_accum: f64 = 0.0,
     mpris_scroll_step: i64 = 0,
     mpris_prev_buf: [64]u8 = undefined,
     mpris_prev_len: usize = 0,
     mpris_player_buf: [128]u8 = undefined,
     mpris_player_len: usize = 0,
     popup: ?PopupMenu = null,
-    /// GPU renderer, lazily initialized on the first draw when use_gpu is
-    /// true (needs bar.width/bar.height, which aren't known until the
-    /// compositor's first configure event). null = not initialized yet, or
-    /// gpu_disabled is set and we've permanently fallen back to shm.
-    gpu: ?gpu.Renderer = null,
-    /// True once EGL init/present has failed for this bar, so we stop
-    /// retrying GPU on every redraw and silently use the shm path (same
-    /// permissive-fallback spirit as every other config field).
-    gpu_disabled: bool = false,
-    /// Renderer chosen at bar creation from current_config.appearance.renderer
-    /// ("gpu"/"shm"). Fixed for the bar's lifetime, like `monitor`.
-    use_gpu: bool,
 };
 
 /// (Re-)applies the layer-shell anchor/size/exclusive-zone/margin from
@@ -2077,7 +2197,6 @@ fn realMain() !void {
         bars[bar_count] = .{
             .shm = shm,
             .surface = surface,
-            .display = display,
             .layer_surface = layer_surface,
             .workspaces = &workspaces,
             .weather = &weather,
@@ -2090,7 +2209,6 @@ fn realMain() !void {
             .wm_base = globals.wm_base,
             .seat = globals.seat,
             .height = current_config.appearance.bar_height,
-            .use_gpu = std.mem.eql(u8, current_config.appearance.renderer, "gpu"),
         };
         layer_surface.setListener(*Bar, layerSurfaceListener, &bars[bar_count]);
         bar_count += 1;
@@ -2732,7 +2850,7 @@ const PolledCommand = struct {
 // equalizer its own frame rate independent of the 1s clock tick. If the
 // daemon dies (cava exits, crashes, frees the audio sink) it's respawned on a
 // slow timer rather than hammering fork/exec. The geometry constants mirror
-// the shipped cava.conf so the two can't silently drift out of agreement;
+// CAVA_DEFAULT_CONF below so the two can't silently drift out of agreement;
 // deviating from that file only changes how the equalizer looks, never how
 // the bar parses (unknown/extra values are ignored defensively).
 
@@ -2741,6 +2859,63 @@ const CAVA_REFERENCE_MAX: u32 = 1000; // [output] ascii_max_range
 const CAVA_BAR_WIDTH: i64 = 1; // [general] bar_width
 const CAVA_BAR_GAP: i64 = 1; // [general] bar_spacing
 const CAVA_RESPAWN_SECONDS: i64 = 5; // wait between a dead cava and a respawn
+
+/// The cava.conf written out when the user doesn't have one, so the visualiser
+/// works on a fresh install instead of silently vanishing (cava exits with
+/// "Unable to open file" and the module just never draws anything). Only ever
+/// written when the file is ABSENT — an existing cava.conf, however odd, is
+/// left completely alone so hand-tweaked visuals survive restarts.
+///
+/// Two keys here are load-bearing and must not be dropped: `data_format =
+/// ascii` (cava >= 1.0 defaults to *binary*, which emits raw bytes this bar's
+/// ';'-delimited parser cannot read at all) and `method = raw` (every other
+/// output method draws to a terminal instead of stdout).
+const CAVA_DEFAULT_CONF =
+    \\# Written by simpbar. Edit freely — it is only re-created when missing.
+    \\[general]
+    \\bars = 24
+    \\bar_width = 1
+    \\bar_spacing = 1
+    \\sleep_timer = 0
+    \\
+    \\[input]
+    \\# 'auto' is the monitor source of the default sink, i.e. whatever plays.
+    \\method = pipewire
+    \\source = auto
+    \\
+    \\[output]
+    \\method = raw
+    \\data_format = ascii
+    \\ascii_max_range = 1000
+    \\bar_delimiter = 59
+    \\frame_delimiter = 10
+    \\
+    \\[smoothing]
+    \\noise_reduction = 77
+    \\
+;
+
+/// Writes CAVA_DEFAULT_CONF to `conf` unless something is already there.
+/// Best-effort like writePidfile: a failure here just means the visualiser
+/// stays dead, which is no worse than the missing-file case it replaces.
+fn ensureCavaConf(conf: [:0]const u8) void {
+    const probe = posix.system.open(conf.ptr, .{ .ACCMODE = .RDONLY }, @as(posix.mode_t, 0));
+    if (probe >= 0) {
+        _ = posix.system.close(@intCast(probe));
+        return; // already there, hands off
+    }
+    const raw_fd = posix.system.open(conf.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(posix.mode_t, 0o644));
+    if (raw_fd < 0) return;
+    const fd: posix.fd_t = @intCast(raw_fd);
+    defer _ = posix.system.close(fd);
+    var off: usize = 0;
+    while (off < CAVA_DEFAULT_CONF.len) {
+        const n = posix.system.write(fd, CAVA_DEFAULT_CONF.ptr + off, CAVA_DEFAULT_CONF.len - off);
+        if (n <= 0) return;
+        off += @intCast(n);
+    }
+    logging.step("cava: wrote default {s}", .{conf});
+}
 
 const CavaState = struct {
     pending_fd: posix.fd_t = -1,
@@ -2762,7 +2937,9 @@ fn closeCava() void {
 
 /// Forks/execs `cava -p ~/.config/simpbar/cava.conf` with the child's stdout
 /// on a pipe this bar keeps, mirroring PolledCommand.startFetch's plumbing
-/// (who owns which end, CLOEXEC on read_fd, dying child = exit 127).
+/// (who owns which end, CLOEXEC on read_fd, dying child = exit 127). A missing
+/// cava.conf is materialised first, because cava's own failure mode is to exit
+/// instantly and leave the module blank with nothing on the bar to hint why.
 fn startCavaFetch() void {
     if (cava_state.pending_fd >= 0) return;
     const home = std.mem.span(getenv("HOME") orelse return);
@@ -2773,6 +2950,7 @@ fn startCavaFetch() void {
     if (conf.len >= conf_z_buf.len) return;
     @memcpy(conf_z_buf[0..conf.len], conf);
     conf_z_buf[conf.len] = 0;
+    ensureCavaConf(conf_z_buf[0..conf.len :0]);
     var argv = [_:null]?[*:0]const u8{ "env", "cava", "-p", conf_z_buf[0..conf.len :0].ptr, null };
 
     var pipe_fds: [2]posix.fd_t = undefined;
@@ -3746,7 +3924,7 @@ fn drawWorkspaces(
         while (nextUtf8Codepoint(text, &i)) |cp| {
             x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, color, 0, buf_width);
         }
-        click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .switch_workspace = ws.id });
+        click_regions.addScrollable(@intCast(hover_start), @intCast(hover_end), .{ .switch_workspace = ws.id }, .step_workspace);
         x0 += workspace_gap;
     }
     return x0;
@@ -3866,7 +4044,8 @@ fn drawLeftGroup(
         // left, the next module still starts MODULE_GAP after it, so a drag
         // that rejoins any two kinds (clock flush after launchers was a
         // 0-gap collision before) can never sit them flush against each
-        // other.
+        // other. Kinds that reserve their own MODULE_CELL_MIN cell below get
+        // that gap for free from the cell's padding, so it isn't double-counted.
         if (any_drawn) x0 += MODULE_GAP;
         switch (entry.kind) {
             .workspaces => {
@@ -3874,11 +4053,21 @@ fn drawLeftGroup(
             },
             .clock => {
                 // Static text, identical treatment to the center's clock
-                // segment (not clickable here either).
+                // segment (not clickable here either). Reserved a
+                // MODULE_CELL_MIN-wide cell like the right group's
+                // single-content modules, bounded by the center group's
+                // start edge — the left group advances rightward, so that
+                // edge is the only thing stopping a cell from growing into
+                // the center. Draws from cell.content_start, not from the
+                // pen, so the glyph run starts at the centered position
+                // while the pen jumps straight to the cell's right edge.
+                const cell = reserveLeftCell(x0, textPixelWidth(font, time_text), center_start_x);
+                var cx = cell.content_start;
                 var i: usize = 0;
                 while (nextUtf8Codepoint(time_text, &i)) |cp| {
-                    x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
+                    cx += drawGlyphAt(pixels, buf_width, buf_height, font, cx, y0, cp, current_config.appearance.text_color, 0, buf_width);
                 }
+                x0 = cell.next_pen;
             },
             .launchers => {
                 // Every pinned launcher, left-aligned from the running pen —
@@ -4098,7 +4287,7 @@ fn drawCenterGroup(
             while (nextUtf8Codepoint(seg.label, &i)) |cp| {
                 x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, color, 0, buf_width);
             }
-            click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .switch_workspace = ws_id });
+            click_regions.addScrollable(@intCast(hover_start), @intCast(hover_end), .{ .switch_workspace = ws_id }, .step_workspace);
         } else if (seg.command) |cmd| {
             const region_start = x0;
             const label_w = seg.icon_w + textPixelWidth(font, seg.label);
@@ -4301,9 +4490,18 @@ fn drawCavaEqualizer(pixels: [*]u32, buf_width: u32, buf_height: u32, x_end: i64
 /// color as it goes, so expanding/collapsing is a quick fade rather than an
 /// instant on/off. `first` tracks whether anything has been drawn yet in
 /// this pass, since only the very first drawn item skips the leading
-/// LAUNCHER_GAP that every subsequent one gets — this generalizes the
+/// MODULE_GAP that every subsequent one gets — this generalizes the
 /// original code's fixed "gap before every call except the first" pattern
 /// to an arbitrary enabled/disabled subset.
+///
+/// Single-content text modules (power, volume, cpu, …) additionally reserve a
+/// MODULE_CELL_MIN-wide cell via reserveRightCell so each one keeps its own
+/// space and never sits flush against its neighbour; the cell's padding is
+/// what fills the gap, so those cases no longer subtract MODULE_GAP
+/// themselves. Multi-item kinds (tray, cava) keep their explicit intra-module
+/// LAUNCHER_GAP instead: a cell per icon would space them arbitrarily far
+/// apart, and their width is data-driven rather than a label's, so there is
+/// no meaningful "natural width" to pad out to a minimum.
 fn drawRightGroup(
     pixels: [*]u32,
     buf_width: u32,
@@ -4314,6 +4512,7 @@ fn drawRightGroup(
     volume_text: []const u8,
     drawer_anim: f32,
     tray: *const Tray,
+    center_start_x: i64,
     pointer_x: i32,
     click_regions: *ClickRegions,
 ) void {
@@ -4336,17 +4535,21 @@ fn drawRightGroup(
 
         switch (entry.kind) {
             .power => {
-                if (!first) x_end -= LAUNCHER_GAP;
+                if (!first) x_end -= MODULE_GAP;
                 first = false;
-                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, POWER_BUTTON.label, text_color, .{ .spawn = POWER_BUTTON.command }, pointer_x, click_regions);
+                const cell = reserveRightCell(x_end, textPixelWidth(font, POWER_BUTTON.label), center_start_x);
+                x_end = cell.next_pen;
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, POWER_BUTTON.label, text_color, .{ .spawn = POWER_BUTTON.command }, pointer_x, click_regions);
             },
             .drawer_toggle => {
-                if (!first) x_end -= LAUNCHER_GAP;
+                if (!first) x_end -= MODULE_GAP;
                 first = false;
-                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, DRAWER_TOGGLE_LABEL, text_color, .toggle_drawer, pointer_x, click_regions);
+                const cell = reserveRightCell(x_end, textPixelWidth(font, DRAWER_TOGGLE_LABEL), center_start_x);
+                x_end = cell.next_pen;
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, DRAWER_TOGGLE_LABEL, text_color, .toggle_drawer, pointer_x, click_regions);
             },
             .volume => {
-                if (!first) x_end -= LAUNCHER_GAP;
+                if (!first) x_end -= MODULE_GAP;
                 first = false;
                 // Volume icon tiers match wireplumber's real "default"
                 // format-icons array (low/medium/high, U+F026/F027/F028).
@@ -4354,15 +4557,19 @@ fn drawRightGroup(
                 const vol_icon: []const u8 = if (vol_pct >= 67) "\u{f028}" else if (vol_pct >= 34) "\u{f027}" else "\u{f026}";
                 var vol_buf: [24]u8 = undefined;
                 const vol_label = std.fmt.bufPrint(&vol_buf, "{s} {s}", .{ vol_icon, volume_text }) catch vol_icon;
-                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, vol_label, drawer_color, null, pointer_x, click_regions);
+                const cell = reserveRightCell(x_end, textPixelWidth(font, vol_label), center_start_x);
+                x_end = cell.next_pen;
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, vol_label, drawer_color, null, pointer_x, click_regions);
             },
             .waypaper => {
-                if (!first) x_end -= LAUNCHER_GAP;
+                if (!first) x_end -= MODULE_GAP;
                 first = false;
-                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, WAYPAPER_BUTTON.label, drawer_color, .{ .spawn = WAYPAPER_BUTTON.command }, pointer_x, click_regions);
+                const cell = reserveRightCell(x_end, textPixelWidth(font, WAYPAPER_BUTTON.label), center_start_x);
+                x_end = cell.next_pen;
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, WAYPAPER_BUTTON.label, drawer_color, .{ .spawn = WAYPAPER_BUTTON.command }, pointer_x, click_regions);
             },
             .pacman => {
-                if (!first) x_end -= LAUNCHER_GAP;
+                if (!first) x_end -= MODULE_GAP;
                 first = false;
                 // custom/pacman's real format is "<big>ᗧ</big> {}" (Pac-Man
                 // glyph + count, no "UPD" text) — that exact character
@@ -4371,7 +4578,9 @@ fn drawRightGroup(
                 // actually ships with).
                 var pac_buf: [24]u8 = undefined;
                 const pac_label = std.fmt.bufPrint(&pac_buf, "\u{f306} {s}", .{pacman_text}) catch "\u{f306}";
-                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, pac_label, drawer_color, null, pointer_x, click_regions);
+                const cell = reserveRightCell(x_end, textPixelWidth(font, pac_label), center_start_x);
+                x_end = cell.next_pen;
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, pac_label, drawer_color, null, pointer_x, click_regions);
             },
             .tray => {
                 // icon-only items, no text label; skipped entirely if an
@@ -4390,50 +4599,62 @@ fn drawRightGroup(
                 // right-click (format-alt-click), which this scaffold
                 // doesn't distinguish from left-click yet.
                 if (weather_text.len > 0) {
-                    if (!first) x_end -= LAUNCHER_GAP;
+                    if (!first) x_end -= MODULE_GAP;
                     first = false;
-                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, weather_text, text_color, null, pointer_x, click_regions);
+                    const cell = reserveRightCell(x_end, textPixelWidth(font, weather_text), center_start_x);
+                    x_end = cell.next_pen;
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, weather_text, text_color, null, pointer_x, click_regions);
                 }
             },
             .cpu => {
-                if (!first) x_end -= LAUNCHER_GAP;
+                if (!first) x_end -= MODULE_GAP;
                 first = false;
                 var cpu_buf: [24]u8 = undefined;
                 const cpu_label = std.fmt.bufPrint(&cpu_buf, "\u{f2db} {d}%", .{sys_stats.cpu_pct}) catch "\u{f2db}";
-                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, cpu_label, color, null, pointer_x, click_regions);
+                const cell = reserveRightCell(x_end, textPixelWidth(font, cpu_label), center_start_x);
+                x_end = cell.next_pen;
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, cpu_label, color, null, pointer_x, click_regions);
             },
             .ram => {
-                if (!first) x_end -= LAUNCHER_GAP;
+                if (!first) x_end -= MODULE_GAP;
                 first = false;
                 var ram_buf: [24]u8 = undefined;
                 const ram_label = std.fmt.bufPrint(&ram_buf, "\u{f538} {d}%", .{sys_stats.ram_pct}) catch "\u{f538}";
-                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, ram_label, color, null, pointer_x, click_regions);
+                const cell = reserveRightCell(x_end, textPixelWidth(font, ram_label), center_start_x);
+                x_end = cell.next_pen;
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, ram_label, color, null, pointer_x, click_regions);
             },
             .disk => {
-                if (!first) x_end -= LAUNCHER_GAP;
+                if (!first) x_end -= MODULE_GAP;
                 first = false;
                 var disk_buf: [24]u8 = undefined;
                 const disk_label = std.fmt.bufPrint(&disk_buf, "\u{f0a0} {d}%", .{disk_pct}) catch "\u{f0a0}";
-                x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, disk_label, color, null, pointer_x, click_regions);
+                const cell = reserveRightCell(x_end, textPixelWidth(font, disk_label), center_start_x);
+                x_end = cell.next_pen;
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, disk_label, color, null, pointer_x, click_regions);
             },
             .battery => {
                 if (battery_state.found) {
-                    if (!first) x_end -= LAUNCHER_GAP;
+                    if (!first) x_end -= MODULE_GAP;
                     first = false;
                     var bat_buf: [24]u8 = undefined;
                     const bat_icon: []const u8 = if (battery_state.charging) "\u{f0e7}" else "\u{f240}";
                     const bat_label = std.fmt.bufPrint(&bat_buf, "{s} {d}%", .{ bat_icon, battery_state.capacity }) catch bat_icon;
-                    x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, bat_label, color, null, pointer_x, click_regions);
+                    const cell = reserveRightCell(x_end, textPixelWidth(font, bat_label), center_start_x);
+                    x_end = cell.next_pen;
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, bat_label, color, null, pointer_x, click_regions);
                 }
             },
             .cpu_temp => {
                 if (cpu_temp_state.found) {
-                    if (!first) x_end -= LAUNCHER_GAP;
+                    if (!first) x_end -= MODULE_GAP;
                     first = false;
                     var temp_buf: [24]u8 = undefined;
                     const celsius = @divTrunc(cpu_temp_state.millidegrees_c, 1000);
                     const temp_label = std.fmt.bufPrint(&temp_buf, "\u{f2c9} {d}\u{00b0}C", .{celsius}) catch "\u{f2c9}";
-                    x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, temp_label, color, null, pointer_x, click_regions);
+                    const cell = reserveRightCell(x_end, textPixelWidth(font, temp_label), center_start_x);
+                    x_end = cell.next_pen;
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, temp_label, color, null, pointer_x, click_regions);
                 }
             },
             .network => {
@@ -4444,11 +4665,13 @@ fn drawRightGroup(
                 else
                     net_speed_state.text();
                 if (value.len > 0) {
-                    if (!first) x_end -= LAUNCHER_GAP;
+                    if (!first) x_end -= MODULE_GAP;
                     first = false;
                     var net_buf: [48]u8 = undefined;
                     const net_label = std.fmt.bufPrint(&net_buf, "\u{f1eb} {s}", .{value}) catch "\u{f1eb}";
-                    x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, net_label, color, null, pointer_x, click_regions);
+                    const cell = reserveRightCell(x_end, textPixelWidth(font, net_label), center_start_x);
+                    x_end = cell.next_pen;
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, net_label, color, null, pointer_x, click_regions);
                 }
             },
             .custom_script => {
@@ -4456,7 +4679,7 @@ fn drawRightGroup(
                 if (custom_script_draw_index < custom_script_count) {
                     const text = custom_scripts[custom_script_draw_index].text();
                     if (text.len > 0) {
-                        if (!first) x_end -= LAUNCHER_GAP;
+                        if (!first) x_end -= MODULE_GAP;
                         first = false;
                         var script_buf: [96]u8 = undefined;
                         const label = entry.label orelse "";
@@ -4464,7 +4687,9 @@ fn drawRightGroup(
                             std.fmt.bufPrint(&script_buf, "{s}: {s}", .{ label, text }) catch text
                         else
                             text;
-                        x_end = drawRightAligned(pixels, buf_width, buf_height, font, y0, x_end, script_label, color, null, pointer_x, click_regions);
+                        const cell = reserveRightCell(x_end, textPixelWidth(font, script_label), center_start_x);
+                        x_end = cell.next_pen;
+                        _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, script_label, color, null, pointer_x, click_regions);
                     }
                 }
             },
@@ -4532,6 +4757,21 @@ fn seatListener(_: *wl.Seat, event: wl.Seat.Event, globals: *Globals) void {
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+
+/// How much vertical scroll distance (Wayland surface units) one workspace
+/// step costs. wl_pointer axis values are 24.8 fixed-point pixels of
+/// "scroll movement", not degrees or lines. Measured on this compositor: a
+/// single discrete wheel notch arrives as exactly 15.00, so this threshold
+/// is one physical click — verified rather than guessed. Touchpads send a
+/// stream of sub-notch deltas that must add up to it, which is what
+/// `scroll_accum` is for.
+const WORKSPACE_SCROLL_STEP: f64 = 15.0;
+
+/// Ceiling on steps dispatched from a single wl_pointer.axis event. A real
+/// wheel notch is one step, so this only ever bites on a pathological delta —
+/// without it, one enormous value could queue an unbounded burst of workspace
+/// switches and leave the desktop somewhere the user never asked for.
+const WORKSPACE_SCROLL_MAX_STEPS: i32 = 3;
 
 /// There is exactly ONE wl_pointer object for the whole client (confirmed:
 /// wl.Seat.getPointer() is called once in main(), regardless of how many
@@ -4648,11 +4888,86 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                 return;
             }
 
-            const region = bar.click_regions.hitTest(bar.pointer_x) orelse return;
+            // A miss here is not an error: regions only cover the modules
+            // themselves, so the gaps between them are bare background and
+            // used to be silently dropped. Left-click there runs the
+            // configured command (empty by default = no-op, as before).
+            // Right-click is deliberately left alone so it keeps falling
+            // through, matching how a right-click on empty background behaved
+            // when it was simply ignored.
+            const region = bar.click_regions.hitTest(bar.pointer_x);
+            if (region) |r| {
+                if (e.button == BTN_LEFT) {
+                    handleAction(bar, r.action);
+                } else if (e.button == BTN_RIGHT) {
+                    if (r.right_action) |ra| handleAction(bar, ra);
+                }
+                return;
+            }
             if (e.button == BTN_LEFT) {
-                handleAction(bar, region.action);
-            } else if (e.button == BTN_RIGHT) {
-                if (region.right_action) |ra| handleAction(bar, ra);
+                const cmd = current_config.appearance.empty_click_command;
+                if (cmd.len > 0) spawnDetached(cmd);
+            }
+        },
+        .axis => |e| {
+            // Scroll wheel. Horizontal scroll is left alone deliberately: this
+            // bar has no horizontal-scroll meaning for any module, and volume
+            // changes belong to the volume module's own keyboard path, not to
+            // whichever region happens to be under the pointer.
+            if (e.axis != .vertical_scroll) return;
+            const bar = &router.bars[router.current orelse return];
+            // Popup rows are a separate hit-test space (by y, not x) with no
+            // scroll semantics, so scrolling there is not ours to interpret.
+            if (bar.pointer_over_popup) return;
+            // The region is re-read from the CURRENT pointer_x every event
+            // rather than latched on .enter, so moving along the bar mid-gesture
+            // can't keep firing the module the scroll started over.
+            const region = bar.click_regions.hitTest(bar.pointer_x);
+            const scroll_action = if (region) |r| r.scroll_action else null;
+            if (scroll_action == null) {
+                // Drop any partial scroll on the floor: it was meant for a
+                // different module, and carrying it would make the next
+                // module jump the moment the pointer reached it.
+                bar.scroll_accum = 0.0;
+                return;
+            }
+            // Accumulate the axis delta and dispatch a step per whole notch
+            // worth, rather than per event: a touchpad streams sub-notch
+            // deltas, and firing on each would flip through workspaces far too
+            // fast to land on one. (Which SIGN means "forward" is settled by
+            // measurement below, not by the axis sign the protocol docs imply.)
+            bar.scroll_accum += e.value.toDouble();
+            // Truncate toward zero, so a partial step is carried in the
+            // remainder rather than rounded away: sustained scroll keeps
+            // flowing smoothly instead of needing a fresh full notch each time.
+            var steps: i32 = @intFromFloat(@divTrunc(bar.scroll_accum, WORKSPACE_SCROLL_STEP));
+            if (steps > WORKSPACE_SCROLL_MAX_STEPS) steps = WORKSPACE_SCROLL_MAX_STEPS;
+            if (steps < -WORKSPACE_SCROLL_MAX_STEPS) steps = -WORKSPACE_SCROLL_MAX_STEPS;
+            // Consume exactly the steps being dispatched, so what stays in the
+            // accumulator is only the sub-step remainder. (This must be
+            // computed from the CLAMPED `steps`, or a huge single delta would
+            // be drained from the accumulator while fewer steps actually ran.)
+            bar.scroll_accum -= @as(f64, @floatFromInt(steps)) * WORKSPACE_SCROLL_STEP;
+            if (steps == 0) return;
+            if (scroll_action.? == .step_workspace) {
+                // Direction, measured against the desktop's own binds rather
+                // than assumed: hyprland.lua binds mainMod+mouse_down/up to
+                // focus({workspace="e+1"/"e-1"}), and driving those exact
+                // binds with injected REL_WHEEL shows Hyprland reports the
+                // forward scroll as a NEGATIVE axis value (and back as
+                // positive) — the opposite of the wl_pointer.axis sign the
+                // protocol docs suggest. Injected-notch tests confirm this
+                // mapping lands on the same workspace the keyboard does, so
+                // the bar and the keybinds agree by measurement, not by
+                // reading the spec.
+                const direction: i32 = if (steps < 0) 1 else -1;
+                logging.step("axis: step_workspace {d} step(s) {s} (value {d:.2}, x {d}, accum left {d:.2})", .{
+                    @abs(steps), if (direction > 0) "next" else "prev", e.value.toDouble(), bar.pointer_x, bar.scroll_accum,
+                });
+                var n: usize = 0;
+                while (n < @as(usize, @intCast(@abs(steps)))) : (n += 1) {
+                    bar.workspaces.stepWorkspace(direction);
+                }
             }
         },
         else => {},
@@ -4727,9 +5042,59 @@ fn sqShrunkRadius(r: i32, side_a_px: u32, side_b_px: u32) i32 {
 }
 
 /// Rasterizes one frame into `pixels` (ARGB8888, bar.width×bar.height) — the
-/// shared CPU drawing step used by both presenters below. Background fill,
-/// borders, every module, and corner rounding all draw here first; only the
-/// final buffer hand-off to the compositor differs (shm vs gpu).
+/// CPU drawing step. Background fill, borders, every module, and corner
+/// rounding all draw here; drawAndCommit then hands the finished buffer to
+/// the compositor via wl_shm.
+/// Renders the clicked-on-this-frame geometry into one compact log line, and
+/// only when it differs from the line last logged. This is the single most
+/// useful trace when a module "isn't responding to the mouse": it shows every
+/// region's real x-range and what it does, which pixel analysis of a
+/// screenshot can only infer.
+fn actionName(a: Action) []const u8 {
+    return switch (a) {
+        .switch_workspace => "switch_workspace",
+        .spawn => "spawn",
+        .toggle_drawer => "toggle_drawer",
+        .activate_tray => "activate_tray",
+        .context_menu_tray => "context_menu_tray",
+        .mpris_control => "mpris_control",
+    };
+}
+
+fn logClickRegionLayout(bar: *Bar) void {
+    var line_buf: [1024]u8 = undefined;
+    var used: usize = 0;
+    // bufPrint into the remaining tail, advancing `used` — std.io's
+    // fixedBufferStream is gone in Zig 0.16, and this file already builds all
+    // its strings with bufPrint for that reason.
+    const append = struct {
+        fn f(buf: []u8, len: *usize, comptime fmt: []const u8, args: anytype) void {
+            const tail = buf[len.*..];
+            const s = std.fmt.bufPrint(tail, fmt, args) catch return;
+            len.* += s.len;
+        }
+    }.f;
+    append(&line_buf, &used, "regions ({d}):", .{bar.click_regions.len});
+    for (bar.click_regions.items[0..bar.click_regions.len]) |r| {
+        append(&line_buf, &used, " {d}-{d}={s}", .{ r.x_start, r.x_end, actionName(r.action) });
+        if (r.action == .switch_workspace) {
+            append(&line_buf, &used, "({d})", .{r.action.switch_workspace});
+        }
+        if (r.scroll_action) |sa| {
+            append(&line_buf, &used, "+scroll:{s}", .{@tagName(sa)});
+        }
+    }
+    const line = line_buf[0..used];
+    if (g_last_region_log_len == line.len and
+        std.mem.eql(u8, line, g_last_region_log[0..line.len])) return;
+    @memcpy(g_last_region_log[0..line.len], line);
+    g_last_region_log_len = line.len;
+    logging.step("layout {s}", .{line});
+}
+
+var g_last_region_log: [1024]u8 = undefined;
+var g_last_region_log_len: usize = 0;
+
 fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     const pixel_count: usize = @as(usize, bar.width) * bar.height;
     // Only the fill's alpha varies with bg_opacity_percent — text/icons/
@@ -4849,9 +5214,16 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
         volume_text,
         bar.drawer_anim,
         bar.tray,
+        center_start_x,
         bar.pointer_x,
         &bar.click_regions,
     );
+
+    // Region layout changes only when module widths change (a workspace
+    // appears, a tray icon arrives, the clock's digits change width), so
+    // logging it only on change keeps module geometry debuggable without
+    // producing a line per frame — the bar redraws continuously.
+    logClickRegionLayout(bar);
 
     // Corner rounding — the very last drawing step, so it clips everything
     // (background, borders, every module) rather than just the background
@@ -4910,11 +5282,12 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     }
 }
 
-/// Shared-memory presenter: allocate an anonymous memfd buffer, paint the
-/// frame into it, then hand it to the compositor as a wl_shm argb8888
-/// buffer. This is the original renderer (no GPU involved), used when
-/// `renderer` is "shm" or the GPU path has fallen back.
-fn drawShmAndCommit(bar: *Bar) !void {
+/// Paints the current frame and hands it to the compositor: allocate an
+/// anonymous memfd buffer, paint the frame into it, then attach it as a
+/// wl_shm argb8888 buffer. This is the bar's only presenter — every pixel is
+/// rasterized on the CPU (see paintFrame) and handed over through shared
+/// memory, so no EGL/GLES context is ever created and no GL driver is loaded.
+fn drawAndCommit(bar: *Bar) !void {
     const stride = bar.width * 4; // ARGB8888
     const size: usize = @as(usize, stride) * bar.height;
 
@@ -4953,41 +5326,4 @@ fn drawShmAndCommit(bar: *Bar) !void {
     bar.surface.attach(buffer, 0, 0);
     bar.surface.damageBuffer(0, 0, @intCast(bar.width), @intCast(bar.height));
     bar.surface.commit();
-}
-
-/// Paints the current frame and hands it to the compositor through whichever
-/// renderer is configured: "gpu" (EGL/GLES2 blit, src/gpu.zig) or "shm" (the
-/// original shared-memory path). GPU is best-effort — init or present
-/// failures log once and permanently fall back to shm for that bar, so a
-/// compositor without a GPU path just gets the old renderer instead of a
-/// dead bar.
-fn drawAndCommit(bar: *Bar) !void {
-    if (bar.use_gpu) {
-        if (bar.gpu == null and !bar.gpu_disabled) {
-            bar.gpu = gpu.Renderer.init(std.heap.page_allocator, bar.display, bar.surface, bar.width, bar.height) catch |err| blk: {
-                logging.warn("gpu: EGL init failed ({}); falling back to shared memory", .{err});
-                bar.gpu_disabled = true;
-                break :blk null;
-            };
-        }
-        if (bar.gpu) |*g| {
-            g.ensurePixels(bar.width, bar.height) catch |err| {
-                logging.err("gpu: buffer resize failed ({}); falling back to shared memory", .{err});
-                g.deinit();
-                bar.gpu = null;
-                bar.gpu_disabled = true;
-                return drawShmAndCommit(bar);
-            };
-            paintFrame(bar, g.pixels.ptr);
-            g.present() catch |err| {
-                logging.err("gpu: present failed ({}); falling back to shared memory", .{err});
-                g.deinit();
-                bar.gpu = null;
-                bar.gpu_disabled = true;
-                return drawShmAndCommit(bar);
-            };
-            return;
-        }
-    }
-    return drawShmAndCommit(bar);
 }

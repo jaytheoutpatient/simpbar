@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=App Drawer
+Comment=Open the simpbar app drawer (SUPER+Tab)
+# Bare `appdrawer`, not $HOME/.local/bin/appdrawer. The desktop-entry spec has
+# no environment-variable expansion for Exec, and GLib does not merely fail to
+# expand it -- `gio launch` rejects such a file outright and exits 1 without
+# ever running anything. The script lives in /usr/bin, which is on the session
+# PATH, so no expansion is needed.
+Exec=appdrawer
+Icon=preferences-desktop-display-symbolic
+Terminal=false
+Categories=Utility;
+StartupNotify=true

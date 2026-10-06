@@ -29,6 +29,7 @@ Same interactive flow as the Arch script, adapted to apt. It's regularly tested 
 - AUR-only items are skipped with working replacements: `sway-notification-center` instead of swaync, `mate-polkit` autostart instead of the Arch polkit path, `wlogout`/`steam-devices` from apt, `azote` + a `swaybg.service` (systemd user service) instead of waypaper for the Bing wallpaper (both pickers are just front-ends to swaybg), plus an `azote-restore.service` so the wallpaper you pick in azote comes back after every login, and rofi's bundled Material theme instead of installing one
 - Dropped in favour of a fast AUR package set on Arch; on Debian, matugen (the Material You colorscheme generator) isn't packaged either — the installer offers a `cargo install matugen` route instead (see [Auto-theming with matugen](#auto-theming-with-matugen))
 - Heroic takes the Flatpak route (`com.heroicgameslauncher.hgl`), Discord the official `.deb`; ProtonPlus, falcond, nwg-drawer, and the dracula/zafiro themes aren't packaged on Debian and are skipped with a warning
+- The app drawer needs **quickshell**, which is in Arch's `extra` repo but isn't packaged on Debian in any suite (checked bookworm/trixie/sid). The Debian installer skips the drawer with a warning and rofi remains the launcher, but it still places the QML and the toggle script ready to go, so installing quickshell later is all it takes to switch over (see [App drawer](#app-drawer))
 - The GPU detection picks Debian's actual driver/repo names: `nvidia-driver` + `libnvidia-egl-wayland` (with a prompt to enable `non-free` if unavailable), `mesa-vulkan-drivers`/`intel-media-va-driver` for AMD/Intel
 
 The shipped binaries are distro-aware — `simpbar`, `simpbar-welcome`, `simpbar-config`, `simpbar-check-updates`, and `simpbar-launch-browser` detect apt vs pacman at runtime, so a single build works on either family.
@@ -48,12 +49,43 @@ How it works — matugen never touches your bar config, wallpaper, or anything e
 
 The chosen scheme type lives in `~/.config/simpbar/matugen-type` (a simpbar-owned file, since matugen 4.x only accepts `--type` on the command line and **ignores** a `type` key in its own config.toml); `simpbar-matugen` reads it on every run. The installer wires all of this when you opt into matugen: Arch pulls it from the AUR, Debian from crates.io (rustc + cargo), then places the config + template, installs `simpbar-matugen`, adds the picker hook, and pre-generates a scheme from that day's Bing wallpaper.
 
+## App drawer
+
+An ArcMenu-style launcher that slides up from under the bar — app grid, categories, search, pinned favourites, and a power menu (lock / suspend / log out / restart / power off). It reads the same `matugen.json` as the bar, so both repaint together when you change wallpaper.
+
+Three ways to open it:
+
+- **Click empty bar space** (see below)
+- **`SUPER + Tab`**
+- **`appdrawer`** by hand — `toggle` (default), `open`, `close`, or `start`. It's in `/usr/bin`, so no path needed.
+
+It's a [quickshell](https://quickshell.org) panel living in `~/.config/quickshell/appdrawer/`, not a plain Qt/QML app: layer-shell support (the thing that lets a window dock to a screen edge like a panel) lives in quickshell's QtWayland fork rather than upstream `qt6-wayland`, so a stock Qt6 QML app has no way to make one.
+
+- **Arch**: quickshell is in the official `extra` repo, so the installer pulls it and deploys the panel.
+- **Debian**: quickshell isn't packaged in any suite, and building it isn't a good option — it uses private Qt APIs and must be compiled against the exact Qt version it ships with or it crashes on ABI mismatch. The installer skips the drawer with a warning and leaves rofi as the launcher, but still stages the QML in `~/.local/share/simpbar/appdrawer/` and the toggle script, so installing quickshell yourself is all that's needed afterwards.
+
+Your pinned apps live in `~/.config/quickshell/appdrawer/favourites.json`, which the installer never overwrites once it exists.
+
+## Clicking empty bar space
+
+`empty_click_command`: the `appearance` section of `~/.config/simpbar/config.json` takes a command to run when you **left-click bare bar background** — any spot no module occupies, i.e. the gaps between them:
+
+```json
+{ "appearance": { "empty_click_command": "appdrawer" } }
+```
+
+It runs through `sh -c`, so `$HOME` expands and shell operators work. Empty (the default) disables the behaviour and the click does nothing, exactly as before. Right-clicking empty space is deliberately left alone.
+
+This is *not* the same as the bar's own drawer toggle (the `⌄` button, which reveals `in_drawer` modules like volume and tray) — the two are independent and can be enabled separately.
+
+There is no widget for this in **simpbar-config**, but it is round-tripped from disk on every save, so hand-editing it in `config.json` and then using the GUI is safe.
+
 ## What the install script sets up
 
 **Bar, compositor & theming**
 - simpbar (this repo's source, built from scratch during install), Hyprland, foot (terminal), rofi with its bundled Material theme, swaync (notifications)
 - Dracula GTK theme, Zafiro-Dracula icon theme, Bibata Modern Classic cursor — all applied automatically via nwg-look's settings, no manual toggling needed
-- nwg-drawer as the app-menu behind the bar's Menu button (ArcMenu-style GNOME Shell extensions don't run under Hyprland at all — this is the actual Wayland-native equivalent)
+- nwg-drawer, usable from rofi as a fallback app-menu (ArcMenu-style GNOME Shell extensions don't run under Hyprland at all)
 - fastfetch (also wired into every new bash/fish shell)
 
 **Wallpaper**
@@ -85,7 +117,7 @@ The chosen scheme type lives in `~/.config/simpbar/matugen-type` (a simpbar-owne
 - A background update checker (systemd timer, runs every 6h) that notifies you when there's a new Arch/AUR update or a new commit on this repo
 
 **Pinned apps in the bar**
-simpbar ships with quick-launch icons next to the menu button: Browser, Discord, Files (Nautilus), Terminal, Steam, Config (Hyprland settings), and Simpbar Welcome. Browser and Discord are smart about it — whichever one you actually installed is what launches by default, and you can change your mind later from the Welcome app without needing to touch any config directly.
+simpbar ships with quick-launch icons: Browser, Discord, Files (Nautilus), Terminal, Steam, Config (Hyprland settings), and Simpbar Welcome. Browser and Discord are smart about it — whichever one you actually installed is what launches by default, and you can change your mind later from the Welcome app without needing to touch any config directly.
 
 ## Simpbar Welcome
 
@@ -122,6 +154,8 @@ pages (Appearance, Modules, Shortcuts).
 | `SUPER` | (modifier) |
 | `SUPER + Enter` | Open terminal |
 | `SUPER + Space` | Open Rofi |
+| `SUPER + Tab` | Toggle the app drawer |
+| `SUPER + W` | Restart the bar |
 | `SUPER + E` | Open Nautilus |
 | `SUPER + Q` | Exit the focused app |
 | `SUPER + [1–0]` | Switch workspaces |

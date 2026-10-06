@@ -242,7 +242,7 @@ run_spinner "Extracting archive" \
     || die "Could not extract simpbar archive."
 rm -f /tmp/simpbar.zip
 
-CONFIG_DIRS=(hypr swaync fastfetch)
+CONFIG_DIRS=(hypr swaync fastfetch matugen)
 for d in "${CONFIG_DIRS[@]}" simpbar; do
     if [ ! -d "/tmp/simpbar-temp/simpbar-main/$d" ]; then
         rm -rf /tmp/simpbar-temp
@@ -253,6 +253,13 @@ done
 for d in "${CONFIG_DIRS[@]}"; do
     cp -r "/tmp/simpbar-temp/simpbar-main/$d" ~/.config/
 done
+# Fix matugen layout: templates in templates/ subdir, scripts in root
+if [ -d ~/.config/matugen ]; then
+    mkdir -p ~/.config/matugen/templates
+    for f in ~/.config/matugen/*.json ~/.config/matugen/*.css ~/.config/matugen/*.lua ~/.config/matugen/*.ini ~/.config/matugen/*.conf; do
+        [ -f "$f" ] && mv -f "$f" ~/.config/matugen/templates/ 2>/dev/null || true
+    done
+fi
 ok "Configs placed in ~/.config/{${CONFIG_DIRS[*]// /,}}"
 
 mkdir -p ~/.local/share/simpbar
@@ -274,6 +281,30 @@ for f in "${AUX_FILES[@]}"; do
     cp "/tmp/simpbar-temp/simpbar-main/$f" ~/.local/share/simpbar/
 done
 ok "simpbar aux files (logo, update-checker, launchers, .desktop entries) placed in ~/.local/share/simpbar"
+
+# The app drawer's QML and its toggle script, staged under ~/.local/share/simpbar
+# (NOT /tmp/simpbar-temp, deleted on the next line, and NOT ~/.config, because
+# the drawer needs quickshell — which Debian does not package, so it is optional
+# here; see the "App drawer" section further down).
+if [ ! -d "/tmp/simpbar-temp/simpbar-main/quickshell/appdrawer" ]; then
+    rm -rf /tmp/simpbar-temp
+    die "Downloaded archive did not contain quickshell/appdrawer/ — layout may have changed upstream."
+fi
+rm -rf ~/.local/share/simpbar/appdrawer
+cp -r /tmp/simpbar-temp/simpbar-main/quickshell/appdrawer ~/.local/share/simpbar/appdrawer
+
+if [ ! -f "/tmp/simpbar-temp/simpbar-main/appdrawer" ]; then
+    rm -rf /tmp/simpbar-temp
+    die "Downloaded archive did not contain the appdrawer script — layout may have changed upstream."
+fi
+cp /tmp/simpbar-temp/simpbar-main/appdrawer ~/.local/share/simpbar/appdrawer-bin
+
+if [ ! -f "/tmp/simpbar-temp/simpbar-main/appdrawer.desktop" ]; then
+    rm -rf /tmp/simpbar-temp
+    die "Downloaded archive did not contain appdrawer.desktop — layout may have changed upstream."
+fi
+cp /tmp/simpbar-temp/simpbar-main/appdrawer.desktop ~/.local/share/simpbar/appdrawer.desktop
+
 rm -rf /tmp/simpbar-temp
 
 # waypaper is Arch/AUR-only — not in Debian. Azote (installed above) is the
@@ -917,6 +948,74 @@ else
     warn "qt6ct or breeze isn't installed — skipping Qt6 theme setup"
 fi
 
+# ── App drawer (quickshell panel) ────────────────────────────────────
+# An ArcMenu-style launcher that slides up from under the bar: app grid,
+# categories, search, pinned favourites, and a system-actions menu, all
+# themed from the same matugen.json the bar reads so the two repaint
+# together on a wallpaper change. Clicking empty bar space opens it too
+# (see the empty_click_command option).
+#
+# OPTIONAL ON DEBIAN, unlike Arch. quickshell ships in Arch's `extra` repo but
+# is NOT packaged on Debian in any suite (checked bookworm/trixie/sid), and it
+# is not something to build from source here either: quickshell uses private Qt
+# APIs and MUST be compiled against the exact Qt version it ships with or it
+# crashes on ABI mismatch, so a self-build against Debian's Qt would be a
+# coin flip rather than an install.
+#
+# So the drawer is deployed only if quickshell happens to be present, and the
+# files are still installed when it isn't so enabling it later is a one-liner
+# (install quickshell, restart, done). rofi remains the launcher here — see the
+# nwg-drawer note above.
+if command -v quickshell >/dev/null 2>&1; then
+    mkdir -p ~/.config/quickshell/appdrawer
+    for qml in AppModel.qml AppTile.qml Drawer.qml Icons.qml shell.qml Theme.qml; do
+        if [ ! -f "$HOME/.local/share/simpbar/appdrawer/$qml" ]; then
+            warn "appdrawer $qml missing from the archive — the drawer may not load (skipped)"
+        else
+            cp "$HOME/.local/share/simpbar/appdrawer/$qml" ~/.config/quickshell/appdrawer/$qml
+        fi
+    done
+    ok "App drawer QML placed in ~/.config/quickshell/appdrawer"
+
+    if [ ! -f ~/.config/quickshell/appdrawer/favourites.json ]; then
+        printf '{ "ids": [] }\n' > ~/.config/quickshell/appdrawer/favourites.json
+        ok "App drawer favourites file created (empty — pin apps from the drawer)"
+    else
+        ok "Existing app drawer favourites kept"
+    fi
+
+    # /usr/bin (like every other helper here) rather than ~/.local/bin, so the
+    # Hyprland bind and the .desktop entry can both call a bare `appdrawer`.
+    # ~/.local/bin is NOT on the session PATH, and a .desktop Exec has no
+    # environment-variable expansion to fall back on.
+    sudo install -Dm755 "$HOME/.local/share/simpbar/appdrawer-bin" /usr/bin/appdrawer
+    sudo install -Dm644 "$HOME/.local/share/simpbar/appdrawer.desktop" /usr/share/applications/appdrawer.desktop
+    ok "App drawer toggle installed to /usr/bin/appdrawer"
+
+    # Only writes the key when config.json is absent or already lacks it: the
+    # bar's own default is "" (feature off), and overwriting a value the user
+    # has since changed would be rude. On an existing config this needs a bar
+    # restart to take effect, so say so rather than implying it's live.
+    mkdir -p ~/.config/simpbar
+    if [ ! -f ~/.config/simpbar/config.json ]; then
+        printf '{"appearance":{"empty_click_command":"appdrawer"}}\n' \
+            > ~/.config/simpbar/config.json
+        ok "Wrote ~/.config/simpbar/config.json with empty_click_command set"
+    elif grep -q '"empty_click_command"' ~/.config/simpbar/config.json; then
+        ok "config.json already sets empty_click_command — leaving your value alone"
+    else
+        warn "config.json exists but doesn't set empty_click_command — add \"empty_click_command\": \"appdrawer\" to its appearance block to enable empty-bar clicks (restart the bar after)"
+    fi
+else
+    warn "quickshell isn't packaged on Debian (it's Arch's \"extra\" repo only), so the app drawer is NOT installed"
+    warn "  Everything is staged for later, so enabling it is a few commands once you have quickshell:"
+    warn "    mkdir -p ~/.config/quickshell && cp -r ~/.local/share/simpbar/appdrawer ~/.config/quickshell/appdrawer"
+    warn "    sudo install -m755 ~/.local/share/simpbar/appdrawer-bin /usr/bin/appdrawer"
+    warn "    sudo install -m644 ~/.local/share/simpbar/appdrawer.desktop /usr/share/applications/appdrawer.desktop"
+    warn "  Until then the SUPER+Tab bind does nothing and rofi (SUPER+Space) is your launcher."
+    warn "  Empty bar clicks are unaffected: empty_click_command defaults to off."
+fi
+
 # ── Step 5: choose a browser ─────────────────────────────────────────
 # None of the six Arch options are in Debian repos, so each is installed from
 # its official apt repo/.deb where one exists, or Firefox ESR from Debian.
@@ -1271,39 +1370,8 @@ if [ "$INSTALL_MATUGEN" -eq 1 ]; then
         if [ -e ~/.config/matugen/config.toml ]; then
             warn "~/.config/matugen/config.toml already exists — leaving your existing matugen config alone"
         else
-            cat > ~/.config/matugen/config.toml <<'MATUGENCONF'
-# Matugen config for simpbar auto-theming. Writes ~/.config/simpbar/matugen.json,
-# which the bar merges in on every reload (see the "Auto-theme with matugen"
-# toggle in simpbar-config). To merge this into an existing matugen setup
-# instead of copying it wholesale, just add the [templates.simpbar] block to
-# your current ~/.config/matugen/config.toml.
-
-[config]
-# Non-interactive: never prompt for a source color to pick from the image,
-# so wallpaper pickers can run this in the background.
-version_check = false
-# fallback_color + prefer are what make `matugen image …` deterministic —
-# the color closest to this Material-ish teal wins, so no "Multiple source
-# colors found" prompt ever appears. Change it to taste.
-fallback_color = "#80CBC4"
-prefer = "closest-to-fallback"
-
-# simpbar doesn't want matugen touching the wallpaper — azote owns that.
-[config.wallpaper]
-set = false
-# matugen 4.2.0 requires this key even with set = false (it only runs when
-# set = true, it just must exist for the config to parse).
-command = "true"
-
-[templates.simpbar]
-input_path = "~/.config/matugen/templates/simpbar.json"
-output_path = "~/.config/simpbar/matugen.json"
-# Reload the running bar (SIGUSR1) right after the colors land. Wrapped in
-# `sh -c '…'` so it works no matter what the user's $SHELL is (fish, zsh,
-# …) — the hook runs through matugen via the login shell. NO-ops if the bar
-# isn't running or never wrote its pidfile.
-post_hook = "sh -c 'if [ -s \"$HOME/.config/simpbar/simpbar.pid\" ]; then kill -USR1 \"$(cat \"$HOME/.config/simpbar/simpbar.pid\")\" 2>/dev/null; fi'"
-MATUGENCONF
+            warn "matugen config missing — copying from repo's full config"
+            cp "/tmp/simpbar-temp/simpbar-main/matugen/config.toml" ~/.config/matugen/config.toml 2>/dev/null || true
             ok "matugen config placed in ~/.config/matugen/config.toml"
         fi
 
@@ -1546,6 +1614,9 @@ if [ -x /usr/bin/simpbar ]; then
 fi
 if [ -x /usr/bin/simpbar-config ]; then
     ok "simpbar-config installed to /usr/bin/simpbar-config — configure the bar's appearance, modules, and shortcuts anytime from rofi, or run 'simpbar-config'"
+fi
+if command -v quickshell >/dev/null 2>&1; then
+    ok "App drawer installed — SUPER+Tab, or click empty bar space, to open it (themed from matugen)"
 fi
 ok "hypr config in ~/.config/hypr"
 ok "swaync config in ~/.config/swaync"

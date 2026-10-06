@@ -1,0 +1,73 @@
+#!/bin/sh
+# Toggle the quickshell app drawer (~/.config/quickshell/appdrawer).
+#
+# Normally this is a single IPC round trip to the already-running daemon, which
+# measures ~25ms. The cold path matters too: if the daemon is not up (crashed,
+# or a keypress lands before the autostart has settled) we start it and then
+# open the drawer, so one keypress always does the obvious thing rather than
+# silently doing nothing.
+#
+#   appdrawer        toggle the drawer (self-healing)
+#   appdrawer start  start the daemon in the background, do not toggle
+#   appdrawer open   open the drawer
+#   appdrawer close  close the drawer
+#
+# `quickshell ipc call` exits 255 when no instance is running, which is what the
+# cold-path detection keys off.
+set -u
+
+CFG=appdrawer
+QS=quickshell
+
+if [ "$#" -gt 0 ]; then
+    case "$1" in
+        start)
+            # -d detaches, so this returns immediately instead of blocking the
+            # compositor's startup path.
+            "$QS" -c "$CFG" -d >/dev/null 2>&1
+            exit $?
+            ;;
+        open|close|toggle)
+            ACTION="$1"
+            ;;
+        *)
+            printf 'usage: %s [toggle|open|close|start]\n' "$0" >&2
+            exit 2
+            ;;
+    esac
+else
+    ACTION=toggle
+fi
+
+# quickshell missing entirely (it is in Arch's `extra` repo but is not packaged
+# on Debian, where the installer skips the drawer). Fail with a clear message
+# rather than letting the shell print `quickshell: not found` on every keypress,
+# or worse: hanging through the 6s cold-path retry below on something that can
+# never succeed.
+if ! command -v "$QS" >/dev/null 2>&1; then
+    printf 'appdrawer: %s is not installed, so the app drawer cannot run.\n' "$QS" >&2
+    printf '         On Debian it is not packaged at all; see https://quickshell.org to build it.\n' >&2
+    exit 127
+fi
+
+# Fast path: daemon already running.
+if "$QS" ipc -c "$CFG" call "drawer" "$ACTION" >/dev/null 2>&1; then
+    exit 0
+fi
+
+# Cold path: bring the daemon up, then retry until its IPC target is registered.
+# The handler is registered during config load, well before the icon scan and
+# app catalogue finish, so this normally succeeds in well under a second.
+"$QS" -c "$CFG" -d >/dev/null 2>&1 &
+
+waited=0
+while [ "$waited" -lt 60 ]; do
+    if "$QS" ipc -c "$CFG" call "drawer" "$ACTION" >/dev/null 2>&1; then
+        exit 0
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+done
+
+printf 'appdrawer: daemon did not come up within 6s\n' >&2
+exit 1

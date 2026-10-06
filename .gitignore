@@ -2,3 +2,9 @@
 zig-out/
 __pycache__/
 *.pyc
+
+# Per-user app-drawer state (the user's pinned apps), not repo config. The
+# installer's copy lives in ~/.config/quickshell/appdrawer/ and is never
+# overwritten once it exists; this is here so running the drawer from a repo
+# checkout can't leak one person's favourites into a commit.
+quickshell/appdrawer/favourites.json

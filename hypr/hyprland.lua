@@ -36,6 +36,9 @@ hl.on("hyprland.start", function()
 	--   hl.exec_cmd(terminal)
 	--   hl.exec_cmd("nm-applet")
 	hl.exec_cmd("simpbar &")
+	-- App drawer daemon (quickshell). Started up front so the SUPER+Tab bind is
+	-- a plain IPC round trip instead of a cold start on first press.
+	hl.exec_cmd("appdrawer start")
 	--Delete this line to prevent it starting at every boot
 	hl.exec_cmd("simpbar-welcome")
 	-- This Line here ^^
@@ -153,7 +156,16 @@ hl.bind(mainMod .. " + V", hl.dsp.window.float({ action = "toggle" }))
 hl.bind(mainMod .. " + Space", hl.dsp.exec_cmd(menu))
 hl.bind(mainMod .. " + P", hl.dsp.window.pseudo())
 hl.bind(mainMod .. " + J", hl.dsp.layout("togglesplit")) -- dwindle only
-hl.bind(mainMod .. " + W", hl.dsp.exec_cmd("pkill -x simpbar || simpbar &"))
+-- Restart the bar. The kill and the start are SEPARATE statements on purpose:
+-- `pkill -x simpbar || simpbar &` parses as `(pkill || simpbar) &`, so whenever
+-- the bar is actually running -- the only case where you want a restart --
+-- pkill succeeds and the `||` short-circuits, meaning the bar never comes back.
+hl.bind(mainMod .. " + W", hl.dsp.exec_cmd("pkill -x simpbar; simpbar &"))
+-- App drawer: a quickshell panel that slides up from under the bar, themed from
+-- the same matugen.json. Clicking empty bar space opens it too.
+-- Bare `appdrawer`: the installer puts the toggle in /usr/bin, which is on the
+-- session PATH. ~/.local/bin is not, and a .desktop Exec gets no $HOME expansion.
+hl.bind(mainMod .. " + Tab", hl.dsp.exec_cmd("appdrawer"))
 -- Move focus with mainMod + arrow keys
 hl.bind(mainMod .. " + left", hl.dsp.focus({ direction = "left" }))
 hl.bind(mainMod .. " + right", hl.dsp.focus({ direction = "right" }))

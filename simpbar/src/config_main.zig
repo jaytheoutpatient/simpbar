@@ -158,7 +158,6 @@ const DEFAULT_RIGHT = [_]ModuleEntry{
     .{ .kind = .weather, .enabled = true },
 };
 const CENTER_LAUNCHERS = [_]LauncherButton{
-    .{ .label = "\u{f0c9} Menu", .command = "nwg-drawer" },
     .{ .label = "\u{f0ac} Browser", .command = "simpbar-launch-browser" },
     .{ .label = "\u{f066f} Discord", .command = "simpbar-launch-discord" },
     .{ .label = "\u{f07c} Files", .command = "nautilus" },
@@ -225,6 +224,16 @@ const JsonAppearance = struct {
     // "matugen" (default) or "manual" — see the toggle in the Appearance
     // tab. Matches main.zig's JsonAppearance.auto_theme exactly.
     auto_theme: []const u8 = "matugen",
+    // Command run on left-click of bare bar background. Matches main.zig's
+    // JsonAppearance.empty_click_command exactly.
+    //
+    // There is no widget for this in the GUI, so it is round-tripped from disk
+    // untouched: hand-edit it in config.json and every save here preserves it.
+    // That round-trip is the whole reason this field has to exist in this
+    // struct — buildConfigJson below writes an explicit field list rather than
+    // re-serializing what it read, so any key absent from this struct is
+    // silently deleted on the next save.
+    empty_click_command: []const u8 = "",
 };
 
 const JsonModules = struct {
@@ -473,6 +482,11 @@ var live_monitor: []const u8 = "";
 // so — like live_position's own note about avoiding self-referential
 // hazards — reassigning this outright on every toggle is always safe.
 var live_auto_theme: []const u8 = "matugen";
+// Arena-backed from config.json and stable for this GUI's process lifetime,
+// same reasoning as live_monitor (which is also assigned straight from a
+// parsed value) — so assigning it outright on load is safe. No widget edits
+// it; it's carried through saves untouched.
+var live_empty_click_command: []const u8 = "";
 // matugen scheme type (one of MATUGEN_TYPE_CHOICES), always a static literal
 // like live_auto_theme above. Loaded from ~/.config/simpbar/matugen-type;
 // defaults to matugen's own default when that file is absent.
@@ -831,6 +845,7 @@ fn loadConfigFromDisk() void {
     live_clock_format = validClockFormatChoice(j.clock_format);
     live_monitor = j.monitor;
     live_auto_theme = if (std.mem.eql(u8, j.auto_theme, "manual")) "manual" else "matugen";
+    live_empty_click_command = j.empty_click_command;
     // Scheme type lives in its own simpbar-owned file (not config.json, not
     // matugen's config.toml — see matugen_type_path). Ignore anything that
     // isn't a known matugen --type value rather than handing matugen junk.
@@ -1001,6 +1016,8 @@ fn buildConfigJson() ![]u8 {
     try appendJsonString(&list, live_monitor);
     try list.appendSlice(gpa, ",\"auto_theme\":");
     try appendJsonString(&list, live_auto_theme);
+    try list.appendSlice(gpa, ",\"empty_click_command\":");
+    try appendJsonString(&list, live_empty_click_command);
 
     try list.appendSlice(gpa, "},\"modules\":{\"left\":");
     try appendModuleGroup(&list, &live_left);
