@@ -1302,9 +1302,17 @@ if command -v quickshell >/dev/null 2>&1; then
     # Hyprland bind and the .desktop entry can both call a bare `appdrawer`.
     # ~/.local/bin is NOT on the session PATH, and a .desktop Exec has no
     # environment-variable expansion to fall back on.
-    sudo install -Dm755 ~/.local/share/simpbar/appdrawer-bin /usr/bin/appdrawer
-    sudo install -Dm644 ~/.local/share/simpbar/appdrawer.desktop /usr/share/applications/appdrawer.desktop
-    ok "App drawer toggle installed to /usr/bin/appdrawer"
+    # Checked rather than assumed: an unchecked `sudo install` still prints the
+    # ok line when it fails (no set -e here), so a user without sudo rights or
+    # a read-only /usr/bin would get a cheerful message and a drawer that never
+    # opens. Same pattern the other helper installs below use.
+    if sudo install -Dm755 ~/.local/share/simpbar/appdrawer-bin /usr/bin/appdrawer \
+       && sudo install -Dm644 ~/.local/share/simpbar/appdrawer.desktop /usr/share/applications/appdrawer.desktop; then
+        ok "App drawer toggle installed to /usr/bin/appdrawer"
+    else
+        warn "could not install to /usr/bin — put appdrawer somewhere on your PATH yourself, then point"
+        warn "  empty_click_command and the SUPER+Tab bind at it"
+    fi
 
     # Make empty-space bar clicks open the drawer. Only writes the key when
     # config.json is absent or already lacks it: the bar's own default is ""
