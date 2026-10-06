@@ -1,6 +1,6 @@
 #!/bin/bash
 # simpbar-wallpaper — the wallpaper engine: list wallpapers, apply one with
-# swaybg, and retheme the desktop from it with matugen.
+# swaybg, retheme the desktop from it with matugen, and fetch new ones.
 #
 # Usage:
 #   simpbar-wallpaper              open the wallpaper picker (drawer's Wallpapers tab)
@@ -8,6 +8,62 @@
 #   simpbar-wallpaper set <img>    apply <img>: swaybg + matugen + remember it
 #   simpbar-wallpaper random       apply a random wallpaper from the folders
 #   simpbar-wallpaper current      print the wallpaper currently remembered
+#
+# Fetching new ones (saved into the first wallpaper folder, not applied unless
+# you say --apply):
+#   simpbar-wallpaper bing [--count N]          download N of the last 8 Bing wallpapers
+#   simpbar-wallpaper search <query> [opts]     list wallhaven.cc matches, TAB-separated
+#   simpbar-wallpaper search <query> --save N   ...and download the first N of them
+#   simpbar-wallpaper fetch <id|url> [--apply]  download one wallhaven.cc wallpaper
+#   simpbar-wallpaper random --online           fetch a random wallhaven.cc wallpaper
+#
+# search/fetch/random options:
+#   --page N        results page (default 1)
+#   --atleast WxH   minimum resolution; "any" to disable (default 1920x1080)
+#   --sorting S     favorites | toplist | date_added (default favorites)
+#   --order O       asc | desc (default desc)
+#   --category C    general | anime | nature | people, comma-separated, or
+#                   "any" (default general). Enforced locally -- see below.
+#   --purity P      100 sfw, 110 +questionable, 111 +explicit (default 100).
+#                   Anything but 100 needs your own API key -- see below.
+#   --seed S        shuffle seed; the same seed returns the same page
+#   --save N        download the first N results (max 24)
+#   --maxsize MB    skip wallpapers larger than this (default: no limit).
+#                   Real ones run to 14 MB, so this is a metered-connection
+#                   guard rather than a quality default.
+#   --force         overwrite an already-downloaded file
+#   --apply         apply it once downloaded
+#   --minres WxH    random --online only: minimum resolution (default 1920x1080)
+#
+# Two things about wallhaven.cc's search that the defaults here work around:
+#
+#   * sorting=toplist is the API's own default and is a small hand-picked set --
+#     "aurora borealis" has 2 results under it and 588 under favorites. Most
+#     wallpaper wants people actually saved a wallpaper, so favorites is ours.
+#
+#   * categories is accepted by /search and then ignored: general, nature and
+#     anime all return the same total, and nature/people never come back at all.
+#     The category is therefore filtered here rather than trusted to the API, so
+#     --category means what it says. The cost is that a filtered page can come
+#     back empty while later pages have matches; the "no matches" message says
+#     so rather than pretending the query found nothing.
+#
+#   * the single-wallpaper lookup, /api/v1/f/<id>, requires an API key even for
+#     SFW content -- it 404s anonymously even for ids the search endpoint just
+#     handed out. `search` therefore returns the direct image URL as its last
+#     column, `search --save N` downloads straight from those, and `fetch`
+#     accepts a URL as readily as an id. Nothing in the common path needs an
+#     account.
+#
+# Accounts and content rating. wallhaven.cc's SFW search needs no credentials.
+# Anything else does, and it is your key and your account — in
+# ~/.config/simpbar/wallhaven:
+#       key=<your key from https://wallhaven.cc/user/settings/api>
+#       purity=100
+#   or export WALLHAVEN_APIKEY=... in the environment. SFW is the default and
+#   stays the default when no key is present — an adult-rated wallpaper
+#   appearing on screen because a key happened to be lying around is not a
+#   trade this script makes on your behalf.
 #
 # This replaces waypaper as the thing that owns the wallpaper. waypaper is a GUI
 # front-end whose real job is exactly these four steps; keeping it in the loop
@@ -48,6 +104,13 @@ COLOR="#ffffff"
 
 die() { echo "simpbar-wallpaper: $*" >&2; exit 1; }
 log() { echo "simpbar-wallpaper: $*" >&2; }
+
+# Same message, but returns instead of exiting. Needed inside a command
+# substitution: `exit 1` in a subshell exits only the subshell, so a helper that
+# dies while being called as `x="$(helper)"` leaves the caller running on with an
+# empty string where a validated value should be. That is how a refused
+# --purity 111 still went on to run an unfiltered search.
+fatal() { log "$@"; return 1; }
 
 # ---------------------------------------------------------------------------
 # Folders
@@ -316,6 +379,10 @@ cmd_current() {
 }
 
 cmd_random() {
+    # `--online` fetches a new one instead of choosing from what is on disk.
+    case "${1:-}" in
+        --online) shift; cmd_random_online "$@"; return $? ;;
+    esac
     local n
     n="$(list_images | wc -l)"
     [ "$n" -gt 0 ] || die "no wallpapers found in: $(read_dirs | tr '\n' ' ')"
@@ -323,6 +390,673 @@ cmd_random() {
     img="$(list_images | sed -n "$((RANDOM % n + 1))p")"
     [ -n "$img" ] || die "could not pick a wallpaper"
     cmd_set "$img"
+}
+
+# The usage block for the fetch subcommands, which all share one option set.
+# Anchored on two marker lines that live in the header, so it cannot run away to
+# the end of the file the way a `sed` range with a typo'd end pattern does.
+fetch_help() {
+    awk '/^# Fetching new ones/ { on = 1 }
+         /^# Accounts and content rating/ { on = 0 }
+         on { sub(/^# ?/, ""); print }' "$0"
+}
+
+# ---------------------------------------------------------------------------
+# Fetching
+# ---------------------------------------------------------------------------
+#
+# Only the subcommands below need the network, and they are the only ones that
+# need curl and python3. list/set/random/current keep working on a machine
+# without either, so a wallpaper you already have is never gated behind being
+# able to download a new one.
+#
+# Output discipline is the same as the rest of the script: stdout is paths, one
+# per line, and everything meant for a human goes to stderr. That is what makes
+# `search ... | cut -f1 | xargs -n1 fetch --apply` work.
+
+API_TIMEOUT=30          # seconds per request
+UA="simpbar-wallpaper/1.0 (+https://github.com/jaytheoutpatient/simpbar)"
+
+need_curl() {
+    command -v curl >/dev/null 2>&1 \
+        || die "curl is required to download wallpapers"
+}
+
+need_json() {
+    command -v python3 >/dev/null 2>&1 \
+        || die "python3 is required to read the download APIs' JSON"
+}
+
+# The folder new wallpapers land in: the first configured one, so they show up
+# in the picker without any further configuration. Returns non-zero rather than
+# dying, because callers reach this through a command substitution.
+first_dir() {
+    local d
+    d="$(read_dirs | head -n1)"
+    [ -n "$d" ] || fatal "no wallpaper folder configured"
+    [ -n "$d" ] || return 1
+    printf '%s' "$d"
+}
+
+# True when $1 is a plausible wallpaper: real image magic bytes, and big enough
+# to be one.
+#
+# The magic bytes are checked rather than the extension because the extension is
+# exactly what is unverified -- the server chose it. But magic bytes alone are
+# not enough either: Bing answers an unknown image id with HTTP 200 and a 1192
+# byte 1x1 JPEG, which passes every byte check and would land in the wallpaper
+# folder as a plausible-looking .jpg that swaybg happily stretches across the
+# screen and matugen themes from. Real Bing files are 330 KB (1080p) and 3.6 MB
+# (UHD), so a floor this low still leaves two orders of magnitude of headroom.
+MIN_IMAGE_BYTES=16384
+
+is_real_image() {
+    local sig
+    [ -s "$1" ] || return 1
+    [ "$(wc -c < "$1")" -ge "$MIN_IMAGE_BYTES" ] || return 1
+    # NOTE: a case glob has to match the *whole* string, so every pattern below
+    # needs a trailing `*`. Without one the pattern can never fire at all, which
+    # is silently how the AVIF/HEIC check ended up being dead code.
+    sig="$(head -c 12 "$1" | od -An -tx1 2>/dev/null | tr -d ' \n')"
+    case "$sig" in
+        ffd8ff*)                          return 0 ;;  # jpeg
+        89504e470d0a1a0a*)                return 0 ;;  # png
+        474946383[79]61*)                 return 0 ;;  # gif
+        52494646????????57454250*)        return 0 ;;  # webp (RIFF....WEBP)
+        424d????????????????*)            return 0 ;;  # bmp
+        49492a00*|4d4d002a*)               return 0 ;;  # tiff (LE/BE)
+        ????????66747970????*)             return 0 ;;  # avif/heic (....ftyp....)
+        *)                               return 1 ;;
+    esac
+}
+
+# Download $1 to $2 atomically: into a .part sibling, verified, then renamed.
+# A half-finished or non-image download therefore never becomes a wallpaper the
+# picker offers. Returns 0 on success, 1 on transfer failure, 2 on a bad file.
+fetch_to() {
+    local url="$1" dest="$2" tmp="$2.part"
+    mkdir -p "$(dirname "$dest")" || return 1
+    rm -f "$tmp"
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time "$API_TIMEOUT" \
+         -A "$UA" -o "$tmp" "$url" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! is_real_image "$tmp"; then
+        rm -f "$tmp"
+        return 2
+    fi
+    mv -f "$tmp" "$dest" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+# GET $1 and print the JSON body, or fail with a reason that names the actual
+# cause.
+#
+# Deliberately not using `curl -f`. With --fail, a 404 from wallhaven.cc looks
+# exactly like an unplugged network cable, and "no such wallpaper" is the single
+# most common thing to get wrong here. So the status is captured and reported:
+# 404 is a bad id, 429 is throttling, 5xx is their problem, and only a non-zero
+# curl exit is ours.
+api_get() {
+    local url="$1" tmp code rc=0
+    tmp="$(mktemp)" || { log "could not create a temporary file"; return 1; }
+    code="$(curl -sSL --retry 2 --retry-delay 1 --max-time "$API_TIMEOUT" \
+              -A "$UA" -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null)" || rc=$?
+
+    if [ "$rc" -ne 0 ] || [ -z "$code" ] || [ "$code" = "000" ]; then
+        rm -f "$tmp"
+        log "could not reach the server (curl exit $rc)"
+        log "  check your network connection"
+        return 1
+    fi
+    case "$code" in
+        2*) : ;;
+        404) rm -f "$tmp"
+             log "the server has no such entry (HTTP 404)"
+             return 1 ;;
+        429) rm -f "$tmp"
+             # wallhaven.cc publishes a window of 45; make no such claim about
+             # the other host on this URL, so the message stays truthful for
+             # whatever this was called against.
+             log "rate limited by the server (HTTP 429)"
+             log "  wait a minute and try again"
+             return 1 ;;
+        *)   rm -f "$tmp"
+             log "the server returned HTTP $code"
+             return 1 ;;
+    esac
+    # A captive portal serving a 200 login page would otherwise parse as an
+    # empty result set.
+    if ! head -c 1 "$tmp" 2>/dev/null | grep -q '{'; then
+        rm -f "$tmp"
+        log "unexpected response (not JSON) — a proxy or captive portal?"
+        return 1
+    fi
+    cat "$tmp"
+    rm -f "$tmp"
+    return 0
+}
+
+# Percent-encode $1. Hand-rolling this is how you get a query with a space in it
+# silently turning into a different search.
+urlenc() {
+    python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+# --- wallhaven.cc ----------------------------------------------------------
+#
+# https://wallhaven.cc/api — SFW search needs no credentials; anything else
+# does. Read in the same key=value shape as the rest of ~/.config/simpbar.
+
+wallhaven_conf() {
+    local f="$CONFIG_DIR/wallhaven" line
+    if [ -r "$f" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                "$1="*) printf '%s' "${line#*=}"; return 0 ;;
+            esac
+        done < "$f"
+    fi
+    return 1
+}
+
+wallhaven_key() {
+    [ -n "${WALLHAVEN_APIKEY:-}" ] && { printf '%s' "$WALLHAVEN_APIKEY"; return 0; }
+    wallhaven_conf key
+}
+
+# Validated content rating. Bit 1 is SFW, bit 2 questionable, bit 3 explicit —
+# a 3-digit 0/1 mask, which is a poor format and the one thing here worth
+# refusing rather than guessing at. Returns non-zero instead of dying, since
+# every caller reads this through a command substitution.
+wallhaven_purity() {
+    local p="${1:-}"
+    [ -n "$p" ] || p="$(wallhaven_conf purity || printf '100')"
+    case "$p" in
+        100|110|111|010|011|001|101) ;;
+        *) fatal "invalid --purity '$p' (want 100, 110 or 111)"; return 1 ;;
+    esac
+    if [ "$p" != "100" ] && ! wallhaven_key >/dev/null; then
+        fatal "--purity $p needs your wallhaven.cc API key; add 'key=...' to $CONFIG_DIR/wallhaven or set WALLHAVEN_APIKEY"
+        return 1
+    fi
+    printf '%s' "$p"
+}
+
+# "&apikey=..." when there is a key, empty otherwise. Omitting the parameter
+# entirely is different from sending an empty one: the latter is an auth error
+# from the API, not an anonymous request.
+wallhaven_authopts() {
+    local k
+    k="$(wallhaven_key || true)"
+    [ -n "$k" ] && printf '&apikey=%s' "$(urlenc "$k")"
+}
+
+# Print "id<TAB>url<TAB>ext<TAB>category" for one record read on stdin.
+# jpg/webp/png only: those are what the API serves, and they are all things
+# swaybg and matugen can read.
+wallhaven_one() {
+    python3 -c '
+import json, sys
+d = (json.load(sys.stdin).get("data") or {})
+ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(d.get("file_type"), "jpg")
+print("\t".join([str(d.get("id") or ""), str(d.get("path") or ""), ext, str(d.get("category") or "")]))
+'
+}
+
+# Print "id<TAB>extension" parsed out of a wallhaven image URL:
+#   https://w.wallhaven.cc/full/m9/wallhaven-m9rmw1.jpg
+# The `search` output already carries this URL, so the id and type can be had
+# without asking the API anything -- which matters, because wallhaven's
+# single-wallpaper lookup (/api/v1/f/<id>) requires an API key even for SFW
+# content, and so is unusable for an anonymous user.
+wallhaven_id_ext_from_url() {
+    python3 -c '
+import re, sys, urllib.parse
+path = urllib.parse.urlparse(sys.argv[1]).path
+m = re.search(r"wallhaven-([0-9a-zA-Z]+)\.([A-Za-z0-9]+)$", path)
+print("\t".join(m.groups()) if m else "\t")
+' "$1"
+}
+
+# Download one wallhaven image to the wallpaper folder as wallhaven-<id>.<ext>.
+# Prints the saved path. Returns 0 saved-or-already-present, 1 on failure.
+save_wallhaven() {
+    local url="$1" id="$2" ext="$3" force="${4:-0}" dest dir
+    dir="$(first_dir)" || exit 1
+    dest="$dir/wallhaven-${id:-$(date +%s)}.${ext:-jpg}"
+    if [ -e "$dest" ] && [ "$force" -eq 0 ]; then
+        log "already have $(basename "$dest")"
+    else
+        # NOTE: `case "$(fetch_to …)"` would always fall through to the default
+        # branch — command substitution captures stdout, and the exit status is
+        # only readable as $?. fetch_to prints nothing, so the case word would
+        # always be the empty string.
+        local rc=0
+        fetch_to "$url" "$dest" || rc=$?
+        case "$rc" in
+            0) log "saved $(basename "$dest")" ;;
+            2) log "$(basename "$dest"): the server did not return an image"; return 1 ;;
+            *) log "could not download $(basename "$dest")"; return 1 ;;
+        esac
+    fi
+    printf '%s\n' "$dest"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# bing
+# ---------------------------------------------------------------------------
+
+# The archive behind the daily Bing wallpaper. idx=0 is today and n=8 is as far
+# back as this endpoint goes, so it is an 8-day window and not an archive you
+# can page arbitrarily deep into.
+BING_API="https://www.bing.com/HPImageArchive.aspx"
+
+cmd_bing() {
+    local count=1 apply=0 arg
+    while [ $# -gt 0 ]; do
+        arg="$1"
+        case "$arg" in
+            --count) count="${2:-}"; shift 2 || die "--count needs a number" ;;
+            --count=*) count="${arg#*=}"; shift ;;
+            --apply) apply=1; shift ;;
+            -h|--help) fetch_help; return 0 ;;
+            *) die "unknown option for bing: $arg" ;;
+        esac
+    done
+    need_curl; need_json
+
+    case "$count" in
+        ''|*[!0-9]*) die "--count must be a number" ;;
+    esac
+    [ "$count" -ge 1 ] || die "--count must be at least 1"
+    [ "$count" -le 8 ] || die "--count is at most 8 (the archive only serves the last 8 days)"
+
+    local json
+    json="$(api_get "$BING_API?format=js&idx=0&n=$count&mkt=en-US")" || return 1
+
+    local dir; dir="$(first_dir)" || exit 1
+    mkdir -p "$dir" || die "cannot create $dir"
+
+    local got=0 name date urlbase url copyright dest rc newest=""
+    while IFS=$'\t' read -r urlbase url date copyright; do
+        [ -n "$urlbase$url" ] || continue
+        # Fall back to the name if the date was unparseable; a wallpaper named
+        # after Bing's own slug beats one with an empty filename.
+        name="bing-${date:-unknown}.jpg"
+        dest="$dir/$name"
+
+        if [ -e "$dest" ]; then
+            log "already have $name"
+        else
+            # UHD first: urlbase with the _UHD suffix is the 4K original, and
+            # the plain "url" field is a 1920x1080 crop. Fall back to the crop on
+            # *any* UHD failure, not just a bad file — an unknown id answers
+            # 404, and falling back only on a magic-byte mismatch would skip a
+            # perfectly good 1080p download.
+            fetch_to "https://www.bing.com${urlbase}_UHD.jpg" "$dest"
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                fetch_to "https://www.bing.com${url}" "$dest"
+                rc=$?
+            fi
+            case "$rc" in
+                0) log "saved $name  ${copyright:-}" ;;
+                2) log "skipped ${date:-an entry}: the server did not return an image" ; continue ;;
+                *) log "could not download ${date:-an entry}"; continue ;;
+            esac
+        fi
+
+        got=$((got + 1))
+        [ -n "$newest" ] || newest="$dest"
+        printf '%s\n' "$dest"
+    done < <(printf '%s' "$json" | python3 -c '
+import json, re, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for im in (d.get("images") or []):
+    s = re.sub(r"\D", "", str(im.get("startdate") or ""))
+    if len(s) == 8:
+        day = "%s-%s-%s" % (s[0:4], s[4:6], s[6:8])
+    elif len(s) == 6:
+        day = "20%s-%s-%s" % (s[4:6], s[0:2], s[2:4])
+    else:
+        day = ""
+    print("\t".join([str(im.get("urlbase") or ""), str(im.get("url") or ""),
+                     day, str(im.get("copyright") or "").replace("\t", " ")]))
+')
+
+    if [ "$got" -eq 0 ]; then
+        log "Bing's archive returned nothing usable"
+        return 1
+    fi
+    # Only the most recent one is applied. Firing cmd_set for every entry would
+    # run the swaybg swap and a matugen pass per image and leave whichever
+    # happened to be last on screen, which is the oldest of the batch.
+    if [ "$apply" -eq 1 ]; then
+        log "applying the most recent"
+        cmd_set "$newest"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# wallhaven.cc
+# ---------------------------------------------------------------------------
+
+# id, resolution, category/purity, favourites, views, dominant colours, URL.
+# TAB-separated so `cut -f1` is the id and the rest is still there to read.
+cmd_search() {
+    local query="" page=1 atleast="1920x1080" sorting="favorites" order="desc"
+    local category="general" purity="" seed="" save=0 force=0 apply=0 arg
+    local maxsize=0
+
+    while [ $# -gt 0 ]; do
+        arg="$1"
+        case "$arg" in
+            --page)      page="${2:-}"; shift 2 || die "--page needs a number" ;;
+            --page=*)    page="${arg#*=}"; shift ;;
+            --atleast)   atleast="${2:-}"; shift 2 || die "--atleast needs WxH" ;;
+            --atleast=*) atleast="${arg#*=}"; shift ;;
+            --sorting)   sorting="${2:-}"; shift 2 || die "--sorting needs a value" ;;
+            --sorting=*) sorting="${arg#*=}"; shift ;;
+            --order)     order="${2:-}"; shift 2 || die "--order needs asc or desc" ;;
+            --order=*)   order="${arg#*=}"; shift ;;
+            --category)  category="${2:-}"; shift 2 || die "--category needs a value" ;;
+            --category=*) category="${arg#*=}"; shift ;;
+            --purity)    purity="${2:-}"; shift 2 || die "--purity needs a value" ;;
+            --purity=*)  purity="${arg#*=}"; shift ;;
+            --seed)      seed="${2:-}"; shift 2 || die "--seed needs a value" ;;
+            --seed=*)    seed="${arg#*=}"; shift ;;
+            --save)      save="${2:-}"; shift 2 || die "--save needs a count" ;;
+            --maxsize)   maxsize="${2:-}"; shift 2 || die "--maxsize needs a number of MB" ;;
+            --maxsize=*) maxsize="${arg#*=}"; shift ;;
+            --save=*)    save="${arg#*=}"; shift ;;
+            --force)     force=1; shift ;;
+            --apply)     apply=1; shift ;;
+            -h|--help)   fetch_help; return 0 ;;
+            -*)          die "unknown option for search: $arg" ;;
+            *)           query="${query:+$query }$arg"; shift ;;
+        esac
+    done
+
+    need_curl; need_json
+
+    [ -n "$query" ] || die "search needs a query (try: simpbar-wallpaper search 'northern lights')"
+    case "$page" in ''|*[!0-9]*) die "--page must be a number" ;; esac
+    [ "$page" -ge 1 ] || die "--page starts at 1"
+    case "$save" in ''|*[!0-9]*) die "--save needs a count" ;; esac
+    [ "$save" -le 24 ] || die "--save is at most 24 (one page of results)"
+    case "$maxsize" in ''|*[!0-9]*) die "--maxsize must be a number of MB" ;; esac
+    case "$sorting" in favorites|toplist|date_added) ;; *) die "--sorting must be favorites, toplist or date_added" ;; esac
+    case "$order" in asc|desc) ;; *) die "--order must be asc or desc" ;; esac
+    # Comma-separated, because the API's own categories parameter takes a list
+    # even though it then ignores it.
+    local c
+    for c in ${category//,/ }; do
+        case "$c" in
+            general|anime|nature|people) ;;
+            *) die "--category must be general, anime, nature or people (comma-separated), or 'any'" ;;
+        esac
+    done
+    [ "$category" = "any" ] && category=""
+    if [ "$atleast" != "any" ] && ! printf '%s' "$atleast" | grep -Eq '^[0-9]+x[0-9]+$'; then
+        die "--atleast must be WxH (1920x1080) or 'any'"
+    fi
+
+    purity="$(wallhaven_purity "$purity")" || exit 1
+
+    # categories is sent because it costs nothing and may start working, but the
+    # result is filtered locally as well -- see the header.
+    local url="https://wallhaven.cc/api/v1/search"
+    url="$url?q=$(urlenc "$query")&purity=$purity"
+    [ -n "$category" ] && url="$url&categories=$(urlenc "$category")"
+    url="$url&sorting=$sorting&order=$order&page=$page"
+    [ "$atleast" != "any" ] && url="$url&atleast=$atleast"
+    [ -n "$seed" ] && url="$url&seed=$(urlenc "$seed")"
+    url="$url$(wallhaven_authopts)"
+
+    local json
+    json="$(api_get "$url")" || return 1
+
+    local n
+    n="$(printf '%s' "$json" | python3 -c '
+import json, sys
+want = set(filter(None, sys.argv[1].split(",")))
+maxsize = int(sys.argv[2]) * 1024 * 1024
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+rows = []
+for w in (d.get("data") or []):
+    if want and str(w.get("category") or "") not in want:
+        continue
+    size = w.get("file_size")
+    if maxsize and isinstance(size, int) and size > maxsize:
+        continue
+    rows.append("\t".join([
+        str(w.get("id") or ""),
+        str(w.get("resolution") or ""),
+        "%s/%s" % (w.get("category") or "", w.get("purity") or ""),
+        str(size if size is not None else ""),
+        str(w.get("favorites") if w.get("favorites") is not None else ""),
+        ",".join(w.get("colors") or []),
+        str(w.get("path") or ""),
+    ]))
+print("\n".join(rows))
+' "$category" "$maxsize")" || { log "could not read the API's response"; return 1; }
+
+    if ! printf '%s' "$n" | grep -q '[^[:space:]]'; then
+        local total
+        total="$(printf '%s' "$json" | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin).get("meta", {}).get("total", ""))
+except Exception: print("")
+')"
+        if [ -n "$category" ]; then
+            log "no '${category}' results for \"$query\" on page $page"
+            log "  the API does not filter by category itself, so this is filtered here --"
+            log "  the page may simply have had other categories on it. Try --page $((page + 1)) or --category any"
+        else
+            log "no results for \"$query\" (purity=$purity, min ${atleast})"
+        fi
+        return 1
+    fi
+
+    # --save hands out the paths only; the results stay on stderr so a saved run
+    # still shows what it found.
+    if [ "$save" -gt 0 ]; then
+        local first="" sid surl sext sdest rc=0
+        while IFS=$'\t' read -r sid _sres _scat _ssize _sfav _scols surl; do
+            [ "$save" -gt 0 ] || break
+            [ -n "$surl" ] || continue
+            # The id and type come straight out of the URL, so nothing else is
+            # asked of the API -- which is what makes saving work without a key.
+            IFS=$'\t' read -r sid sext < <(wallhaven_id_ext_from_url "$surl")
+            [ -n "$sid" ] || continue
+            sdest="$(save_wallhaven "$surl" "$sid" "$sext" "$force")" || { rc=1; continue; }
+            # save_wallhaven's path went into $sdest via command substitution, so
+            # it has to be re-emitted here for stdout to stay "paths only".
+            printf '%s\n' "$sdest"
+            [ -n "$first" ] || first="$sdest"
+            save=$((save - 1))
+        done <<< "$n"
+        if [ "$apply" -eq 1 ] && [ -n "$first" ]; then
+            log "applying the first result"
+            cmd_set "$first"
+        fi
+        return "$rc"
+    fi
+
+    printf '%s\n' "$n"
+    return 0
+}
+
+# Download one wallpaper, given either a wallhaven id or a direct image URL.
+# Prints the saved path.
+cmd_fetch() {
+    local target="" apply=0 force=0 arg
+    while [ $# -gt 0 ]; do
+        arg="$1"
+        case "$arg" in
+            --apply) apply=1; shift ;;
+            --force) force=1; shift ;;
+            -h|--help) fetch_help; return 0 ;;
+            -*) die "unknown option for fetch: $arg" ;;
+            *) target="$arg"; shift ;;
+        esac
+    done
+    [ -n "$target" ] || die "fetch needs an id or a URL (see: simpbar-wallpaper search --help)"
+    need_curl
+
+    local url id ext dest rec
+    case "$target" in
+        http://*|https://*)
+            # Already a direct link. No API round trip, so no key needed.
+            url="$target"
+            IFS=$'\t' read -r id ext < <(wallhaven_id_ext_from_url "$url")
+            if [ -z "$id" ]; then
+                log "'$target' does not look like a wallhaven image URL"
+                log "  expected something like https://w.wallhaven.cc/full/xx/wallhaven-xxxxx.jpg"
+                return 1
+            fi
+            dest="$(save_wallhaven "$url" "$id" "$ext" "$force")" || return 1
+            ;;
+        */*|*://*)
+            die "'$target' looks like a path, not a wallpaper id — use: simpbar-wallpaper set $target"
+            ;;
+        *)
+            need_json
+            rec="$(api_get "https://wallhaven.cc/api/v1/f/$target$(wallhaven_authopts)")" || {
+                if ! wallhaven_key >/dev/null; then
+                    log "wallhaven requires an API key to look an id up, even for SFW content."
+                    log "  Add key=... to $CONFIG_DIR/wallhaven, or skip the lookup entirely:"
+                    log "    simpbar-wallpaper search '<query>' --save 1"
+                    log "    simpbar-wallpaper fetch <url-from-search>"
+                fi
+                return 1
+            }
+            IFS=$'\t' read -r id url ext _cat <<< "$(printf '%s' "$rec" | wallhaven_one)"
+            [ -n "$url" ] || die "no downloadable file for id $target (it may need an API key at that rating)"
+            dest="$(save_wallhaven "$url" "$id" "$ext" "$force")" || return 1
+            ;;
+    esac
+
+    [ "$apply" -eq 1 ] && cmd_set "$dest"
+    return 0
+}
+
+# One random wallpaper from the internet. Unlike bing/search this applies what
+# it downloads: `random` is the verb that means "put something on my screen",
+# and fetching without showing it would be `fetch` with dice.
+#
+# Built on /search?sorting=random rather than wallhaven's /api/v1/random, which
+# currently answers HTTP 404 to every anonymous request regardless of its
+# parameters. The search endpoint has a documented random sort over the whole
+# catalogue and does work.
+cmd_random_online() {
+    # api_url and img_url are deliberately distinct names: on the first retry
+    # the loop overwrote `url` with the image URL and the next api_get fetched a
+    # JPEG, which then failed the "is this JSON" check.
+    local purity="" minres="1920x1080" category="general" arg api_url json
+    local rec got_id img_url imgext got_cat dest rc=0
+    while [ $# -gt 0 ]; do
+        arg="$1"
+        case "$arg" in
+            --purity)   purity="${2:-}"; shift 2 || die "--purity needs a value" ;;
+            --purity=*) purity="${arg#*=}"; shift ;;
+            --minres)   minres="${2:-}"; shift 2 || die "--minres needs WxH" ;;
+            --minres=*) minres="${arg#*=}"; shift ;;
+            --category) category="${2:-}"; shift 2 || die "--category needs a value" ;;
+            --category=*) category="${arg#*=}"; shift ;;
+            -h|--help)  fetch_help; return 0 ;;
+            *) die "unknown option for --online: $arg" ;;
+        esac
+    done
+    need_curl; need_json
+
+    if [ "$minres" != "any" ] && ! printf '%s' "$minres" | grep -Eq '^[0-9]+x[0-9]+$'; then
+        die "--minres must be WxH (1920x1080) or 'any'"
+    fi
+    local c
+    for c in ${category//,/ }; do
+        case "$c" in
+            general|anime|nature|people) ;;
+            *) die "--category must be general, anime, nature or people (comma-separated), or 'any'" ;;
+        esac
+    done
+    [ "$category" = "any" ] && category=""
+
+    purity="$(wallhaven_purity "$purity")" || exit 1
+
+    api_url="https://wallhaven.cc/api/v1/search?sorting=random&purity=$purity"
+    [ -n "$category" ] && api_url="$api_url&categories=$(urlenc "$category")"
+    [ "$minres" != "any" ] && api_url="$api_url&atleast=$minres"
+    api_url="$api_url$(wallhaven_authopts)"
+
+    # categories is ignored by this endpoint like every other, so a mismatched
+    # category is expected rather than exceptional: draw again until one turns
+    # up instead of accepting a wallpaper from the wrong genre. Each draw scans
+    # the whole page (24 rows), not just the first result — with nature at ~10%
+    # of the catalogue, the first row of a page matches only sometimes, but a
+    # whole page matches almost always, so this rarely needs a second round trip.
+    local attempt=0 max_tries=6 got_cat="" matched=0
+    while [ "$attempt" -lt "$max_tries" ]; do
+        attempt=$((attempt + 1))
+        json="$(api_get "$api_url")" || return 1
+        # Print the first row whose category matches (or the whole list when no
+        # category was asked for), as id/path/file_type/category.
+        rec="$(printf '%s' "$json" | python3 -c '
+import json, sys
+want = sys.argv[1].split(",") if sys.argv[1] else None
+rows = json.load(sys.stdin).get("data") or []
+best = None
+for w in rows:
+    if not want or str(w.get("category") or "") in want:
+        best = w
+        break
+if best is None and rows and not want:
+    best = rows[0]
+if best is None:
+    sys.exit(0)
+print("\t".join(str(best.get(k) or "") for k in ("id", "path", "file_type", "category")))
+' "$category" | sed 's|image/jpeg|jpg|; s|image/png|png|; s|image/webp|webp|')" || { log "could not read the API's response"; return 1; }
+        IFS=$'\t' read -r got_id img_url imgext got_cat <<< "$rec"
+        if [ -z "$img_url" ]; then
+            if [ -n "$category" ]; then
+                # An empty page is normal when filtering by a minority category:
+                # draw again rather than failing.
+                log "no $category wallpaper on that page, drawing again"
+                continue
+            fi
+            log "wallhaven returned nothing"
+            return 1
+        fi
+        if [ -z "$category" ] || printf '%s' ",$category," | grep -q ",$got_cat,"; then
+            matched=1
+            break
+        fi
+        log "no $category wallpaper on that page (only '$got_cat'), drawing again"
+    done
+    if [ "$matched" -eq 0 ]; then
+        die "wallhaven never served a '$category' wallpaper in $max_tries full pages (its feeds leave nature out entirely — verified by paging) — try general, people or anime, or drop --category"
+    fi
+
+    local rdir
+    rdir="$(first_dir)" || exit 1
+    dest="$rdir/wallhaven-${got_id:-random}.${imgext:-jpg}"
+    fetch_to "$img_url" "$dest" || rc=$?  # stdout, not $? -- see save_wallhaven
+    case "$rc" in
+        0) log "saved $(basename "$dest")" ;;
+        2) die "the server did not return an image for $got_id" ;;
+        *) die "could not download $got_id" ;;
+    esac
+    cmd_set "$dest"
 }
 
 # ---------------------------------------------------------------------------
@@ -355,15 +1089,24 @@ main() {
         set)           shift; cmd_set "$@" ;;
         random)        shift; cmd_random "$@" ;;
         current)       cmd_current ;;
+        bing)          shift; cmd_bing "$@" ;;
+        search)        shift; cmd_search "$@" ;;
+        fetch)         shift; cmd_fetch "$@" ;;
         ""|--gui|pick) open_picker ;;
         -h|--help|help)
-            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+            # The usage block, stopping at the prose about *why* the engine works
+            # the way it does (that is in the source). Anchored on a marker line
+            # rather than a line range so it never needs editing when the usage
+            # list above it grows.
+            awk 'NR == 1 { next }
+                 /^# This replaces waypaper/ { exit }
+                 { sub(/^# ?/, ""); print }' "$0" ;;
         *)
             # Treat a bare path as `set`, so `simpbar-wallpaper ~/img.jpg` works.
             if [ -e "${cmd/#\~/$HOME}" ]; then
                 cmd_set "$cmd"
             else
-                die "unknown command: $cmd (try: list, set, random, current)"
+                die "unknown command: $cmd (try: list, set, random, current, bing, search, fetch)"
             fi
             ;;
     esac

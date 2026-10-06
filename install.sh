@@ -927,30 +927,36 @@ if pacman -Qq falcond >/dev/null 2>&1; then
     fi
 fi
 
-# Download today's Bing wallpaper and set up waypaper to use it by default.
+# Download today's Bing wallpaper — through the wallpaper engine, not by
+# parsing Bing's JSON here.
+#
+# The engine already does exactly this, and does it better: it falls back from
+# Bing's undocumented UHD URL to the standard crop, checks that what came back
+# is really an image rather than Bing's 1192-byte 1x1 placeholder for an unknown
+# id, refuses to re-download a wallpaper already on disk, and only ever creates
+# the file atomically. A second copy of that logic here is precisely how the
+# installer's idea of "today's wallpaper" and the engine's would drift apart —
+# the same class of bug this repo keeps removing.
 WALLPAPER_DIR="$HOME/Pictures/Wallpaper"
 mkdir -p "$WALLPAPER_DIR"
 
-BING_JSON=$(curl -fsSL "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=en-US" 2>/dev/null)
-BING_URLBASE=$(printf '%s' "$BING_JSON" | grep -o '"urlbase":"[^"]*"' | head -1 | cut -d'"' -f4)
-BING_URL=$(printf '%s' "$BING_JSON" | grep -o '"url":"[^"]*"' | head -1 | cut -d'"' -f4)
+WALLPAPER_ENGINE="$HOME/.local/share/simpbar/simpbar-wallpaper"
 BING_FILE=""
+BING_TMP=$(mktemp)
+if [ -x "$WALLPAPER_ENGINE" ] \
+   && run_spinner "Downloading today's Bing wallpaper via the wallpaper engine" \
+        bash -c "'$WALLPAPER_ENGINE' bing > '$BING_TMP' 2>>'$BING_TMP.err'"; then
+    BING_FILE=$(head -n1 "$BING_TMP")
+    rm -f "$BING_TMP.err"
+fi
+rm -f "$BING_TMP"
 
-if [ -n "$BING_URLBASE" ]; then
-    BING_FILE="$WALLPAPER_DIR/bing-$(date +%F).jpg"
-    if ! run_spinner "Downloading today's Bing wallpaper (UHD)" \
-        curl -fsSL -o "$BING_FILE" "https://www.bing.com${BING_URLBASE}_UHD.jpg"; then
-        if [ -n "$BING_URL" ]; then
-            run_spinner "UHD unavailable — downloading standard resolution instead" \
-                curl -fsSL -o "$BING_FILE" "https://www.bing.com${BING_URL}" \
-                || { warn "Could not download today's Bing wallpaper"; BING_FILE=""; }
-        else
-            warn "Could not download today's Bing wallpaper"
-            BING_FILE=""
-        fi
-    fi
+if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
+    ok "Bing wallpaper ready ($(basename "$BING_FILE"))"
 else
-    warn "Could not fetch Bing's wallpaper metadata — skipping wallpaper download"
+    BING_FILE=""
+    warn "Could not download today's Bing wallpaper — nothing is wrong, the wallpaper engine simply starts empty"
+    printf '       %sFetch one any time with:%s simpbar-wallpaper bing\n' "$C_BOLD" "$C_RESET"
 fi
 
 if pacman -Qq waypaper >/dev/null 2>&1; then
@@ -1646,6 +1652,8 @@ else
 fi
 printf '  %ssimpbar-wallpaper%s                    # open the picker (Wallpapers tab)\n' "$C_CYAN" "$C_RESET"
 printf '  %ssimpbar-wallpaper random%s             # set a random wallpaper\n' "$C_CYAN" "$C_RESET"
+printf '  %ssimpbar-wallpaper bing%s               # fetch today'"'"'s Bing wallpaper\n' "$C_CYAN" "$C_RESET"
+printf '  %ssimpbar-wallpaper search '"'"'northern lights'"'"'%s   # search wallhaven.cc\n' "$C_CYAN" "$C_RESET"
 printf '  %s/usr/lib/mate-polkit/polkit-mate-authentication-agent-1 &%s   # needed for GUI auth prompts\n' "$C_CYAN" "$C_RESET"
 
 printf '\n%sKeybindings:%s\n' "$C_BOLD" "$C_RESET"

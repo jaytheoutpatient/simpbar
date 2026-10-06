@@ -36,7 +36,7 @@ The shipped binaries are distro-aware — `simpbar`, `simpbar-welcome`, `simpbar
 
 ## Auto-theming with matugen
 
-simbar can recolor itself to match your wallpaper — Material You style — via **[matugen](https://github.com/InioX/matugen)**. Pick a wallpaper in waypaper (Arch) or azote (Debian) and the bar recolors automatically.
+simbar can recolor itself to match your wallpaper — Material You style — via **[matugen](https://github.com/InioX/matugen)**. Pick a wallpaper in the app drawer's Wallpapers tab and the bar recolors automatically; `simpbar-wallpaper` can also fetch new ones from Bing's archive and wallhaven.cc (see [Wallpapers](#wallpapers)).
 
 `auto-theme`: the `appearance` section of `~/.config/simpbar/config.json` has an `auto_theme` field (`"matugen"` or `"manual"`, defaulting to `"matugen"`). Toggle it anytime from **simpbar-config** → Appearance → Theming → the "Auto-theme with matugen" switch. Right below it, a **Matugen color scheme** dropdown picks the palette matugen derives from the image — Tonal spot (default), Content, Expressive, Fidelity, Fruit salad, Monochrome, Neutral, Rainbow, Vibrant, or Smart. Changing it regenerates the scheme immediately.
 
@@ -86,6 +86,48 @@ simpbar-wallpaper current      print the wallpaper currently applied
 
 Bare `simpbar-wallpaper` opens the drawer when quickshell is available, and falls back to rofi, then waypaper/azote, so it still does something useful on a machine without the drawer.
 
+### Getting new wallpapers
+
+The engine also fetches. Downloads land in your first wallpaper folder — so they show up in the picker immediately — and are *not* applied unless you pass `--apply`:
+
+```
+simpbar-wallpaper bing [--count N]          download N of the last 8 Bing wallpapers (1–8)
+simpbar-wallpaper search <query> [opts]     list wallhaven.cc matches
+simpbar-wallpaper search <query> --save N   ...and download the first N of them
+simpbar-wallpaper fetch <id|url> [--apply]  download one wallhaven.cc wallpaper
+simpbar-wallpaper random --online           fetch a random wallhaven.cc wallpaper and apply it
+```
+
+Useful `search` options: `--category general|anime|nature|people`, `--atleast 1920x1080` (or `any`), `--maxsize 10` in MB, `--sorting favorites|date_added|toplist`, `--purity`, `--page`, `--seed`. `--save`/`--apply` work on `bing` and `search` too.
+
+`random --online` is the one that applies what it downloads — `random` is the verb that means "put something on my screen", so fetching without showing it would just be `fetch` with dice. Everything else leaves your current wallpaper alone.
+
+**Output is paths, one per line, on stdout**; progress and diagnostics go to stderr. So it composes:
+
+```sh
+simpbar-wallpaper search 'northern lights' --maxsize 5 | head -1
+simpbar-wallpaper bing --count 8 | tail -1 | xargs -I{} simpbar-wallpaper set {}
+```
+
+**Accounts and content rating.** SFW search needs no credentials and is the default. For anything else, put your own key from <https://wallhaven.cc/user/settings/api> in `~/.config/simpbar/wallhaven` (or export `WALLHAVEN_APIKEY`):
+
+```
+key=your-key-here
+purity=100
+```
+
+`purity` is wallhaven's 3-digit mask: `100` SFW, `110` adds questionable, `111` adds explicit. Anything but `100` requires the key, and is refused without one. SFW stays the default when no key is present — an adult-rated wallpaper appearing on screen because a key happened to be lying around is not a trade this script makes on your behalf.
+
+**Three things about the wallhaven API that the defaults here work around**, all found by testing rather than by reading docs:
+
+- `sorting=toplist` is the API's own default and is a small hand-picked set — "aurora borealis" has 2 results under it and 588 under `favorites`. Most wallpaper wants people who actually saved a wallpaper, so `favorites` is the default here.
+- `categories` is accepted by `/search` and then ignored: `general`, `nature` and `anime` all return the same total, and `nature`/`people` never come back at all — paging through hundreds of rows turns up general, anime and people only. The category is therefore filtered locally, so `--category` means what it says. The cost is that a filtered page can come back empty while later pages have matches — the "no matches" message says so rather than pretending the query found nothing. `nature` is the casualty: the API simply never serves it, so `--category nature` on `random --online` fails with an honest message after a few pages, and on `search` it finds nothing. general, people and anime all work.
+- The single-wallpaper lookup `/api/v1/f/<id>` needs an API key even for SFW content, and `/api/v1/random` currently answers HTTP 404 to every anonymous request. So `search` returns the direct image URL as its last column, `search --save N` downloads straight from those, `fetch` takes a URL as readily as an id, and `random --online` is built on `/search?sorting=random`. Nothing in the common path needs an account.
+
+**Downloads are verified, not trusted.** A response has to start with real image magic bytes *and* be at least 16 KB before it is moved into the wallpaper folder, and it is written to a `.part` sibling and renamed, so a half-finished or bogus file never becomes a wallpaper the picker offers. Both checks exist because of real behaviour: Bing answers an unknown image id with HTTP 200 and a 1192-byte 1×1 JPEG that passes every byte check but would sit on your desktop as a blurry black rectangle that matugen then themes from. Real Bing files are 330 KB (1080p) and 3.6 MB (UHD). Existing files are never re-downloaded without `--force`.
+
+Only the fetch subcommands need `curl` and `python3`; `list`, `set`, `random` and `current` work without either, so a wallpaper you already have is never gated behind being able to download a new one.
+
 **How a wallpaper gets applied.** The new swaybg is started *before* the old one is killed (with a short pause in between), so the screen never flashes black — the reverse order shows bare desktop for a frame on every switch. Then matugen runs (its output goes to `~/.local/state/simpbar/matugen.log`; it's ~140 lines of post-hook chatter per run, which would otherwise drown out this script's machine-readable output), and finally the path is written to `~/.config/simpbar/wallpaper`. Remembering it *before* theming means a matugen crash still leaves a restorable wallpaper.
 
 **Across reboots.** `simpbar-restore-wallpaper` runs from your Hyprland autostart and replays `~/.config/simpbar/wallpaper` through the engine — so the wallpaper comes back *and* the colors match it from the first frame, instead of showing last session's palette until you change it. If you never used the engine it falls back to azote's restore script (`~/.azotebg-hyprland` or `~/.azotebg`), and does nothing at all if neither exists. Because of this, the installer no longer writes a `swaybg.service`: that unit baked today's Bing path into `ExecStart`, which cannot express "whatever was last picked", and its `Restart=on-failure` meant it could resurrect the Bing picture over the top of a newer choice. Any existing one is disabled on install.
@@ -122,7 +164,7 @@ There is no widget for this in **simpbar-config**, but it is round-tripped from 
 - fastfetch (also wired into every new bash/fish shell)
 
 **Wallpaper**
-- Downloads that day's Bing wallpaper into `~/Pictures/Wallpaper`
+- Downloads that day's Bing wallpaper into `~/Pictures/Wallpaper` (through the wallpaper engine, so it's verified and de-duplicated like every other fetch — see [Wallpapers](#wallpapers)) (via the wallpaper engine, so the download is verified and de-duplicated the same way as every other fetch)
 - Seeds the wallpaper engine's state file with it, so the wallpaper you had at logout is the one that comes back at login — nothing to add to your Hyprland autostart yourself (see [Wallpapers](#wallpapers))
 - Installs `simpbar-wallpaper` (the engine) and `simpbar-restore-wallpaper` (the login-time restore) to `/usr/bin`
 - Optional **matugen** auto-theming — the bar recolors to match whatever wallpaper is up (see [Auto-theming with matugen](#auto-theming-with-matugen))
