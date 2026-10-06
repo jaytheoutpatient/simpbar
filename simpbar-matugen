@@ -2,60 +2,128 @@
 # simpbar-matugen — regenerate matugen's Material You colorscheme for a
 # wallpaper so simpbar (and anything else you've wired into matugen's
 # config.toml) recolors to match. With an explicit image path it runs matugen
-# on that image; with no argument it finds the current wallpaper the same way
-# each installer wires its picker:
+# on that image; with no argument it finds the current wallpaper, in order of
+# how well each source knows what is on screen right now:
 #
-#   1. waypaper's ~/.config/waypaper/config.ini (Arch)
-#   2. azote's restore script ~/.azotebg-hyprland / ~/.azotebg (Debian)
-#   3. the most recent ~/Pictures/Wallpaper/bing-*.jpg (the login default)
+#   1. swaybg's own command line (what is actually displayed — cannot be stale)
+#   2. simpbar-wallpaper's state file (~/.config/simpbar/wallpaper)
+#   3. waypaper's ~/.config/waypaper/config.ini
+#   4. azote's restore script ~/.azotebg-hyprland / ~/.azotebg
+#   5. the newest image in the wallpaper folders
+#
+# Every candidate is checked for existence before it is accepted, so a stale
+# entry in one source falls through to the next instead of failing the run.
+# Any image matugen can read is a valid input: no wallpaper is special-cased,
+# which is why step 5 is "the newest image" and not "the newest Bing image".
 #
 # The scheme type (tonal-spot, monochrome, fruit-salad, …) comes from
 # ~/.config/simpbar/matugen-type, which simpbar-config's "Matugen color
 # scheme" dropdown writes; absent/unrecognized falls back to matugen's own
 # default. Either way matugen itself never sets the wallpaper (its config.toml
-# ships with set = false); the pickers own that.
+# ships with set = false); simpbar-wallpaper owns that.
 #
 # Everything runs with set -e so a missing image/file/matugen exits non-zero
 # instead of half-applying a scheme.
 
 set -e
 
+# Expand a leading ~ / ~/ on a path. Waypaper writes its config.ini with
+# tilde-prefixed paths (config.py expanduser()s them on *read*), so a shell
+# reimplementation that forgets this gets "~/Pictures/..." — which never matches
+# a file, because a tilde inside double quotes is just a character. That single
+# missing expansion is what made matugen appear to only work on Bing wallpapers:
+# the only source that ever resolved was the Bing fallback below.
+expand_tilde() {
+    case "$1" in
+        "~") printf '%s' "$HOME" ;;
+        "~/"*) printf '%s' "$HOME/${1#\~/}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# A candidate is only accepted once it has been proven to exist, so one stale
+# entry (a deleted wallpaper still named in config.ini) falls through to the
+# next source instead of aborting the whole run.
+usable() { [ -n "$1" ] && [ -f "$(expand_tilde "$1")" ]; }
+
+# Print the image swaybg is currently displaying.
+#
+# Read /proc/<pid>/cmdline rather than `pgrep -a swaybg`: cmdline is
+# NUL-separated, so argv boundaries survive. Every wallpaper a generative tool
+# produces has spaces in its name ("ChatGPT Image Sep 23, 2026, 05_42_05 PM.png")
+# and a space-joined ps line makes those paths unparseable — you get back
+# ".../ChatGPT" and then a spurious "file not found".
+swaybg_current_image() {
+    local pid arg next=""
+    pid="$(pgrep -x swaybg 2>/dev/null | head -n1)"
+    [ -n "$pid" ] || return 1
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    while IFS= read -r -d '' arg; do
+        if [ -n "$next" ]; then printf '%s' "$arg"; return 0; fi
+        [ "$arg" = "-i" ] && next=1
+    done < "/proc/$pid/cmdline"
+    return 1
+}
+
 IMG=""
 if [ -n "$1" ]; then
-    IMG="$1"
+    IMG="$(expand_tilde "$1")"
 else
-    # 1. waypaper config: "wallpaper = /path/to/image" (installer writes a
-    #    full path there; strip optional surrounding quotes and any CR).
-    WPCFG="$HOME/.config/waypaper/config.ini"
-    if [ -r "$WPCFG" ]; then
-        IMG="$(sed -n 's/^[[:space:]]*wallpaper[[:space:]]*=[[:space:]]*//p' "$WPCFG" | head -n1 | tr -d '\r')"
-        IMG="${IMG%\"}"; IMG="${IMG#\"}"
-        IMG="${IMG%\'}"; IMG="${IMG#\'}"
+    # 1. What swaybg is displaying *right now* — the most authoritative source
+    #    there is, since it cannot disagree with the screen.
+    if IMG="$(swaybg_current_image)"; then
+        usable "$IMG" || IMG=""
+    else
+        IMG=""
     fi
 
-    # 2. azote's restore script(s) — one swaybg line per output; grab the path
+    # 2. simpbar-wallpaper's own state file (what the picker last applied).
+    if [ -z "$IMG" ] && [ -r "$HOME/.config/simpbar/wallpaper" ]; then
+        IMG="$(sed -n 's/^path=//p' "$HOME/.config/simpbar/wallpaper" | head -n1)"
+        usable "$IMG" || IMG=""
+    fi
+
+    # 3. waypaper config: "wallpaper = /path/to/image", optionally quoted.
+    if [ -z "$IMG" ]; then
+        WPCFG="$HOME/.config/waypaper/config.ini"
+        if [ -r "$WPCFG" ]; then
+            IMG="$(sed -n 's/^[[:space:]]*wallpaper[[:space:]]*=[[:space:]]*//p' "$WPCFG" | head -n1 | tr -d '\r')"
+            IMG="${IMG%\"}"; IMG="${IMG#\"}"
+            IMG="${IMG%\'}"; IMG="${IMG#\'}"
+            usable "$IMG" || IMG=""
+        fi
+    fi
+
+    # 4. azote's restore script(s) — one swaybg line per output; grab the path
     #    after the first "-i". Handles single-/double-quoted paths (spaces
     #    included) and bare one-token paths.
     if [ -z "$IMG" ]; then
         for f in "$HOME/.azotebg-hyprland" "$HOME/.azotebg"; do
             [ -f "$f" ] || continue
             IMG="$(grep -m1 -oE -- "-i ('[^']*'|\"[^\"]*\"|[^ ]+)" "$f" | sed -E 's/^-i +//; s/^["'"'"']//; s/["'"'"']$//')"
+            usable "$IMG" || IMG=""
             [ -n "$IMG" ] && break
         done
     fi
 
-    # 3. fall back to the newest Bing download from install time (matches the
-    #    swaybg.service default), so a scheme can be generated before a
-    #    wallpaper has been picked in waypaper/azote.
+    # 5. Newest image in the configured wallpaper folders. Deliberately NOT
+    #    Bing-specific: any wallpaper the picker can show must be themable, so
+    #    a scheme can be generated before one has ever been chosen, and after a
+    #    reboot with no state file yet.
     if [ -z "$IMG" ]; then
-        for f in "$HOME"/Pictures/Wallpaper/bing-*.jpg; do
-            [ -f "$f" ] && IMG="$f"
-        done
+        NEWEST="$(find ~/Pictures/Wallpaper ~/Pictures "$HOME" -maxdepth 1 \
+                    -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \
+                              -o -iname '*.webp' -o -iname '*.bmp' -o -iname '*.avif' \) \
+                    -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-)"
+        usable "$NEWEST" && IMG="$NEWEST"
     fi
 fi
 
 if [ -z "$IMG" ]; then
-    echo "simpbar-matugen: no wallpaper given and none found (waypaper config, azote restore script, or ~/Pictures/Wallpaper/bing-*.jpg)" >&2
+    echo "simpbar-matugen: no wallpaper given and none found." >&2
+    echo "  Looked at: swaybg's command line, ~/.config/simpbar/wallpaper," >&2
+    echo "  waypaper's config.ini, azote's restore script, and ~/Pictures/Wallpaper." >&2
+    echo "  Pass an image path explicitly to theme a specific wallpaper." >&2
     exit 1
 fi
 if [ ! -f "$IMG" ]; then

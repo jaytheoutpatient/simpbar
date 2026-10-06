@@ -1,13 +1,39 @@
 #!/bin/bash
-# simpbar-restore-wallpaper — restores the wallpaper azote last set, run on
-# login. Azote writes its own restore script to ~/.azotebg-hyprland (v1.12.0+,
-# Hyprland/Sway) or ~/.azotebg (older versions) the first time it applies a
-# picture; exec whichever exists so the last azote pick survives reboots.
-# Does nothing (and exits cleanly) until azote has actually set a wallpaper,
-# so swaybg's default stays up until then.
+# simpbar-restore-wallpaper — put back the wallpaper you had at logout. Run on
+# login, before anything reads the theme colors.
+#
+# Order matters. simpbar-wallpaper's own state file comes first because it is the
+# engine that is actually in charge: it knows the exact path, and routing through
+# `simpbar-wallpaper set` means matugen runs here too, so the bar, the terminal
+# and GTK start the session already themed to the wallpaper rather than showing
+# last session's colors until the first wallpaper change.
+#
+# Azote's restore scripts are the fallback for anyone still driving the desktop
+# from azote. Nothing happens if neither exists -- swaybg's default stays up
+# rather than the login racing an empty wallpaper.
+if [ -r "$HOME/.config/simpbar/wallpaper" ]; then
+    IMG="$(sed -n 's/^path=//p' "$HOME/.config/simpbar/wallpaper" | head -n1)"
+    # A leading ~ in the state file would never match a file, since a tilde
+    # inside double quotes is just a character. See simpbar-matugen for how that
+    # same trap made matugen look like it only worked on Bing wallpapers.
+    case "$IMG" in
+        "~")   IMG="$HOME" ;;
+        "~/"*) IMG="$HOME/${IMG#\~/}" ;;
+    esac
+    if [ -n "$IMG" ] && [ -f "$IMG" ] && command -v simpbar-wallpaper >/dev/null 2>&1; then
+        # Not exec: this falls back to azote below when the engine is missing or
+        # the remembered wallpaper has since been deleted.
+        simpbar-wallpaper set "$IMG" >/dev/null 2>&1 \
+            && exit 0
+        echo "simpbar-restore-wallpaper: could not reapply $IMG" >&2
+    fi
+fi
+
 if [ -x "$HOME/.azotebg-hyprland" ]; then
     exec "$HOME/.azotebg-hyprland"
 fi
 if [ -x "$HOME/.azotebg" ]; then
     exec "$HOME/.azotebg"
 fi
+
+exit 0

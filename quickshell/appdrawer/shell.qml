@@ -6,6 +6,7 @@ import Quickshell.Io
 //
 //   Run the daemon:      qs -c appdrawer
 //   Toggle the drawer:   qs -c appdrawer ipc call drawer toggle
+//   Open wallpapers:     qs -c appdrawer ipc call drawer wallpapers
 //
 // The toggle goes through IPC rather than Quickshell.GlobalShortcut because
 // GlobalShortcut needs a Hyprland `global` bind, and that dispatcher does not
@@ -25,6 +26,26 @@ ShellRoot {
 
         function close() {
             drawer.closeDrawer()
+        }
+
+        // Open straight onto a tab, skipping the Apps grid. This is what the
+        // bar's wallpaper button calls (`appdrawer wallpapers`), so the picker
+        // is the first thing on screen rather than something you tab across to.
+        function wallpapers() {
+            drawer.openTab("wallpapers")
+        }
+
+        function apps() {
+            drawer.openTab("apps")
+        }
+
+        // Apply a random wallpaper with the drawer staying shut. Note there is
+        // deliberately no `setWallpaper(path)`: Quickshell's IPC cannot marshal
+        // a string argument across the boundary, and `simpbar-wallpaper set <img>`
+        // is a better entry point for that anyway -- it owns the swaybg swap,
+        // the matugen run and the state file, and needs no daemon running.
+        function randomWallpaper() {
+            WallpaperModel.random()
         }
 
         // Delegates to Drawer so the Theme/Icons/AppModel singletons are

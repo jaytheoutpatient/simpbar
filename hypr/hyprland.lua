@@ -44,7 +44,13 @@ hl.on("hyprland.start", function()
 	-- This Line here ^^
 	hl.exec_cmd("swaync")
 	hl.exec_cmd("gnome-calendar -silent")
-	hl.exec_cmd("waypaper --restore")
+	-- Restore the wallpaper from simpbar-wallpaper's state file, which also
+	-- re-runs matugen so the whole desktop starts themed to match. This
+	-- replaces `waypaper --restore`: waypaper's GUI still works as a picker,
+	-- but the engine that owns the wallpaper is now simpbar-wallpaper, and
+	-- leaving waypaper's restore in place would have two programs disagreeing
+	-- about the current wallpaper again.
+	hl.exec_cmd("simpbar-restore-wallpaper")
 	hl.exec_cmd("/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1")
 	--hl.exec_cmd("/usr/libexec/polkit-mate-authentication-agent-1")
 end)
@@ -166,6 +172,10 @@ hl.bind(mainMod .. " + W", hl.dsp.exec_cmd("pkill -x simpbar; simpbar &"))
 -- Bare `appdrawer`: the installer puts the toggle in /usr/bin, which is on the
 -- session PATH. ~/.local/bin is not, and a .desktop Exec gets no $HOME expansion.
 hl.bind(mainMod .. " + Tab", hl.dsp.exec_cmd("appdrawer"))
+-- Wallpaper picker: the drawer's second tab, opened directly. Pairs with the
+-- bind above so the two are discoverable together, and spends no fresh letter.
+-- `simpbar-wallpaper` bare would do the same thing; naming it here is clearer.
+hl.bind(mainMod .. " + SHIFT + Tab", hl.dsp.exec_cmd("appdrawer wallpapers"))
 -- Move focus with mainMod + arrow keys
 hl.bind(mainMod .. " + left", hl.dsp.focus({ direction = "left" }))
 hl.bind(mainMod .. " + right", hl.dsp.focus({ direction = "right" }))

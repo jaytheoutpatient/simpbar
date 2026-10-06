@@ -307,14 +307,12 @@ cp /tmp/simpbar-temp/simpbar-main/appdrawer.desktop ~/.local/share/simpbar/appdr
 
 rm -rf /tmp/simpbar-temp
 
-# waypaper is Arch/AUR-only — not in Debian. Azote (installed above) is the
-# wallpaper picker instead; both are front-ends to swaybg and ~/Pictures/
-# Wallpaper is created later in Step 4 (the Bing wallpaper download).
-# Comment waypaper's autostart line out of hyprland.lua — the systemd
-# swaybg.service (Bing default) and azote-restore.service (last azote pick)
-# installed later handle the wallpaper on Debian.
-sed -i -E 's|^(\s*)hl\.exec_cmd\("waypaper --restore"\)|\1--hl.exec_cmd("waypaper --restore")  # Debian: not packaged, swaybg.service + azote-restore.service handle the wallpaper|' ~/.config/hypr/hyprland.lua
-ok "waypaper autostart disabled in hyprland.lua (not packaged on Debian) — swaybg.service sets Bing, azote-restore.service restores your last azote pick"
+# hyprland.lua autostarts simpbar-restore-wallpaper, which puts back the
+# wallpaper the engine last applied and falls back to azote's own restore
+# script otherwise — so the repo's autostart is already correct on Debian and
+# there is nothing to comment out here. (It used to sed out waypaper's
+# `waypaper --restore`, which no longer exists.)
+ok "hyprland.lua restores the wallpaper via simpbar-restore-wallpaper (azote fallback included)"
 
 # ── Step 3: enable i386 (for Steam) + refresh lists ──────────────────
 # Steam on Debian ships 32-bit binaries, so the i386 foreign architecture
@@ -1166,35 +1164,24 @@ ok "simpbar logs will be written to ~/Documents/simpbar-logs"
 
 FISH_PATH=$(command -v fish) || true
 
-# The bar's pinned-app launchers, wallpaper picker + restore, and the
+# The bar's pinned-app launchers, wallpaper engine + restore, and the
 # background update checker come from the downloaded simpbar repo (distro-aware
 # for updates). Desktop entries + the logo.png asset end up next to them.
-# The wallpaper button points at the wallpaper switcher (downloaded in Step 4)
-# rather than an azote/waypaper GUI.
+# On Debian the picker opens through the app drawer where quickshell is
+# available and falls back to rofi otherwise -- azote stays usable as its own
+# picker without being the thing that owns the wallpaper.
 mkdir -p ~/.local/share/applications ~/.config/systemd/user
 
 sudo install -Dm755 ~/.local/share/simpbar/simpbar-check-updates  /usr/bin/simpbar-check-updates
 sudo install -Dm755 ~/.local/share/simpbar/simpbar-launch-browser /usr/bin/simpbar-launch-browser
 sudo install -Dm755 ~/.local/share/simpbar/simpbar-launch-discord /usr/bin/simpbar-launch-discord
+# The wallpaper engine and its login-time restore come straight from the repo,
+# so there is one implementation rather than a wrapper that can drift from it.
+sudo install -Dm755 ~/.local/share/simpbar/simpbar-wallpaper        /usr/bin/simpbar-wallpaper
 sudo install -Dm755 ~/.local/share/simpbar/simpbar-restore-wallpaper /usr/bin/simpbar-restore-wallpaper
-
-# The wallpaper button uses the rofi picker -> swaybg + matugen switcher from
-# ~/wallpaper-switcher, falling back to azote if it isn't installed. Written
-# inline so a freshly downloaded archive always ships the same wrapper.
-sudo tee /usr/bin/simpbar-wallpaper >/dev/null <<'WALLPAPERWRAPEOF'
-#!/bin/bash
-# simpbar-wallpaper — the bar's "change wallpaper" button. Runs the rofi
-# picker -> swaybg + matugen switcher from ~/wallpaper-switcher (installed by
-# the installers); falls back to azote if the switcher isn't there.
-if [ -x "$HOME/wallpaper-switcher/wallpaper_switcher.sh" ]; then
-    exec "$HOME/wallpaper-switcher/wallpaper_switcher.sh"
-fi
-exec azote "$@"
-WALLPAPERWRAPEOF
-sudo chmod +x /usr/bin/simpbar-wallpaper
 cp ~/.local/share/simpbar/simpbar-welcome.desktop ~/.local/share/applications/
 cp ~/.local/share/simpbar/simpbar-config.desktop   ~/.local/share/applications/
-ok "Pinned-app launchers (browser, Discord), wallpaper switcher + restore, update checker, and .desktop entries installed"
+ok "Pinned-app launchers (browser, Discord), wallpaper engine + restore, update checker, and .desktop entries installed"
 
 cat > ~/.config/systemd/user/simpbar-update-checker.service <<'CHECKERSVCEOF'
 [Unit]
@@ -1274,100 +1261,51 @@ else
     warn "Could not fetch Bing's wallpaper metadata — skipping wallpaper download"
 fi
 
-# swaybg is the actual wallpaper daemon (azote and waypaper are just GUI
-# pickers; waypaper isn't packaged on Debian) — give it a systemd user
-# service so the wallpaper survives logins. This replaces the Arch
-# installer's waypaper config path.
-if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ] && command -v swaybg >/dev/null; then
-    mkdir -p ~/.config/systemd/user
-    cat > ~/.config/systemd/user/swaybg.service <<EOF
-[Unit]
-Description=swaybg wallpaper
-PartOf=graphical-session.target
-
-[Service]
-ExecStart=$(command -v swaybg) -i $BING_FILE -m fill
-Restart=on-failure
-
-[Install]
-WantedBy=graphical-session.target
-EOF
-    run_spinner "Enabling swaybg.service" systemctl --user enable --now swaybg.service \
-        || warn "Could not enable swaybg.service — set the wallpaper manually: swaybg -i $BING_FILE -m fill"
-    ok "swaybg pointed at today's Bing wallpaper via ~/.config/systemd/user/swaybg.service"
-else
-    warn "No downloaded wallpaper or swaybg not installed — skipping swaybg service setup"
+# One owner for the wallpaper. This used to hand login to a swaybg.service unit
+# with $BING_FILE baked into ExecStart, which cannot express "whatever the user
+# last picked" — every wallpaper change made it stale — plus an
+# azote-restore.service whose only real job was to stop that unit before azote
+# fought it. simpbar-wallpaper keeps the path in ~/.config/simpbar/wallpaper and
+# simpbar-restore-wallpaper reads it at login, falling back to azote's own
+# restore script, so neither unit is needed and nothing is left to fight.
+if systemctl --user is-enabled swaybg.service >/dev/null 2>&1; then
+    run_spinner "Handing the wallpaper over from swaybg.service to simpbar-wallpaper" \
+        bash -c 'systemctl --user disable --now swaybg.service 2>/dev/null || true' \
+        || warn "Could not disable swaybg.service — disable it yourself, or it may reassert the old wallpaper"
+    ok "swaybg.service disabled so it cannot fight the wallpaper engine"
 fi
-
-# Make azote picks survive reboots: azote writes its own restore script
-# (~/.azotebg-hyprland on Hyprland, v1.12.0+) the first time it applies a
-# wallpaper — run it after swaybg.service so the last azote pick wins over
-# the Bing default. azote's restore script does `pkill swaybg`, and
-# swaybg.service has Restart=on-failure, so the service would otherwise just
-# come back and fight azote — stop it first to hand the session over cleanly.
-# simpbar-restore-wallpaper no-ops until azote has set a wallpaper, so the
-# swaybg default stays up until then.
-if command -v azote >/dev/null && command -v swaybg >/dev/null && [ -x /usr/bin/simpbar-restore-wallpaper ]; then
-    mkdir -p ~/.config/systemd/user
-    cat > ~/.config/systemd/user/azote-restore.service <<'AZOTERESTORESVCEOF'
-[Unit]
-Description=Restore last azote wallpaper
-PartOf=graphical-session.target
-After=swaybg.service
-
-[Service]
-Type=oneshot
-# azote's restore script backgrounds swaybg ("&") and exits — KillMode=none
-# stops systemd from reaping those backgrounded swaybgs when the oneshot
-# finishes (default control-group killmode would take the wallpaper down).
-ExecStartPre=systemctl --user stop swaybg.service
-KillMode=none
-ExecStart=/usr/bin/simpbar-restore-wallpaper
-
-[Install]
-WantedBy=graphical-session.target
-AZOTERESTORESVCEOF
-    run_spinner "Enabling azote-restore.service" systemctl --user enable --now azote-restore.service \
-        || warn "Could not enable azote-restore.service — your last azote wallpaper won't auto-restore on login"
-    ok "azote-restore.service enabled — the wallpaper you pick in azote comes back each session (swaybg's default until azote picks one)"
-else
-    warn "azote/restore script not available — skipping azote-restore.service (azote still picks wallpapers on demand)"
+if systemctl --user is-enabled azote-restore.service >/dev/null 2>&1; then
+    run_spinner "Disabling the now-redundant azote-restore.service" \
+        bash -c 'systemctl --user disable --now azote-restore.service 2>/dev/null || true' \
+        || warn "Could not disable azote-restore.service — it only ran simpbar-restore-wallpaper, which now runs directly"
 fi
+rm -f ~/.config/systemd/user/azote-restore.service
 
-# The wallpaper switcher that the bar's wallpaper button execs lives in its
-# own repo (rofi picker -> swaybg + matugen, wallpapers under
-# ~/wallpaper-switcher/wallpaper). Pull it in so a fresh install gets the
-# picker + images; simpbar-wallpaper falls back to azote if this never lands.
-if [ -d ~/wallpaper-switcher ]; then
-    ok "~/wallpaper-switcher already exists — leaving your existing copy alone"
-else
-    mkdir -p ~/wallpaper-switcher
-    run_spinner "Downloading the wallpaper switcher" \
-        curl -fL -o /tmp/wallpaper-switcher.zip https://github.com/k4ahr/wallpaper-switcher/archive/refs/heads/main.zip \
-        || warn "Could not download the wallpaper switcher — the wallpaper button will fall back to azote"
-    if [ -f /tmp/wallpaper-switcher.zip ]; then
-        unzip -o /tmp/wallpaper-switcher.zip -d /tmp/wallpaper-switcher-temp >/dev/null 2>&1 \
-            || true
-        rm -f /tmp/wallpaper-switcher.zip
-        if [ -d /tmp/wallpaper-switcher-temp/wallpaper-switcher-main ]; then
-            rm -rf ~/wallpaper-switcher
-            cp -r /tmp/wallpaper-switcher-temp/wallpaper-switcher-main ~/wallpaper-switcher
-            chmod +x ~/wallpaper-switcher/wallpaper_switcher.sh 2>/dev/null || true
-            ok "Wallpaper switcher placed in ~/wallpaper-switcher — the bar's wallpaper button uses it"
-        else
-            warn "Downloaded archive was missing the wallpaper switcher — the wallpaper button will fall back to azote"
-        fi
-        rm -rf /tmp/wallpaper-switcher-temp
+if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
+    # Seed the engine's state with today's download so the very first login
+    # already restores it. Never overwrites an existing path: re-running the
+    # installer must not undo wallpapers the user has since picked.
+    mkdir -p ~/.config/simpbar
+    if [ -r ~/.config/simpbar/wallpaper ]; then
+        ok "Keeping your remembered wallpaper ($(sed -n 's/^path=//p' ~/.config/simpbar/wallpaper | head -n1))"
+    else
+        printf 'path=%s\nfill=fill\ncolor=#ffffff\n' "$BING_FILE" > ~/.config/simpbar/wallpaper
+        ok "Wallpaper engine seeded — today's Bing wallpaper is restored at login"
     fi
+else
+    warn "No downloaded wallpaper — the wallpaper engine starts empty; pick one whenever you like"
 fi
 
-# matugen — the Material You colorscheme generator simpbar reads for
-# wallpaper-based auto-theming. Not in Debian repos: rustc/cargo were added
-# to the apt step above when requested, and matugen itself comes from
-# crates.io here. It renders its simpbar template to
+
+# The wallpaper-switcher repo used to be downloaded here and shelled out to for
+# the bar's wallpaper button. It is gone on purpose: it drives swww + pywal, not
+# swaybg + matugen, so it disagreed with the rest of the desktop theming-wise,
+# and it kept a second copy of the images. The engine in this repo does the same
+# job against swaybg and matugen from one shared wallpaper folder.
+
 # ~/.config/simpbar/matugen.json, which the bar merges in on reload; an azote
 # path unit re-runs it every time azote rewrites its restore script. matugen
-# never sets the wallpaper itself, so azote stays the sole owner of it.
+# never sets the wallpaper itself, so simpbar-wallpaper stays the sole owner.
 if [ "$INSTALL_MATUGEN" -eq 1 ]; then
     MATUGEN_BIN="$(command -v matugen 2>/dev/null || true)"
     if [ -z "$MATUGEN_BIN" ] && command -v cargo >/dev/null 2>&1; then
@@ -1409,106 +1347,15 @@ MATUGENTPL
             ok "matugen template placed in ~/.config/matugen/templates/simpbar.json"
         fi
 
-        # The helper normally comes from the downloaded archive (copied across by
-        # the AUX_FILES loop in Step 2). Fall back to an embedded copy if that
-        # ever didn't happen (e.g. this script run from an older archive
-        # without the file), so the install below can't fail on a missing
-        # source. Keep it in sync with ~/simpbar/simpbar-matugen.
+        # Strictly from the downloaded archive. This used to fall back to an
+        # embedded copy of simpbar-matugen, which is how the helper ended up with
+        # two implementations that disagreed about which wallpaper was current --
+        # the embedded one could not expand the ~ that waypaper writes into its
+        # config, so it silently fell through to a Bing-only fallback and the bar
+        # stayed themed to the wrong image. A missing file here means a bad
+        # archive, and that should be loud rather than quietly wrong.
         if [ ! -f "$HOME/.local/share/simpbar/simpbar-matugen" ]; then
-            mkdir -p ~/.local/share/simpbar
-            cat > ~/.local/share/simpbar/simpbar-matugen <<'MATUGENHELPEREOF'
-#!/bin/bash
-# simpbar-matugen — regenerate matugen's Material You colorscheme for a
-# wallpaper so simpbar (and anything else you've wired into matugen's
-# config.toml) recolors to match. With an explicit image path it runs matugen
-# on that image; with no argument it finds the current wallpaper the same way
-# each installer wires its picker:
-#
-#   1. waypaper's ~/.config/waypaper/config.ini (Arch)
-#   2. azote's restore script ~/.azotebg-hyprland / ~/.azotebg (Debian)
-#   3. the most recent ~/Pictures/Wallpaper/bing-*.jpg (the login default)
-#
-# The scheme type (tonal-spot, monochrome, fruit-salad, …) comes from
-# ~/.config/simpbar/matugen-type, which simpbar-config's "Matugen color
-# scheme" dropdown writes; absent/unrecognized falls back to matugen's own
-# default. Either way matugen itself never sets the wallpaper (its config.toml
-# ships with set = false); the pickers own that.
-#
-# Everything runs with set -e so a missing image/file/matugen exits non-zero
-# instead of half-applying a scheme.
-
-set -e
-
-IMG=""
-if [ -n "$1" ]; then
-    IMG="$1"
-else
-    # 1. waypaper config: "wallpaper = /path/to/image" (installer writes a
-    #    full path there; strip optional surrounding quotes and any CR).
-    WPCFG="$HOME/.config/waypaper/config.ini"
-    if [ -r "$WPCFG" ]; then
-        IMG="$(sed -n 's/^[[:space:]]*wallpaper[[:space:]]*=[[:space:]]*//p' "$WPCFG" | head -n1 | tr -d '\r')"
-        IMG="${IMG%\"}"; IMG="${IMG#\"}"
-        IMG="${IMG%\'}"; IMG="${IMG#\'}"
-    fi
-
-    # 2. azote's restore script(s) — one swaybg line per output; grab the path
-    #    after the first "-i". Handles single-/double-quoted paths (spaces
-    #    included) and bare one-token paths.
-    if [ -z "$IMG" ]; then
-        for f in "$HOME/.azotebg-hyprland" "$HOME/.azotebg"; do
-            [ -f "$f" ] || continue
-            IMG="$(grep -m1 -oE -- "-i ('[^']*'|\"[^\"]*\"|[^ ]+)" "$f" | sed -E 's/^-i +//; s/^["'"'"']//; s/["'"'"']$//')"
-            [ -n "$IMG" ] && break
-        done
-    fi
-
-    # 3. fall back to the newest Bing download from install time (matches the
-    #    swaybg.service default), so a scheme can be generated before a
-    #    wallpaper has been picked in waypaper/azote.
-    if [ -z "$IMG" ]; then
-        for f in "$HOME"/Pictures/Wallpaper/bing-*.jpg; do
-            [ -f "$f" ] && IMG="$f"
-        done
-    fi
-fi
-
-if [ -z "$IMG" ]; then
-    echo "simpbar-matugen: no wallpaper given and none found (waypaper config, azote restore script, or ~/Pictures/Wallpaper/bing-*.jpg)" >&2
-    exit 1
-fi
-if [ ! -f "$IMG" ]; then
-    echo "simpbar-matugen: wallpaper file not found: $IMG" >&2
-    exit 1
-fi
-
-# matugen may live in ~/.cargo/bin (e.g. the Debian installer's `cargo
-# install matugen`) where a systemd user service's restricted PATH won't
-# find it — try the cargo bin dir explicitly before giving up.
-if command -v matugen >/dev/null 2>&1; then
-    MATUGEN_BIN="$(command -v matugen)"
-elif [ -x "$HOME/.cargo/bin/matugen" ]; then
-    MATUGEN_BIN="$HOME/.cargo/bin/matugen"
-else
-    echo "simpbar-matugen: matugen isn't installed or isn't on your PATH" >&2
-    exit 1
-fi
-
-# Scheme type chosen in simpbar-config. Validate against matugen's known
-# values so a stale/hand-edited file can't make matugen error out.
-TYPE="scheme-tonal-spot"
-TYPE_FILE="$HOME/.config/simpbar/matugen-type"
-if [ -r "$TYPE_FILE" ]; then
-    read -r TYPE < "$TYPE_FILE" || true
-fi
-case "$TYPE" in
-    scheme-tonal-spot|scheme-content|scheme-expressive|scheme-fidelity|scheme-fruit-salad|scheme-monochrome|scheme-neutral|scheme-rainbow|scheme-vibrant|scheme-smart) ;;
-    *) TYPE="scheme-tonal-spot" ;;
-esac
-
-exec "$MATUGEN_BIN" -t "$TYPE" image "$IMG"
-MATUGENHELPEREOF
-            chmod +x ~/.local/share/simpbar/simpbar-matugen
+            warn "The downloaded archive did not contain simpbar-matugen - skipping the matugen helper (layout may have changed upstream)"
         fi
 
         run_spinner "Installing simpbar-matugen to /usr/bin" \
@@ -1609,11 +1456,8 @@ if [ -n "$BROWSER_NAME" ]; then
 else
     ok "Browser install skipped, as requested"
 fi
-if [ -e ~/.config/systemd/user/swaybg.service ]; then
-    ok "swaybg.service enabled — Bing wallpaper set automatically each session"
-fi
-if [ -e ~/.config/systemd/user/azote-restore.service ] && systemctl --user is-enabled azote-restore.service >/dev/null 2>&1; then
-    ok "azote-restore.service enabled — the wallpaper you pick in azote returns after every login"
+if [ -r ~/.config/simpbar/wallpaper ]; then
+    ok "Wallpaper engine seeded — your wallpaper is restored at login and rethemes the desktop"
 fi
 if [ "$INSTALL_MATUGEN" -eq 1 ] && [ -e ~/.config/simpbar/matugen.json ]; then
     ok "matugen auto-theming set up — the bar recolors to each azote wallpaper (toggle off in simpbar-config anytime)"
@@ -1621,7 +1465,7 @@ fi
 if [ -e ~/.config/waypaper/config.ini ]; then
     :
 else
-    ok "Wallpaper picking is azote (waypaper is Arch-only) — swaybg.service sets Bing by default, azote-restore.service brings back your last azote pick"
+    ok "Wallpaper picking: the app drawer's Wallpapers tab, or rofi without quickshell. Azote still works as a picker, and the engine remembers whichever way you chose"
 fi
 if [ -x /usr/bin/simpbar ]; then
     ok "simpbar built and installed to /usr/bin/simpbar (source in ~/.local/share/simpbar/simpbar)"
@@ -1644,10 +1488,12 @@ printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %ssimpbar &%s\n' "$C_CYAN" "$C_RESET"
 if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
-    printf '  %sswaybg -i %s -m fill &%s\n' "$C_CYAN" "$BING_FILE" "$C_RESET"
+    printf '  %ssimpbar-wallpaper set %q%s   # apply a wallpaper directly\n' "$C_CYAN" "$BING_FILE" "$C_RESET"
 else
-    printf '  %sswaybg -i /path/to/your/wallpaper.jpg -m fill &%s   # example\n' "$C_CYAN" "$C_RESET"
+    printf '  %ssimpbar-wallpaper set /path/to/your/wallpaper.jpg%s   # example\n' "$C_CYAN" "$C_RESET"
 fi
+printf '  %ssimpbar-wallpaper%s                    # open the picker\n' "$C_CYAN" "$C_RESET"
+printf '  %ssimpbar-wallpaper random%s             # set a random wallpaper\n' "$C_CYAN" "$C_RESET"
 printf '  %s%s%s                          # polkit auth agent (already in hyprland.lua)\n' "$C_CYAN" "$POLKIT_DEBIAN" "$C_RESET"
 
 printf '\n%sKeybindings:%s\n' "$C_BOLD" "$C_RESET"

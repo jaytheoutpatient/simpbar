@@ -1,12 +1,372 @@
 #!/bin/bash
-# simpbar-wallpaper — the bar's "change wallpaper" button. Runs the rofi
-# picker -> swaybg + matugen switcher from ~/wallpaper-switcher (installed by
-# the installers); falls back to the distro's GTK picker (azote on Debian,
-# waypaper on Arch) if the switcher isn't there.
-if [ -x "$HOME/wallpaper-switcher/wallpaper_switcher.sh" ]; then
-    exec "$HOME/wallpaper-switcher/wallpaper_switcher.sh"
-fi
-if command -v azote >/dev/null 2>&1; then
-    exec azote "$@"
-fi
-exec waypaper "$@"
+# simpbar-wallpaper — the wallpaper engine: list wallpapers, apply one with
+# swaybg, and retheme the desktop from it with matugen.
+#
+# Usage:
+#   simpbar-wallpaper              open the wallpaper picker (drawer's Wallpapers tab)
+#   simpbar-wallpaper list         print "path<TAB>name" per wallpaper, one per line
+#   simpbar-wallpaper set <img>    apply <img>: swaybg + matugen + remember it
+#   simpbar-wallpaper random       apply a random wallpaper from the folders
+#   simpbar-wallpaper current      print the wallpaper currently remembered
+#
+# This replaces waypaper as the thing that owns the wallpaper. waypaper is a GUI
+# front-end whose real job is exactly these four steps; keeping it in the loop
+# meant two programs could disagree about the current wallpaper, and the bar
+# ended up themed from a different image than the one on screen.
+#
+# Why each step matters:
+#
+#   * swaybg is the actual wallpaper daemon (waypaper, azote and the old
+#     ~/wallpaper-switcher were all just front-ends to it). The new process is
+#     started *before* the old one is killed, so the screen never flashes black;
+#     the reverse order shows bare desktop for a frame on every switch.
+#
+#   * matugen recolors the bar, terminal, GTK, Qt and the rest from the image.
+#     It runs on whatever image is picked — no wallpaper is special-cased.
+#
+#   * The chosen path is written to ~/.config/simpbar/wallpaper so
+#     simpbar-restore-wallpaper can bring it back at login. That replaces
+#     waypaper's --restore.
+#
+# Wallpaper folders come from ~/.config/simpbar/wallpaper-dirs (one per line,
+# ~ expanded), defaulting to the XDG pictures dir. Image types match the set
+# swaybg can actually load; matching is case-insensitive because real
+# collections are full of things like ".JPG".
+
+set -uo pipefail
+
+CONFIG_DIR="$HOME/.config/simpbar"
+DIRS_FILE="$CONFIG_DIR/wallpaper-dirs"
+STATE_FILE="$CONFIG_DIR/wallpaper"
+
+# swaybg's usable image formats. Keep in sync with what swaybg can decode —
+# anything else fails silently and leaves you looking at a stale wallpaper.
+IMAGE_EXTS="jpg jpeg png gif webp bmp pnm tiff tif avif"
+
+FILL="fill"
+COLOR="#ffffff"
+
+die() { echo "simpbar-wallpaper: $*" >&2; exit 1; }
+log() { echo "simpbar-wallpaper: $*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Folders
+# ---------------------------------------------------------------------------
+
+default_dirs() {
+    # XDG pictures dir, falling back to the conventional ~/Pictures/Wallpaper
+    # on systems that don't set XDG_PICTURES_DIR. Printed one per line.
+    if [ -n "${XDG_PICTURES_DIR:-}" ]; then
+        echo "${XDG_PICTURES_DIR%/}/Wallpaper"
+    else
+        echo "$HOME/Pictures/Wallpaper"
+    fi
+}
+
+# Expand a leading ~ or ~/ anywhere in the path. Written as a case instead of
+# using `eval` so a folder line containing spaces or quotes stays one path.
+expand_tilde() {
+    case "$1" in
+        "~") echo "$HOME" ;;
+        "~/"*) echo "$HOME/${1#\~/}" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+read_dirs() {
+    if [ -r "$DIRS_FILE" ]; then
+        # Skip blanks and #comments; expand ~ per line.
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                ''|\#*) continue ;;
+            esac
+            expand_tilde "$line"
+        done < "$DIRS_FILE"
+    else
+        default_dirs
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Enumeration
+# ---------------------------------------------------------------------------
+
+# True when $1 has an image extension swaybg can load. Lowercased before
+# matching so ".JPG" and ".jpg" are the same file type.
+is_image() {
+    local f="${1,,}" ext
+    for ext in $IMAGE_EXTS; do
+        case "$f" in
+            *".$ext") return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Every image across every configured folder, sorted by name. Missing folders
+# are skipped silently: a user who deleted ~/Pictures/Wallpaper should get an
+# empty list, not an error.
+list_images() {
+    local dir f
+    while IFS= read -r dir; do
+        [ -d "$dir" ] || continue
+        for f in "$dir"/*; do
+            [ -f "$f" ] || continue
+            is_image "$f" || continue
+            printf '%s\n' "$f"
+        done
+    done < <(read_dirs) | sort
+}
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+# Read one key out of the state file. Written by hand rather than with grep so a
+# path containing spaces (which every AI-generated wallpaper name does) comes
+# back whole.
+state_get() {
+    [ -r "$STATE_FILE" ] || return 1
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "$1="*) printf '%s' "${line#*=}"; return 0 ;;
+        esac
+    done < "$STATE_FILE"
+    return 1
+}
+
+state_set() {
+    local tmp="$STATE_FILE.tmp.$$"
+    mkdir -p "$CONFIG_DIR" || die "cannot create $CONFIG_DIR"
+    # Preserve any keys we don't know about, so a future version's settings
+    # survive an older script rewriting the file.
+    if [ -r "$STATE_FILE" ]; then
+        grep -v "^$1=" "$STATE_FILE" > "$tmp" 2>/dev/null || true
+    else
+        : > "$tmp"
+    fi
+    printf '%s=%s\n' "$1" "$2" >> "$tmp"
+    # Replace atomically: a half-written state file would restore no wallpaper
+    # at all after a reboot.
+    mv -f "$tmp" "$STATE_FILE" || { rm -f "$tmp"; die "cannot write $STATE_FILE"; }
+}
+
+# ---------------------------------------------------------------------------
+# Applying
+# ---------------------------------------------------------------------------
+
+# Swap the running swaybg over to $1. Returns non-zero if swaybg is missing so
+# callers can report it rather than pretending the wallpaper changed.
+apply_swaybg() {
+    local img="$1" monitor="$2"
+
+    if ! command -v swaybg >/dev/null 2>&1; then
+        return 1
+    fi
+
+    # Only swaybg processes that are actually setting an image (-i). Skipping
+    # the rest leaves a deliberate multi-monitor setup alone instead of killing
+    # a window the user placed themselves. `-x` matches the process name
+    # exactly, so this cannot match the grep/pgrep pipeline itself the way
+    # `pgrep -f swaybg` can.
+    local old_pids
+    old_pids="$(pgrep -x swaybg 2>/dev/null || true)"
+
+    local -a cmd=(swaybg)
+    [ -n "$monitor" ] && cmd+=(-o "$monitor")
+    cmd+=(-i "$img" -m "$FILL" -c "$COLOR")
+
+    # setsid so swaybg survives this script exiting and is not reaped when the
+    # session's process group is cleaned up — same reason waypaper's Popen
+    # leaves it running.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "${cmd[@]}" >/dev/null 2>&1 &
+    else
+        "${cmd[@]}" >/dev/null 2>&1 &
+    fi
+    local new_pid=$!
+
+    # Give swaybg a moment to map its surface before the old one goes away,
+    # otherwise there is a visible black frame on every switch.
+    sleep 0.3
+
+    local pid
+    for pid in $old_pids; do
+        [ "$pid" = "$new_pid" ] && continue
+        kill "$pid" 2>/dev/null || true
+    done
+
+    # Confirm something survived: if swaybg died immediately (unreadable file,
+    # bad decoder) say so instead of leaving a stale wallpaper looking correct.
+    sleep 0.2
+    if [ -n "$new_pid" ] && ! kill -0 "$new_pid" 2>/dev/null; then
+        if ! pgrep -x swaybg >/dev/null 2>&1; then
+            log "swaybg exited immediately — is this file a format swaybg can read?"
+            return 2
+        fi
+    fi
+    return 0
+}
+
+# Push the desktop's colors at $1. A theming failure is reported but does NOT
+# fail the whole operation: the wallpaper is already up and visible, and failing
+# here would make the picker look like it did nothing.
+#
+# matugen's own output is captured to a log rather than passed through. matugen
+# 4.x prints ~140 lines to stdout on every run (a full fastfetch dump, repeated
+# once per post_hook it fires), and this script's stdout is the machine-readable
+# result the app drawer's model parses -- a "Setting…" status field full of ASCII
+# art, and a `current` value that is not a path, are both strictly worse than
+# nothing. It is still available for debugging in the log.
+apply_matugen() {
+    local img="$1"
+    if [ -x /usr/bin/simpbar-matugen ]; then
+        MATUGEN_CMD=/usr/bin/simpbar-matugen
+    elif command -v simpbar-matugen >/dev/null 2>&1; then
+        MATUGEN_CMD="$(command -v simpbar-matugen)"
+    else
+        log "simpbar-matugen not found — wallpaper set, but colors were not regenerated"
+        return 0
+    fi
+    local log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/simpbar"
+    if mkdir -p "$log_dir" 2>/dev/null; then
+        # Truncated per run: this is a diagnostic tail, not a history, and an
+        # append-only file here would grow without bound.
+        if ! "$MATUGEN_CMD" "$img" >"$log_dir/matugen.log" 2>&1; then
+            log "matugen failed on $(basename "$img") — wallpaper is set, colors may be stale"
+            log "  see $log_dir/matugen.log"
+        fi
+    else
+        # No writable state dir: discard the noise rather than corrupt stdout.
+        "$MATUGEN_CMD" "$img" >/dev/null 2>&1 \
+            || log "matugen failed on $(basename "$img") — wallpaper is set, colors may be stale"
+    fi
+    return 0
+}
+
+cmd_set() {
+    local img="$1" monitor="${2:-}"
+
+    # Expand a leading ~ so `simpbar-wallpaper set ~/Pictures/...` works when
+    # quoted or unquoted. A quoted "~" never expands on its own, which is
+    # exactly the trap that made matugen only ever theme Bing wallpapers.
+    img="$(expand_tilde "$img")"
+    img="${img/#\~/$HOME}"
+    [ -n "$img" ] || die "no wallpaper path given"
+    [ -f "$img" ] || die "not a file: $img"
+    is_image "$img" || die "unsupported image type: $img (expected one of: $IMAGE_EXTS)"
+
+    local rc=0
+    apply_swaybg "$img" "$monitor" || rc=$?
+    case "$rc" in
+        1) die "swaybg isn't installed — nothing was changed" ;;
+        2) die "swaybg could not display $(basename "$img")" ;;
+    esac
+
+    # Remember it before theming so a matugen crash still leaves a restorable
+    # wallpaper rather than reverting to whatever was there before.
+    state_set path "$img"
+    state_set fill "$FILL"
+    state_set color "$COLOR"
+
+    apply_matugen "$img"
+    printf '%s\n' "$img"
+}
+
+cmd_list() {
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        printf '%s\t%s\n' "$f" "$(basename "$f")"
+    done < <(list_images)
+}
+
+# Print the image swaybg is currently displaying, or fail.
+#
+# Reads /proc/<pid>/cmdline (NUL-separated argv) rather than `pgrep -a swaybg`.
+# ps joins argv with spaces, which is unrecoverable for a filename containing
+# spaces — and every AI-generated wallpaper has them. argv boundaries are the
+# only way to tell where the path ends.
+swaybg_current_image() {
+    local pid arg next=""
+    pid="$(pgrep -x swaybg 2>/dev/null | head -n1)"
+    [ -n "$pid" ] || return 1
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    while IFS= read -r -d '' arg; do
+        if [ -n "$next" ]; then printf '%s' "$arg"; return 0; fi
+        [ "$arg" = "-i" ] && next=1
+    done < "/proc/$pid/cmdline"
+    return 1
+}
+
+cmd_current() {
+    local p
+    if p="$(state_get path)"; then
+        printf '%s\n' "$(expand_tilde "$p")"
+        return 0
+    fi
+    # No state of ours. Report whatever swaybg actually has on screen so the
+    # picker can highlight the right tile even on a first run.
+    if p="$(swaybg_current_image)"; then
+        printf '%s\n' "$p"
+        return 0
+    fi
+    return 1
+}
+
+cmd_random() {
+    local n
+    n="$(list_images | wc -l)"
+    [ "$n" -gt 0 ] || die "no wallpapers found in: $(read_dirs | tr '\n' ' ')"
+    local img
+    img="$(list_images | sed -n "$((RANDOM % n + 1))p")"
+    [ -n "$img" ] || die "could not pick a wallpaper"
+    cmd_set "$img"
+}
+
+# ---------------------------------------------------------------------------
+# Picker
+# ---------------------------------------------------------------------------
+
+# With no arguments, open a picker. The drawer's Wallpapers tab is the real one;
+# the fallbacks are for a machine without quickshell (e.g. Debian by default).
+open_picker() {
+    if command -v appdrawer >/dev/null 2>&1; then
+        exec appdrawer wallpapers
+    fi
+    if command -v rofi >/dev/null 2>&1; then
+        local chosen
+        chosen="$(cmd_list | rofi -dmenu -i -p "wallpaper")" || exit 0
+        [ -n "$chosen" ] && cmd_set "${chosen%%$'\t'*}"
+        exit 0
+    fi
+    for fb in waypaper azote; do
+        command -v "$fb" >/dev/null 2>&1 && exec "$fb"
+    done
+    die "no wallpaper picker available (install the app drawer, rofi, waypaper or azote)"
+}
+
+# ---------------------------------------------------------------------------
+main() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        list)          shift; cmd_list "$@" ;;
+        set)           shift; cmd_set "$@" ;;
+        random)        shift; cmd_random "$@" ;;
+        current)       cmd_current ;;
+        ""|--gui|pick) open_picker ;;
+        -h|--help|help)
+            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+        *)
+            # Treat a bare path as `set`, so `simpbar-wallpaper ~/img.jpg` works.
+            if [ -e "${cmd/#\~/$HOME}" ]; then
+                cmd_set "$cmd"
+            else
+                die "unknown command: $cmd (try: list, set, random, current)"
+            fi
+            ;;
+    esac
+}
+
+main "$@"

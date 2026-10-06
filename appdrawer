@@ -7,10 +7,18 @@
 # open the drawer, so one keypress always does the obvious thing rather than
 # silently doing nothing.
 #
-#   appdrawer        toggle the drawer (self-healing)
-#   appdrawer start  start the daemon in the background, do not toggle
-#   appdrawer open   open the drawer
-#   appdrawer close  close the drawer
+#   appdrawer            toggle the drawer (self-healing)
+#   appdrawer start      start the daemon in the background, do not toggle
+#   appdrawer open       open the drawer on the Apps tab
+#   appdrawer close      close the drawer
+#   appdrawer wallpapers open the drawer straight on the Wallpapers tab
+#   appdrawer apps       open the drawer straight on the Apps tab
+#
+# Applying a wallpaper deliberately has no subcommand here: `simpbar-wallpaper
+# set <img>` is the engine that actually does the work (swaybg swap, matugen
+# recolour, state file), and it runs fine with the drawer closed. Routing it
+# through IPC as well would mean two entry points that could disagree about
+# which one is in charge.
 #
 # `quickshell ipc call` exits 255 when no instance is running, which is what the
 # cold-path detection keys off.
@@ -27,11 +35,11 @@ if [ "$#" -gt 0 ]; then
             "$QS" -c "$CFG" -d >/dev/null 2>&1
             exit $?
             ;;
-        open|close|toggle)
+        open|close|toggle|wallpapers|apps)
             ACTION="$1"
             ;;
         *)
-            printf 'usage: %s [toggle|open|close|start]\n' "$0" >&2
+            printf 'usage: %s [toggle|open|close|start|wallpapers|apps]\n' "$0" >&2
             exit 2
             ;;
     esac

@@ -34,6 +34,16 @@ PanelWindow {
     property bool open: false
     property string powerOpen: ""
 
+    // Which tab the body shows. Settable from outside via `appdrawer
+    // wallpapers`, which is how the bar's wallpaper button lands straight here
+    // -- so it is a plain string, not something inferred from the search box.
+    property string tab: "apps"
+    readonly property var tabs: [
+        { id: "apps", label: "Apps" },
+        { id: "wallpapers", label: "Wallpapers" }
+    ]
+    readonly property bool showingWallpapers: win.tab === "wallpapers"
+
     // Session actions. loginctl is used rather than systemctl because
     // systemd-logind is what arbitrates suspend against inhibitors; calling
     // systemctl suspend from a shell can return before the machine sleeps,
@@ -69,7 +79,8 @@ PanelWindow {
     readonly property int padY: 16
     readonly property int sidebarW: 168
     readonly property int bodyH: win.gridH
-    readonly property int panelH: win.padY * 2 + 46 + 10 + win.bodyH + 30
+    // +42 for the tab strip between the search box and the body.
+    readonly property int panelH: win.padY * 2 + 46 + 42 + win.bodyH + 30
 
     function toggle() {
         if (win.open) {
@@ -79,14 +90,40 @@ PanelWindow {
         }
     }
 
-    // The search field's text and AppModel.query are two separate stores, and
+    // The search field's text and the model's query are two separate stores, and
     // the only binding between them runs TextInput -> query. Clearing the query
     // alone therefore leaves stale text sitting in the box, and the next
     // keystroke is appended to it, so successive searches silently concatenate
     // ("firefox" then "gpu" becomes "firefoxgpu"). Always go through here.
+    //
+    // Both models are cleared, not just the visible one: switching tabs and back
+    // would otherwise restore a filter the user forgot they typed.
     function resetSearch() {
         AppModel.query = ""
+        WallpaperModel.query = ""
         search.text = ""
+    }
+
+    // The tab's own model, so the search box and Enter do not branch on the tab
+    // at every call site.
+    readonly property var activeModel: win.showingWallpapers ? WallpaperModel
+                                                             : AppModel
+
+    function setTab(id) {
+        if (win.tab === id)
+            return
+        win.tab = id
+        win.powerOpen = ""
+        resetSearch()
+        // Refresh on entry: the wallpaper list and the current wallpaper can
+        // both change underneath us (a random pick from a terminal, a file added
+        // in a file manager), and a stale "current" badge would point at an
+        // image that is no longer on screen.
+        if (id === "wallpapers") {
+            WallpaperModel.refresh()
+            WallpaperModel.refreshCurrent()
+        }
+        search.forceActiveFocus()
     }
 
     function openDrawer() {
@@ -94,6 +131,17 @@ PanelWindow {
         win.open = true
         win.visible = true
         search.forceActiveFocus()
+    }
+
+    // Land straight on one tab. This is how the bar's wallpaper button reaches
+    // the picker without going through the Apps grid first.
+    function openTab(id) {
+        win.setTab(id)
+        win.openDrawer()
+        if (id === "wallpapers") {
+            WallpaperModel.refresh()
+            WallpaperModel.refreshCurrent()
+        }
     }
 
     function closeDrawer() {
@@ -168,11 +216,20 @@ PanelWindow {
                     clip: true
                     focus: true
 
-                    // Rewritten on every keystroke so the grid updates live.
-                    onTextChanged: AppModel.query = text
+                    // Rewritten on every keystroke so the active tab's grid
+                    // updates live.
+                    onTextChanged: win.activeModel.query = text
                     Keys.onEscapePressed: win.closeDrawer()
                     Keys.onReturnPressed: {
-                        if (AppModel.visibleApps.length > 0) {
+                        // Enter acts on whatever the visible tab is: launch the
+                        // first app, or apply the first wallpaper match. The
+                        // drawer stays open for the wallpaper case so the
+                        // recolour is visible.
+                        if (win.showingWallpapers) {
+                            if (WallpaperModel.visibleItems.length > 0)
+                                WallpaperModel.apply(
+                                    WallpaperModel.visibleItems[0].path);
+                        } else if (AppModel.visibleApps.length > 0) {
                             AppModel.launch(AppModel.visibleApps[0]);
                             win.closeDrawer();
                         }
@@ -184,9 +241,54 @@ PanelWindow {
                     verticalAlignment: Text.AlignVCenter
                     leftPadding: 16
                     visible: search.text.length === 0
-                    text: "Search apps"
+                    text: win.showingWallpapers ? "Search wallpapers"
+                                                : "Search apps"
                     color: Theme.dim
                     font.pixelSize: 16
+                }
+            }
+        }
+
+        // ---- tab strip -----------------------------------------------------
+        Row {
+            id: tabStrip
+            anchors.top: searchRow.bottom
+            anchors.topMargin: 10
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: 6
+
+            Repeater {
+                model: win.tabs
+
+                delegate: Rectangle {
+                    required property var modelData
+
+                    width: tabLabel.implicitWidth + 26
+                    height: 28
+                    radius: 9
+                    color: win.tab === modelData.id ? Theme.accent
+                                                    : (tabHover.hovered ? Theme.hover
+                                                                        : "transparent")
+                    opacity: win.tab === modelData.id ? 0.22 : 1.0
+                    border.width: 1
+                    border.color: win.tab === modelData.id ? Theme.accent
+                                                            : Theme.separator
+                    Behavior on color {
+                        ColorAnimation { duration: 80 }
+                    }
+
+                    Text {
+                        id: tabLabel
+                        anchors.centerIn: parent
+                        text: modelData.label
+                        color: win.tab === modelData.id ? Theme.accent : Theme.text
+                        font.pixelSize: 13
+                    }
+
+                    HoverHandler { id: tabHover }
+                    TapHandler {
+                        onTapped: win.setTab(modelData.id)
+                    }
                 }
             }
         }
@@ -194,7 +296,7 @@ PanelWindow {
         // ---- body: categories + grid --------------------------------------
         Item {
             id: body
-            anchors.top: searchRow.bottom
+            anchors.top: tabStrip.bottom
             anchors.topMargin: 10
             anchors.left: parent.left
             anchors.right: parent.right
@@ -205,7 +307,10 @@ PanelWindow {
             // category sidebar
             Item {
                 id: side
-                width: win.sidebarW
+                // No categories apply to wallpapers, so the whole column is
+                // dropped and the grid below takes the full width.
+                visible: !win.showingWallpapers
+                width: win.showingWallpapers ? 0 : win.sidebarW
                 anchors.top: parent.top
                 anchors.bottom: parent.bottom
 
@@ -278,8 +383,8 @@ PanelWindow {
             // app grid
             GridView {
                 id: grid
-                anchors.left: side.right
-                anchors.leftMargin: 18
+                anchors.left: win.showingWallpapers ? parent.left : side.right
+                anchors.leftMargin: win.showingWallpapers ? 0 : 18
                 anchors.right: parent.right
                 anchors.top: parent.top
                 anchors.bottom: parent.bottom
@@ -311,6 +416,42 @@ PanelWindow {
                     font.pixelSize: 15
                 }
             }
+
+            // ---- wallpaper grid --------------------------------------------
+            // A sibling of the app grid rather than a swap inside it: the two
+            // have unrelated models and delegate types, and keeping them as
+            // separate views means an app scroll position survives a trip to
+            // the wallpapers tab and back.
+            GridView {
+                id: wpGrid
+                anchors.fill: parent
+                visible: win.showingWallpapers
+                clip: true
+                interactive: win.open
+                model: WallpaperModel.visibleItems
+                cellWidth: 156
+                cellHeight: 132
+                boundsBehavior: Flickable.StopAtBounds
+
+                delegate: WallpaperTile {
+                    required property var modelData
+                    wp: modelData
+                    active: WallpaperModel.isCurrent(modelData.path)
+                    onPicked: (path) => WallpaperModel.apply(path)
+                }
+
+                Text {
+                    anchors.centerIn: parent
+                    visible: wpGrid.count === 0
+                    text: WallpaperModel.ready
+                          ? (WallpaperModel.items.length === 0
+                             ? "No wallpapers found in ~/Pictures/Wallpaper"
+                             : "No wallpapers match")
+                          : "Loading wallpapers…"
+                    color: Theme.dim
+                    font.pixelSize: 15
+                }
+            }
         }
 
         // ---- footer --------------------------------------------------------
@@ -325,13 +466,52 @@ PanelWindow {
 
             Text {
                 anchors.verticalCenter: parent.verticalCenter
-                text: AppModel.visibleApps.length + " apps  ·  Enter launch  ·  Esc close  ·  right-click a tile to pin"
+                // Status takes precedence: while a wallpaper is being applied
+                // the busy text is the only thing worth reading.
+                text: win.showingWallpapers
+                      ? (WallpaperModel.status.length > 0
+                         ? WallpaperModel.status
+                         : WallpaperModel.visibleItems.length + " wallpapers  ·  Enter apply  ·  Esc close")
+                      : (AppModel.visibleApps.length + " apps  ·  Enter launch  ·  Esc close  ·  right-click a tile to pin")
                 color: Theme.dim
                 font.pixelSize: 12
             }
 
+            // Random pick, wallpapers tab only. Sits left of the Power button,
+            // which is right-anchored, so the two never overlap.
+            Item {
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.right: powerBtn.left
+                anchors.rightMargin: 8
+                width: 92
+                height: 26
+                visible: win.showingWallpapers
+
+                Rectangle {
+                    anchors.fill: parent
+                    radius: 8
+                    color: randHover.hovered ? Theme.hover : "transparent"
+                    border.width: 1
+                    border.color: Theme.separator
+                    opacity: WallpaperModel.applying ? 0.5 : 1.0
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: WallpaperModel.applying ? "Working…" : "Random"
+                        color: Theme.text
+                        font.pixelSize: 12
+                    }
+                }
+                HoverHandler { id: randHover }
+                TapHandler {
+                    enabled: !WallpaperModel.applying
+                    onTapped: WallpaperModel.random()
+                }
+            }
+
             // system actions
             Item {
+                id: powerBtn
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.right: parent.right
                 width: 96
@@ -449,7 +629,19 @@ PanelWindow {
             + " panelVisible=" + panel.visible
             + " query='" + AppModel.query + "'"
             + " searchText='" + search.text + "'"
-            + " matches=" + AppModel.visibleApps.length);
+            + " matches=" + AppModel.visibleApps.length
+            // Tab + wallpaper state, so the picker can be verified over IPC
+            // without reading pixels: a click test cannot tell "the grid is
+            // empty" from "the model never loaded".
+            + " tab=" + win.tab
+            + " wpReady=" + WallpaperModel.ready
+            + " wpTotal=" + WallpaperModel.items.length
+            + " wpMatches=" + WallpaperModel.visibleItems.length
+            + " wpCurrent='" + WallpaperModel.current + "'"
+            + " wpApplying=" + WallpaperModel.applying
+            + " wpStatus='" + WallpaperModel.status + "'"
+            + " wpFirst='" + (WallpaperModel.visibleItems.length > 0
+                             ? WallpaperModel.visibleItems[0].path : "") + "'");
     }
 
     Process {
