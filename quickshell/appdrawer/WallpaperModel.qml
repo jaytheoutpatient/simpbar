@@ -220,7 +220,12 @@ Singleton {
                 root.current = applied;
             root.refresh();
             root.refreshCurrent();
-            if (root.status.length > 0 && !root.status.endsWith("…"))
+            // exit == 0 is a success, and a success's stderr chatter
+            // ("already have …", "saved …") is just noise -- clear it so the
+            // footer doesn't sit on a stale line after a quiet dedup. A
+            // non-zero exit means the engine had a real problem, whose message
+            // it printed to stderr; that one stays on screen.
+            if (exitCode !== 0)
                 return;
             root.status = "";
         }
