@@ -389,6 +389,13 @@ PanelWindow {
                 anchors.top: parent.top
                 anchors.bottom: parent.bottom
 
+                // The two grids occupy the same rect, so exactly one of them may
+                // be visible at a time -- `visible` (not `Loader`) so the hidden
+                // one keeps its scroll position and delegates alive. Without
+                // this the app grid stayed painted underneath the wallpaper grid
+                // and the two interleaved, since their cell sizes differ.
+                visible: !win.showingWallpapers
+
                 clip: true
                 interactive: win.open
                 model: AppModel.visibleApps
@@ -641,7 +648,13 @@ PanelWindow {
             + " wpApplying=" + WallpaperModel.applying
             + " wpStatus='" + WallpaperModel.status + "'"
             + " wpFirst='" + (WallpaperModel.visibleItems.length > 0
-                             ? WallpaperModel.visibleItems[0].path : "") + "'");
+                             ? WallpaperModel.visibleItems[0].path : "") + "'"
+            // The two grids are siblings occupying one rect, so "both visible"
+            // is a real, silently-wrong state that a screenshot shows only as
+            // something looking untidy. Worth asserting rather than eyeballing.
+            + " appGridVisible=" + grid.visible
+            + " wpGridVisible=" + wpGrid.visible
+            + " sidebarVisible=" + side.visible);
     }
 
     Process {
