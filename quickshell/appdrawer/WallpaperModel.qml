@@ -179,6 +179,80 @@ Singleton {
         setter.running = true;
     }
 
+    // ---- fetching new wallpapers (Bing today / random from wallhaven) ----
+
+    // True while a fetch runs. Kept separate from `applying` so the two are
+    // distinguishable in the footer, but both block the action buttons: only
+    // one wallpaper-related process may be in flight at a time, and they share
+    // the same "Working…" state.
+    property bool fetching: false
+
+    Process {
+        id: fetcher
+        stdout: StdioCollector {
+            onStreamFinished: {
+                // bing --apply and random --online echo the applied wallpaper's
+                // path on stdout. Keep it for the exit handler rather than
+                // repainting the badge mid-run.
+                var out = text.trim();
+                if (out.length > 0)
+                    root._fetchApplied = out.split("\n")[0];
+            }
+        }
+        stderr: StdioCollector {
+            onStreamFinished: {
+                var msg = text.trim();
+                if (msg.length > 0)
+                    root.status = msg.split("\n")[0];
+            }
+        }
+        // One place to unwind success and failure alike: a fetch changes what's
+        // in the wallpaper folder and possibly what's on screen, so the grid
+        // and the "current" badge are refetched however the run ended. Keeping
+        // the applied path across stdout/stderr/exit is also why the badge
+        // update happens here rather than in a collector, which can fire before
+        // the other stream has finished.
+        onExited: {
+            root.fetching = false;
+            var applied = root._fetchApplied;
+            root._fetchApplied = "";
+            if (applied.length > 0)
+                root.current = applied;
+            root.refresh();
+            root.refreshCurrent();
+            if (root.status.length > 0 && !root.status.endsWith("…"))
+                return;
+            root.status = "";
+        }
+    }
+    property string _fetchApplied: ""
+
+    // Today's Bing wallpaper, downloaded into the wallpaper folder and applied.
+    // --apply is the drawer's call, not the CLI default: clicking a fetch
+    // button here is the same gesture as clicking Random -- "put something on
+    // screen" -- so it ends with the wallpaper on screen, and the tile showing
+    // up in the grid is the side effect that makes the picker feel alive.
+    function fetchBing() {
+        if (applying || fetching)
+            return;
+        fetching = true;
+        status = "Fetching today's Bing wallpaper…";
+        fetcher.command = ["simpbar-wallpaper", "bing", "--count", "1", "--apply"];
+        fetcher.running = true;
+    }
+
+    // A random wallpaper from wallhaven.cc, fetched and applied. The engines's
+    // `random --online` applies by design; this is the same verb over the
+    // internet rather than the local folder.
+    function randomOnline() {
+        if (applying || fetching)
+            return;
+        fetching = true;
+        status = "Drawing a random online wallpaper…";
+        fetcher.command = ["simpbar-wallpaper", "random", "--online"];
+        fetcher.running = true;
+    }
+
     function nameOf(path) {
         var i = path.lastIndexOf("/");
         return i === -1 ? path : path.substring(i + 1);

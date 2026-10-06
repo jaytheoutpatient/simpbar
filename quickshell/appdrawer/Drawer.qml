@@ -33,6 +33,9 @@ PanelWindow {
 
     property bool open: false
     property string powerOpen: ""
+    // Overlay popups are mutually exclusive: opening one closes the other,
+    // instead of letting a second one paint over an open menu.
+    property bool optionsOpen: false
 
     // Which tab the body shows. Settable from outside via `appdrawer
     // wallpapers`, which is how the bar's wallpaper button lands straight here
@@ -43,6 +46,10 @@ PanelWindow {
         { id: "wallpapers", label: "Wallpapers" }
     ]
     readonly property bool showingWallpapers: win.tab === "wallpapers"
+    // Any wallpaper process in flight (apply, local random, or a fetch). The
+    // footer's action buttons share one busy state and one "Working…" label so
+    // they can never race each other for the swaybg swap.
+    readonly property bool wpBusy: WallpaperModel.applying || WallpaperModel.fetching
 
     // Session actions. loginctl is used rather than systemctl because
     // systemd-logind is what arbitrates suspend against inhibitors; calling
@@ -114,6 +121,7 @@ PanelWindow {
             return
         win.tab = id
         win.powerOpen = ""
+        win.optionsOpen = false
         resetSearch()
         // Refresh on entry: the wallpaper list and the current wallpaper can
         // both change underneath us (a random pick from a terminal, a file added
@@ -147,6 +155,7 @@ PanelWindow {
     function closeDrawer() {
         win.open = false
         win.powerOpen = ""
+        win.optionsOpen = false
         resetSearch()
         // Unmap once the slide-out finishes, otherwise the full-screen
         // invisible surface would keep swallowing clicks and the keyboard.
@@ -484,15 +493,86 @@ PanelWindow {
                 font.pixelSize: 12
             }
 
-            // Random pick, wallpapers tab only. Sits left of the Power button,
-            // which is right-anchored, so the two never overlap.
+            // Wallpaper source actions, wallpapers tab only. Chained from the
+            // right, in the same style as Power: an Item + Rectangle + labels +
+            // HoverHandler + TapHandler, so they all read as one group.
+            // Overlays close each other: tapping Power closes Options and vice
+            // versa.
+            //
+            // [Bing] [Online] [Random]        [Options] [Power]
+
+            // Today's Bing wallpaper, downloaded and applied.
             Item {
                 anchors.verticalCenter: parent.verticalCenter
-                anchors.right: powerBtn.left
+                anchors.right: onlineBtn.left
+                anchors.rightMargin: 8
+                width: 72
+                height: 26
+                visible: win.showingWallpapers && !win.optionsOpen
+
+                Rectangle {
+                    anchors.fill: parent
+                    radius: 8
+                    color: bingHover.hovered ? Theme.hover : "transparent"
+                    border.width: 1
+                    border.color: Theme.separator
+                    opacity: win.wpBusy ? 0.5 : 1.0
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: win.wpBusy ? "Working…" : "Bing"
+                        color: Theme.text
+                        font.pixelSize: 12
+                    }
+                }
+                HoverHandler { id: bingHover }
+                TapHandler {
+                    enabled: !win.wpBusy && !win.optionsOpen
+                    onTapped: WallpaperModel.fetchBing()
+                }
+            }
+
+            // A random wallpaper from wallhaven.cc, fetched and applied.
+            Item {
+                id: onlineBtn
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.right: randBtn.left
+                anchors.rightMargin: 8
+                width: 76
+                height: 26
+                visible: win.showingWallpapers && !win.optionsOpen
+
+                Rectangle {
+                    anchors.fill: parent
+                    radius: 8
+                    color: onlineHover.hovered ? Theme.hover : "transparent"
+                    border.width: 1
+                    border.color: Theme.separator
+                    opacity: win.wpBusy ? 0.5 : 1.0
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: win.wpBusy ? "Working…" : "Online"
+                        color: Theme.text
+                        font.pixelSize: 12
+                    }
+                }
+                HoverHandler { id: onlineHover }
+                TapHandler {
+                    enabled: !win.wpBusy && !win.optionsOpen
+                    onTapped: WallpaperModel.randomOnline()
+                }
+            }
+
+            // Random pick from the local folder.
+            Item {
+                id: randBtn
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.right: optsBtn.left
                 anchors.rightMargin: 8
                 width: 92
                 height: 26
-                visible: win.showingWallpapers
+                visible: win.showingWallpapers && !win.optionsOpen
 
                 Rectangle {
                     anchors.fill: parent
@@ -500,19 +580,51 @@ PanelWindow {
                     color: randHover.hovered ? Theme.hover : "transparent"
                     border.width: 1
                     border.color: Theme.separator
-                    opacity: WallpaperModel.applying ? 0.5 : 1.0
+                    opacity: win.wpBusy ? 0.5 : 1.0
 
                     Text {
                         anchors.centerIn: parent
-                        text: WallpaperModel.applying ? "Working…" : "Random"
+                        text: win.wpBusy ? "Working…" : "Random"
                         color: Theme.text
                         font.pixelSize: 12
                     }
                 }
                 HoverHandler { id: randHover }
                 TapHandler {
-                    enabled: !WallpaperModel.applying
+                    enabled: !win.wpBusy && !win.optionsOpen
                     onTapped: WallpaperModel.random()
+                }
+            }
+
+            // Wallhaven options: paste the user's own API key (Sketchy/Explicit
+            // need one), pick the content rating. The panel itself is painted
+            // below; this button just owns the open/close state.
+            Item {
+                id: optsBtn
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.right: powerBtn.left
+                anchors.rightMargin: 8
+                width: 78
+                height: 26
+                visible: win.showingWallpapers
+
+                Rectangle {
+                    anchors.fill: parent
+                    radius: 8
+                    color: optsHover.hovered ? Theme.hover : "transparent"
+                    border.width: 1
+                    border.color: win.optionsOpen ? Theme.accent : Theme.separator
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Options"
+                        color: win.optionsOpen ? Theme.accent : Theme.text
+                        font.pixelSize: 12
+                    }
+                }
+                HoverHandler { id: optsHover }
+                TapHandler {
+                    onTapped: win.toggleOptions()
                 }
             }
 
@@ -530,6 +642,7 @@ PanelWindow {
                     color: pwrHover.hovered ? Theme.hover : "transparent"
                     border.width: 1
                     border.color: Theme.separator
+                    opacity: win.powerOpen === "menu" ? 0.5 : 1.0
 
                     Text {
                         anchors.centerIn: parent
@@ -601,6 +714,309 @@ PanelWindow {
                 }
             }
         }
+
+        // ---- wallhaven options (overlaid, inside the panel) -----------
+        // Where the user's own wallhaven.cc API key goes, plus the content
+        // rating. Both are written to ~/.config/simpbar/wallhaven -- the same
+        // file the engine reads -- so a key pasted here is exactly a key typed
+        // in a terminal: one file, one meaning, no second store to drift. The
+        // form only commits on Save, so closing without saving changes nothing.
+        Rectangle {
+            id: whOpts
+            visible: win.optionsOpen
+            anchors.right: parent.right
+            anchors.rightMargin: win.padX
+            anchors.bottom: footer.top
+            anchors.bottomMargin: 6
+            width: 320
+            height: 262
+            radius: 12
+            color: Theme.window
+            border.width: 1
+            border.color: Theme.separator
+            z: 50
+
+            // Current file contents, kept apart from the widgets so the widgets
+            // can be edited freely and committed only by Save.
+            property string fileKey: ""
+            property string purity: "100"
+            property string status: ""
+            property bool saving: false
+
+            readonly property string path: (Quickshell.env("XDG_CONFIG_HOME")
+                                            || Quickshell.env("HOME") + "/.config")
+                                        + "/simpbar/wallhaven"
+
+            // Whether the key arrives from the environment instead of this
+            // file. The engine prefers WALLHAVEN_APIKEY over the file, so an
+            // input here would be silently ignored -- disable it and say so,
+            // like noctalia does. Purity still comes from the file.
+            readonly property bool envManaged: {
+                var v = Quickshell.env("WALLHAVEN_APIKEY");
+                return v !== undefined && v !== null && String(v).length > 0;
+            }
+
+            onVisibleChanged: {
+                if (visible)
+                    load();
+            }
+
+            function load() {
+                whOpts.status = "";
+                whOpts.saving = false;
+                keyField.clear();
+                whReader.command = ["sh", "-c",
+                    "cat \"$1\" 2>/dev/null || true",
+                    "simpbar-wallhaven-read",
+                    whOpts.path];
+                whReader.running = true;
+            }
+
+            function applyFile(text) {
+                var key = "";
+                var purity = "100";
+                var lines = text.split("\n");
+                for (var i = 0; i < lines.length; i++) {
+                    var l = lines[i];
+                    if (l.indexOf("key=") === 0)
+                        key = l.substring(4).trim();
+                    else if (l.indexOf("purity=") === 0) {
+                        var v = l.substring(7).trim();
+                        if (v.length > 0) purity = v;
+                    }
+                }
+                whOpts.fileKey = key;
+                whOpts.purity = purity;
+                // Prefill the (masked) field with the current key, like
+                // noctalia does: hitting Save without touching it writes the
+                // same key back, so an empty-by-default field can never wipe a
+                // configured key by accident. The environment-owned key is the
+                // one case where the field stays deliberately blank.
+                if (!whOpts.envManaged)
+                    keyField.text = key;
+                if (whOpts.envManaged)
+                    whOpts.status = "engine key takes WALLHAVEN_APIKEY";
+            }
+
+            function save() {
+                if (whOpts.saving)
+                    return;
+                whOpts.saving = true;
+                whOpts.status = "Saving…";
+                whWriter.command = ["sh", "-c",
+                    "mkdir -p \"$HOME/.config/simpbar\" && printf 'key=%s\\npurity=%s\\n' \"$1\" \"$2\" > \"$HOME/.config/simpbar/wallhaven\"",
+                    "simpbar-wallhaven-save",
+                    keyField.text.trim(),
+                    whOpts.purity];
+                whWriter.running = true;
+            }
+
+            Column {
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: 10
+
+                // header
+                Item {
+                    width: parent.width
+                    height: 20
+
+                    Text {
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Wallhaven"
+                        color: Theme.text
+                        font.pixelSize: 14
+                        font.bold: true
+                    }
+                    Text {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 74
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "source"
+                        color: Theme.dim
+                        font.pixelSize: 11
+                    }
+                    Rectangle {
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 22
+                        height: 18
+                        radius: 6
+                        color: closeXHover.hovered ? Theme.hover : "transparent"
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "×"
+                            color: Theme.dim
+                            font.pixelSize: 13
+                        }
+
+                        HoverHandler { id: closeXHover }
+                        TapHandler { onTapped: win.optionsOpen = false }
+                    }
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: 1
+                    color: Theme.separator
+                }
+
+                Text {
+                    text: "API key (optional)"
+                    color: Theme.dim
+                    font.pixelSize: 11
+                }
+
+                Rectangle {
+                    id: keyBox
+                    width: parent.width
+                    height: 32
+                    radius: 8
+                    border.width: 1
+                    border.color: keyField.activeFocus ? Theme.accent : Theme.separator
+
+                    TextInput {
+                        id: keyField
+                        anchors.fill: parent
+                        anchors.leftMargin: 12
+                        anchors.rightMargin: 12
+                        verticalAlignment: TextInput.AlignVCenter
+                        color: Theme.text
+                        font.pixelSize: 13
+                        echoMode: TextInput.Password
+                        selectByMouse: true
+                        enabled: !whOpts.envManaged
+                        clip: true
+                        Keys.onReturnPressed: whOpts.save()
+                    }
+                    Text {
+                        anchors.fill: parent
+                        anchors.leftMargin: 12
+                        anchors.rightMargin: 12
+                        verticalAlignment: Text.AlignVCenter
+                        visible: keyField.length === 0
+                        text: whOpts.envManaged
+                              ? "managed by WALLHAVEN_APIKEY"
+                              : (whOpts.fileKey.length > 0
+                                 ? "key set — paste to replace"
+                                 : "paste your key…")
+                        color: Theme.dim
+                        font.pixelSize: 13
+                        clip: true
+                    }
+                }
+
+                Text {
+                    width: parent.width
+                    height: 28
+                    text: "SFW needs no key. Sketchy and explicit content need your key from wallhaven.cc/user/settings/api."
+                    color: Theme.dim
+                    font.pixelSize: 10
+                    wrapMode: Text.WordWrap
+                    lineHeight: 1.3
+                }
+
+                Text {
+                    text: "Content"
+                    color: Theme.dim
+                    font.pixelSize: 11
+                }
+
+                Row {
+                    width: parent.width
+                    height: 24
+                    spacing: 6
+
+                    Repeater {
+                        model: [
+                            { v: "100", l: "SFW" },
+                            { v: "110", l: "Sketchy" },
+                            { v: "111", l: "Explicit" }
+                        ]
+
+                        delegate: Rectangle {
+                            required property var modelData
+                            id: purityChip
+                            width: chipLabel.implicitWidth + 20
+                            height: 24
+                            radius: 8
+                            color: chipHover.hovered ? Theme.hover : "transparent"
+                            opacity: whOpts.purity === modelData.v ? 0.22 : 1.0
+                            border.width: 1
+                            border.color: whOpts.purity === modelData.v
+                                           ? Theme.accent : Theme.separator
+
+                            Text {
+                                id: chipLabel
+                                anchors.centerIn: parent
+                                text: modelData.l
+                                color: whOpts.purity === modelData.v ? Theme.accent : Theme.text
+                                font.pixelSize: 12
+                            }
+                            HoverHandler { id: chipHover }
+                            TapHandler { onTapped: whOpts.purity = modelData.v }
+                        }
+                    }
+                }
+
+                // status + save
+                Item {
+                    width: parent.width
+                    height: 26
+
+                    Text {
+                        anchors.left: parent.left
+                        anchors.right: saveBtn.left
+                        anchors.rightMargin: 8
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: whOpts.status
+                        color: Theme.dim
+                        font.pixelSize: 11
+                        elide: Text.ElideRight
+                    }
+                    Item {
+                        id: saveBtn
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 76
+                        height: 26
+
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: 8
+                            color: saveHover.hovered ? Theme.hover : "transparent"
+                            border.width: 1
+                            border.color: Theme.accent
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: whOpts.saving ? "Saving…" : "Save"
+                                color: Theme.accent
+                                font.pixelSize: 12
+                            }
+                        }
+                        HoverHandler { id: saveHover }
+                        TapHandler {
+                            enabled: !whOpts.saving
+                            onTapped: whOpts.save()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    function toggleOptions() {
+        if (win.optionsOpen) {
+            win.optionsOpen = false;
+            return;
+        }
+        if (!win.open)
+            win.openDrawer();
+        win.powerOpen = "";
+        win.optionsOpen = true;
     }
 
     function runPower(argv) {
@@ -646,7 +1062,16 @@ PanelWindow {
             + " wpMatches=" + WallpaperModel.visibleItems.length
             + " wpCurrent='" + WallpaperModel.current + "'"
             + " wpApplying=" + WallpaperModel.applying
+            + " wpFetching=" + WallpaperModel.fetching
             + " wpStatus='" + WallpaperModel.status + "'"
+            // Popup state. The key itself is never dumped -- it is a secret,
+            // and it lives in the log file; whether one is configured is
+            // enough for a state dump.
+            + " optsOpen=" + win.optionsOpen
+            + " whEnv=" + whOpts.envManaged
+            + " whHasKey=" + (whOpts.fileKey.length > 0)
+            + " whPurity=" + whOpts.purity
+            + " whSaving=" + whOpts.saving
             + " wpFirst='" + (WallpaperModel.visibleItems.length > 0
                              ? WallpaperModel.visibleItems[0].path : "") + "'"
             // The two grids are siblings occupying one rect, so "both visible"
@@ -661,5 +1086,41 @@ PanelWindow {
         id: powerRunner
         stdout: StdioCollector {}
         stderr: StdioCollector {}
+    }
+
+    // Reads ~/.config/simpbar/wallhaven when the options popup opens. Read via
+    // the same parse the widgets use, so the popup shows exactly what the
+    // engine would see (missing file = no key, SFW).
+    Process {
+        id: whReader
+        stdout: StdioCollector {
+            onStreamFinished: {
+                whOpts.applyFile(text);
+                whReader.running = false;
+            }
+        }
+        stderr: StdioCollector {
+            onStreamFinished: whReader.running = false
+        }
+    }
+
+    // Writes the wallhaven file on Save. Stderr carries a real problem (the
+    // `printf >` failing, a permissions error); a clean run leaves it empty
+    // and onExited flips the status to "Saved".
+    Process {
+        id: whWriter
+        stdout: StdioCollector {}
+        stderr: StdioCollector {
+            onStreamFinished: {
+                var msg = text.trim();
+                if (msg.length > 0)
+                    whOpts.status = msg;
+            }
+        }
+        onExited: {
+            whOpts.saving = false;
+            if (whOpts.status === "Saving…")
+                whOpts.status = "Saved";
+        }
     }
 }

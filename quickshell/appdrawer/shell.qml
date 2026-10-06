@@ -48,6 +48,23 @@ ShellRoot {
             WallpaperModel.random()
         }
 
+        // Fetch today's Bing wallpaper (download + apply), or a random one from
+        // wallhaven.cc. Exposed over IPC so a keybind can do in one call what
+        // the footer buttons do with a click.
+        function fetchBing() {
+            WallpaperModel.fetchBing()
+        }
+
+        function randomOnlineWallpaper() {
+            WallpaperModel.randomOnline()
+        }
+
+        // Open (or close) the Wallhaven options popup. No keyboard equivalent
+        // exists today; this is also how the popup is verified over IPC.
+        function openOptions() {
+            drawer.toggleOptions()
+        }
+
         // Delegates to Drawer so the Theme/Icons/AppModel singletons are
         // resolved in a scope where they actually exist: they are registered in
         // this directory's synthesised qmldir, but shell.qml does not import
