@@ -167,8 +167,13 @@ fn loadConfig(gpa: std.mem.Allocator) ShellConfig {
     };
     defer gpa.free(bytes);
 
+    // alloc_always: the default (alloc_if_needed) would leave string fields
+    // pointing into `bytes`, which is freed below — a dangling holiday_country
+    // then segfaults the calendar widget's configure(). Strings must outlive
+    // this function (they land in cfg / g_shell_cfg for the process lifetime).
     const parsed = std.json.parseFromSliceLeaky(JsonConfig, gpa, bytes, .{
         .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
     }) catch |err| {
         logging.warn("config: could not parse {s}: {} — keeping defaults", .{ shell_config_path, err });
         return cfg;

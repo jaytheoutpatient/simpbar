@@ -1618,11 +1618,20 @@ pub const CalendarWidget = struct {
         var fired_count: usize = 0;
         var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
         while (lines.next()) |raw_line| {
-            const line = std.mem.trim(u8, raw_line, " \t\r");
+            var line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0 or line[0] == '#') continue;
+            // Tolerate one stray leading '+' (seen on a hand- or tool-edited
+            // line once) — valid lines always start with the year.
+            if (line[0] == '+') {
+                logging.step("calendar: stripping stray '+' from: {s}", .{line});
+                line = line[1..];
+            }
             if (fresh_count >= REM_MAX) break;
             var r: Reminder = undefined;
-            if (!parseReminderLine(line, &r)) continue;
+            if (!parseReminderLine(line, &r)) {
+                logging.step("calendar: skipping malformed line: {s}", .{line});
+                continue;
+            }
             var carried = false;
             for (0..self.reminder_count) |i| {
                 const old = &self.reminders[i];
