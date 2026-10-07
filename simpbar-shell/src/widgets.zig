@@ -19,7 +19,7 @@ const font_mod = @import("font");
 const art_mod = @import("art");
 const logging = @import("logging");
 
-pub const WidgetId = enum { clock, weather, media, system, calendar };
+pub const WidgetId = enum { clock, weather, media, system, calendar, watch };
 
 /// Axis-aligned rect in surface coordinates. The host keeps one per widget
 /// (measured from the font at startup, placed from config).
@@ -78,6 +78,14 @@ const CAL_WD_GAP: i64 = 4;
 const CAL_FOOT_GAP: i64 = 6;
 const CAL_ARROW_ZONE: i64 = 20; // clickable width of the < / > header zones
 
+// Analog watch (Seiko 5 style) geometry: a square whose content IS the
+// widget — the host skips its frosted card for this one, the steel case and
+// bracelet stubs are the chrome. cardSizeFor and WatchWidget.paint share
+// these so the measured rect always fits the painted watch.
+const WATCH_W: i64 = 190;
+const WATCH_H: i64 = 240;
+const WATCH_CASE_R: f64 = 86;
+
 /// 0xAARRGGBB with alpha rescaled to `alpha_pct` (0-100), RGB untouched.
 /// Used for card fills so only the background's opacity varies.
 pub fn withAlpha(color: u32, alpha_pct: u32) u32 {
@@ -104,6 +112,8 @@ pub fn cardSizeFor(id: WidgetId, font: *const font_mod.Font) [2]u32 {
         .media => .{ @intCast(MEDIA_W), @intCast(2 * CARD_PAD + MEDIA_COVER + MEDIA_HEAD_GAP + MEDIA_PROG_H + MEDIA_TIME_GAP + lh + MEDIA_CTRL_GAP + lh) },
         .system => .{ 190, @intCast(2 * CARD_PAD + 3 * lh + 2 * ROW_GAP + 2 * BAR_H) },
         .calendar => .{ @intCast(CAL_W), @intCast(2 * CARD_PAD + 3 * lh + CAL_HEAD_GAP + CAL_WD_GAP + CAL_ROWS * CAL_CELL_H + CAL_FOOT_GAP) },
+        // Fixed-size: the watch is drawn from its own geometry, not the font.
+        .watch => .{ @intCast(WATCH_W), @intCast(WATCH_H) },
     };
 }
 
@@ -258,6 +268,113 @@ pub const Canvas = struct {
                 if (!insideRounded(px, py, x, y, iw, ih, radius)) continue;
                 const src = (a << 24) | (@as(u32, rgba[o]) << 16) | (@as(u32, rgba[o + 1]) << 8) | rgba[o + 2];
                 self.pixels[pyu * self.width + pxu] = blendOver(self.pixels[pyu * self.width + pxu], src);
+            }
+        }
+    }
+
+    /// A float-space point — the anti-aliased primitives below take arrays
+    /// of these.
+    pub const FPt = struct { x: f64, y: f64 };
+
+    /// Alpha-blend `color` at (x, y) with fractional coverage `cov`
+    /// (0..1) — shared exit for the AA primitives: `cov` becomes the
+    /// source's alpha, then the usual straight-alpha OVER blend.
+    fn blendCov(self: Canvas, x: i64, y: i64, color: u32, cov: f64) void {
+        if (cov <= 0.0) return;
+        if (x < 0 or y < 0) return;
+        const pxu: usize = @intCast(x);
+        const pyu: usize = @intCast(y);
+        if (pxu >= self.width or pyu >= self.height) return;
+        const a: f64 = @floatFromInt((color >> 24) & 0xFF);
+        const eff: u32 = @intFromFloat(@min(1.0, cov) * a);
+        if (eff == 0) return;
+        const src = (eff << 24) | (color & 0x00FFFFFF);
+        self.pixels[pyu * self.width + pxu] = blendOver(self.pixels[pyu * self.width + pxu], src);
+    }
+
+    /// Anti-aliased filled circle: solid inside, one-pixel feather at the
+    /// rim from the signed distance to it. The case and dial edges lean on
+    /// this — at 172px across, hard-edged stair-stepping would be obvious.
+    pub fn fillCircleAA(self: Canvas, cx: f64, cy: f64, rad: f64, color: u32) void {
+        const x0: i64 = @intFromFloat(@floor(cx - rad - 1.0));
+        const x1: i64 = @intFromFloat(@ceil(cx + rad + 1.0));
+        const y0: i64 = @intFromFloat(@floor(cy - rad - 1.0));
+        const y1: i64 = @intFromFloat(@ceil(cy + rad + 1.0));
+        var y = @max(y0, 0);
+        while (y <= y1) : (y += 1) {
+            var x = @max(x0, 0);
+            while (x <= x1) : (x += 1) {
+                const dx = @as(f64, @floatFromInt(x)) + 0.5 - cx;
+                const dy = @as(f64, @floatFromInt(y)) + 0.5 - cy;
+                const dist = @sqrt(dx * dx + dy * dy);
+                self.blendCov(x, y, color, rad + 0.5 - dist);
+            }
+        }
+    }
+
+    /// AA-filled ring (annulus) — bezels and the stepped edge where the
+    /// case drops into the dial. Coverage is the product of both rims'.
+    pub fn fillRingAA(self: Canvas, cx: f64, cy: f64, rad_in: f64, rad_out: f64, color: u32) void {
+        const x0: i64 = @intFromFloat(@floor(cx - rad_out - 1.0));
+        const x1: i64 = @intFromFloat(@ceil(cx + rad_out + 1.0));
+        const y0: i64 = @intFromFloat(@floor(cy - rad_out - 1.0));
+        const y1: i64 = @intFromFloat(@ceil(cy + rad_out + 1.0));
+        var y = @max(y0, 0);
+        while (y <= y1) : (y += 1) {
+            var x = @max(x0, 0);
+            while (x <= x1) : (x += 1) {
+                const dx = @as(f64, @floatFromInt(x)) + 0.5 - cx;
+                const dy = @as(f64, @floatFromInt(y)) + 0.5 - cy;
+                const dist = @sqrt(dx * dx + dy * dy);
+                self.blendCov(x, y, color, @min(rad_out + 0.5 - dist, dist - (rad_in - 0.5)));
+            }
+        }
+    }
+
+    /// AA-filled convex polygon (either winding): per-pixel coverage from
+    /// the distance to the nearest edge. This is how rotated index batons
+    /// and the sweeping hands stay smooth at any angle.
+    pub fn fillConvex(self: Canvas, pts: []const FPt, color: u32) void {
+        if (pts.len < 3) return;
+        var minx = pts[0].x;
+        var maxx = pts[0].x;
+        var miny = pts[0].y;
+        var maxy = pts[0].y;
+        for (pts[1..]) |p| {
+            minx = @min(minx, p.x);
+            maxx = @max(maxx, p.x);
+            miny = @min(miny, p.y);
+            maxy = @max(maxy, p.y);
+        }
+        // Signed area picks up the winding; flip distances so "inside" is
+        // positive either way.
+        var area: f64 = 0;
+        for (pts, 0..) |p, i| {
+            const q = pts[(i + 1) % pts.len];
+            area += p.x * q.y - q.x * p.y;
+        }
+        const orient: f64 = if (area >= 0) 1.0 else -1.0;
+        const x0: i64 = @intFromFloat(@floor(minx - 1.0));
+        const x1: i64 = @intFromFloat(@ceil(maxx + 1.0));
+        const y0: i64 = @intFromFloat(@floor(miny - 1.0));
+        const y1: i64 = @intFromFloat(@ceil(maxy + 1.0));
+        var y = @max(y0, 0);
+        while (y <= y1) : (y += 1) {
+            var x = @max(x0, 0);
+            while (x <= x1) : (x += 1) {
+                const px = @as(f64, @floatFromInt(x)) + 0.5;
+                const py = @as(f64, @floatFromInt(y)) + 0.5;
+                var min_d: f64 = std.math.floatMax(f64);
+                for (pts, 0..) |p, i| {
+                    const q = pts[(i + 1) % pts.len];
+                    const ex = q.x - p.x;
+                    const ey = q.y - p.y;
+                    const len = @sqrt(ex * ex + ey * ey);
+                    if (len == 0.0) continue;
+                    const cross = (ex * (py - p.y) - ey * (px - p.x)) * orient;
+                    min_d = @min(min_d, cross / len);
+                }
+                self.blendCov(x, y, color, min_d + 0.5);
             }
         }
     }
@@ -1276,8 +1393,9 @@ fn parseKbAfterColon(line: []const u8) u64 {
 // growing in-process UI machinery:
 //
 //   * reminders live in a plain text file (~/.config/simpbar/reminders.txt,
-//     one per line: "YYYY-MM-DD HH:MM lead text" — lead = days before the
-//     date to notify, 0 = on the day). Editing goes through rofi when a day
+//     one per line: "YYYY-MM-DD HH:MM [lead] text" — lead = days before the
+//     date to notify, 0 = on the day, and optional for hand-written lines
+//     (the rest of the line is the text). Editing goes through rofi when a day
 //     is clicked; notifications through notify-send when a due time passes.
 //   * holidays come from date.nager.at's free no-key API for a configurable
 //     country (shell.json: holiday_country, holiday_region), colour-coded:
@@ -1316,9 +1434,12 @@ const Reminder = struct {
 
 const CalPhase = enum { holidays, menu };
 
-/// Parses "YYYY-MM-DD HH:MM lead text" into `out` (raw copy included).
+/// Parses "YYYY-MM-DD HH:MM [lead] text" into `out` (raw copy included).
+/// The lead field is optional so hand-written lines like
+/// "2026-10-20 10:00 PayDay" work: a non-numeric first token means the
+/// text starts right there and the reminder notifies on the day (lead 0).
 fn parseReminderLine(line: []const u8, out: *Reminder) bool {
-    if (line.len < 20) return false;
+    if (line.len < 18) return false;
     if (line[4] != '-' or line[7] != '-' or line[10] != ' ' or line[13] != ':' or line[16] != ' ') return false;
     if (line.len > out.raw.len) return false;
     const y = std.fmt.parseInt(i32, line[0..4], 10) catch return false;
@@ -1328,8 +1449,12 @@ fn parseReminderLine(line: []const u8, out: *Reminder) bool {
     const mm = std.fmt.parseInt(u8, line[14..16], 10) catch return false;
     var i: usize = 17;
     while (i < line.len and line[i] != ' ') i += 1;
-    const lead = std.fmt.parseInt(u8, line[17..i], 10) catch return false;
-    if (i >= line.len or i + 1 >= line.len) return false; // text required
+    const lead_opt: ?u8 = std.fmt.parseInt(u8, line[17..i], 10) catch null;
+    if (lead_opt != null and (i >= line.len or i + 1 >= line.len)) return false; // lead but no text
+    const lead = lead_opt orelse 0;
+    var text_start: usize = if (lead_opt != null) i + 1 else 17;
+    while (text_start < line.len and line[text_start] == ' ') text_start += 1;
+    if (text_start >= line.len) return false; // text required
     if (y < 1970 or y > 2100 or m < 1 or m > 12 or d < 1 or d > 31) return false;
     if (hh > 23 or mm > 59 or lead > 60) return false;
     @memcpy(out.raw[0..line.len], line);
@@ -1340,8 +1465,8 @@ fn parseReminderLine(line: []const u8, out: *Reminder) bool {
     out.hh = hh;
     out.mm = mm;
     out.lead = lead;
-    out.text_off = @intCast(i + 1);
-    out.text_len = @intCast(line.len - (i + 1));
+    out.text_off = @intCast(text_start);
+    out.text_len = @intCast(line.len - text_start);
     out.fired = false;
     return true;
 }
@@ -1975,6 +2100,255 @@ pub const CalendarWidget = struct {
     }
 };
 
+// --- analog watch (Seiko 5 automatic) --------------------------------------
+
+/// An analog clock drawn like a Seiko 5 automatic: brushed steel case on
+/// bracelet stubs, applied baton indices (double at 12, none at 3 — the
+/// day-date window takes that spot), and a seconds hand stepping in
+/// 1/6-second beats — the 21,600 vph sweep of the 7S26 movement rather
+/// than a dead-beat tick.
+///
+/// Clicking anywhere on the watch flips between the classic white dial and
+/// a black (SNK809-flavoured) one. Every paint reads the wall clock fresh —
+/// no hand-angle state, nothing to drift.
+pub const WatchWidget = struct {
+    /// 0 = white dial, 1 = black dial.
+    dial: u8 = 0,
+
+    /// Six repaints a second = six beats (21,600 vibrations/hour).
+    pub const interval_ms: i64 = 167; // six beats per second (21,600 vph)
+
+    /// Colours for one dial variant (0xAARRGGBB). The steel of the case
+    /// and bracelet is shared between both variants.
+    const Palette = struct {
+        dial: u32,
+        minute_tick: u32,
+        five_tick: u32,
+        index: u32,
+        hand: u32,
+        lume: u32,
+        seconds: u32,
+        shield_bg: u32,
+        shield_fg: u32,
+        window_fg: u32,
+    };
+
+    const STEEL_BODY: u32 = 0xFFA9AEB6;
+    const STEEL_POLISH: u32 = 0xFFD6DBE1;
+    const STEEL_BEZEL: u32 = 0xFFBEC3CA;
+    const STEEL_SHADOW: u32 = 0xFF7C818A;
+    const STEEL_CAP: u32 = 0xFFC8CDD4;
+    const STRAP: u32 = 0xFF8E939B;
+    const STRAP_LINK: u32 = 0xFF6E737A;
+    const STRAP_EDGE: u32 = 0xFFB7BCC3;
+    const WINDOW_BG: u32 = 0xFFFFFFFF;
+    const WINDOW_BORDER: u32 = 0xFF1C1C1F;
+
+    const WHITE_DIAL: Palette = .{
+        .dial = 0xFFF7F6F1,
+        .minute_tick = 0xFFB4B3AB,
+        .five_tick = 0xFF3C3C38,
+        .index = 0xFF26262A,
+        .hand = 0xFF1B1C20,
+        .lume = 0xFFE9F2C6,
+        .seconds = 0xFF575D66,
+        .shield_bg = 0xFF26262A,
+        .shield_fg = 0xFFF7F6F1,
+        .window_fg = 0xFF17171A,
+    };
+    const BLACK_DIAL: Palette = .{
+        .dial = 0xFF17191D,
+        .minute_tick = 0xFF494C52,
+        .five_tick = 0xFFD8DBE0,
+        .index = 0xFFE3E6EA,
+        .hand = 0xFFECEEF2,
+        .lume = 0xFFC9E48F,
+        .seconds = 0xFFB8BEC6,
+        .shield_bg = 0xFFE3E6EA,
+        .shield_fg = 0xFF17191D,
+        .window_fg = 0xFF17171A,
+    };
+
+    /// Uppercased day abbreviations for the window — DAYS is title-case for
+    /// the digital clock's sub-line.
+    const DAYS_UPPER = [_][]const u8{ "SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT" };
+
+    const DEG = std.math.pi / 180.0;
+
+    pub fn tick(self: *WatchWidget) bool {
+        _ = self;
+        return true; // the hands move on every beat — always repaint
+    }
+
+    /// Click the watch to swap the dial (the host repaints after any click).
+    pub fn click(self: *WatchWidget) void {
+        self.dial = (self.dial + 1) % 2;
+    }
+
+    /// Radial unit direction for angle `a` in radians: 0 = 12 o'clock,
+    /// growing clockwise.
+    fn radial(a: f64) [2]f64 {
+        return .{ @sin(a), -@cos(a) };
+    }
+
+    /// Point at radius `along` with lateral offset `off` from the dial
+    /// center, along direction (dx, dy).
+    fn at(cx: f64, cy: f64, dx: f64, dy: f64, along: f64, off: f64) Canvas.FPt {
+        return .{ .x = cx + dx * along - dy * off, .y = cy + dy * along + dx * off };
+    }
+
+    /// Tapered baton from radius r0 to r1 (either end may pass the center,
+    /// so hands can carry a tail), width w0 → w1. AA via fillConvex.
+    fn baton(c: Canvas, cx: f64, cy: f64, a: f64, r0: f64, r1: f64, w0: f64, w1: f64, color: u32) void {
+        const d = radial(a);
+        const pts = [4]Canvas.FPt{
+            at(cx, cy, d[0], d[1], r0, -w0 / 2),
+            at(cx, cy, d[0], d[1], r1, -w1 / 2),
+            at(cx, cy, d[0], d[1], r1, w1 / 2),
+            at(cx, cy, d[0], d[1], r0, w0 / 2),
+        };
+        c.fillConvex(&pts, color);
+    }
+
+    /// Centered, letterspaced text — dial brand lettering is spaced like
+    /// this on the real watch. ASCII only (SEIKO / AUTOMATIC).
+    fn drawSpaced(c: Canvas, cx: i64, baseline: i64, text: []const u8, gap: i64, color: u32) void {
+        var total: i64 = 0;
+        for (text, 0..) |_, i| {
+            total += (c.font.glyph(text[i]) catch continue).advance_x;
+            if (i + 1 < text.len) total += gap;
+        }
+        var pen = cx - @divTrunc(total, 2);
+        for (text, 0..) |_, i| {
+            _ = c.drawText(pen, baseline, text[i .. i + 1], color);
+            pen += (c.font.glyph(text[i]) catch continue).advance_x + gap;
+        }
+    }
+
+    pub fn paint(self: *const WatchWidget, c: Canvas, r: Rect) void {
+        const P: Palette = if (self.dial == 0) WHITE_DIAL else BLACK_DIAL;
+        const cx_i: i64 = @as(i64, r.x) + WATCH_W / 2;
+        const cy_i: i64 = @as(i64, r.y) + WATCH_H / 2;
+        const cx: f64 = @floatFromInt(cx_i);
+        const cy: f64 = @floatFromInt(cy_i);
+
+        // Wall clock drives every hand — no angle state to drift. The
+        // sub-second read gives the beat phase (6 beats per second).
+        var tp: posix.timespec = undefined;
+        if (libc_mono.clock_gettime(0, &tp) != 0) { // 0 = CLOCK_REALTIME
+            tp.sec = @intCast(libc_time.time(null));
+            tp.nsec = 0;
+        }
+        const epoch: i64 = @intCast(tp.sec);
+        var tm: libc_time.Tm = undefined;
+        _ = libc_time.localtime_r(&epoch, &tm);
+        const nsec: i64 = @intCast(tp.nsec);
+        const beat: i64 = @divTrunc(@mod(nsec, 1_000_000_000) * 6, 1_000_000_000);
+
+        // Seconds: 6°/s with the hand stepping 1° per beat. Minute and
+        // hour ride continuously on top of that.
+        const sec_a = (@as(f64, @floatFromInt(tm.sec)) * 6.0 + @as(f64, @floatFromInt(beat))) * DEG;
+        const min_a = (@as(f64, @floatFromInt(tm.min)) + @as(f64, @floatFromInt(tm.sec)) / 60.0) * 6.0 * DEG;
+        const hr_a = (@as(f64, @floatFromInt(@mod(tm.hour, 12))) + @as(f64, @floatFromInt(tm.min)) / 60.0) * 30.0 * DEG;
+
+        // Bracelet stubs first — the case laps over their inner ends.
+        const strap_x = cx_i - 27;
+        const strap_len: i64 = WATCH_H / 2;
+        for ([2]bool{ true, false }) |is_top| {
+            const y0: i64 = if (is_top) @as(i64, r.y) else cy_i;
+            c.fillRect(strap_x, y0, 54, @intCast(strap_len), STRAP);
+            // Link grooves + side edges (the case overdraws the middle).
+            var gy = y0 + 9;
+            while (gy < y0 + strap_len) : (gy += 8) {
+                c.fillRect(strap_x + 4, gy, 46, 1, STRAP_LINK);
+            }
+            c.fillRect(strap_x, y0, 1, @intCast(strap_len), STRAP_EDGE);
+            c.fillRect(strap_x + 53, y0, 1, @intCast(strap_len), STRAP_LINK);
+        }
+
+        // Crown at 3 o'clock, poking out from behind the case.
+        c.fillRect(cx_i + 81, cy_i - 5, 9, 10, STEEL_BODY);
+        c.fillCircleAA(cx + 88.5, cy, 4.6, STEEL_BODY);
+        c.fillRect(cx_i + 83, cy_i - 4, 1, 8, STEEL_SHADOW);
+        c.fillRect(cx_i + 86, cy_i - 4, 1, 8, STEEL_SHADOW);
+
+        // Case: brushed body, polished outer band, bezel, then the step
+        // down into the dial.
+        c.fillCircleAA(cx, cy, WATCH_CASE_R, STEEL_BODY);
+        c.fillRingAA(cx, cy, WATCH_CASE_R - 3, WATCH_CASE_R, STEEL_POLISH);
+        c.fillRingAA(cx, cy, 77, 83, STEEL_BEZEL);
+        c.fillRingAA(cx, cy, 75, 77, STEEL_SHADOW);
+        c.fillCircleAA(cx, cy, 75, P.dial);
+
+        // Minute track: 60 ticks, the 5-minute ones heavier, in the ring
+        // just outside the applied indices.
+        var i: u32 = 0;
+        while (i < 60) : (i += 1) {
+            const a = @as(f64, @floatFromInt(i)) * 6.0 * DEG;
+            if (i % 5 == 0) {
+                baton(c, cx, cy, a, 64, 71.5, 2.2, 2.6, P.five_tick);
+            } else {
+                baton(c, cx, cy, a, 66.5, 71.5, 1.0, 1.0, P.minute_tick);
+            }
+        }
+
+        // Applied baton indices — double at 12, none at 3.
+        var k: i32 = 0;
+        while (k < 12) : (k += 1) {
+            if (k == 3) continue;
+            const a = @as(f64, @floatFromInt(k)) * 30.0 * DEG;
+            if (k == 0) {
+                baton(c, cx, cy, a - 4.0 * DEG, 44, 61, 3.0, 4.2, P.index);
+                baton(c, cx, cy, a + 4.0 * DEG, 44, 61, 3.0, 4.2, P.index);
+            } else {
+                baton(c, cx, cy, a, 44, 61, 3.0, 4.2, P.index);
+            }
+        }
+
+        // Day-date window at 3 o'clock — the Seiko signature.
+        const win_x = cx_i + 14;
+        const win_y = cy_i - 11;
+        const win_w = 58;
+        const win_h = 22;
+        c.fillRect(win_x - 1, win_y - 1, win_w + 2, win_h + 2, WINDOW_BORDER);
+        c.fillRect(win_x, win_y, win_w, win_h, WINDOW_BG);
+        c.fillRect(win_x + 36, win_y + 1, 1, win_h - 2, 0xFF3A3A3E);
+        var date_buf: [4]u8 = undefined;
+        const date_str = std.fmt.bufPrint(&date_buf, "{d}", .{tm.mday}) catch " ";
+        const day_str = DAYS_UPPER[@as(usize, @intCast(tm.wday))];
+        const text_base = cy_i + @divTrunc(c.font.ascentPx(), 2);
+        const day_w = c.textWidth(day_str);
+        _ = c.drawText(win_x + 1 + @divTrunc(34 - day_w, 2), text_base, day_str, P.window_fg);
+        const date_w = c.textWidth(date_str);
+        _ = c.drawText(win_x + 37 + @divTrunc(20 - date_w, 2), text_base, date_str, P.window_fg);
+
+        // Branding: SEIKO under the 12, the "5" shield and AUTOMATIC above
+        // the 6.
+        drawSpaced(c, cx_i, cy_i - 31, "SEIKO", 2, P.index);
+        c.fillCircleAA(cx, cy + 23, 7.5, P.shield_bg);
+        const five = "5";
+        _ = c.drawText(
+            cx_i - @divTrunc(c.textWidth(five), 2),
+            cy_i + 23 + @divTrunc(c.font.ascentPx(), 2),
+            five,
+            P.shield_fg,
+        );
+        drawSpaced(c, cx_i, cy_i + 42, "AUTOMATIC", 1, P.index);
+
+        // Hands: tapered batons with lume stripes (minute over hour), then
+        // the thin seconds hand stepping exactly 1° per beat.
+        baton(c, cx, cy, hr_a, -7, 42, 6.0, 4.4, P.hand);
+        baton(c, cx, cy, hr_a, 2, 33, 2.4, 2.0, P.lume);
+        baton(c, cx, cy, min_a, -9, 63, 5.4, 3.6, P.hand);
+        baton(c, cx, cy, min_a, 2, 55, 2.2, 1.8, P.lume);
+        baton(c, cx, cy, sec_a, -14, 70, 1.8, 1.8, P.seconds);
+        const sd = radial(sec_a);
+        c.fillCircleAA(cx - sd[0] * 12, cy - sd[1] * 12, 2.6, P.seconds); // counterweight
+        c.fillCircleAA(cx, cy, 4.4, STEEL_CAP);
+        c.fillCircleAA(cx, cy, 1.8, P.hand);
+    }
+};
+
 // --- the composite widget ---------------------------------------------------
 
 pub const Widget = union(WidgetId) {
@@ -1983,6 +2357,7 @@ pub const Widget = union(WidgetId) {
     media: MediaWidget,
     system: SystemWidget,
     calendar: CalendarWidget,
+    watch: WatchWidget,
 
     pub fn intervalMs(self: Widget) i64 {
         return switch (self) {
@@ -1991,6 +2366,7 @@ pub const Widget = union(WidgetId) {
             .media => MediaWidget.interval_ms,
             .system => SystemWidget.interval_ms,
             .calendar => CalendarWidget.interval_ms,
+            .watch => WatchWidget.interval_ms,
         };
     }
 
@@ -2015,6 +2391,9 @@ pub const Widget = union(WidgetId) {
             },
             .calendar => |*k| blk: {
                 break :blk k.tick();
+            },
+            .watch => |*w| blk: {
+                break :blk w.tick();
             },
         };
     }
@@ -2049,6 +2428,7 @@ pub const Widget = union(WidgetId) {
             .media => |*m| m.clickAt(r, font, x, y),
             .system => |s| s.click(),
             .calendar => |*k| k.clickAt(r, font, x, y),
+            .watch => |*w| w.click(),
         }
     }
 
@@ -2060,6 +2440,7 @@ pub const Widget = union(WidgetId) {
             .media => |w| w.paint(c, r),
             .system => |w| w.paint(c, r),
             .calendar => |w| w.paint(c, r),
+            .watch => |w| w.paint(c, r),
         }
     }
 };

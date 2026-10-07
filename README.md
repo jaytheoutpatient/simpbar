@@ -72,7 +72,7 @@ Your pinned apps live in `favourites.json` next to the panel — under `$XDG_CON
 
 ## Desktop widgets (simpbar-shell)
 
-A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget cards — **clock**, **weather**, **media**, **system monitor**, and **calendar** — on a layer just above the wallpaper (below windows), reinventing the Event-Horizon-Shell style of desktop widgets on simpbar's own Wayland/shm/font plumbing. The installer builds and autostarts it, and it reads the same `matugen.json` colors, the same nerd font, and its own `~/.config/simpbar/shell.json` for layout:
+A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget cards — **clock**, **weather**, **media**, **system monitor**, **calendar**, and an **analog watch** — on a layer just above the wallpaper (below windows), reinventing the Event-Horizon-Shell style of desktop widgets on simpbar's own Wayland/shm/font plumbing. The installer builds and autostarts it, and it reads the same `matugen.json` colors, the same nerd font, and its own `~/.config/simpbar/shell.json` for layout:
 
 ```json
 {
@@ -86,23 +86,27 @@ A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget
     { "id": "weather",  "x": 24, "y": 106 },
     { "id": "media",    "x": 24, "y": 176 },
     { "id": "system",   "x": 24, "y": 350 },
-    { "id": "calendar", "x": 24, "y": 470 }
+    { "id": "calendar", "x": 24, "y": 470 },
+    { "id": "watch",    "x": 1711, "y": 24 }
   ]
 }
 ```
 
 Missing or malformed keys keep the defaults above (`font_path` empty defaults to the bar's JetBrainsMono Nerd). Cards are translucent (55% opacity by default) so the wallpaper shows through, frosted by a Hyprland layer rule for the `simpbar-shell` namespace — like the bar, a Wayland client can't blur what's behind its own surface, so the desktop config supplies it.
 
-Each card repaints on its own lazy schedule — clock every second, system every 2s, media progress every second while playing (metadata refetched every 2s), weather every 20 minutes, calendar every 30s — and the shell only commits a new frame when something changed. Clicks do something where there's something to do: the media card has shuffle / previous / play-pause / next / repeat controls plus the real cover art from MPRIS (`file://` read directly, `http(s)://` downloaded with curl and decoded with gdk-pixbuf like the bar's tray icons; anything else keeps the music-note placeholder tile), weather opens wttr.in. The surface's input region is exactly the union of the cards, so the rest of the desktop passes clicks straight through.
+Each card repaints on its own lazy schedule — clock every second, system every 2s, media progress every second while playing (metadata refetched every 2s), weather every 20 minutes, calendar every 30s, watch six times a second for the sweep — and the shell only commits a new frame when something changed (widgets render into per-card tile caches first, so the watch's cadence only re-rasters its own 190×240 tile). Clicks do something where there's something to do: the media card has shuffle / previous / play-pause / next / repeat controls plus the real cover art from MPRIS (`file://` read directly, `http(s)://` downloaded with curl and decoded with gdk-pixbuf like the bar's tray icons; anything else keeps the music-note placeholder tile), weather opens wttr.in, and clicking the watch swaps the dial. The surface's input region is exactly the union of the cards, so the rest of the desktop passes clicks straight through.
 
 **Repositioning cards** — hold **Ctrl** and drag any card with the left mouse button; it follows the pointer and snaps back on-screen if you drop it off the edge. Releasing writes the new positions back to `shell.json` (every other key round-tripped untouched), so the layout survives restarts.
+
+**The analog watch** is drawn like a Seiko 5 automatic — brushed steel case on bracelet stubs, applied baton indices (double at 12, none at 3 where the day–date window sits), SEIKO / "5" shield / AUTOMATIC dial print, a crown at 3, and a seconds hand that steps in 1/6-second beats: the 21,600 vph sweep of the 7S26 movement instead of a dead-beat tick. It's the one widget without a frosted card — the case *is* the chrome — paints straight from the wall clock (no hand angles to drift), and a click swaps between the classic white dial and a black one. Like every other widget it can be Ctrl+dragged anywhere.
 
 **The calendar card** shows a month grid (arrows step months, the month title jumps back to today) with a dot on every day that has a reminder. Click a day to edit its reminders through rofi: *+ New reminder* accepts free text (notified at 09:00 that day) or a full `HH:MM lead text` line, and selecting an existing entry deletes it. Reminders live in `~/.config/simpbar/reminders.txt`, one per line:
 
 ```
-YYYY-MM-DD HH:MM lead text
+YYYY-MM-DD HH:MM [lead] text
 2026-10-12 14:00 0 dentist appointment   # notify on the day at 14:00
 2026-11-03 09:00 2 buy mum a gift        # notify two days before, at 09:00
+2026-10-20 10:00 PayDay                  # hand-written: lead defaults to 0
 ```
 
 A reminder notifies once at its date minus `lead` days (via `notify-send`), delivered up to 15 minutes late if the machine was asleep, and entries edited straight in the file are picked up on the next tick.
@@ -202,7 +206,7 @@ There is no widget for this in **simpbar-config**, but it is round-tripped from 
 
 **Bar, compositor & theming**
 - simpbar (this repo's source, built from scratch during install), Hyprland, foot (terminal), rofi with its bundled Material theme, swaync (notifications)
-- simpbar-shell: desktop widget cards (clock/weather/media/system monitor) on a layer just above the wallpaper, themed from the same matugen colors (see [Desktop widgets](#desktop-widgets-simpbar-shell))
+- simpbar-shell: desktop widget cards (clock/weather/media/system monitor/calendar/analog watch) on a layer just above the wallpaper, themed from the same matugen colors (see [Desktop widgets](#desktop-widgets-simpbar-shell))
 - Dracula GTK theme, Zafiro-Dracula icon theme, Bibata Modern Classic cursor — all applied automatically via nwg-look's settings, no manual toggling needed
 - nwg-drawer, usable from rofi as a fallback app-menu (ArcMenu-style GNOME Shell extensions don't run under Hyprland at all)
 - fastfetch (also wired into every new bash/fish shell)
