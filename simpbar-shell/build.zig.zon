@@ -1,0 +1,21 @@
+.{
+    .name = .simpbar_shell,
+    .version = "0.0.1",
+    .fingerprint = 0xbbf369314e2ac9ac,
+    .minimum_zig_version = "0.16.0",
+
+    // Same zig-wayland pin as the bar (../simpbar/build.zig.zon).
+    .dependencies = .{
+        .wayland = .{
+            .url = "git+https://codeberg.org/ifreund/zig-wayland?ref=main#23839e41161de025d71ce082561ecba1c5331281",
+            .hash = "wayland-0.7.0-dev-lQa1kl38AQC-kQolS5D4jV1GJ2rH2jv1VWHr14YLVnyn",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "protocols",
+    },
+}

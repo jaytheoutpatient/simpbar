@@ -70,6 +70,28 @@ It's a [quickshell](https://quickshell.org) panel living in `~/.config/quickshel
 
 Your pinned apps live in `favourites.json` next to the panel — under `$XDG_CONFIG_HOME/quickshell/appdrawer/` when `XDG_CONFIG_HOME` is set, `~/.config/quickshell/appdrawer/` otherwise. That is the same place quickshell itself searches for configs, so the panel and its state can never drift apart. The installer never overwrites an existing `favourites.json`.
 
+## Desktop widgets (simpbar-shell)
+
+A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget cards — **clock**, **weather**, **media**, and **system monitor** — directly onto the wallpaper's background layer, reinventing the Event-Horizon-Shell style of desktop widgets on simpbar's own Wayland/shm/font plumbing. The installer builds and autostarts it, and it reads the same `matugen.json` colors, the same nerd font, and its own `~/.config/simpbar/shell.json` for layout:
+
+```json
+{
+  "font_path": "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+  "card_bg_opacity": 55,
+  "card_corner_radius": 12,
+  "widgets": [
+    { "id": "clock",   "x": 24, "y": 24 },
+    { "id": "weather", "x": 24, "y": 106 },
+    { "id": "media",   "x": 24, "y": 176 },
+    { "id": "system",  "x": 24, "y": 252 }
+  ]
+}
+```
+
+Missing or malformed keys keep the defaults above (`font_path` empty defaults to the bar's JetBrainsMono Nerd). Cards are translucent (55% opacity by default) so the wallpaper shows through, frosted by a Hyprland layer rule for the `simpbar-shell` namespace — like the bar, a Wayland client can't blur what's behind its own surface, so the desktop config supplies it.
+
+Each card repaints on its own lazy schedule — clock every second, system every 2s, media every 2s, weather every 20 minutes — and the shell only commits a new frame when something changed. Clicks do something where there's something to do: media toggles play/pause via `playerctl`, weather opens wttr.in. The surface's input region is exactly the union of the cards, so the rest of the desktop passes clicks straight through.
+
 ## Wallpapers
 
 The drawer's second tab is a wallpaper picker: a grid of thumbnails of everything in your wallpaper folder, the active one outlined in the accent colour, a **Random** button, and live filtering through the same search box as the app grid. Picking one swaps the wallpaper and re-themes the whole desktop behind the drawer, which stays open on purpose so you can watch the colors change. `appdrawer wallpapers` opens straight onto that tab — which is where the bar's wallpaper button goes.
@@ -163,6 +185,7 @@ There is no widget for this in **simpbar-config**, but it is round-tripped from 
 
 **Bar, compositor & theming**
 - simpbar (this repo's source, built from scratch during install), Hyprland, foot (terminal), rofi with its bundled Material theme, swaync (notifications)
+- simpbar-shell: desktop widget cards (clock/weather/media/system monitor) painted on the wallpaper layer, themed from the same matugen colors (see [Desktop widgets](#desktop-widgets-simpbar-shell))
 - Dracula GTK theme, Zafiro-Dracula icon theme, Bibata Modern Classic cursor — all applied automatically via nwg-look's settings, no manual toggling needed
 - nwg-drawer, usable from rofi as a fallback app-menu (ArcMenu-style GNOME Shell extensions don't run under Hyprland at all)
 - fastfetch (also wired into every new bash/fish shell)

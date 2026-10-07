@@ -263,6 +263,16 @@ rm -rf ~/.local/share/simpbar/simpbar
 cp -r /tmp/simpbar-temp/simpbar-main/simpbar ~/.local/share/simpbar/simpbar
 ok "simpbar source placed in ~/.local/share/simpbar/simpbar"
 
+# simpbar-shell (desktop widgets) is source like the bar, staged beside it so
+# its build.zig can import the bar's font/logging modules over ../simpbar/...
+if [ ! -d "/tmp/simpbar-temp/simpbar-main/simpbar-shell" ]; then
+    rm -rf /tmp/simpbar-temp
+    die "Downloaded archive did not contain a simpbar-shell/ directory — layout may have changed upstream."
+fi
+rm -rf ~/.local/share/simpbar/simpbar-shell
+cp -r /tmp/simpbar-temp/simpbar-main/simpbar-shell ~/.local/share/simpbar/simpbar-shell
+ok "simpbar-shell source placed in ~/.local/share/simpbar/simpbar-shell"
+
 # simpbar-matugen (the wallpaper→Material You recolor helper, tracked at the
 # repo root alongside the source) is staged beside the source now while the
 # archive is still around — the matugen section lower down installs it to
@@ -517,6 +527,16 @@ run_spinner "Installing simpbar-config to /usr/bin" \
     sudo install -Dm755 ~/.local/share/simpbar/simpbar/zig-out/bin/simpbar-config /usr/bin/simpbar-config \
     || die "Failed to install the simpbar-config binary to /usr/bin."
 ok "simpbar-config built and installed to /usr/bin/simpbar-config"
+
+# Build simpbar-shell (the desktop widgets) too — same zig, against the bar's
+# source layout it was staged next to above. Started by hyprland.lua on login.
+run_spinner "Building simpbar-shell" bash -c 'cd ~/.local/share/simpbar/simpbar-shell && zig build -Doptimize=ReleaseFast' \
+    || die "Failed to build simpbar-shell — check zig, freetype2, wayland, and wayland-protocols installed correctly."
+
+run_spinner "Installing simpbar-shell to /usr/bin" \
+    sudo install -Dm755 ~/.local/share/simpbar/simpbar-shell/zig-out/bin/simpbar-shell /usr/bin/simpbar-shell \
+    || die "Failed to install the simpbar-shell binary to /usr/bin."
+ok "simpbar-shell built and installed to /usr/bin/simpbar-shell"
 
 # Enable the pipewire audio stack as user services so pavucontrol has
 # something to control without needing a reboot/relogin first.
@@ -1631,6 +1651,9 @@ fi
 if [ -x /usr/bin/simpbar-config ]; then
     ok "simpbar-config installed to /usr/bin/simpbar-config — configure the bar's appearance, modules, and shortcuts anytime from rofi/nwg-drawer, or run 'simpbar-config'"
 fi
+if [ -x /usr/bin/simpbar-shell ]; then
+    ok "simpbar-shell installed to /usr/bin/simpbar-shell — desktop widget cards on every output"
+fi
 if command -v quickshell >/dev/null 2>&1; then
     ok "App drawer installed — SUPER+Tab, or click empty bar space, to open it (themed from matugen)"
 fi
@@ -1645,6 +1668,7 @@ fi
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %ssimpbar &%s\n' "$C_CYAN" "$C_RESET"
+printf '  %ssimpbar-shell &%s          # desktop widget cards (clock/weather/media/system)\n' "$C_CYAN" "$C_RESET"
 if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
     printf '  %ssimpbar-wallpaper set %q%s   # apply a wallpaper directly\n' "$C_CYAN" "$BING_FILE" "$C_RESET"
 else

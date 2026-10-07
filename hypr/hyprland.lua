@@ -51,6 +51,10 @@ hl.on("hyprland.start", function()
 	-- leaving waypaper's restore in place would have two programs disagreeing
 	-- about the current wallpaper again.
 	hl.exec_cmd("simpbar-restore-wallpaper")
+	-- Desktop widgets (clock / weather / media / system cards) painted on the
+	-- wallpaper's background layer, started after the wallpaper engine so the
+	-- cards composite above the wallpaper like the bar does.
+	hl.exec_cmd("simpbar-shell &")
 	hl.exec_cmd("/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1")
 	--hl.exec_cmd("/usr/libexec/polkit-mate-authentication-agent-1")
 end)
@@ -340,6 +344,17 @@ hl.window_rule({
 	match = { class = "foot" },
 	size = { 900, 700 },
 	float = true,
+})
+
+-- Frost the desktop widgets (simpbar-shell) like the bar: a layer rule can
+-- add blur that a client can't request for itself on Wayland. ignore_alpha
+-- keeps the fully transparent parts of the surface (where the wallpaper shows
+-- straight through) crisp instead of washed out.
+hl.layer_rule({
+	name = "simpbar-shell-blur",
+	match = { namespace = "^simpbar-shell$" },
+	blur = true,
+	ignore_alpha = 0.5,
 })
 
 -- Load the simpbar-config Hyprland settings (keybinds, monitors, animations,
