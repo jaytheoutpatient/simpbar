@@ -72,7 +72,7 @@ Your pinned apps live in `favourites.json` next to the panel — under `$XDG_CON
 
 ## Desktop widgets (simpbar-shell)
 
-A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget cards — **clock**, **weather**, **media**, and **system monitor** — directly onto the wallpaper's background layer, reinventing the Event-Horizon-Shell style of desktop widgets on simpbar's own Wayland/shm/font plumbing. The installer builds and autostarts it, and it reads the same `matugen.json` colors, the same nerd font, and its own `~/.config/simpbar/shell.json` for layout:
+A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget cards — **clock**, **weather**, **media**, and **system monitor** — on a layer just above the wallpaper (below windows), reinventing the Event-Horizon-Shell style of desktop widgets on simpbar's own Wayland/shm/font plumbing. The installer builds and autostarts it, and it reads the same `matugen.json` colors, the same nerd font, and its own `~/.config/simpbar/shell.json` for layout:
 
 ```json
 {
@@ -185,7 +185,7 @@ There is no widget for this in **simpbar-config**, but it is round-tripped from 
 
 **Bar, compositor & theming**
 - simpbar (this repo's source, built from scratch during install), Hyprland, foot (terminal), rofi with its bundled Material theme, swaync (notifications)
-- simpbar-shell: desktop widget cards (clock/weather/media/system monitor) painted on the wallpaper layer, themed from the same matugen colors (see [Desktop widgets](#desktop-widgets-simpbar-shell))
+- simpbar-shell: desktop widget cards (clock/weather/media/system monitor) on a layer just above the wallpaper, themed from the same matugen colors (see [Desktop widgets](#desktop-widgets-simpbar-shell))
 - Dracula GTK theme, Zafiro-Dracula icon theme, Bibata Modern Classic cursor — all applied automatically via nwg-look's settings, no manual toggling needed
 - nwg-drawer, usable from rofi as a fallback app-menu (ArcMenu-style GNOME Shell extensions don't run under Hyprland at all)
 - fastfetch (also wired into every new bash/fish shell)

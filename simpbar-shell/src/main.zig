@@ -520,8 +520,11 @@ pub fn main() !void {
 
     // One desktop layer surface per output (or a single compositor-picked
     // surface if the registry reported none), anchored edge-to-edge on the
-    // background layer — same level as the wallpaper, matching the
-    // Event-Horizon-Shell "widgets on the desktop" concept.
+    // bottom layer — above the wallpaper's background level, never below
+    // it. Same-level layers stack by map order, so a freshly restarted
+    // swaybg (every wallpaper change) would bury .background widgets under
+    // the new wallpaper surface; .bottom always composites above it while
+    // staying below windows and the bar.
     const desktop_count: usize = if (globals.output_count > 0) globals.output_count else 1;
     for (0..desktop_count) |i| {
         const surface = compositor.createSurface() catch continue;
@@ -529,7 +532,7 @@ pub fn main() !void {
         const layer_surface = layer_shell.getLayerSurface(
             surface,
             output,
-            .background,
+            .bottom,
             "simpbar-shell",
         ) catch {
             surface.destroy();
