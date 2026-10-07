@@ -538,6 +538,19 @@ run_spinner "Installing simpbar-shell to /usr/bin" \
     || die "Failed to install the simpbar-shell binary to /usr/bin."
 ok "simpbar-shell built and installed to /usr/bin/simpbar-shell"
 
+# Seed the calendar widget's reminders file with its format reference on
+# first install (the widget appends it on demand too — this just documents
+# the line format for anyone editing it by hand).
+if [ ! -f ~/.config/simpbar/reminders.txt ]; then
+    mkdir -p ~/.config/simpbar
+    cat > ~/.config/simpbar/reminders.txt <<'REMIN'
+# Reminders — one per line: YYYY-MM-DD HH:MM lead text
+#   lead = days before the date to notify (0 = on the day)
+# Click a day on the calendar card to add/remove via rofi.
+REMIN
+    ok "Seeded ~/.config/simpbar/reminders.txt (calendar reminder format)"
+fi
+
 # Enable the pipewire audio stack as user services so pavucontrol has
 # something to control without needing a reboot/relogin first.
 PIPEWIRE_UNITS=(pipewire.socket pipewire-pulse.socket wireplumber.service)
