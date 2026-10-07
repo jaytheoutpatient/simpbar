@@ -16,6 +16,7 @@
 const std = @import("std");
 const posix = std.posix;
 const font_mod = @import("font");
+const art_mod = @import("art");
 
 pub const WidgetId = enum { clock, weather, media, system };
 
@@ -214,6 +215,33 @@ pub const Canvas = struct {
             pen += g.advance_x;
         }
         return pen - x;
+    }
+
+    /// Blits straight-alpha RGBA bytes (`w*h*4` row-major) with a rounded-
+    /// corner mask — the media cover art over its tile. Per-pixel OVER blend
+    /// like drawText, so translucent PNG edges composite instead of punching
+    /// holes to the wallpaper.
+    pub fn blitRgba(self: Canvas, x: i64, y: i64, w: u64, h: u64, rgba: []const u8, radius: i64) void {
+        const iw: i64 = @intCast(w);
+        const ih: i64 = @intCast(h);
+        var row: u64 = 0;
+        while (row < h) : (row += 1) {
+            var col: u64 = 0;
+            while (col < w) : (col += 1) {
+                const o = (row * w + col) * 4;
+                const a: u32 = rgba[o + 3];
+                if (a == 0) continue;
+                const px = x + @as(i64, @intCast(col));
+                const py = y + @as(i64, @intCast(row));
+                if (px < 0 or py < 0) continue;
+                const pxu: usize = @intCast(px);
+                const pyu: usize = @intCast(py);
+                if (pxu >= self.width or pyu >= self.height) continue;
+                if (!insideRounded(px, py, x, y, iw, ih, radius)) continue;
+                const src = (a << 24) | (@as(u32, rgba[o]) << 16) | (@as(u32, rgba[o + 1]) << 8) | rgba[o + 2];
+                self.pixels[pyu * self.width + pxu] = blendOver(self.pixels[pyu * self.width + pxu], src);
+            }
+        }
     }
 };
 
@@ -588,10 +616,15 @@ fn fmtDur(us: u64, buf: []u8) []const u8 {
 
 // --- media -----------------------------------------------------------------
 
-const MPRIS_SCRIPT = "playerctl metadata --format 'M\x1f{{status}}\x1f{{artist}}\x1f{{title}}\x1f{{position}}\x1f{{mpris:length}}' 2>/dev/null; printf '\\nS:'; playerctl shuffle 2>/dev/null; printf '\\nL:'; playerctl loop 2>/dev/null; printf '\\n'";
+const MPRIS_SCRIPT = "playerctl metadata --format 'M\x1f{{status}}\x1f{{artist}}\x1f{{title}}\x1f{{position}}\x1f{{mpris:length}}\x1f{{mpris:artUrl}}' 2>/dev/null; printf '\\nS:'; playerctl shuffle 2>/dev/null; printf '\\nL:'; playerctl loop 2>/dev/null; printf '\\n'";
+
+/// Where downloaded http(s) cover art lands before decode. Single fixed
+/// path — fetches are strictly sequential, so nothing races it.
+const ART_CACHE: [:0]const u8 = "/tmp/simpbar-shell-art.bin";
 
 pub const MediaLoop = enum { none, track, playlist };
 pub const MediaControl = enum { shuffle, prev, toggle, next, loop };
+pub const MediaPhase = enum { meta, art };
 
 pub const MediaWidget = struct {
     artist_buf: [128]u8 = undefined,
@@ -607,6 +640,17 @@ pub const MediaWidget = struct {
     stamp_ms: i64 = 0,
     next_fetch_ms: i64 = 0,
     painted_sec: i64 = -1,
+    /// Cover-art state. `art_url_*` is the last MPRIS artUrl seen; a new URL
+    /// resets to fetch again, an unchanged one is never re-downloaded.
+    art_url_buf: [512]u8 = undefined,
+    art_url_len: usize = 0,
+    art: enum { none, ready, failed } = .none,
+    art_rgba: [art_mod.COVER_BYTES]u8 = undefined,
+    art_w: u8 = 0,
+    art_h: u8 = 0,
+    /// Which fetch the shared pipe is carrying: metadata text, or the curl
+    /// completion marker for a cover-art download.
+    phase: MediaPhase = .meta,
     fetch: Fetcher = .{},
 
     // Progress repaints while playing; the metadata refetch below runs every
@@ -644,6 +688,80 @@ pub const MediaWidget = struct {
         return true;
     }
 
+    /// file:// MPRIS art URL -> filesystem path, %XX-decoded, NUL-terminated
+    /// for the decoder. Returns null when the URL isn't usable.
+    fn fileUrlPath(url: []const u8, dst: []u8) ?[:0]u8 {
+        const prefix = "file://";
+        if (!std.mem.startsWith(u8, url, prefix)) return null;
+        var rest = url[prefix.len..];
+        if (std.mem.startsWith(u8, rest, "localhost")) rest = rest["localhost".len..];
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < rest.len) {
+            if (n + 1 >= dst.len) return null;
+            if (rest[i] == '%' and i + 2 < rest.len) {
+                const hi = std.fmt.charToDigit(rest[i + 1], 16) catch null;
+                const lo = std.fmt.charToDigit(rest[i + 2], 16) catch null;
+                if (hi != null and lo != null) {
+                    dst[n] = hi.? * 16 + lo.?;
+                    n += 1;
+                    i += 3;
+                    continue;
+                }
+            }
+            dst[n] = rest[i];
+            n += 1;
+            i += 1;
+        }
+        dst[n] = 0;
+        return dst[0..n :0];
+    }
+
+    /// Decodes `path` into the cover buffer. Returns true with dims stored on
+    /// success, false (placeholder kept) on any failure.
+    fn loadArtFile(self: *MediaWidget, path: [:0]const u8) bool {
+        if (art_mod.decodeCover(path, &self.art_rgba)) |dims| {
+            self.art_w = dims.w;
+            self.art_h = dims.h;
+            self.art = .ready;
+            return true;
+        }
+        self.art = .failed;
+        return false;
+    }
+
+    /// Reconciles cover art after a metadata fetch: new URL -> decode now for
+    /// file://, queue a curl download for http(s), placeholder otherwise.
+    /// Unchanged URLs are never re-fetched.
+    fn updateArt(self: *MediaWidget, art_url: []const u8) void {
+        if (std.mem.eql(u8, art_url, self.art_url_buf[0..self.art_url_len])) return;
+        const u = art_url[0..@min(art_url.len, self.art_url_buf.len)];
+        @memcpy(self.art_url_buf[0..u.len], u);
+        self.art_url_len = u.len;
+        self.art = .none;
+        self.art_w = 0;
+        self.art_h = 0;
+        if (u.len == 0) return;
+        var path_buf: [512]u8 = undefined;
+        if (fileUrlPath(u, &path_buf)) |path| {
+            _ = self.loadArtFile(path);
+            return;
+        }
+        const http = std.mem.startsWith(u8, u, "http://") or std.mem.startsWith(u8, u, "https://");
+        if (!http or std.mem.indexOfScalar(u8, u, '\'') != null) {
+            self.art = .failed; // data: URIs and unquotable URLs stay placeholders
+            return;
+        }
+        var script: [1024]u8 = undefined;
+        const s = std.fmt.bufPrintZ(&script, "curl -s -o {s} -- '{s}' && printf art-ok || printf art-fail", .{ ART_CACHE, u }) catch {
+            self.art = .failed;
+            return;
+        };
+        var argv = [_:null]?[*:0]const u8{ "sh", "-c", s.ptr, null };
+        self.fetch.start("/bin/sh", &argv);
+        self.phase = .art;
+    }
+
     /// Call when the fetch pipe is readable. Returns true when the fetch
     /// finished (state may have changed).
     pub fn onPipe(self: *MediaWidget) bool {
@@ -651,6 +769,19 @@ pub const MediaWidget = struct {
         const n = self.fetch.onReadable(&out);
         if (n == 0) return false;
         self.fetch.closeFd();
+        // Cover-art download finished: the marker (printed after curl
+        // exits, so the cache file is complete) says whether curl itself
+        // succeeded; the decode can still fail on format.
+        if (self.phase == .art) {
+            self.phase = .meta;
+            const marker = std.mem.trim(u8, out[0..n], " \t\r\n");
+            if (std.mem.eql(u8, marker, "art-ok")) {
+                _ = self.loadArtFile(ART_CACHE);
+            } else {
+                self.art = .failed;
+            }
+            return true;
+        }
         const now = monoMs();
         var meta: ?[]const u8 = null;
         var shuffle_s: ?[]const u8 = null;
@@ -676,6 +807,8 @@ pub const MediaWidget = struct {
             self.len_us = 0;
             self.stamp_ms = 0;
             self.painted_sec = -1;
+            self.art = .none;
+            self.art_url_len = 0;
             return true;
         }
         var parts = std.mem.splitScalar(u8, meta.?, 0x1F);
@@ -684,6 +817,7 @@ pub const MediaWidget = struct {
         const title = std.mem.trim(u8, parts.next() orelse "", " \t");
         const pos_s = std.mem.trim(u8, parts.next() orelse "", " \t");
         const len_s = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const art_s = std.mem.trim(u8, parts.next() orelse "", " \t");
         const a = artist[0..@min(artist.len, self.artist_buf.len)];
         @memcpy(self.artist_buf[0..a.len], a);
         self.artist_len = a.len;
@@ -709,8 +843,11 @@ pub const MediaWidget = struct {
             self.len_us = 0;
             self.stamp_ms = 0;
             self.painted_sec = -1;
+            self.art = .none;
+            self.art_url_len = 0;
             return true;
         }
+        self.updateArt(art_s);
         self.stamp_ms = now;
         self.painted_sec = @intCast(self.displayPosUs(now) / 1_000_000);
         return true;
@@ -789,14 +926,30 @@ pub const MediaWidget = struct {
             .h = @intCast(MEDIA_COVER),
         };
         c.card(tile, c.theme.hover_color, c.theme.border_color);
-        const note: []const u8 = "\u{f001}";
-        const note_w = c.textWidth(note);
-        _ = c.drawText(
-            l.inner_x + @divTrunc(MEDIA_COVER - note_w, 2),
-            r.y + CARD_PAD + @divTrunc(MEDIA_COVER + ascent - descent, 2),
-            note,
-            dim(c.theme.text_color, 0xAA),
-        );
+        if (self.art == .ready and self.art_w > 0 and self.art_h > 0) {
+            // Real cover art, centered in the tile inside the 1px border
+            // ring, masked to the tile's inner corner radius.
+            const aw: i64 = self.art_w;
+            const ah: i64 = self.art_h;
+            const tile_r: i64 = @min(@as(i64, @intCast(c.theme.radius_px)), MEDIA_COVER / 2);
+            c.blitRgba(
+                l.inner_x + @divTrunc(MEDIA_COVER - aw, 2),
+                r.y + CARD_PAD + @divTrunc(MEDIA_COVER - ah, 2),
+                @intCast(aw),
+                @intCast(ah),
+                self.art_rgba[0..@as(usize, self.art_w) * self.art_h * 4],
+                if (tile_r > 0) tile_r - 1 else 0,
+            );
+        } else {
+            const note: []const u8 = "\u{f001}";
+            const note_w = c.textWidth(note);
+            _ = c.drawText(
+                l.inner_x + @divTrunc(MEDIA_COVER - note_w, 2),
+                r.y + CARD_PAD + @divTrunc(MEDIA_COVER + ascent - descent, 2),
+                note,
+                dim(c.theme.text_color, 0xAA),
+            );
+        }
 
         // Title over artist, truncated to the space right of the cover.
         const text_x = l.inner_x + MEDIA_COVER + 10;

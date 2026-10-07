@@ -53,6 +53,18 @@ pub fn build(b: *Build) !void {
     });
     widgets_mod.addImport("font", font_mod);
 
+    // Album-art decode for the media card: same gdk-pixbuf shim the bar
+    // compiles for tray icons, referenced out of ../simpbar/src like the
+    // font module above (the installer stages both trees side by side).
+    const art_mod = b.createModule(.{
+        .root_source_file = b.path("src/art.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    art_mod.addIncludePath(b.path("../simpbar/src")); // gdkpixbuf_shim.h lives with the bar's sources
+    widgets_mod.addImport("art", art_mod);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -67,6 +79,12 @@ pub fn build(b: *Build) !void {
     // exactly like the bar.
     exe_mod.linkSystemLibrary("wayland-client", .{});
     exe_mod.linkSystemLibrary("freetype2", .{});
+    exe_mod.linkSystemLibrary("gdk-pixbuf-2.0", .{}); // media cover-art decode (src/art.zig)
+    // Same translate-c workaround as the bar: gdk-pixbuf.h itself is only
+    // ever included from gdkpixbuf_shim.c, compiled by a real C compiler;
+    // art.zig @cImports the shim's plain-C header.
+    exe_mod.addIncludePath(b.path("../simpbar/src"));
+    exe_mod.addCSourceFile(.{ .file = b.path("../simpbar/src/gdkpixbuf_shim.c"), .flags = &.{} });
 
     const exe = b.addExecutable(.{
         .name = "simpbar-shell",

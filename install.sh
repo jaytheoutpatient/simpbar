@@ -531,7 +531,7 @@ ok "simpbar-config built and installed to /usr/bin/simpbar-config"
 # Build simpbar-shell (the desktop widgets) too — same zig, against the bar's
 # source layout it was staged next to above. Started by hyprland.lua on login.
 run_spinner "Building simpbar-shell" bash -c 'cd ~/.local/share/simpbar/simpbar-shell && zig build -Doptimize=ReleaseFast' \
-    || die "Failed to build simpbar-shell — check zig, freetype2, wayland, and wayland-protocols installed correctly."
+    || die "Failed to build simpbar-shell — check zig, freetype2, gdk-pixbuf2, wayland, and wayland-protocols installed correctly."
 
 run_spinner "Installing simpbar-shell to /usr/bin" \
     sudo install -Dm755 ~/.local/share/simpbar/simpbar-shell/zig-out/bin/simpbar-shell /usr/bin/simpbar-shell \
