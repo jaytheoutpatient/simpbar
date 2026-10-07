@@ -1215,7 +1215,10 @@ pub const SystemWidget = struct {
         const scaled: i64 = @intFromFloat(@round(v * 100.0));
         const whole: i64 = @divTrunc(scaled, 100);
         const frac: i64 = @mod(scaled, 100);
-        const s = std.fmt.bufPrint(&self.load_buf, "{d}.{d:0>2}", .{ whole, frac }) catch return;
+        // frac must be unsigned: Zig 0.16 fmt prints '+' for signed ints
+        // under a width spec ("2.+98" instead of "2.98"). @mod keeps it
+        // in [0,100) for any input sign, so the cast cannot overflow.
+        const s = std.fmt.bufPrint(&self.load_buf, "{d}.{d:0>2}", .{ whole, @as(u32, @intCast(frac)) }) catch return;
         self.load_len = s.len;
     }
 
@@ -1707,7 +1710,11 @@ pub const CalendarWidget = struct {
     fn openDayMenu(self: *CalendarWidget, y: i32, m: u8, d: u8) void {
         if (self.fetch.busy()) return;
         var d_buf: [16]u8 = undefined;
-        const ds = std.fmt.bufPrint(&d_buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ y, m, d }) catch return;
+        // NOTE: view_y is i32, but Zig 0.16's fmt renders an explicit '+'
+        // for signed ints whenever a width/fill spec is applied — that '+'
+        // leaked into the date (d='+2026-10-09'), which broke the menu's
+        // grep match and wrote '+'-prefixed lines. Cast to unsigned.
+        const ds = std.fmt.bufPrint(&d_buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(@max(y, 0))), m, d }) catch return;
         var script: [1536]u8 = undefined;
         const s = std.fmt.bufPrintZ(&script,
             \\printf 'menu-run\n'
