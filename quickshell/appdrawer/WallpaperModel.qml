@@ -212,7 +212,7 @@ Singleton {
         // the applied path across stdout/stderr/exit is also why the badge
         // update happens here rather than in a collector, which can fire before
         // the other stream has finished.
-        onExited: {
+        onExited: function(exitCode) {
             root.fetching = false;
             var applied = root._fetchApplied;
             root._fetchApplied = "";

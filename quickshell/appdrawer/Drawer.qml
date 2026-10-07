@@ -36,6 +36,10 @@ PanelWindow {
     // Overlay popups are mutually exclusive: opening one closes the other,
     // instead of letting a second one paint over an open menu.
     property bool optionsOpen: false
+    // Wallpapers tab only: when true, the top search box asks wallhaven.cc
+    // instead of filtering local tiles, and the grid below becomes a remote
+    // preview feed until a tile is clicked.
+    property bool whOnline: false
 
     // Which tab the body shows. Settable from outside via `appdrawer
     // wallpapers`, which is how the bar's wallpaper button lands straight here
@@ -46,10 +50,12 @@ PanelWindow {
         { id: "wallpapers", label: "Wallpapers" }
     ]
     readonly property bool showingWallpapers: win.tab === "wallpapers"
-    // Any wallpaper process in flight (apply, local random, or a fetch). The
-    // footer's action buttons share one busy state and one "Working…" label so
-    // they can never race each other for the swaybg swap.
+    // Any wallpaper process in flight (apply, local random, fetch, or an
+    // online preview search/apply). The footer's action buttons share one busy
+    // state and one "Working…" label so they can never race each other for the
+    // swaybg swap.
     readonly property bool wpBusy: WallpaperModel.applying || WallpaperModel.fetching
+                                  || WallhavenSearch.searching || WallhavenSearch.applying
 
     // Session actions. loginctl is used rather than systemctl because
     // systemd-logind is what arbitrates suspend against inhibitors; calling
@@ -152,6 +158,18 @@ PanelWindow {
         }
     }
 
+    // Flips the wallpapers-tab search box between filtering the local folder
+    // and asking wallhaven.cc. Used by the mini tab in the strip and (as an
+    // IPC target) by tests that cannot type into the box.
+    function toggleSearchMode() {
+        if (!win.open)
+            openDrawer()
+        win.whOnline = !win.whOnline
+        if (!win.whOnline)
+            win.activeModel.query = search.text
+        search.forceActiveFocus()
+    }
+
     function closeDrawer() {
         win.open = false
         win.powerOpen = ""
@@ -226,14 +244,27 @@ PanelWindow {
                     focus: true
 
                     // Rewritten on every keystroke so the active tab's grid
-                    // updates live.
-                    onTextChanged: win.activeModel.query = text
+                    // updates live. In wallhaven mode the box is a query for
+                    // the engine, launched on Enter -- there is nothing to
+                    // filter locally until results come back and a tile is
+                    // downloaded.
+                    onTextChanged: {
+                        if (win.showingWallpapers && win.whOnline)
+                            return;
+                        win.activeModel.query = text
+                    }
                     Keys.onEscapePressed: win.closeDrawer()
                     Keys.onReturnPressed: {
                         // Enter acts on whatever the visible tab is: launch the
                         // first app, or apply the first wallpaper match. The
                         // drawer stays open for the wallpaper case so the
-                        // recolour is visible.
+                        // recolour is visible. In wallhaven mode it runs the
+                        // online search instead.
+                        if (win.showingWallpapers && win.whOnline) {
+                            if (search.text.trim().length > 0)
+                                WallhavenSearch.search(search.text.trim());
+                            return;
+                        }
                         if (win.showingWallpapers) {
                             if (WallpaperModel.visibleItems.length > 0)
                                 WallpaperModel.apply(
@@ -250,10 +281,14 @@ PanelWindow {
                     verticalAlignment: Text.AlignVCenter
                     leftPadding: 16
                     visible: search.text.length === 0
-                    text: win.showingWallpapers ? "Search wallpapers"
-                                                : "Search apps"
+                    text: win.whOnline
+                          ? "search wallhaven.cc…"
+                          : (win.showingWallpapers ? "Search wallpapers"
+                                                   : "Search apps")
                     color: Theme.dim
                     font.pixelSize: 16
+                    elide: Text.ElideRight
+                    rightPadding: 60
                 }
             }
         }
@@ -300,6 +335,71 @@ PanelWindow {
                     }
                 }
             }
+
+                // Source of the search box on the wallpapers tab: filter the
+                // local folder vs ask wallhaven.cc. Presented as a mini tab so
+                // the mode reads at a glance; the box's placeholder and the
+                // grid below both change to match.
+                Item {
+                    visible: win.showingWallpapers
+                    width: 132
+                    height: 28
+
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: 9
+                        color: "transparent"
+                        border.width: 1
+                        border.color: Theme.separator
+                    }
+
+                    // Local: the box filters tiles in the folder below.
+                    Rectangle {
+                        anchors.top: parent.top
+                        anchors.bottom: parent.bottom
+                        anchors.left: parent.left
+                        width: parent.width / 2
+                        radius: 9
+                        color: localHover.hovered ? Theme.hover
+                                : (win.whOnline ? "transparent" : Theme.accent)
+                        opacity: win.whOnline ? 1.0 : 0.22
+                        border.width: 1
+                        border.color: win.whOnline ? "transparent" : Theme.accent
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "Local"
+                            color: win.whOnline ? Theme.text : Theme.accent
+                            font.pixelSize: 12
+                        }
+                        HoverHandler { id: localHover }
+                        TapHandler { onTapped: win.whOnline = false }
+                    }
+
+                    // Wallhaven: the box searches wallhaven.cc on Enter, and
+                    // the grid shows a remote preview feed below.
+                    Rectangle {
+                        anchors.top: parent.top
+                        anchors.bottom: parent.bottom
+                        anchors.right: parent.right
+                        width: parent.width / 2
+                        radius: 9
+                        color: netHover.hovered ? Theme.hover
+                                : (win.whOnline ? Theme.accent : "transparent")
+                        opacity: win.whOnline ? 0.22 : 1.0
+                        border.width: 1
+                        border.color: win.whOnline ? Theme.accent : "transparent"
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "Wallhaven"
+                            color: win.whOnline ? Theme.accent : Theme.text
+                            font.pixelSize: 12
+                        }
+                        HoverHandler { id: netHover }
+                        TapHandler { onTapped: win.whOnline = true }
+                    }
+                }
         }
 
         // ---- body: categories + grid --------------------------------------
@@ -441,7 +541,9 @@ PanelWindow {
             GridView {
                 id: wpGrid
                 anchors.fill: parent
-                visible: win.showingWallpapers
+                // The wallhaven preview grid occupies the same rect and swaps
+                // in on the wallpapers tab in online mode.
+                visible: win.showingWallpapers && !win.whOnline
                 clip: true
                 interactive: win.open
                 model: WallpaperModel.visibleItems
@@ -468,6 +570,134 @@ PanelWindow {
                     font.pixelSize: 15
                 }
             }
+
+            // ---- wallhaven preview grid -------------------------------------
+            // Remote results of an online search, shown while the search box is
+            // in wallhaven mode. Thumbnails only, no downloads: clicking a tile
+            // is what fetches the full wallpaper and applies it, and the file
+            // then shows up in the local grid on the next refresh too.
+            GridView {
+                id: whGrid
+                anchors.fill: parent
+                visible: win.showingWallpapers && win.whOnline
+                clip: true
+                interactive: win.open
+                model: WallhavenSearch.results
+                cellWidth: 156
+                cellHeight: 132
+                boundsBehavior: Flickable.StopAtBounds
+
+                delegate: Item {
+                    required property var modelData
+                    required property int index
+
+                    width: 156
+                    height: 132
+                    x: 8
+                    y: 8
+
+                    Rectangle {
+                        id: whTile
+                        anchors.fill: parent
+                        radius: 10
+                        color: whTileHover.hovered ? Theme.hover : Theme.window
+                        border.width: 1
+                        border.color: whTileHover.hovered ? Theme.accent : Theme.separator
+                        clip: true
+
+                        Image {
+                            id: thumb
+                            anchors.fill: parent
+                            anchors.margins: 1
+                            source: modelData.thumb
+                            fillMode: Image.PreserveAspectCrop
+                            asynchronous: true
+                            sourceSize: Qt.size(312, 264)
+                            cache: true
+
+                            // Loading/error overlay so a slow thumb or a broken
+                            // CDN link doesn't read as an empty tile.
+                            Rectangle {
+                                anchors.fill: parent
+                                color: "transparent"
+                                visible: thumb.status === Image.Loading
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "…"
+                                    color: Theme.dim
+                                    font.pixelSize: 14
+                                }
+                            }
+                            Rectangle {
+                                anchors.fill: parent
+                                color: "#00000080"
+                                visible: thumb.status === Image.Error
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "no preview"
+                                    color: "#ffffff"
+                                    font.pixelSize: 11
+                                }
+                            }
+                        }
+
+                        // Rating badge: the whole point of the purity config is
+                        // being able to tell sfw from the rest at a glance.
+                        Rectangle {
+                            anchors.left: parent.left
+                            anchors.bottom: parent.bottom
+                            anchors.margins: 6
+                            width: badge.implicitWidth + 12
+                            height: 18
+                            radius: 6
+                            color: "#cc000000"
+                            Text {
+                                id: badge
+                                anchors.centerIn: parent
+                                text: ratingLabel()
+                                color: ratingColor()
+                                font.pixelSize: 10
+                                font.bold: true
+                            }
+                        }
+                    }
+                    HoverHandler { id: whTileHover }
+                    TapHandler {
+                        onTapped: WallhavenSearch.applyResult(index)
+                    }
+
+                    function ratingLabel() {
+                        var s = String(modelData.purity || "");
+                        var i = s.indexOf("/");
+                        return i >= 0 ? s.substring(i + 1).toUpperCase() : s.toUpperCase();
+                    }
+                    function ratingColor() {
+                        var p = String(modelData.purity || "").toLowerCase();
+                        if (p.indexOf("nsfw") >= 0) return "#ff8a8a";
+                        if (p.indexOf("sketchy") >= 0) return "#ffc46b";
+                        return "#9ed9a5";
+                    }
+                }
+
+                Text {
+                    anchors.centerIn: parent
+                    visible: whGrid.count === 0 && !WallhavenSearch.searching
+                    text: WallhavenSearch.results.length === 0
+                          ? (WallhavenSearch.query.length > 0
+                             ? "no results — try a different query"
+                             : "type a query in the box above and press Enter")
+                          : ""
+                    color: Theme.dim
+                    font.pixelSize: 15
+                }
+                Text {
+                    anchors.centerIn: parent
+                    visible: whGrid.count === 0 && WallhavenSearch.searching
+                    text: "Searching wallhaven…"
+                    color: Theme.dim
+                    font.pixelSize: 15
+                }
+            }
         }
 
         // ---- footer --------------------------------------------------------
@@ -483,11 +713,18 @@ PanelWindow {
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 // Status takes precedence: while a wallpaper is being applied
-                // the busy text is the only thing worth reading.
+                // the busy text is the only thing worth reading. In wallhaven
+                // mode the online search's chatter wins over the folder's.
                 text: win.showingWallpapers
-                      ? (WallpaperModel.status.length > 0
-                         ? WallpaperModel.status
-                         : WallpaperModel.visibleItems.length + " wallpapers  ·  Enter apply  ·  Esc close")
+                      ? (WallhavenSearch.status.length > 0
+                         ? WallhavenSearch.status
+                         : (WallpaperModel.status.length > 0
+                            ? WallpaperModel.status
+                            : (win.whOnline
+                               ? (WallhavenSearch.results.length > 0
+                                  ? WallhavenSearch.results.length + " results  ·  click a tile to download & apply"
+                                  : "press Enter to search wallhaven.cc")
+                               : WallpaperModel.visibleItems.length + " wallpapers  ·  Enter apply  ·  Esc close")))
                       : (AppModel.visibleApps.length + " apps  ·  Enter launch  ·  Esc close  ·  right-click a tile to pin")
                 color: Theme.dim
                 font.pixelSize: 12
@@ -1072,6 +1309,15 @@ PanelWindow {
             + " whHasKey=" + (whOpts.fileKey.length > 0)
             + " whPurity=" + whOpts.purity
             + " whSaving=" + whOpts.saving
+            // Online search mode: whether the box is asking wallhaven.cc, and
+            // what the last query turned up. Query text is not a secret, but it
+            // does include anything the user typed -- which is fine for a
+            // local debug dump.
+            + " whOnline=" + win.whOnline
+            + " whSearching=" + WallhavenSearch.searching
+            + " whApplying=" + WallhavenSearch.applying
+            + " whResults=" + WallhavenSearch.results.length
+            + " whQuery='" + WallhavenSearch.query + "'"
             + " wpFirst='" + (WallpaperModel.visibleItems.length > 0
                              ? WallpaperModel.visibleItems[0].path : "") + "'"
             // The two grids are siblings occupying one rect, so "both visible"

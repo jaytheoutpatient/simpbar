@@ -36,6 +36,8 @@
 #                   guard rather than a quality default.
 #   --force         overwrite an already-downloaded file
 #   --apply         apply it once downloaded
+#   --thumbs        search only: also print each result's small-thumbnail URL as
+#                   an extra column after the image URL (preview grids use it)
 #   --minres WxH    random --online only: minimum resolution (default 1920x1080)
 #
 # Two things about wallhaven.cc's search that the defaults here work around:
@@ -756,7 +758,7 @@ for im in (d.get("images") or []):
 cmd_search() {
     local query="" page=1 atleast="1920x1080" sorting="favorites" order="desc"
     local category="general" purity="" seed="" save=0 force=0 apply=0 arg
-    local maxsize=0
+    local maxsize=0 thumbs=0
 
     while [ $# -gt 0 ]; do
         arg="$1"
@@ -781,6 +783,7 @@ cmd_search() {
             --save=*)    save="${arg#*=}"; shift ;;
             --force)     force=1; shift ;;
             --apply)     apply=1; shift ;;
+            --thumbs)    thumbs=1; shift ;;
             -h|--help)   fetch_help; return 0 ;;
             -*)          die "unknown option for search: $arg" ;;
             *)           query="${query:+$query }$arg"; shift ;;
@@ -831,6 +834,7 @@ cmd_search() {
 import json, sys
 want = set(filter(None, sys.argv[1].split(",")))
 maxsize = int(sys.argv[2]) * 1024 * 1024
+wantthumbs = sys.argv[3] == "1"
 try:
     d = json.load(sys.stdin)
 except Exception:
@@ -842,7 +846,7 @@ for w in (d.get("data") or []):
     size = w.get("file_size")
     if maxsize and isinstance(size, int) and size > maxsize:
         continue
-    rows.append("\t".join([
+    row = [
         str(w.get("id") or ""),
         str(w.get("resolution") or ""),
         "%s/%s" % (w.get("category") or "", w.get("purity") or ""),
@@ -850,9 +854,12 @@ for w in (d.get("data") or []):
         str(w.get("favorites") if w.get("favorites") is not None else ""),
         ",".join(w.get("colors") or []),
         str(w.get("path") or ""),
-    ]))
+    ]
+    if wantthumbs:
+        row.append((w.get("thumbs") or {}).get("small") or "")
+    rows.append("\t".join(row))
 print("\n".join(rows))
-' "$category" "$maxsize")" || { log "could not read the API's response"; return 1; }
+' "$category" "$maxsize" "$thumbs")" || { log "could not read the API's response"; return 1; }
 
     if ! printf '%s' "$n" | grep -q '[^[:space:]]'; then
         local total

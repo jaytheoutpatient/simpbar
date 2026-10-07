@@ -1189,7 +1189,7 @@ if command -v quickshell >/dev/null 2>&1; then
     # resolves its own path the same way, so the two always agree.
     QS_APPDRAWER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/quickshell/appdrawer"
     mkdir -p "$QS_APPDRAWER_DIR"
-    for qml in AppModel.qml AppTile.qml Drawer.qml Icons.qml shell.qml Theme.qml; do
+    for qml in AppModel.qml AppTile.qml Drawer.qml Icons.qml shell.qml Theme.qml WallpaperModel.qml WallpaperTile.qml WallhavenSearch.qml; do
         if [ ! -f "$HOME/.local/share/simpbar/appdrawer/$qml" ]; then
             warn "appdrawer $qml missing from the archive — the drawer may not load (skipped)"
         else
