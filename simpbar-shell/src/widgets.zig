@@ -19,7 +19,7 @@ const font_mod = @import("font");
 const art_mod = @import("art");
 const logging = @import("logging");
 
-pub const WidgetId = enum { clock, weather, media, system, calendar, watch };
+pub const WidgetId = enum { clock, weather, media, system, calendar, watch, note1, note2, note3 };
 
 /// Axis-aligned rect in surface coordinates. The host keeps one per widget
 /// (measured from the font at startup, placed from config).
@@ -52,7 +52,9 @@ pub const Theme = struct {
     radius_px: u32 = 12,
 };
 
-const CARD_PAD: i64 = 14;
+/// Public so the host can compute a note's text width, which sharing this
+/// constant (and thus always matching paint) is worth the API surface.
+pub const CARD_PAD: i64 = 14;
 const ROW_GAP: i64 = 5;
 const BAR_H: i64 = 6;
 
@@ -113,6 +115,8 @@ pub fn cardSizeFor(id: WidgetId, font: *const font_mod.Font) [2]u32 {
         .media => .{ @intCast(MEDIA_W), @intCast(2 * CARD_PAD + MEDIA_COVER + MEDIA_HEAD_GAP + MEDIA_PROG_H + MEDIA_TIME_GAP + lh + MEDIA_CTRL_GAP + lh) },
         .system => .{ 190, @intCast(2 * CARD_PAD + 3 * lh + 2 * ROW_GAP + 2 * BAR_H) },
         .calendar => .{ @intCast(CAL_W), @intCast(2 * CARD_PAD + 3 * lh + CAL_HEAD_GAP + CAL_WD_GAP + CAL_ROWS * CAL_CELL_H + CAL_FOOT_GAP) },
+        // Sticky notes: a text card, tall enough for six wrapped lines.
+        .note1, .note2, .note3 => .{ @intCast(NoteWidget.NOTE_W), @intCast(2 * CARD_PAD + NoteWidget.VISIBLE_LINES * lh) },
         // Fixed-size: the watch is drawn from its own geometry, not the font.
         .watch => .{ @intCast(WATCH_W), @intCast(WATCH_H) },
     };
@@ -2510,6 +2514,461 @@ pub const WatchWidget = struct {
     }
 };
 
+// --- sticky notes (KDE-Plasma style) --------------------------------------
+
+/// A note card holds plain text you type straight into the desktop widget.
+/// Each slot persists to ~/.config/simpbar/notes/note{N}.txt and reloads at
+/// startup, so a note lives until you erase its text — empty text is an
+/// empty note, never a missing one. There are no add/delete buttons: the
+/// three slots are ordinary config widgets, and "deleting" is clearing the
+/// buffer.
+///
+/// Editing is whole-process single-slot: the host sets `edit_index` when a
+/// note card is clicked ([on_demand] keyboard interactivity grants focus),
+/// routes compositor key events here through xkb (UTF-32 decode), and
+/// releases the slot on Esc, focus-leave, or a click elsewhere. Edits save
+/// atomically (tmp + rename) on release and autosave after a quiet typing
+/// pause, so a crash can't eat recent keystrokes.
+///
+/// Text is capped at NOTE_MAX *bytes* so the fixed wrap-line array always
+/// fits the worst case (every byte a newline ⇒ text.len + 1 lines).
+pub const NoteWidget = struct {
+    pub const NOTE_MAX: usize = 1023;
+    pub const MAX_WRAP_LINES: usize = 1025;
+    /// Public — cardSizeFor measures the card from these.
+    pub const NOTE_W: i64 = 230;
+    pub const VISIBLE_LINES: i64 = 6;
+    /// Cadence while editing: caret blink + autosave check. Idle notes have
+    /// nothing to repaint, so Widget.intervalMs drops them to 60 s.
+    pub const interval_ms: i64 = 500;
+    pub const idle_interval_ms: i64 = 60_000;
+
+    text_buf: [NOTE_MAX]u8 = undefined,
+    text_len: usize = 0,
+    path_buf: [320]u8 = undefined,
+    path_len: usize = 0,
+    /// Byte offset of the caret while editing.
+    caret: usize = 0,
+    editing: bool = false,
+    dirty: bool = false,
+    /// First wrapped line shown at the top of the card.
+    scroll: usize = 0,
+    /// Horizontal goal kept across Up/Down (like a normal editor).
+    desired_x: i64 = 0,
+    blink_on: bool = true,
+    /// monoMs() of the last keyed change — autosave cadence source.
+    last_change_ms: i64 = 0,
+
+    pub fn path(self: *const NoteWidget) [:0]const u8 {
+        return self.path_buf[0..self.path_len :0];
+    }
+
+    pub fn text(self: *const NoteWidget) []const u8 {
+        return self.text_buf[0..self.text_len];
+    }
+
+    /// Stores the slot file path and loads whatever it currently holds.
+    pub fn configure(self: *NoteWidget, notes_dir: []const u8, slot: u8) void {
+        const s = std.fmt.bufPrint(self.path_buf[0..], "{s}/note{d}.txt", .{ notes_dir, slot }) catch return;
+        self.path_len = s.len;
+        self.path_buf[self.path_len] = 0; // NUL-terminate for [:0] slices
+        self.text_len = readFileInto(self.path(), &self.text_buf);
+        self.caret = self.text_len;
+        self.scroll = 0;
+        self.editing = false;
+        self.dirty = false;
+        self.last_change_ms = 0;
+        logging.step("notes: note{d} holds {d} bytes from {s}", .{ slot, self.text_len, self.path() });
+    }
+
+    /// Persist the text if it changed (tmp file + rename). Called on edit
+    /// release — Esc, focus leave, click elsewhere, delete.
+    pub fn commit(self: *NoteWidget) void {
+        if (self.write()) {
+            logging.step("notes: saved {d} bytes to {s}", .{ self.text_len, self.path() });
+        }
+    }
+
+    /// Leave editing: hide the caret, drop the view back to the top.
+    pub fn endEditing(self: *NoteWidget) void {
+        self.editing = false;
+        self.blink_on = true;
+        self.scroll = 0;
+    }
+
+    /// Editor cadence tick: flip the caret blink and quietly autosave a
+    /// typing pause. Always asks for a repaint while editing (the blink).
+    pub fn tick(self: *NoteWidget) bool {
+        if (!self.editing) return false;
+        self.blink_on = !self.blink_on;
+        if (monoMs() - self.last_change_ms > 1500) _ = self.write();
+        return true;
+    }
+
+    /// Every keyed change re-adds the dirty flag and wakes the fence.
+    fn markChanged(self: *NoteWidget) void {
+        self.dirty = true;
+        self.last_change_ms = monoMs();
+        self.blink_on = true;
+    }
+
+    /// Save-on-dirty: returns true when a write actually happened.
+    fn write(self: *NoteWidget) bool {
+        if (!self.dirty) return false;
+        self.dirty = false;
+        if (self.path_len == 0) return false; // unconfigured (unit tests) — nothing to persist
+        return writeFileAtomicZ(self.path(), self.text());
+    }
+
+    // --- caret editing (pure — the host feeds keys, we move bytes) --------
+
+    fn insertCp(self: *NoteWidget, cp: u21) bool {
+        var enc: [4]u8 = undefined;
+        const n = utf8Encode(cp, &enc);
+        if (self.text_len + n > NOTE_MAX) return false;
+        // Shift the tail up by n (memmove semantics: dest precedes source).
+        var k = self.text_len;
+        while (k > self.caret) : (k -= 1) {
+            self.text_buf[k + n - 1] = self.text_buf[k - 1];
+        }
+        @memcpy(self.text_buf[self.caret..][0..n], enc[0..n]);
+        self.caret += n;
+        self.text_len += n;
+        return true;
+    }
+
+    /// Byte offset just before the codepoint ending at `at`.
+    fn prevBoundary(self: *const NoteWidget, at: usize) usize {
+        var p = at;
+        while (p > 0 and (self.text_buf[p - 1] & 0xC0) == 0x80) p -= 1; // back over continuation bytes
+        if (p > 0) return p - 1;
+        return 0;
+    }
+
+    /// Byte offset just after the codepoint starting at `at`.
+    fn nextBoundary(self: *const NoteWidget, at: usize) usize {
+        var i = at;
+        _ = nextUtf8Codepoint(self.text(), &i);
+        return i;
+    }
+
+    fn backspace(self: *NoteWidget) bool {
+        if (self.caret == 0) return false;
+        const lo = self.prevBoundary(self.caret);
+        // Pull the tail left (dest is before source — forward copy is safe).
+        var k = self.caret;
+        while (k < self.text_len) : (k += 1) {
+            self.text_buf[lo + (k - self.caret)] = self.text_buf[k];
+        }
+        self.text_len -= self.caret - lo;
+        self.caret = lo;
+        return true;
+    }
+
+    fn deleteForward(self: *NoteWidget) bool {
+        if (self.caret >= self.text_len) return false;
+        const hi = self.nextBoundary(self.caret);
+        var k = hi;
+        while (k < self.text_len) : (k += 1) {
+            self.text_buf[self.caret + (k - hi)] = self.text_buf[k];
+        }
+        self.text_len -= hi - self.caret;
+        return true;
+    }
+
+    fn moveLeft(self: *NoteWidget) bool {
+        if (self.caret == 0) return false;
+        self.caret = self.prevBoundary(self.caret);
+        return true;
+    }
+
+    fn moveRight(self: *NoteWidget) bool {
+        if (self.caret >= self.text_len) return false;
+        self.caret = self.nextBoundary(self.caret);
+        return true;
+    }
+
+    fn caretX(self: *const NoteWidget, measure: anytype, lines: []const LayoutLine, li: usize, caret: usize) i64 {
+        return advSlice(measure, self.text()[lines[li].start..caret]);
+    }
+
+    fn moveUpInner(self: *NoteWidget, measure: anytype, lines: []const LayoutLine, count: usize) bool {
+        if (self.caret == 0) return false;
+        const li = caretLine(lines, count, self.caret);
+        if (li == 0) return false;
+        const l = lines[li - 1];
+        self.caret = offsetNear(measure, self.text()[l.start..l.end], self.desired_x) + l.start;
+        return true;
+    }
+
+    fn moveDownInner(self: *NoteWidget, measure: anytype, lines: []const LayoutLine, count: usize) bool {
+        if (self.caret >= self.text_len) return false;
+        const li = caretLine(lines, count, self.caret);
+        if (li + 1 >= count) return false;
+        const l = lines[li + 1];
+        self.caret = offsetNear(measure, self.text()[l.start..l.end], self.desired_x) + l.start;
+        return true;
+    }
+
+    /// Scroll so the caret's wrapped line stays among the visible ones, and
+    /// keep the stored scroll honest when the text shrank under it.
+    fn keepVisible(self: *NoteWidget, lines: []const LayoutLine, count: usize) void {
+        const vis: usize = @intCast(VISIBLE_LINES);
+        if (count > vis and self.scroll > count - vis) self.scroll = count - vis;
+        if (count <= vis) self.scroll = 0;
+        const li = caretLine(lines, count, self.caret);
+        if (li < self.scroll) self.scroll = li;
+        if (li >= self.scroll + vis) self.scroll = li - vis + 1;
+    }
+
+    /// Feed one compositor key event. `utf32` comes from xkb (already
+    /// unmapped on non-printables); `keycode` is the raw evdev code for the
+    /// editing specials (Backspace etc.) that have no UTF-32 equivalent.
+    /// Returns what the host should do with the key afterward.
+    pub const KeyResult = enum { ignored, handled, exited };
+
+    pub fn keyPress(self: *NoteWidget, measure: anytype, max_w: i64, keycode: u32, utf32: u32) KeyResult {
+        if (keycode == KEY_ESC) {
+            self.commit();
+            self.endEditing();
+            return .exited;
+        }
+        var lines_arr: [MAX_WRAP_LINES]LayoutLine = undefined;
+        const lines = &lines_arr;
+        const count = wrapLines(measure, self.text(), max_w, lines);
+        const handled = switch (keycode) {
+            KEY_BACKSPACE => self.backspace(),
+            KEY_DELETE => self.deleteForward(),
+            KEY_ENTER, KEY_KP_ENTER => self.insertCp('\n'),
+            KEY_LEFT => self.moveLeft(),
+            KEY_RIGHT => self.moveRight(),
+            KEY_UP => self.moveUpInner(measure, lines, count),
+            KEY_DOWN => self.moveDownInner(measure, lines, count),
+            KEY_HOME => blk: {
+                self.caret = lines[caretLine(lines, count, self.caret)].start;
+                break :blk true;
+            },
+            KEY_END => blk: {
+                self.caret = lines[caretLine(lines, count, self.caret)].end;
+                break :blk true;
+            },
+            else => blk: {
+                // Printable text only: control magnitudes (C0) and DEL (0x7F)
+                // never insert — xkb hands them back as 0 anyway.
+                if (utf32 == 0 or utf32 < 0x20 or utf32 == 0x7F) return .ignored;
+                break :blk self.insertCp(@intCast(utf32));
+            },
+        };
+        if (!handled) return .ignored;
+        self.markChanged();
+        if (keycode != KEY_UP and keycode != KEY_DOWN) {
+            const li = caretLine(lines, count, self.caret);
+            self.desired_x = self.caretX(measure, lines, li, self.caret);
+        }
+        self.keepVisible(lines, count);
+        return .handled;
+    }
+
+    /// A click anywhere inside the card starts (or continues) editing and
+    /// drops the caret onto the wrapped line nearest the click point.
+    pub fn clickAt(self: *NoteWidget, r: Rect, font: *font_mod.Font, px: i32, py: i32) void {
+        self.editing = true;
+        self.blink_on = true;
+        const rx: i64 = r.x;
+        const ry: i64 = r.y;
+        const lh = lineH(font);
+        const max_w: i64 = @as(i64, @intCast(r.w)) - 2 * CARD_PAD;
+        var lines: [MAX_WRAP_LINES]LayoutLine = undefined;
+        const count = wrapLines(FontMeasure{ .font = font }, self.text(), max_w, &lines);
+        const rel_x = @max(@as(i64, px) - (rx + CARD_PAD), 0);
+        var rel_y = @as(i64, py) - (ry + CARD_PAD);
+        rel_y = std.math.clamp(rel_y, 0, VISIBLE_LINES * lh - 1); // padding clicks → nearest line
+        var li = self.scroll + @as(usize, @intCast(@divTrunc(rel_y, lh)));
+        if (li >= count) li = count - 1;
+        const l = lines[li];
+        self.caret = offsetNear(FontMeasure{ .font = font }, self.text()[l.start..l.end], rel_x) + l.start;
+        const line_w = advSlice(FontMeasure{ .font = font }, self.text()[l.start..l.end]);
+        self.desired_x = @min(rel_x, line_w);
+    }
+
+    pub fn paint(self: *const NoteWidget, c: Canvas, r: Rect) void {
+        const rx: i64 = r.x;
+        const ry: i64 = r.y;
+        const lh = lineH(c.font);
+        const ascent: i64 = c.font.ascentPx();
+        const max_w: i64 = @as(i64, @intCast(r.w)) - 2 * CARD_PAD;
+        var lines: [MAX_WRAP_LINES]LayoutLine = undefined;
+        const count = wrapLines(FontMeasure{ .font = c.font }, self.text(), max_w, &lines);
+        const vis: usize = @intCast(VISIBLE_LINES);
+        var scroll = self.scroll;
+        if (count > vis and scroll > count - vis) scroll = count - vis;
+        if (count <= vis) scroll = 0;
+
+        const t = c.theme.text_color;
+        const baseline = ry + CARD_PAD + ascent;
+        const rows = @min(vis, count);
+        for (0..rows) |row| {
+            const l = lines[scroll + row];
+            if (l.end > l.start) {
+                _ = c.drawText(rx + CARD_PAD, baseline + @as(i64, @intCast(row)) * lh, self.text()[l.start..l.end], t);
+            }
+        }
+
+        if (self.text_len == 0 and !self.editing) {
+            _ = c.drawText(rx + CARD_PAD, baseline, "click to type", dim(t, 0x55));
+        }
+
+        // Blinking caret at its byte offset within the visible wrapped line.
+        if (self.editing and self.blink_on) {
+            const li = caretLine(&lines, count, self.caret);
+            if (li >= scroll and li < scroll + vis) {
+                const caret_x = rx + CARD_PAD + advSlice(FontMeasure{ .font = c.font }, self.text()[lines[li].start..self.caret]);
+                const top = ry + CARD_PAD + 1 + @as(i64, @intCast(li - scroll)) * lh;
+                c.fillRect(caret_x, top, 2, @intCast(lh - 2), t);
+            }
+        }
+    }
+};
+
+/// Mode-independent font advance — the layout math reads glyph advances
+/// through this so the same code runs in painting and in tests (tests use a
+/// fixed-advance stand-in via `measure: anytype`).
+pub const FontMeasure = struct {
+    font: *font_mod.Font,
+    pub fn advance(self: FontMeasure, cp: u32) i64 {
+        return (self.font.glyph(cp) catch return 8).advance_x;
+    }
+};
+
+/// One wrapped line: byte range of its content. `end` excludes the newline
+/// or line-breaking space that terminated it.
+const LayoutLine = struct { start: usize, end: usize };
+
+/// Sum of `text`'s glyph advances.
+fn advSlice(measure: anytype, text: []const u8) i64 {
+    var i: usize = 0;
+    var w: i64 = 0;
+    while (nextUtf8Codepoint(text, &i)) |cp| w += measure.advance(cp);
+    return w;
+}
+
+/// Greedy word-wrap over `lines` (capacity ≥ text.len + 1 always holds for
+/// the note buffers). Breaks at hard newlines and at the line-breaking space
+/// nearest the limit — that space terminates the wrapped line and is dropped
+/// from it — and hard-breaks words longer than a whole line.
+fn wrapLines(measure: anytype, text: []const u8, max_w: i64, lines: []LayoutLine) usize {
+    var count: usize = 0;
+    var start: usize = 0;
+    var w: i64 = 0;
+    var last_space: ?usize = null;
+    var i: usize = 0;
+    while (i < text.len) {
+        const cp_start = i;
+        const cp = nextUtf8Codepoint(text, &i) orelse break;
+        var consumed = false;
+        if (cp == '\n') {
+            lines[count] = .{ .start = start, .end = cp_start };
+            count += 1;
+            start = i;
+            w = 0;
+            last_space = null;
+            consumed = true;
+        } else {
+            const a = measure.advance(cp);
+            if (w > 0 and w + a > max_w and cp_start > start) {
+                if (last_space) |sp| {
+                    lines[count] = .{ .start = start, .end = sp };
+                    count += 1;
+                    if (sp == cp_start) {
+                        // The overflowing char IS the line-breaking space:
+                        // drop it from both sides and start fresh after it.
+                        start = i;
+                        w = 0;
+                        last_space = null;
+                        consumed = true;
+                    } else {
+                        start = sp + 1;
+                        w = advSlice(measure, text[start..cp_start]);
+                        last_space = null;
+                    }
+                } else {
+                    // No space yet on this line — hard-break the long word.
+                    lines[count] = .{ .start = start, .end = cp_start };
+                    count += 1;
+                    start = cp_start;
+                    w = 0;
+                }
+            }
+            if (!consumed) {
+                if (cp == ' ') last_space = cp_start;
+                w += a;
+            }
+        }
+    }
+    lines[count] = .{ .start = start, .end = text.len };
+    return count + 1;
+}
+
+/// Index of the wrapped line that holds byte offset `caret` (the last line
+/// wins when the caret sits on a line break).
+fn caretLine(lines: []const LayoutLine, count: usize, caret: usize) usize {
+    var li: usize = 0;
+    for (1..count) |i| {
+        if (lines[i].start > caret) break;
+        li = i;
+    }
+    return li;
+}
+
+/// Byte offset in `line_text` whose boundary is closest to pixel `x`.
+fn offsetNear(measure: anytype, line_text: []const u8, x: i64) usize {
+    var i: usize = 0;
+    var w: i64 = 0;
+    while (i < line_text.len) {
+        const start = i;
+        const cp = nextUtf8Codepoint(line_text, &i) orelse break;
+        const a = measure.advance(cp);
+        if (x < w + @divTrunc(a, 2)) return start;
+        if (x < w + a) return i;
+        w += a;
+    }
+    return line_text.len;
+}
+
+/// Linux evdev key codes the note editor routes by hardware code — stable
+/// across layouts; the xkb round-trip only decodes text.
+pub const KEY_ESC: u32 = 1;
+pub const KEY_BACKSPACE: u32 = 14;
+pub const KEY_ENTER: u32 = 28;
+pub const KEY_KP_ENTER: u32 = 96;
+pub const KEY_LEFT: u32 = 105;
+pub const KEY_RIGHT: u32 = 106;
+pub const KEY_UP: u32 = 103;
+pub const KEY_DOWN: u32 = 108;
+pub const KEY_HOME: u32 = 102;
+pub const KEY_END: u32 = 107;
+pub const KEY_DELETE: u32 = 111;
+
+/// Atomic file write (tmp + rename) — the same pattern saveConfig uses, for
+/// the note payloads. Returns true on success.
+pub fn writeFileAtomicZ(path: [:0]const u8, data: []const u8) bool {
+    if (path.len + 4 >= 512) return false;
+    var tmp_buf: [400]u8 = undefined;
+    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{path}) catch return false;
+    const raw_fd = posix.system.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(posix.mode_t, 0o644));
+    if (raw_fd < 0) return false;
+    const fd: posix.fd_t = @intCast(raw_fd);
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = std.c.write(fd, data.ptr + off, data.len - off);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    _ = posix.system.close(fd);
+    if (off != data.len) return false;
+    return std.c.rename(tmp.ptr, path.ptr) == 0;
+}
+
 // --- the composite widget ---------------------------------------------------
 
 pub const Widget = union(WidgetId) {
@@ -2519,6 +2978,9 @@ pub const Widget = union(WidgetId) {
     system: SystemWidget,
     calendar: CalendarWidget,
     watch: WatchWidget,
+    note1: NoteWidget,
+    note2: NoteWidget,
+    note3: NoteWidget,
 
     pub fn intervalMs(self: Widget) i64 {
         return switch (self) {
@@ -2527,6 +2989,8 @@ pub const Widget = union(WidgetId) {
             .media => MediaWidget.interval_ms,
             .system => SystemWidget.interval_ms,
             .calendar => CalendarWidget.interval_ms,
+            // Editing notes blink every half second; idle ones never repaint.
+            .note1, .note2, .note3 => |n| if (n.editing) NoteWidget.interval_ms else NoteWidget.idle_interval_ms,
             .watch => WatchWidget.interval_ms,
         };
     }
@@ -2552,6 +3016,9 @@ pub const Widget = union(WidgetId) {
             },
             .calendar => |*k| blk: {
                 break :blk k.tick();
+            },
+            .note1, .note2, .note3 => |*n| blk: {
+                break :blk n.tick();
             },
             .watch => |*w| blk: {
                 break :blk w.tick();
@@ -2589,6 +3056,7 @@ pub const Widget = union(WidgetId) {
             .media => |*m| m.clickAt(r, font, x, y),
             .system => |s| s.click(),
             .calendar => |*k| k.clickAt(r, font, x, y),
+            .note1, .note2, .note3 => |*n| n.clickAt(r, font, x, y),
             .watch => |*w| w.click(),
         }
     }
@@ -2601,10 +3069,22 @@ pub const Widget = union(WidgetId) {
             .media => |w| w.paint(c, r),
             .system => |w| w.paint(c, r),
             .calendar => |w| w.paint(c, r),
+            .note1, .note2, .note3 => |n| n.paint(c, r),
             .watch => |w| w.paint(c, r),
         }
     }
 };
+
+/// The sticky-note slot number of a note widget, else null — the host uses
+/// it to open/close the single-edit slot on pointer clicks.
+pub fn noteSlot(w: *const Widget) ?u8 {
+    return switch (w.*) {
+        .note1 => 1,
+        .note2 => 2,
+        .note3 => 3,
+        else => null,
+    };
+}
 
 // --- bezel-timer math tests ------------------------------------------------
 // Run from simpbar-shell/ with:
@@ -2650,4 +3130,137 @@ test "watch bezel turn quantize + clamp" {
     try std.testing.expectEqual(@as(u8, 0), w.bezel_min);
     try std.testing.expect(w.turnBezel(0, sixth * 100));
     try std.testing.expectEqual(@as(u8, 59), w.bezel_min);
+}
+
+// --- sticky-note tests ------------------------------------------------------
+
+/// Fixed 8px-advance stand-in for FontMeasure — the wrap/caret math never
+/// touches the real freetype font, so these run headless.
+const FixedAdv = struct {
+    pub fn advance(self: FixedAdv, cp: u32) i64 {
+        _ = self;
+        _ = cp;
+        return 8;
+    }
+};
+
+test "notes: greedy word wrap" {
+    const m = FixedAdv{};
+    var lines: [NoteWidget.MAX_WRAP_LINES]LayoutLine = undefined;
+    // 5 chars fit: "aaaa bbbb cccc" wraps at both line-breaking spaces.
+    const text1 = "aaaa bbbb cccc";
+    const n1 = wrapLines(m, text1, 40, &lines);
+    try std.testing.expectEqual(@as(usize, 3), n1);
+    try std.testing.expectEqualSlices(u8, "aaaa", text1[lines[0].start..lines[0].end]);
+    try std.testing.expectEqualSlices(u8, "bbbb", text1[lines[1].start..lines[1].end]);
+    try std.testing.expectEqualSlices(u8, "cccc", text1[lines[2].start..lines[2].end]);
+    // Explicit newlines force breaks.
+    const text2 = "ab\ncd";
+    const n2 = wrapLines(m, text2, 40, &lines);
+    try std.testing.expectEqual(@as(usize, 2), n2);
+    try std.testing.expectEqualSlices(u8, "ab", text2[lines[0].start..lines[0].end]);
+    try std.testing.expectEqualSlices(u8, "cd", text2[lines[1].start..lines[1].end]);
+    // A word longer than the line is hard-broken mid-word.
+    const text3 = "abcdefghij";
+    const n3 = wrapLines(m, text3, 40, &lines);
+    try std.testing.expectEqual(@as(usize, 2), n3);
+    try std.testing.expectEqualSlices(u8, "abcde", text3[lines[0].start..lines[0].end]);
+    try std.testing.expectEqualSlices(u8, "fghij", text3[lines[1].start..lines[1].end]);
+    // Empty text is a single empty line.
+    const n4 = wrapLines(m, "", 40, &lines);
+    try std.testing.expectEqual(@as(usize, 1), n4);
+    try std.testing.expectEqual(@as(usize, 0), lines[0].end - lines[0].start);
+}
+
+test "notes: caret moves are codepoint-aware" {
+    var note = NoteWidget{};
+    _ = note.insertCp('a'); // 1 byte
+    _ = note.insertCp('b'); // 1 byte
+    _ = note.insertCp(0xE9); // é — 2 bytes
+    try std.testing.expectEqual(@as(usize, 4), note.text_len);
+    try std.testing.expectEqual(@as(usize, 4), note.caret);
+    // Left crosses the whole é in one step, not half a byte.
+    _ = note.moveLeft();
+    try std.testing.expectEqual(@as(usize, 2), note.caret);
+    _ = note.moveRight();
+    try std.testing.expectEqual(@as(usize, 4), note.caret);
+    // Backspace before é removes it whole.
+    _ = note.backspace();
+    try std.testing.expectEqual(@as(usize, 2), note.text_len);
+    try std.testing.expectEqual(@as(usize, 2), note.caret);
+    try std.testing.expectEqualSlices(u8, "ab", note.text());
+}
+
+test "notes: text capped at NOTE_MAX" {
+    var note = NoteWidget{};
+    for (0..NoteWidget.NOTE_MAX) |_| _ = note.insertCp('x');
+    try std.testing.expectEqual(NoteWidget.NOTE_MAX, note.text_len);
+    _ = note.insertCp('y'); // no room — still exactly NOTE_MAX
+    try std.testing.expectEqual(NoteWidget.NOTE_MAX, note.text_len);
+    // Deleting a byte frees a slot again.
+    _ = note.backspace();
+    _ = note.insertCp('y');
+    try std.testing.expectEqual(NoteWidget.NOTE_MAX, note.text_len);
+    try std.testing.expectEqual(@as(u8, 'y'), note.text_buf[note.text_len - 1]);
+}
+
+test "notes: wrap line array fits the worst case" {
+    var note = NoteWidget{};
+    for (0..NoteWidget.NOTE_MAX) |_| _ = note.insertCp('\n');
+    var lines: [NoteWidget.MAX_WRAP_LINES]LayoutLine = undefined;
+    const n = wrapLines(FixedAdv{}, note.text(), 40, &lines);
+    // NOTE_MAX newlines ⇒ NOTE_MAX lines + one trailing empty.
+    try std.testing.expectEqual(NoteWidget.NOTE_MAX + 1, n);
+    try std.testing.expect(n <= lines.len);
+}
+
+test "notes: keyPress edit commands, Enter, Esc" {
+    var note = NoteWidget{};
+    const m = FixedAdv{};
+    const K = NoteWidget.KeyResult;
+    // Non-special keycodes with an xkb-decoded codepoint insert text.
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 999, 'a'));
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 999, 'b'));
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_ENTER, 0));
+    try std.testing.expectEqualSlices(u8, "ab\n", note.text());
+    // Delete is exactly one codepoint, and Backspace undoes a newline.
+    _ = note.moveLeft();
+    _ = note.deleteForward();
+    try std.testing.expectEqualSlices(u8, "ab", note.text());
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_BACKSPACE, 0));
+    try std.testing.expectEqualSlices(u8, "a", note.text());
+    // Home / End sweep the visual line.
+    _ = note.keyPress(m, 40, 999, 'b');
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_HOME, 0));
+    try std.testing.expectEqual(@as(usize, 0), note.caret);
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_END, 0));
+    try std.testing.expectEqual(@as(usize, 2), note.caret);
+    // Non-printable / unmapped keys are ignored, not inserted.
+    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, 999, 0));
+    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, 999, 0x7F));
+    try std.testing.expectEqualSlices(u8, "ab", note.text());
+    // Esc commits and hands the slot back.
+    try std.testing.expectEqual(K.exited, note.keyPress(m, 40, KEY_ESC, 0));
+    try std.testing.expect(!note.editing);
+}
+
+test "notes: up/down walk wrapped lines" {
+    var note = NoteWidget{};
+    const m = FixedAdv{};
+    const K = NoteWidget.KeyResult;
+    for ("aaaa bbbb cccc") |ch| _ = note.insertCp(@intCast(ch));
+    note.caret = note.text_len;
+    note.desired_x = 0;
+    // Line 3 -> line 2 at the same column.
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_UP, 0));
+    try std.testing.expectEqual(@as(usize, 5), note.caret); // start of "bbbb"
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_UP, 0));
+    try std.testing.expectEqual(@as(usize, 0), note.caret); // start of "aaaa"
+    // At the top, Up is a no-op (ignored).
+    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, KEY_UP, 0));
+    // And Down walks back down.
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_DOWN, 0));
+    try std.testing.expectEqual(@as(usize, 5), note.caret);
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_DOWN, 0));
+    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, KEY_DOWN, 0));
 }

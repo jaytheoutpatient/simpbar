@@ -72,7 +72,7 @@ Your pinned apps live in `favourites.json` next to the panel — under `$XDG_CON
 
 ## Desktop widgets (simpbar-shell)
 
-A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget cards — **clock**, **weather**, **media**, **system monitor**, **calendar**, and an **analog watch** — on a layer just above the wallpaper (below windows), reinventing the Event-Horizon-Shell style of desktop widgets on simpbar's own Wayland/shm/font plumbing. The installer builds and autostarts it, and it reads the same `matugen.json` colors, the same nerd font, and its own `~/.config/simpbar/shell.json` for layout:
+A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget cards — **clock**, **weather**, **media**, **system monitor**, **calendar**, an **analog watch**, and three **sticky notes** — on a layer just above the wallpaper (below windows), reinventing the Event-Horizon-Shell style of desktop widgets on simpbar's own Wayland/shm/font plumbing. The installer builds and autostarts it, and it reads the same `matugen.json` colors, the same nerd font, and its own `~/.config/simpbar/shell.json` for layout:
 
 ```json
 {
@@ -87,7 +87,10 @@ A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget
     { "id": "media",    "x": 24, "y": 176 },
     { "id": "system",   "x": 24, "y": 350 },
     { "id": "calendar", "x": 24, "y": 470 },
-    { "id": "watch",    "x": 1711, "y": 24 }
+    { "id": "watch",    "x": 1711, "y": 24 },
+    { "id": "note1",    "x": 24, "y": 700 },
+    { "id": "note2",    "x": 264, "y": 700 },
+    { "id": "note3",    "x": 504, "y": 700 }
   ]
 }
 ```
@@ -112,6 +115,8 @@ YYYY-MM-DD HH:MM [lead] text
 A reminder notifies once at its date minus `lead` days (via `notify-send`), delivered up to 15 minutes late if the machine was asleep, and entries edited straight in the file are picked up on the next tick.
 
 **Holidays** come from the free [date.nager.at](https://date.nager.at) API for `holiday_country` (ISO country code, default `AU`): public holidays are drawn on their day numbers in the matugen template's `holiday_color`, regional/state holidays dimmed, and the card's footer names today's holiday or the next upcoming one. Set `holiday_region` (e.g. `"WA"`) to show only your region's regional holidays alongside the nationwide ones; empty shows all. `holiday_color` is generated with the rest of the theme — a missing key falls back to a warm accent.
+
+**Sticky notes** — three fixed slots (`note1`, `note2`, `note3`) let you type straight onto the desktop, fridge-door style. Click a card and the shell takes the keyboard: it decodes raw evdev keycodes with **xkbcommon** rather than asking for a focused window, so your layout's symbols still land even though no window has focus. **Enter** starts a new line, the arrow keys move the caret (Home/End jump to the line, Up/Down walk to the same column on the wrapped line above/below), and **Escape** saves and exits the field. Each note lives in its own file, `~/.config/simpbar/notes/note1.txt` … `note3.txt`, so text survives restarts — a note only dies when you erase its text. Emptying a card and pressing Escape empties the file and the card falls back to a dim "click to type" placeholder, which is what an untouched slot shows. Saves also fire when you click away from a card and, while editing, automatically shortly after you stop typing — so a crash can't eat your last sentence. There are no add/remove buttons: three slots, always there, Ctrl+dragged like any other card.
 
 ## Wallpapers
 
@@ -206,7 +211,7 @@ There is no widget for this in **simpbar-config**, but it is round-tripped from 
 
 **Bar, compositor & theming**
 - simpbar (this repo's source, built from scratch during install), Hyprland, foot (terminal), rofi with its bundled Material theme, swaync (notifications)
-- simpbar-shell: desktop widget cards (clock/weather/media/system monitor/calendar/analog watch) on a layer just above the wallpaper, themed from the same matugen colors (see [Desktop widgets](#desktop-widgets-simpbar-shell))
+- simpbar-shell: desktop widget cards (clock/weather/media/system monitor/calendar/analog watch/sticky notes) on a layer just above the wallpaper, themed from the same matugen colors (see [Desktop widgets](#desktop-widgets-simpbar-shell))
 - Dracula GTK theme, Zafiro-Dracula icon theme, Bibata Modern Classic cursor — all applied automatically via nwg-look's settings, no manual toggling needed
 - nwg-drawer, usable from rofi as a fallback app-menu (ArcMenu-style GNOME Shell extensions don't run under Hyprland at all)
 - fastfetch (also wired into every new bash/fish shell)

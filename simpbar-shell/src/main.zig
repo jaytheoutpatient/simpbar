@@ -23,7 +23,9 @@ const widgets_mod = @import("widgets");
 pub const panic = std.debug.FullPanic(logging.panicHandler);
 
 const MAX_OUTPUTS: usize = 8;
-const MAX_WIDGETS: usize = 8;
+// 6 base widgets + 3 sticky notes = 9 ≤ 12. Only bits tell you a tile is
+// stale, without scanning every widget for changes.
+const MAX_WIDGETS: usize = 12;
 const FONT_PIXEL_SIZE: u32 = 13;
 const BTN_LEFT: u32 = 0x110;
 
@@ -97,6 +99,11 @@ const DEFAULT_WIDGETS = [_]WidgetCfg{
     // Calendar below the stack (≈ 215px tall); drag anywhere with
     // Ctrl+left-click once running.
     .{ .id = .calendar, .x = 24, .y = 470 },
+    // Sticky notes along the middle-left, clear of the watch (right) and the
+    // weather/media/calendar stack (left column) at the 13px default font.
+    .{ .id = .note1, .x = 24, .y = 700 },
+    .{ .id = .note2, .x = 264, .y = 700 },
+    .{ .id = .note3, .x = 504, .y = 700 },
     // The analog watch stands alone on the right — it draws its own steel
     // case instead of a frosted card.
     .{ .id = .watch, .x = 1711, .y = 24 },
@@ -108,6 +115,38 @@ var matugen_path_buf: [512]u8 = undefined;
 var matugen_path: [:0]const u8 = "";
 var reminders_path_buf: [512]u8 = undefined;
 var reminders_path: [:0]const u8 = "";
+var notes_dir_path_buf: [512]u8 = undefined;
+var notes_dir_path: [:0]const u8 = "";
+
+// --- xkbcommon (hand-bound, like everything else in this shell) ------------
+
+// The sticky notes translate compositor key events back into text, and only
+// xkbcommon can interpret the keymap the compositor sends. The bar links it
+// for the same reason; the C surface here is the four calls we need.
+const xkb = struct {
+    pub const Context = opaque {};
+    pub const Keymap = opaque {};
+    pub const State = opaque {};
+    pub const CONTEXT_NO_FLAGS: c_uint = 0;
+    pub const KEYMAP_FORMAT_TEXT_V1: c_uint = 1;
+    pub const KEYMAP_COMPILE_NO_FLAGS: c_uint = 0;
+
+    extern "c" fn xkb_context_new(flags: c_uint) ?*Context;
+    extern "c" fn xkb_context_unref(ctx: ?*Context) void;
+    extern "c" fn xkb_keymap_new_from_string(ctx: *Context, str: [*:0]const u8, format: c_uint, flags: c_uint) ?*Keymap;
+    extern "c" fn xkb_keymap_unref(keymap: ?*Keymap) void;
+    extern "c" fn xkb_state_new(keymap: *Keymap) ?*State;
+    extern "c" fn xkb_state_unref(state: ?*State) void;
+    extern "c" fn xkb_state_update_mask(state: *State, depressed: u32, latched: u32, locked: u32, depressed_layout: u32, latched_layout: u32, locked_layout: u32) c_int;
+    extern "c" fn xkb_state_key_get_utf32(state: *State, key: u32) u32;
+};
+
+var g_xkb_ctx: ?*xkb.Context = null;
+var g_xkb_keymap: ?*xkb.Keymap = null;
+var g_xkb_state: ?*xkb.State = null;
+/// True once the compositor's keymap has been compiled — note editing won't
+/// decode anything before it (and the self-test waits for it).
+var g_kb_ready = false;
 
 fn resolveConfigPaths() void {
     const home = std.mem.span(getenv("HOME") orelse return);
@@ -117,6 +156,8 @@ fn resolveConfigPaths() void {
     shell_config_path = std.fmt.bufPrintZ(&shell_config_path_buf, "{s}/shell.json", .{dir}) catch "";
     matugen_path = std.fmt.bufPrintZ(&matugen_path_buf, "{s}/matugen.json", .{dir}) catch "";
     reminders_path = std.fmt.bufPrintZ(&reminders_path_buf, "{s}/reminders.txt", .{dir}) catch "";
+    notes_dir_path = std.fmt.bufPrintZ(&notes_dir_path_buf, "{s}/notes", .{dir}) catch "";
+    if (notes_dir_path.len > 0) _ = posix.system.mkdir(notes_dir_path.ptr, 0o755); // sticky-note slots
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
@@ -335,11 +376,19 @@ const Host = struct {
     /// one 190x240 repaint instead of re-rastering every widget on every
     /// output (measured: 12% -> ~3% of a core).
     tiles: [MAX_WIDGETS]?[]u32 = [_]?[]u32{null} ** MAX_WIDGETS,
-    tile_dirty: u8 = 0xFF, // all dirty until first paint; MAX_WIDGETS ≤ 8
+    tile_dirty: u16 = 0xFFFF, // all dirty until first paint; MAX_WIDGETS ≤ 16
     hovered_index: ?usize = null,
     pointer_desktop: ?usize = null,
     pointer_x: i32 = 0,
     pointer_y: i32 = 0,
+    // Sticky-note editing: the one note currently receiving keys via the
+    // compositor's on_demand keyboard grab. The host owns the slot (the
+    // widget owns text/caret) and the key-repeat clock.
+    edit_index: ?usize = null,
+    repeat_key: ?u32 = null,
+    repeat_next_ms: i64 = 0,
+    kb_rate: i32 = 0, // key auto-repeat from wl_keyboard.repeat_info (0 = off)
+    kb_delay: i32 = 400,
     // Ctrl+drag state. A press is held pending until release so the Ctrl
     // decision survives the focus-on-click ordering (the modifiers event can
     // arrive just after the press): press+Ctrl becomes a drag, anything else
@@ -369,6 +418,9 @@ fn initWidgets(host: *Host, cfg: ShellConfig) void {
             .media => .{ .media = .{} },
             .system => .{ .system = .{} },
             .calendar => .{ .calendar = .{} },
+            .note1 => .{ .note1 = .{} },
+            .note2 => .{ .note2 = .{} },
+            .note3 => .{ .note3 = .{} },
             .watch => .{ .watch = .{} },
         };
         if (wc.id == .calendar) {
@@ -377,6 +429,12 @@ fn initWidgets(host: *Host, cfg: ShellConfig) void {
                 cfg.holiday_country,
                 cfg.holiday_region,
             );
+        } else switch (wc.id) {
+            // Sticky notes load their text (possibly empty) from disk.
+            .note1 => host.widgets[host.widget_count].note1.configure(notes_dir_path, 1),
+            .note2 => host.widgets[host.widget_count].note2.configure(notes_dir_path, 2),
+            .note3 => host.widgets[host.widget_count].note3.configure(notes_dir_path, 3),
+            else => {},
         }
         host.widget_rects[host.widget_count] = .{
             .x = wc.x,
@@ -538,7 +596,7 @@ fn paintDesktop(host: *Host, d: *Desktop) !void {
     //    tick/onPipe/click, or a frame-wide hover/theme change). A tile is
     //    widget-local: rect at (0, 0), so paint coordinates stay small.
     for (0..host.widget_count) |i| {
-        const bit = @as(u8, 1) << @intCast(i);
+        const bit = @as(u16, 1) << @intCast(i);
         if ((host.tile_dirty & bit) == 0) continue;
         const tile = host.tiles[i] orelse continue;
         // Fresh backdrop every re-render — cards and glyph edges alpha-
@@ -616,13 +674,13 @@ fn blitTile(pixels: [*]u32, d: *Desktop, r: widgets_mod.Rect, tile: []const u32)
 /// re-render before the next frame.
 fn markDirty(host: *Host, i: usize) void {
     host.needs_repaint = true;
-    host.tile_dirty |= @as(u8, 1) << @intCast(i);
+    host.tile_dirty |= @as(u16, 1) << @intCast(i);
 }
 
 /// A frame-wide factor changed (hover highlight): every tile is stale.
 fn markAllDirty(host: *Host) void {
     host.needs_repaint = true;
-    host.tile_dirty = 0xFF;
+    host.tile_dirty = 0xFFFF;
 }
 
 fn layerSurfaceListener(_: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, d: *Desktop) void {
@@ -700,40 +758,59 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
                 host.needs_repaint = true;
             } else if (updateHover(host)) markAllDirty(host);
         },
-        .button => |e| {
-            if (e.button != BTN_LEFT) return;
-            if (e.state == .pressed) {
-                host.left_down = true;
-                host.press_index = host.hovered_index;
-                // Bezel ring (no Ctrl) starts a timer turn; anywhere else
-                // the press is a move when Ctrl is known (see tryStartDrag)
-                // or a click on release.
-                if (!tryStartBezel(host)) tryStartDrag(host);
-            } else {
-                host.left_down = false;
-                if (host.drag_index != null) {
-                    endDrag(host);
-                } else if (host.bezel_index) |i| {
-                    host.bezel_index = null;
-                    // Settle with the release point, then arm (or clear).
-                    turnBezel(host, i);
-                    host.widgets[i].watch.releaseBezel(nowMs());
-                    markDirty(host, i);
-                } else if (host.press_index) |i| {
-                    host.press_index = null;
-                    // A click is press + release over the same widget.
-                    if (host.widget_rects[i].contains(host.pointer_x, host.pointer_y)) {
-                        host.widgets[i].click(host.font, host.widget_rects[i], host.pointer_x, host.pointer_y);
-                        markDirty(host, i); // widgets flip state on click
-                    }
-                }
-            }
-        },
+        .button => |e| pointerButton(host, e.button, e.state == .pressed),
         .frame => {},
         .axis => {},
         .axis_source => {},
         .axis_stop => {},
         .axis_discrete => {},
+    }
+}
+
+/// Left-button press/release over a widget — the body of the pointer
+/// listener's button arm, split out so the self-test can drive the exact
+/// same code path without synthesizing wl events. A press anywhere that
+/// isn't the note being edited commits that note first (Plasma-style: the
+/// focused-vs-clicking ordering can otherwise eat keystrokes).
+fn pointerButton(host: *Host, btn: u32, pressed: bool) void {
+    if (btn != BTN_LEFT) return;
+    if (pressed) {
+        host.left_down = true;
+        host.press_index = host.hovered_index;
+        if (host.edit_index) |ei| {
+            const pi = host.press_index;
+            if (pi == null or pi != ei) endEdit(host);
+        }
+        // Bezel ring (no Ctrl) starts a timer turn; anywhere else the press
+        // is a move when Ctrl is known (see tryStartDrag) or a click on
+        // release.
+        if (!tryStartBezel(host)) tryStartDrag(host);
+    } else {
+        host.left_down = false;
+        if (host.drag_index != null) {
+            endDrag(host);
+        } else if (host.bezel_index) |i| {
+            host.bezel_index = null;
+            // Settle with the release point, then arm (or clear).
+            turnBezel(host, i);
+            host.widgets[i].watch.releaseBezel(nowMs());
+            markDirty(host, i);
+        } else if (host.press_index) |i| {
+            host.press_index = null;
+            // A click is press + release over the same widget.
+            if (host.widget_rects[i].contains(host.pointer_x, host.pointer_y)) {
+                host.widgets[i].click(host.font, host.widget_rects[i], host.pointer_x, host.pointer_y);
+                // Clicking a note opens the single-edit slot: the card took
+                // on_demand keyboard focus, so the compositor will route key
+                // events here. The widget owns text/caret; the host owns the
+                // slot, the repeat clock, and the edit cadence.
+                if (widgets_mod.noteSlot(&host.widgets[i]) != null) {
+                    host.edit_index = i;
+                    reschedule(host, i);
+                }
+                markDirty(host, i); // widgets flip state on click
+            }
+        }
     }
 }
 
@@ -818,15 +895,46 @@ fn endDrag(host: *Host) void {
 fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, host: *Host) void {
     switch (event) {
         .keymap => |e| {
-            // No xkb state is built — the compositor's mapping fd is ours
-            // to close once received (spec), so it can't accumulate.
-            _ = posix.system.close(e.fd);
+            // The keymap fd is ours to close once received (spec) — do that
+            // no matter how far decoding gets.
+            defer _ = posix.system.close(e.fd);
+            if (e.format != .xkb_v1) return;
+            const size: usize = e.size;
+            const buf = host.gpa.alloc(u8, size + 2) catch return;
+            defer host.gpa.free(buf);
+            var got: usize = 0;
+            while (got < size) {
+                const n = posix.read(e.fd, buf[got..size]) catch break;
+                if (n == 0) break;
+                got += n;
+            }
+            if (got == 0) return;
+            buf[got] = 0; // xkb wants a NUL-terminated string
+            if (g_xkb_ctx == null) g_xkb_ctx = xkb.xkb_context_new(xkb.CONTEXT_NO_FLAGS);
+            const ctx = g_xkb_ctx orelse return;
+            const km = xkb.xkb_keymap_new_from_string(ctx, buf[0..got:0], xkb.KEYMAP_FORMAT_TEXT_V1, xkb.KEYMAP_COMPILE_NO_FLAGS) orelse return;
+            const st = xkb.xkb_state_new(km) orelse {
+                xkb.xkb_keymap_unref(km);
+                return;
+            };
+            if (g_xkb_keymap) |old| xkb.xkb_keymap_unref(old);
+            if (g_xkb_state) |old| xkb.xkb_state_unref(old);
+            g_xkb_keymap = km;
+            g_xkb_state = st;
+            g_kb_ready = true;
+            logging.step("keyboard: xkb keymap live ({d} bytes)", .{got});
         },
         // The compositor always follows enter with a modifiers event, so
         // focus changes need no handling of their own.
         .enter => {},
-        .leave => host.ctrl_down = false,
-        .key => {},
+        .leave => {
+            host.ctrl_down = false;
+            host.repeat_key = null;
+            // Editing a note then clicking a window (our surface loses the
+            // on_demand focus) commits it, Plasma-style.
+            endEdit(host);
+        },
+        .key => |e| onKeyboardKey(host, e.key, e.state == .pressed),
         .modifiers => |e| {
             // Control is real-mod index 2 in the depressed mask.
             const ctrl = e.mods_depressed & (1 << 2) != 0;
@@ -835,9 +943,95 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, host: *Host) void
             // the moment Ctrl is known and the button is down over a widget,
             // turn the pending press into a drag.
             if (ctrl) tryStartDrag(host);
+            // Keep xkb's modifier/group state in lockstep so UTF-32 decode
+            // honors the actual layout (Shift for caps, group for altgr).
+            if (g_xkb_state) |st| {
+                _ = xkb.xkb_state_update_mask(st, e.mods_depressed, e.mods_latched, e.mods_locked, 0, 0, e.group);
+            }
         },
-        .repeat_info => {},
+        .repeat_info => |e| {
+            // The compositor's auto-repeat parameters; we synthesize repeats
+            // from them while editing (rate Hz, delay ms; rate 0 = no repeat).
+            host.kb_rate = e.rate;
+            host.kb_delay = e.delay;
+        },
     }
+}
+
+fn onKeyboardKey(host: *Host, keycode: u32, pressed: bool) void {
+    if (pressed) keyPress(host, keycode) else keyRelease(host, keycode);
+}
+
+fn keyRelease(host: *Host, keycode: u32) void {
+    if (host.repeat_key == keycode) host.repeat_key = null;
+}
+
+/// Routes one keyboard press. Nothing happens unless a note is being edited;
+/// the key is decoded through xkb into UTF-32 and handed to the note editor.
+fn keyPress(host: *Host, keycode: u32) void {
+    const i = host.edit_index orelse return;
+    // Ctrl chords are ignored while editing (no text shortcuts) — except
+    // Esc, which always commits.
+    if (keycode != widgets_mod.KEY_ESC and host.ctrl_down) return;
+    var utf32: u32 = 0;
+    if (g_xkb_state) |st| utf32 = xkb.xkb_state_key_get_utf32(st, keycode + 8);
+    const res = switch (host.widgets[i]) {
+        .note1, .note2, .note3 => |*n| n.keyPress(widgets_mod.FontMeasure{ .font = host.font }, noteMaxW(host, i), keycode, utf32),
+        else => .ignored,
+    };
+    switch (res) {
+        .ignored => {},
+        .handled => {
+            markDirty(host, i);
+            armRepeat(host, keycode);
+            // The whole keystroke burst shouldn't wait out the idle cadence.
+            reschedule(host, i);
+        },
+        .exited => {
+            host.edit_index = null;
+            host.repeat_key = null;
+            host.repeat_next_ms = 0;
+            reschedule(host, i);
+            markDirty(host, i);
+        },
+    }
+}
+
+/// Text width available inside the note card (match NoteWidget.paint).
+fn noteMaxW(host: *Host, i: usize) i64 {
+    return @as(i64, @intCast(host.widget_rects[i].w)) - 2 * widgets_mod.CARD_PAD;
+}
+
+/// Set up compositor-style auto-repeat (rate Hz, delay ms) for the key that
+/// just edited. Repeat fires through the poll deadline, not per event.
+fn armRepeat(host: *Host, keycode: u32) void {
+    if (host.kb_rate <= 0) return;
+    host.repeat_key = keycode;
+    host.repeat_next_ms = nowMs() + @max(host.kb_delay, 30);
+}
+
+/// Re-arm a widget's cadence from now (a note that starts editing, or gets
+/// a key, wants its 500 ms blink/autosave ticks immediately).
+fn reschedule(host: *Host, i: usize) void {
+    host.next_tick_ms[i] = nowMs() + host.widgets[i].intervalMs();
+}
+
+/// Stop editing the editing note: commit (Esc / focus-leave / click
+/// elsewhere) and hand the slot and key routing back.
+fn endEdit(host: *Host) void {
+    const i = host.edit_index orelse return;
+    host.edit_index = null;
+    host.repeat_key = null;
+    host.repeat_next_ms = 0;
+    switch (host.widgets[i]) {
+        .note1, .note2, .note3 => |*n| {
+            n.commit();
+            n.endEditing();
+        },
+        else => {},
+    }
+    reschedule(host, i);
+    markDirty(host, i);
 }
 
 /// Reaps finished detached children (weather/media fetches) so they don't
@@ -847,6 +1041,98 @@ fn reapChildren() void {
         var status: c_int = undefined;
         const pid = std.c.waitpid(-1, &status, std.c.W.NOHANG);
         if (pid <= 0) break;
+    }
+}
+
+// --- sticky-note self-test (SIMPBAR_SELFTEST=1) -----------------------------
+// This box has no input-injection tool (wtype/ydotool/dotool absent,
+// /dev/uinput needs root), so with the env var set the shell drives note1
+// through the SAME pointer/keyboard code paths the compositor events take,
+// verifies the persisted file, then restores the note's original text.
+//   1. a synthetic press+release over note1 starts editing,
+//   2. evdev key codes go through onKeyboardKey → xkb decode → NoteWidget,
+//   3. Esc commits and note1.txt must contain exactly the typed text,
+//   4. the original note text is written back so nothing is left behind.
+var g_selftest = false;
+var g_st_done = false;
+var g_st_start_ms: i64 = 0;
+
+fn runSelfTest(host: *Host) void {
+    g_st_done = true;
+    var slot_idx: ?usize = null;
+    for (0..host.widget_count) |i| {
+        if (widgets_mod.noteSlot(&host.widgets[i]) == 1) {
+            slot_idx = i;
+            break;
+        }
+    }
+    const i = slot_idx orelse {
+        logging.warn("selftest: config has no note1 — SKIP", .{});
+        return;
+    };
+    const n = &host.widgets[i].note1;
+    const orig_len = n.text_len;
+    var orig_buf: [widgets_mod.NoteWidget.NOTE_MAX]u8 = undefined;
+    @memcpy(orig_buf[0..orig_len], n.text()[0..orig_len]);
+    const path = n.path();
+    var failures: usize = 0;
+
+    // Click into the note's first text line (question mark placement: the
+    // card rect is known, the pointer is fake).
+    const r = host.widget_rects[i];
+    host.pointer_x = r.x + 40;
+    host.pointer_y = r.y + 30;
+    _ = updateHover(host);
+    pointerButton(host, BTN_LEFT, true);
+    pointerButton(host, BTN_LEFT, false);
+    if (host.edit_index != i) {
+        failures += 1;
+        logging.err("selftest: click did not start editing (edit_index={?})", .{host.edit_index});
+    }
+
+    // Type "abc 123", backspace once, Enter, then Esc to commit. evdev key
+    // codes: a=30 b=48 c=46 space=57 1=2 2=3 3=4 backspace=14 enter=28 esc=1.
+    const seq = [_]u32{ 30, 48, 46, 57, 2, 3, 4, 14, 28, 1 };
+    for (seq) |code| {
+        onKeyboardKey(host, code, true);
+        onKeyboardKey(host, code, false);
+    }
+    if (host.edit_index != null) {
+        failures += 1;
+        logging.err("selftest: Esc did not close editing", .{});
+    }
+
+    const saved = readFileAlloc(host.gpa, path) catch null;
+    defer if (saved) |s| host.gpa.free(s);
+    const want = "abc 12\n";
+    if (saved) |s| {
+        if (!std.mem.eql(u8, s, want)) {
+            failures += 1;
+            logging.err("selftest: note1.txt = \"{s}\", want \"{s}\"", .{ s, want });
+        }
+    } else {
+        failures += 1;
+        logging.err("selftest: could not read back {s}", .{path});
+    }
+
+    // Restore the original note (content in memory + on disk) and release
+    // the edit slot so the desktop is exactly as it was.
+    n.text_len = orig_len;
+    @memcpy(n.text_buf[0..orig_len], orig_buf[0..orig_len]);
+    n.caret = orig_len;
+    n.scroll = 0;
+    n.editing = false;
+    n.dirty = false;
+    host.edit_index = null;
+    host.repeat_key = null;
+    _ = widgets_mod.writeFileAtomicZ(path, orig_buf[0..orig_len]);
+    reschedule(host, i);
+    markDirty(host, i);
+
+    if (failures == 0) {
+        logging.step("SELFTEST PASS — note edit→commit round-trip ok (\"{s}\" saved, original restored)", .{want});
+    } else {
+        logging.err("SELFTEST FAIL — {d} failure(s); note restored to original", .{failures});
     }
 }
 
@@ -964,6 +1250,10 @@ pub fn main() !void {
     defer if (keyboard) |kb| kb.release();
     if (keyboard) |kb| kb.setListener(*Host, keyboardListener, &host);
 
+    g_selftest = getenv("SIMPBAR_SELFTEST") != null;
+    if (g_selftest) logging.warn("selftest: SIMPBAR_SELFTEST set — note1 will be driven at startup", .{});
+    g_st_start_ms = nowMs();
+
     // One poll slot per widget fetch pipe, after the display fd.
     var poll_fds = [_]posix.pollfd{
         .{ .fd = display.getFd(), .events = posix.POLL.IN, .revents = 0 },
@@ -992,6 +1282,10 @@ pub fn main() !void {
         var next_deadline: i64 = std.math.maxInt(i64);
         for (0..host.widget_count) |i| {
             next_deadline = @min(next_deadline, host.next_tick_ms[i]);
+        }
+        // A held editing key needs its auto-repeat fired on schedule too.
+        if (host.edit_index != null and host.repeat_key != null) {
+            next_deadline = @min(next_deadline, host.repeat_next_ms);
         }
         const timeout: i32 = blk: {
             if (host.widget_count == 0) break :blk -1; // nothing to wake for; wait for events only
@@ -1028,6 +1322,20 @@ pub fn main() !void {
                 if (host.widgets[i].tick()) markDirty(&host, i);
                 host.next_tick_ms[i] = now2 + host.widgets[i].intervalMs();
             }
+        }
+
+        // Hold-down auto-repeat while editing a note — synthesized from the
+        // compositor's rate/delay so Backspace/arrows/repeated letters feel
+        // like a native editor instead of a per-event text widget.
+        if (host.edit_index != null and host.repeat_key != null and now2 >= host.repeat_next_ms) {
+            keyPress(&host, host.repeat_key.?);
+            host.repeat_next_ms = now2 + @max(@divTrunc(1000, @max(host.kb_rate, 1)), 10);
+        }
+
+        // Self-test: once the keymap is live, drive note1 through the exact
+        // pointer/key paths the compositor events use, then verify the file.
+        if (g_selftest and !g_st_done and g_kb_ready and now2 - g_st_start_ms > 800) {
+            runSelfTest(&host);
         }
 
         if (host.needs_repaint) {

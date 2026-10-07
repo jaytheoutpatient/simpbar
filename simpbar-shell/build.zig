@@ -81,6 +81,9 @@ pub fn build(b: *Build) !void {
     exe_mod.linkSystemLibrary("wayland-client", .{});
     exe_mod.linkSystemLibrary("freetype2", .{});
     exe_mod.linkSystemLibrary("gdk-pixbuf-2.0", .{}); // media cover-art decode (src/art.zig)
+    // Sticky-note typing decodes the compositor's keymap through xkb; the
+    // bar links the same library for its input handling.
+    exe_mod.linkSystemLibrary("xkbcommon", .{});
     // Same translate-c workaround as the bar: gdk-pixbuf.h itself is only
     // ever included from gdkpixbuf_shim.c, compiled by a real C compiler;
     // art.zig @cImports the shim's plain-C header.
