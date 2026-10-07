@@ -1356,6 +1356,7 @@ if [ "$INSTALL_MATUGEN" -eq 1 ]; then
   "text_color": "#{{ colors.on_surface.default.hex_stripped }}",
   "border_color": "#{{ colors.primary.default.hex_stripped }}",
   "hover_color": "#{{ colors.primary_container.default.hex_stripped }}",
+  "holiday_color": "#{{ colors.error.default.hex_stripped }}",
   "workspace_active_color": "#{{ colors.primary.default.hex_stripped }}",
   "workspace_inactive_color": "#{{ colors.on_surface_variant.default.hex_stripped }}",
   "popup_bg_color": "#{{ colors.surface_container.default.hex_stripped }}",

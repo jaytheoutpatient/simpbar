@@ -72,25 +72,42 @@ Your pinned apps live in `favourites.json` next to the panel — under `$XDG_CON
 
 ## Desktop widgets (simpbar-shell)
 
-A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget cards — **clock**, **weather**, **media**, and **system monitor** — on a layer just above the wallpaper (below windows), reinventing the Event-Horizon-Shell style of desktop widgets on simpbar's own Wayland/shm/font plumbing. The installer builds and autostarts it, and it reads the same `matugen.json` colors, the same nerd font, and its own `~/.config/simpbar/shell.json` for layout:
+A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget cards — **clock**, **weather**, **media**, **system monitor**, and **calendar** — on a layer just above the wallpaper (below windows), reinventing the Event-Horizon-Shell style of desktop widgets on simpbar's own Wayland/shm/font plumbing. The installer builds and autostarts it, and it reads the same `matugen.json` colors, the same nerd font, and its own `~/.config/simpbar/shell.json` for layout:
 
 ```json
 {
   "font_path": "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
   "card_bg_opacity": 55,
   "card_corner_radius": 12,
+  "holiday_country": "AU",
+  "holiday_region": "",
   "widgets": [
-    { "id": "clock",   "x": 24, "y": 24 },
-    { "id": "weather", "x": 24, "y": 106 },
-    { "id": "media",   "x": 24, "y": 176 },
-    { "id": "system",  "x": 24, "y": 350 }
+    { "id": "clock",    "x": 24, "y": 24 },
+    { "id": "weather",  "x": 24, "y": 106 },
+    { "id": "media",    "x": 24, "y": 176 },
+    { "id": "system",   "x": 24, "y": 350 },
+    { "id": "calendar", "x": 24, "y": 470 }
   ]
 }
 ```
 
 Missing or malformed keys keep the defaults above (`font_path` empty defaults to the bar's JetBrainsMono Nerd). Cards are translucent (55% opacity by default) so the wallpaper shows through, frosted by a Hyprland layer rule for the `simpbar-shell` namespace — like the bar, a Wayland client can't blur what's behind its own surface, so the desktop config supplies it.
 
-Each card repaints on its own lazy schedule — clock every second, system every 2s, media progress every second while playing (metadata refetched every 2s), weather every 20 minutes — and the shell only commits a new frame when something changed. Clicks do something where there's something to do: the media card has shuffle / previous / play-pause / next / repeat controls plus the real cover art from MPRIS (`file://` read directly, `http(s)://` downloaded with curl and decoded with gdk-pixbuf like the bar's tray icons; anything else keeps the music-note placeholder tile), weather opens wttr.in. The surface's input region is exactly the union of the cards, so the rest of the desktop passes clicks straight through.
+Each card repaints on its own lazy schedule — clock every second, system every 2s, media progress every second while playing (metadata refetched every 2s), weather every 20 minutes, calendar every 30s — and the shell only commits a new frame when something changed. Clicks do something where there's something to do: the media card has shuffle / previous / play-pause / next / repeat controls plus the real cover art from MPRIS (`file://` read directly, `http(s)://` downloaded with curl and decoded with gdk-pixbuf like the bar's tray icons; anything else keeps the music-note placeholder tile), weather opens wttr.in. The surface's input region is exactly the union of the cards, so the rest of the desktop passes clicks straight through.
+
+**Repositioning cards** — hold **Ctrl** and drag any card with the left mouse button; it follows the pointer and snaps back on-screen if you drop it off the edge. Releasing writes the new positions back to `shell.json` (every other key round-tripped untouched), so the layout survives restarts.
+
+**The calendar card** shows a month grid (arrows step months, the month title jumps back to today) with a dot on every day that has a reminder. Click a day to edit its reminders through rofi: *+ New reminder* accepts free text (notified at 09:00 that day) or a full `HH:MM lead text` line, and selecting an existing entry deletes it. Reminders live in `~/.config/simpbar/reminders.txt`, one per line:
+
+```
+YYYY-MM-DD HH:MM lead text
+2026-10-12 14:00 0 dentist appointment   # notify on the day at 14:00
+2026-11-03 09:00 2 buy mum a gift        # notify two days before, at 09:00
+```
+
+A reminder notifies once at its date minus `lead` days (via `notify-send`), delivered up to 15 minutes late if the machine was asleep, and entries edited straight in the file are picked up on the next tick.
+
+**Holidays** come from the free [date.nager.at](https://date.nager.at) API for `holiday_country` (ISO country code, default `AU`): public holidays are drawn on their day numbers in the matugen template's `holiday_color`, regional/state holidays dimmed, and the card's footer names today's holiday or the next upcoming one. Set `holiday_region` (e.g. `"WA"`) to show only your region's regional holidays alongside the nationwide ones; empty shows all. `holiday_color` is generated with the rest of the theme — a missing key falls back to a warm accent.
 
 ## Wallpapers
 

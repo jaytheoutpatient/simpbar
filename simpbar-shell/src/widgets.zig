@@ -17,8 +17,9 @@ const std = @import("std");
 const posix = std.posix;
 const font_mod = @import("font");
 const art_mod = @import("art");
+const logging = @import("logging");
 
-pub const WidgetId = enum { clock, weather, media, system };
+pub const WidgetId = enum { clock, weather, media, system, calendar };
 
 /// Axis-aligned rect in surface coordinates. The host keeps one per widget
 /// (measured from the font at startup, placed from config).
@@ -43,6 +44,10 @@ pub const Theme = struct {
     text_color: u32 = 0xFFDCDCDC,
     border_color: u32 = 0xFF454545,
     hover_color: u32 = 0xFF3A3A3A,
+    /// Warm accent for public-holiday days on the calendar. Sourced from the
+    /// matugen template's `holiday_color` when present, so it follows the
+    /// wallpaper theme like the rest.
+    holiday_color: u32 = 0xFFF0805C,
     card_alpha: u32 = 55,
     radius_px: u32 = 12,
 };
@@ -60,6 +65,18 @@ const MEDIA_PROG_H: i64 = 4;
 const MEDIA_TIME_GAP: i64 = 8;
 const MEDIA_TITLE_GAP: i64 = 4;
 const MEDIA_CTRL_GAP: i64 = 10;
+
+// Calendar-card geometry: header row (< month year >), weekday row, a 6x7
+// day grid, and a footer line naming today's/next holiday. cardSizeFor and
+// CalendarWidget share these.
+const CAL_W: i64 = 196;
+const CAL_CELL_W: i64 = 24; // 7 cells: 168 = CAL_W - 2*CARD_PAD
+const CAL_CELL_H: i64 = 20;
+const CAL_ROWS: i64 = 6;
+const CAL_HEAD_GAP: i64 = 6;
+const CAL_WD_GAP: i64 = 4;
+const CAL_FOOT_GAP: i64 = 6;
+const CAL_ARROW_ZONE: i64 = 20; // clickable width of the < / > header zones
 
 /// 0xAARRGGBB with alpha rescaled to `alpha_pct` (0-100), RGB untouched.
 /// Used for card fills so only the background's opacity varies.
@@ -86,6 +103,7 @@ pub fn cardSizeFor(id: WidgetId, font: *const font_mod.Font) [2]u32 {
         .weather => .{ 170, @intCast(2 * CARD_PAD + lh) },
         .media => .{ @intCast(MEDIA_W), @intCast(2 * CARD_PAD + MEDIA_COVER + MEDIA_HEAD_GAP + MEDIA_PROG_H + MEDIA_TIME_GAP + lh + MEDIA_CTRL_GAP + lh) },
         .system => .{ 190, @intCast(2 * CARD_PAD + 3 * lh + 2 * ROW_GAP + 2 * BAR_H) },
+        .calendar => .{ @intCast(CAL_W), @intCast(2 * CARD_PAD + 3 * lh + CAL_HEAD_GAP + CAL_WD_GAP + CAL_ROWS * CAL_CELL_H + CAL_FOOT_GAP) },
     };
 }
 
@@ -358,7 +376,9 @@ fn setCloexec(fd: posix.fd_t) void {
 }
 
 pub const Fetcher = struct {
-    read_buf: [1024]u8 = undefined,
+    // Sized for the largest payload any widget pulls down: the calendar's
+    // holiday JSON (a year of entries runs ~7 KB).
+    read_buf: [10240]u8 = undefined,
     read_len: usize = 0,
     pending_fd: posix.fd_t = -1,
 
@@ -428,6 +448,7 @@ pub const Fetcher = struct {
 const libc_time = struct {
     extern "c" fn time(t: ?*i64) i64;
     extern "c" fn localtime_r(timer: *const i64, result: *Tm) ?*Tm;
+    extern "c" fn mktime(tm: *Tm) i64;
 
     // Layout matches glibc's `struct tm` (tm_gmtoff/tm_zone tail is a glibc
     // extension, present on Linux x86_64).
@@ -448,6 +469,59 @@ const libc_time = struct {
 
 const DAYS = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 const MONTHS = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+const MONTHS_FULL = [_][]const u8{
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+};
+const WD_ROW = [_][]const u8{ "Mo", "Tu", "We", "Th", "Fr", "Sa", "Su" };
+
+// --- proleptic-Gregorian date math ----------------------------------------
+//
+// Pure integer conversions (Howard Hinnant's days_from_civil / civil_from_
+// days): no timezone surprises, no mktime round-trips for calendar layout.
+// mktime is still used where wall-clock matters (notification due times).
+
+fn daysFromCivil(y: i32, m: u32, d: u32) i64 {
+    const yy: i64 = y - @as(i32, if (m <= 2) 1 else 0);
+    const era: i64 = @divFloor(yy, 400);
+    const yoe: i64 = yy - era * 400; // [0, 399]
+    const mp: i64 = if (m > 2) @as(i64, @intCast(m)) - 3 else @as(i64, @intCast(m)) + 9;
+    const doy = @divTrunc(153 * mp + 2, 5) + @as(i64, @intCast(d)) - 1;
+    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn civilFromDays(z0: i64) struct { y: i32, m: u8, d: u8 } {
+    const z = z0 + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe = z - era * 146097; // [0, 146096]
+    const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365); // [0, 399]
+    const y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
+    const mp = @divTrunc(5 * doy + 2, 153);
+    const d = doy - @divTrunc(153 * mp + 2, 5) + 1;
+    const m: i64 = if (mp < 10) mp + 3 else mp - 9;
+    return .{ .y = @intCast(if (m <= 2) y + 1 else y), .m = @intCast(m), .d = @intCast(d) };
+}
+
+/// Weekday of an epoch day: 0 = Sunday (day 0 = 1970-01-01 = Thursday).
+fn wdayOf(days: i64) u8 {
+    return @intCast(@mod(days + 4, 7));
+}
+
+/// Monday-first column (0..6) for a Sunday-based weekday.
+fn monCol(wd: u8) u8 {
+    return @mod(wd + 6, 7);
+}
+
+fn daysInMonth(y: i32, m: u8) u8 {
+    return switch (m) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (@mod(y, 4) == 0 and (@mod(y, 100) != 0 or @mod(y, 400) == 0)) 29 else 28,
+        else => 30,
+    };
+}
 
 pub const ClockWidget = struct {
     main_buf: [24]u8 = undefined,
@@ -1192,6 +1266,699 @@ fn parseKbAfterColon(line: []const u8) u64 {
     return std.fmt.parseInt(u64, num, 10) catch 0;
 }
 
+// --- calendar ---------------------------------------------------------------
+//
+// Month grid + reminders + public holidays. Two external touchpoints, both
+// following the bar/shell conventions of spawning tiny helpers rather than
+// growing in-process UI machinery:
+//
+//   * reminders live in a plain text file (~/.config/simpbar/reminders.txt,
+//     one per line: "YYYY-MM-DD HH:MM lead text" — lead = days before the
+//     date to notify, 0 = on the day). Editing goes through rofi when a day
+//     is clicked; notifications through notify-send when a due time passes.
+//   * holidays come from date.nager.at's free no-key API for a configurable
+//     country (shell.json: holiday_country, holiday_region), colour-coded:
+//     global public holidays in the bright accent, regional ones dimmed.
+
+const MAX_HOLIDAYS: usize = 48;
+const REM_MAX: usize = 48;
+const NOTIFY_GRACE_S: i64 = 900; // deliver a due notification up to 15 min late
+
+const Holiday = struct {
+    m: u8,
+    d: u8,
+    global: bool,
+    name_len: u8,
+    name: [56]u8,
+};
+
+const Reminder = struct {
+    y: i32,
+    m: u8,
+    d: u8,
+    hh: u8,
+    mm: u8,
+    lead: u8,
+    text_off: u16,
+    text_len: u16,
+    raw_len: u16,
+    fired: bool,
+    /// The exact file line — reloads carry `fired` across by matching this.
+    raw: [176]u8,
+
+    fn text(self: *const Reminder) []const u8 {
+        return self.raw[self.text_off .. self.text_off + self.text_len];
+    }
+};
+
+const CalPhase = enum { holidays, menu };
+
+/// Parses "YYYY-MM-DD HH:MM lead text" into `out` (raw copy included).
+fn parseReminderLine(line: []const u8, out: *Reminder) bool {
+    if (line.len < 20) return false;
+    if (line[4] != '-' or line[7] != '-' or line[10] != ' ' or line[13] != ':' or line[16] != ' ') return false;
+    if (line.len > out.raw.len) return false;
+    const y = std.fmt.parseInt(i32, line[0..4], 10) catch return false;
+    const m = std.fmt.parseInt(u8, line[5..7], 10) catch return false;
+    const d = std.fmt.parseInt(u8, line[8..10], 10) catch return false;
+    const hh = std.fmt.parseInt(u8, line[11..13], 10) catch return false;
+    const mm = std.fmt.parseInt(u8, line[14..16], 10) catch return false;
+    var i: usize = 17;
+    while (i < line.len and line[i] != ' ') i += 1;
+    const lead = std.fmt.parseInt(u8, line[17..i], 10) catch return false;
+    if (i >= line.len or i + 1 >= line.len) return false; // text required
+    if (y < 1970 or y > 2100 or m < 1 or m > 12 or d < 1 or d > 31) return false;
+    if (hh > 23 or mm > 59 or lead > 60) return false;
+    @memcpy(out.raw[0..line.len], line);
+    out.raw_len = @intCast(line.len);
+    out.y = y;
+    out.m = m;
+    out.d = d;
+    out.hh = hh;
+    out.mm = mm;
+    out.lead = lead;
+    out.text_off = @intCast(i + 1);
+    out.text_len = @intCast(line.len - (i + 1));
+    out.fired = false;
+    return true;
+}
+
+/// Notification moment for a reminder: its date shifted back `lead` days, at
+/// HH:MM local time (mktime — wall-clock, so DST resolves normally).
+fn dueEpoch(r: Reminder) i64 {
+    const c = civilFromDays(daysFromCivil(r.y, r.m, r.d) - @as(i64, r.lead));
+    var tm: libc_time.Tm = std.mem.zeroes(libc_time.Tm);
+    tm.year = c.y - 1900;
+    tm.mon = c.m - 1;
+    tm.mday = c.d;
+    tm.hour = r.hh;
+    tm.min = r.mm;
+    tm.isdst = -1;
+    return libc_time.mktime(&tm);
+}
+
+/// Wraps `text` in single quotes for `sh -c`, escaping embedded quotes.
+/// Returns the slice written, or null if `out` is too small.
+fn shQuote(text: []const u8, out: []u8) ?[]const u8 {
+    if (out.len < 3) return null;
+    out[0] = '\'';
+    var n: usize = 1;
+    for (text) |ch| {
+        if (ch == '\'') {
+            if (n + 4 >= out.len) return null;
+            @memcpy(out[n .. n + 4], "'\\''");
+            n += 4;
+        } else {
+            if (n + 1 >= out.len) return null;
+            out[n] = ch;
+            n += 1;
+        }
+    }
+    out[n] = '\'';
+    return out[0 .. n + 1];
+}
+
+/// Reads `"key": "value"` out of a JSON object slice, unescaping \" and \\.
+/// Returns null when the key is absent or malformed.
+fn jsonField(obj: []const u8, key: []const u8, out: []u8) ?[]const u8 {
+    const k = std.mem.indexOf(u8, obj, key) orelse return null;
+    var i = k + key.len;
+    while (i < obj.len and obj[i] == ' ') i += 1;
+    if (i >= obj.len or obj[i] != ':') return null;
+    i += 1;
+    while (i < obj.len and obj[i] == ' ') i += 1;
+    if (i >= obj.len or obj[i] != '"') return null;
+    i += 1;
+    var n: usize = 0;
+    while (i < obj.len) {
+        const ch = obj[i];
+        if (ch == '"') return out[0..n];
+        if (ch == '\\' and i + 1 < obj.len) {
+            const c: u8 = switch (obj[i + 1]) {
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                else => { // \uXXXX: drop (nager emits raw UTF-8, not escapes)
+                    i += 2;
+                    continue;
+                },
+            };
+            if (n >= out.len) return out[0..n];
+            out[n] = c;
+            n += 1;
+            i += 2;
+            continue;
+        }
+        if (n >= out.len) return out[0..n];
+        out[n] = ch;
+        n += 1;
+        i += 1;
+    }
+    return null; // unterminated string
+}
+
+/// True when the holiday's `counties` array mentions the configured region
+/// ("WA" matches county "AU-WA"). Absent/null counties never match.
+fn countyMatches(obj: []const u8, region: []const u8) bool {
+    const key = "\"counties\":[";
+    const c = std.mem.indexOf(u8, obj, key) orelse return false;
+    const start = c + key.len;
+    const end = std.mem.indexOfScalarPos(u8, obj, start, ']') orelse obj.len;
+    var i = start;
+    while (i < end) {
+        const q1 = std.mem.indexOfScalarPos(u8, obj, i, '"') orelse return false;
+        const q2 = std.mem.indexOfScalarPos(u8, obj, q1 + 1, '"') orelse return false;
+        const county = obj[q1 + 1 .. q2];
+        if (std.mem.eql(u8, county, region)) return true;
+        if (county.len > region.len + 1 and
+            county[county.len - region.len - 1] == '-' and
+            std.mem.eql(u8, county[county.len - region.len ..], region)) return true;
+        i = q2 + 1;
+    }
+    return false;
+}
+
+pub const CalendarWidget = struct {
+    // View state: which month is shown, and whether it tracks the real one.
+    view_y: i32 = 0,
+    view_m: u8 = 1,
+    have_view: bool = false,
+    follow: bool = true,
+    /// Epoch day of the real today — today's highlight and the footer's
+    /// "next holiday" always refer to actual dates, not the browsed month.
+    today_days: i64 = 0,
+
+    // Holiday list (for `holiday_year`, the real current year).
+    holiday_year: i32 = 0,
+    fetch_year: i32 = 0,
+    holiday_count: usize = 0,
+    holidays: [MAX_HOLIDAYS]Holiday = undefined,
+    holiday_retry_ms: i64 = 0,
+    phase: CalPhase = .holidays,
+    fetch: Fetcher = .{},
+
+    // Reminders, kept in sync with the file.
+    reminders: [REM_MAX]Reminder = undefined,
+    reminder_count: usize = 0,
+    cache: [4096]u8 = undefined,
+    cache_len: usize = 0,
+
+    rem_buf: [512]u8 = undefined,
+    rem_len: usize = 0,
+    country_buf: [8]u8 = undefined,
+    country_len: usize = 0,
+    region_buf: [8]u8 = undefined,
+    region_len: usize = 0,
+
+    // Monthly-ish cadence: 30 s covers the day rollover, the notification
+    // window, and reminder-file changes without a busy loop.
+    pub const interval_ms: i64 = 30_000;
+
+    /// One-time wiring from the host: reminders path + holiday country/region
+    /// from shell.json (sanitized — the country lands in a URL path).
+    pub fn configure(self: *CalendarWidget, rem_path: []const u8, country_code: []const u8, region_code: []const u8) void {
+        const p = rem_path[0..@min(rem_path.len, self.rem_buf.len - 1)];
+        @memcpy(self.rem_buf[0..p.len], p);
+        self.rem_buf[p.len] = 0;
+        self.rem_len = p.len;
+
+        var n: usize = 0;
+        for (country_code) |ch| {
+            if (std.ascii.isAlphabetic(ch) and n < self.country_buf.len) {
+                self.country_buf[n] = ch;
+                n += 1;
+            }
+        }
+        if (n == 0) {
+            @memcpy(self.country_buf[0..2], "AU");
+            n = 2;
+        }
+        self.country_len = n;
+
+        var rn: usize = 0;
+        for (region_code) |ch| {
+            if ((std.ascii.isAlphanumeric(ch) or ch == '-') and rn < self.region_buf.len) {
+                self.region_buf[rn] = ch;
+                rn += 1;
+            }
+        }
+        self.region_len = rn;
+    }
+
+    fn remPath(self: *const CalendarWidget) [:0]const u8 {
+        return self.rem_buf[0..self.rem_len :0];
+    }
+
+    fn country(self: *const CalendarWidget) []const u8 {
+        return self.country_buf[0..self.country_len];
+    }
+
+    fn region(self: *const CalendarWidget) []const u8 {
+        return self.region_buf[0..self.region_len];
+    }
+
+    // --- holidays ---------------------------------------------------------
+
+    fn startHolidayFetch(self: *CalendarWidget, year: i32) void {
+        if (self.fetch.busy()) return;
+        var url_buf: [160]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "https://date.nager.at/api/v3/PublicHolidays/{d}/{s}", .{ year, self.country() }) catch return;
+        var script: [256]u8 = undefined;
+        // The printf marker keeps output non-empty even when curl fails, so
+        // the fetch pipe always reaches EOF-with-bytes (the Fetcher treats a
+        // fully empty read as "still in flight"); --max-time stops a black-
+        // holed network from wedging the fetcher (and the retry gate) open.
+        const s = std.fmt.bufPrintZ(&script, "curl -sf --max-time 20 -- '{s}' || printf '\\nH'", .{url}) catch return;
+        var argv = [_:null]?[*:0]const u8{ "sh", "-c", s.ptr, null };
+        self.fetch.start("/bin/sh", &argv);
+        self.phase = .holidays;
+    }
+
+    /// Parses a date.nager.at PublicHolidays response into self.holidays.
+    /// `region` empty keeps every entry; otherwise non-global holidays are
+    /// kept only when their county matches. Returns false when the payload
+    /// isn't a JSON list at all (curl error page, truncated body).
+    fn parseHolidays(self: *CalendarWidget, json: []const u8, region_filter: []const u8) bool {
+        if (std.mem.indexOf(u8, json, "[") == null) return false;
+        var count: usize = 0;
+        var i: usize = 0;
+        while (count < MAX_HOLIDAYS) {
+            const o = std.mem.indexOfScalarPos(u8, json, i, '{') orelse break;
+            const e = std.mem.indexOfScalarPos(u8, json, o, '}') orelse break;
+            const obj = json[o .. e + 1];
+            i = e;
+            var dbuf: [16]u8 = undefined;
+            const date = jsonField(obj, "\"date\"", &dbuf) orelse continue;
+            if (date.len < 10) continue;
+            const m = std.fmt.parseInt(u8, date[5..7], 10) catch continue;
+            const d = std.fmt.parseInt(u8, date[8..10], 10) catch continue;
+            if (m < 1 or m > 12 or d < 1 or d > 31) continue;
+            const global = std.mem.indexOf(u8, obj, "\"global\":false") == null;
+            if (!global and region_filter.len > 0 and !countyMatches(obj, region_filter)) continue;
+            var nbuf: [56]u8 = undefined;
+            const name = jsonField(obj, "\"localName\"", &nbuf) orelse
+                jsonField(obj, "\"name\"", &nbuf) orelse "Holiday";
+            var h = Holiday{ .m = m, .d = d, .global = global, .name_len = 0, .name = undefined };
+            const nm = name[0..@min(name.len, h.name.len)];
+            @memcpy(h.name[0..nm.len], nm);
+            h.name_len = @intCast(nm.len);
+            self.holidays[count] = h;
+            count += 1;
+        }
+        self.holiday_count = count;
+        // Insertion sort by (month, day) — cheap at this size, and the
+        // footer's "next holiday" logic wants ordered entries.
+        var k: usize = 1;
+        while (k < count) : (k += 1) {
+            var j: usize = k;
+            while (j > 0 and (self.holidays[j].m < self.holidays[j - 1].m or
+                (self.holidays[j].m == self.holidays[j - 1].m and self.holidays[j].d < self.holidays[j - 1].d)))
+            {
+                const tmp = self.holidays[j];
+                self.holidays[j] = self.holidays[j - 1];
+                self.holidays[j - 1] = tmp;
+                j -= 1;
+            }
+        }
+        return true;
+    }
+
+    fn holidayFor(self: *const CalendarWidget, y: i32, m: u8, d: u8) ?*const Holiday {
+        if (y != self.holiday_year) return null;
+        for (0..self.holiday_count) |i| {
+            const h = &self.holidays[i];
+            if (h.m == m and h.d == d) return h;
+        }
+        return null;
+    }
+
+    // --- reminders --------------------------------------------------------
+
+    /// Re-reads the reminders file. Unchanged content is a cheap no-op;
+    /// changed content is re-parsed with each line's `fired` flag carried
+    /// over from the previous set (matched by exact line), so reloads —
+    /// every tick, or right after the rofi menu closes — never re-notify.
+    /// Returns true when the entry set changed (day dots may move).
+    fn loadReminders(self: *CalendarWidget) bool {
+        var buf: [4096]u8 = undefined;
+        const n = readFileInto(self.remPath(), &buf);
+        if (n == self.cache_len and (n == 0 or std.mem.eql(u8, buf[0..n], self.cache[0..self.cache_len]))) {
+            return false;
+        }
+        const copy_len = @min(n, self.cache.len);
+        @memcpy(self.cache[0..copy_len], buf[0..copy_len]);
+        self.cache_len = copy_len;
+
+        const now_t = libc_time.time(null);
+        var fresh: [REM_MAX]Reminder = undefined;
+        var fresh_count: usize = 0;
+        var fired_count: usize = 0;
+        var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            if (fresh_count >= REM_MAX) break;
+            var r: Reminder = undefined;
+            if (!parseReminderLine(line, &r)) continue;
+            var carried = false;
+            for (0..self.reminder_count) |i| {
+                const old = &self.reminders[i];
+                if (old.raw_len == r.raw_len and std.mem.eql(u8, old.raw[0..old.raw_len], r.raw[0..r.raw_len])) {
+                    r.fired = old.fired;
+                    carried = true;
+                    break;
+                }
+            }
+            // Only a never-seen entry whose due time already passed is born
+            // fired (created too late to announce). A carried entry keeps its
+            // armed state even when the file is edited around it — otherwise
+            // a reparse between "due" and "next tick" would swallow the
+            // notification.
+            if (!carried and dueEpoch(r) < now_t) {
+                r.fired = true;
+                logging.step("calendar: new past-due entry marked silently: {s}", .{line});
+            }
+            fresh[fresh_count] = r;
+            fresh_count += 1;
+            if (r.fired) fired_count += 1;
+        }
+        self.reminders = fresh;
+        self.reminder_count = fresh_count;
+        logging.step("calendar: reminders loaded: {d} entries ({d} fired)", .{ fresh_count, fired_count });
+        return true;
+    }
+
+    fn hasReminder(self: *const CalendarWidget, y: i32, m: u8, d: u8) bool {
+        for (0..self.reminder_count) |i| {
+            const r = self.reminders[i];
+            if (r.y == y and r.m == m and r.d == d) return true;
+        }
+        return false;
+    }
+
+    /// Fires notifications for reminders whose due time passed since the
+    /// last tick, marking them fired either way (a due time missed by more
+    /// than the grace window — suspend, downtime — is marked silently).
+    fn checkReminders(self: *CalendarWidget, now_t: i64) void {
+        for (0..self.reminder_count) |i| {
+            const r = &self.reminders[i];
+            if (r.fired) continue;
+            const due = dueEpoch(r.*);
+            if (now_t < due) continue;
+            r.fired = true;
+            if (now_t - due > NOTIFY_GRACE_S) {
+                logging.step("calendar: reminder {s} missed the {d}s window ({d}s late) — marked silently", .{ r.text(), NOTIFY_GRACE_S, now_t - due });
+                continue;
+            }
+            var when_buf: [32]u8 = undefined;
+            const when = std.fmt.bufPrint(&when_buf, "{s} {d} {s} {d:0>2}:{d:0>2}", .{
+                DAYS[wdayOf(daysFromCivil(r.y, r.m, r.d)) % 7],
+                r.d,
+                MONTHS[r.m - 1],
+                r.hh,
+                r.mm,
+            }) catch continue;
+            var t_q: [400]u8 = undefined;
+            var w_q: [80]u8 = undefined;
+            const title = shQuote(r.text(), &t_q) orelse continue;
+            const body = shQuote(when, &w_q) orelse continue;
+            var cmd: [560]u8 = undefined;
+            const s = std.fmt.bufPrintZ(&cmd, "notify-send -a simpbar -u normal {s} {s}", .{ title, body }) catch continue;
+            logging.step("calendar: reminder due, notifying: {s}", .{r.text()});
+            spawnDetached(s);
+        }
+    }
+
+    /// Click on a day: rofi menu for that date — add a reminder (free-text,
+    /// optionally "HH:MM lead text" prefixed) or delete an existing one.
+    /// The script edits the file; the completion fires loadReminders().
+    fn openDayMenu(self: *CalendarWidget, y: i32, m: u8, d: u8) void {
+        if (self.fetch.busy()) return;
+        var d_buf: [16]u8 = undefined;
+        const ds = std.fmt.bufPrint(&d_buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ y, m, d }) catch return;
+        var script: [1536]u8 = undefined;
+        const s = std.fmt.bufPrintZ(&script,
+            \\printf 'menu-run\n'
+            \\f='{s}'
+            \\d='{s}'
+            \\menu=$(printf '+ New reminder\n'; grep -F -- "$d " "$f" 2>/dev/null | sed 's/^[0-9-]* //')
+            \\sel=$(printf '%s\n' "$menu" | rofi -dmenu -i -p "Reminders · $d") || exit 0
+            \\[ -n "$sel" ] || exit 0
+            \\case "$sel" in
+            \\'+ New reminder')
+            \\  inp=$(rofi -dmenu -p "$d — text, or HH:MM lead text" </dev/null) || exit 0
+            \\  case "$inp" in
+            \\    '') exit 0 ;;
+            \\    [0-9][0-9]:[0-9][0-9]' '*) line="$d $inp" ;;
+            \\    *) line="$d 09:00 0 $inp" ;;
+            \\  esac
+            \\  printf '%s\n' "$line" >> "$f"
+            \\  notify-send -a simpbar "Reminder added" "$line" 2>/dev/null
+            \\  ;;
+            \\*)
+            \\  grep -vxF -- "$d $sel" "$f" > "$f.tmp" 2>/dev/null
+            \\  mv "$f.tmp" "$f" 2>/dev/null
+            \\  notify-send -a simpbar "Reminder removed" "$d $sel" 2>/dev/null
+            \\  ;;
+            \\esac
+            \\printf 'menu-done'
+        , .{ self.remPath(), ds }) catch return;
+        var argv = [_:null]?[*:0]const u8{ "sh", "-c", s.ptr, null };
+        self.fetch.start("/bin/sh", &argv);
+        self.phase = .menu;
+    }
+
+    // --- cadence / io -----------------------------------------------------
+
+    /// 30 s tick: follow the real month/day, kick a holiday fetch when the
+    /// year isn't loaded yet, re-sync the reminders file, fire due
+    /// notifications. Returns true when displayed pixels changed.
+    pub fn tick(self: *CalendarWidget) bool {
+        var changed = false;
+        const now_t = libc_time.time(null);
+        var tm: libc_time.Tm = undefined;
+        _ = libc_time.localtime_r(&now_t, &tm);
+        const cur_y: i32 = tm.year + 1900;
+        const cur_m: u8 = @intCast(tm.mon + 1);
+        const cur_d: u8 = @intCast(tm.mday);
+        const today = daysFromCivil(cur_y, cur_m, cur_d);
+
+        if (!self.have_view) {
+            self.view_y = cur_y;
+            self.view_m = cur_m;
+            self.have_view = true;
+            self.follow = true;
+            changed = true;
+        } else if (self.follow and (self.view_y != cur_y or self.view_m != cur_m)) {
+            self.view_y = cur_y;
+            self.view_m = cur_m;
+            changed = true;
+        }
+        if (self.today_days != today) {
+            self.today_days = today;
+            changed = true;
+        }
+
+        if (self.holiday_year != cur_y and !self.fetch.busy() and monoMs() >= self.holiday_retry_ms) {
+            self.fetch_year = cur_y;
+            self.holiday_retry_ms = monoMs() + 3_600_000; // hourly retry until a year loads
+            self.startHolidayFetch(cur_y);
+        }
+        if (self.loadReminders()) changed = true;
+        self.checkReminders(now_t);
+        return changed;
+    }
+
+    /// Fetch pipe finished: holiday JSON parsed, or the rofi menu closed
+    /// (either way the reminders file may have changed).
+    pub fn onPipe(self: *CalendarWidget) bool {
+        var out: [10240]u8 = undefined;
+        const n = self.fetch.onReadable(&out);
+        if (n == 0) return false;
+        self.fetch.closeFd();
+        switch (self.phase) {
+            .holidays => {
+                if (self.parseHolidays(out[0..n], self.region())) {
+                    self.holiday_year = self.fetch_year;
+                    return true;
+                }
+                return false; // next hourly gate retries
+            },
+            .menu => return self.loadReminders(),
+        }
+    }
+
+    // --- layout / painting ------------------------------------------------
+
+    /// Absolute layout shared by paint and click hit-testing.
+    const CalLayout = struct {
+        padx: i64,
+        grid_x: i64,
+        grid_y: i64,
+        b1: i64, // header baseline
+        wd_b: i64, // weekday row baseline
+        foot_b: i64, // footer baseline
+        lh: i64,
+    };
+
+    fn calLayout(r: Rect, font: *font_mod.Font) CalLayout {
+        const lh = lineH(font);
+        const ascent: i64 = font.ascentPx();
+        const padx = r.x + CARD_PAD;
+        const b1 = r.y + CARD_PAD + ascent;
+        const wd_b = r.y + CARD_PAD + lh + CAL_HEAD_GAP + ascent;
+        const grid_y = r.y + CARD_PAD + 2 * lh + CAL_HEAD_GAP + CAL_WD_GAP;
+        const foot_b = grid_y + CAL_ROWS * CAL_CELL_H + CAL_FOOT_GAP + ascent;
+        return .{ .padx = padx, .grid_x = padx, .grid_y = grid_y, .b1 = b1, .wd_b = wd_b, .foot_b = foot_b, .lh = lh };
+    }
+
+    fn navMonth(self: *CalendarWidget, delta: i32) void {
+        self.follow = false; // browsing detaches from the real month
+        var m: i32 = @as(i32, self.view_m) + delta;
+        var y = self.view_y;
+        if (m < 1) {
+            m = 12;
+            y -= 1;
+        } else if (m > 12) {
+            m = 1;
+            y += 1;
+        }
+        self.view_m = @intCast(m);
+        self.view_y = y;
+    }
+
+    fn jumpToToday(self: *CalendarWidget) void {
+        const now_t = libc_time.time(null);
+        var tm: libc_time.Tm = undefined;
+        _ = libc_time.localtime_r(&now_t, &tm);
+        self.view_y = tm.year + 1900;
+        self.view_m = @intCast(tm.mon + 1);
+        self.follow = true;
+    }
+
+    pub fn paint(self: *const CalendarWidget, c: Canvas, r: Rect) void {
+        const l = calLayout(r, c.font);
+        const ascent: i64 = c.font.ascentPx();
+        const grid_w: i64 = 7 * CAL_CELL_W;
+
+        // Header: < Month YYYY > — chevrons from Font Awesome, title click
+        // jumps back to the real month (see clickAt).
+        if (self.have_view) {
+            var title_buf: [32]u8 = undefined;
+            const title = std.fmt.bufPrint(&title_buf, "{s} {d}", .{ MONTHS_FULL[self.view_m - 1], self.view_y }) catch "";
+            const left: []const u8 = "\u{f053}";
+            const right: []const u8 = "\u{f054}";
+            _ = c.drawText(l.grid_x, l.b1, left, dim(c.theme.text_color, 0x99));
+            _ = c.drawText(l.grid_x + grid_w - c.textWidth(right), l.b1, right, dim(c.theme.text_color, 0x99));
+            const tw = c.textWidth(title);
+            _ = c.drawText(l.grid_x + @divTrunc(grid_w - tw, 2), l.b1, title, c.theme.text_color);
+        }
+
+        // Weekday header (Monday first — matches the grid below).
+        for (WD_ROW, 0..) |lbl, col| {
+            const lw = c.textWidth(lbl);
+            _ = c.drawText(
+                l.grid_x + @as(i64, @intCast(col)) * CAL_CELL_W + @divTrunc(CAL_CELL_W - lw, 2),
+                l.wd_b,
+                lbl,
+                dim(c.theme.text_color, 0x88),
+            );
+        }
+
+        if (self.have_view) {
+            const first_col: i64 = monCol(wdayOf(daysFromCivil(self.view_y, self.view_m, 1)));
+            const dim_days = daysInMonth(self.view_y, self.view_m);
+            var day: i32 = 1;
+            var pos: i64 = first_col;
+            while (day <= dim_days) : (day += 1) {
+                const col = @mod(pos, 7);
+                const row = @divFloor(pos, 7);
+                pos += 1;
+                const x0 = l.grid_x + col * CAL_CELL_W;
+                const y0 = l.grid_y + row * CAL_CELL_H;
+                const is_today = daysFromCivil(self.view_y, self.view_m, @intCast(day)) == self.today_days;
+                const hol = self.holidayFor(self.view_y, self.view_m, @intCast(day));
+                if (is_today) {
+                    // Accent pill behind today's number.
+                    c.card(
+                        .{ .x = @intCast(x0 + 1), .y = @intCast(y0 + 1), .w = @intCast(CAL_CELL_W - 2), .h = @intCast(CAL_CELL_H - 3) },
+                        dim(c.theme.border_color, 0x33),
+                        dim(c.theme.border_color, 0x99),
+                    );
+                }
+                var num_buf: [4]u8 = undefined;
+                const num = std.fmt.bufPrint(&num_buf, "{d}", .{day}) catch continue;
+                const num_col: u32 = if (hol) |h|
+                    if (h.global) c.theme.holiday_color else dim(c.theme.holiday_color, 0x99)
+                else if (is_today) c.theme.text_color //
+                else dim(c.theme.text_color, 0xE0);
+                _ = c.drawText(x0 + @divTrunc(CAL_CELL_W - c.textWidth(num), 2), y0 + 2 + ascent, num, num_col);
+                if (self.hasReminder(self.view_y, self.view_m, @intCast(day))) {
+                    c.fillRect(x0 + @divTrunc(CAL_CELL_W, 2) - 1, y0 + CAL_CELL_H - 4, 3, 3, c.theme.text_color);
+                }
+            }
+        }
+
+        // Footer: today's holiday in the accent color, else the next
+        // upcoming one of the real year.
+        if (self.holiday_count > 0) {
+            var chosen: ?*const Holiday = null;
+            var is_today_hol = false;
+            for (0..self.holiday_count) |i| {
+                const h = &self.holidays[i];
+                const hd = daysFromCivil(self.holiday_year, h.m, h.d);
+                if (hd == self.today_days) {
+                    chosen = h;
+                    is_today_hol = true;
+                    break;
+                }
+                if (hd > self.today_days and chosen == null) chosen = h;
+            }
+            if (chosen) |h| {
+                var label_buf: [96]u8 = undefined;
+                const label = if (is_today_hol)
+                    std.fmt.bufPrint(&label_buf, "{s}", .{h.name[0..h.name_len]}) catch ""
+                else
+                    std.fmt.bufPrint(&label_buf, "Next: {s} · {d} {s}", .{ h.name[0..h.name_len], h.d, MONTHS[h.m - 1] }) catch "";
+                var clip: [120]u8 = undefined;
+                const col = if (is_today_hol) c.theme.holiday_color else dim(c.theme.text_color, 0x99);
+                _ = c.drawText(l.padx, l.foot_b, fitText(c, label, grid_w, &clip), col);
+            }
+        }
+    }
+
+    /// Left-click: header arrows step months, the month title jumps back to
+    /// today, a day cell opens its rofi reminder menu.
+    pub fn clickAt(self: *CalendarWidget, r: Rect, font: *font_mod.Font, px: i32, py: i32) void {
+        if (!self.have_view) return;
+        const l = calLayout(r, font);
+        const grid_w: i64 = 7 * CAL_CELL_W;
+        const px64: i64 = px;
+        const py64: i64 = py;
+        const head_top: i64 = r.y + CARD_PAD;
+        if (py64 >= head_top and py64 < head_top + l.lh) {
+            if (px64 < l.grid_x + CAL_ARROW_ZONE) navMonth(self, -1) //
+            else if (px64 >= l.grid_x + grid_w - CAL_ARROW_ZONE) navMonth(self, 1) //
+            else jumpToToday(self);
+            return;
+        }
+        if (py64 >= l.grid_y and py64 < l.grid_y + CAL_ROWS * CAL_CELL_H and
+            px64 >= l.grid_x and px64 < l.grid_x + grid_w)
+        {
+            const col = @divFloor(px64 - l.grid_x, CAL_CELL_W);
+            const row = @divFloor(py64 - l.grid_y, CAL_CELL_H);
+            const first_col = @as(i64, monCol(wdayOf(daysFromCivil(self.view_y, self.view_m, 1))));
+            const day = row * 7 + col - first_col + 1;
+            if (day >= 1 and day <= daysInMonth(self.view_y, self.view_m)) {
+                self.openDayMenu(self.view_y, self.view_m, @intCast(day));
+            }
+        }
+    }
+};
+
 // --- the composite widget ---------------------------------------------------
 
 pub const Widget = union(WidgetId) {
@@ -1199,6 +1966,7 @@ pub const Widget = union(WidgetId) {
     weather: WeatherWidget,
     media: MediaWidget,
     system: SystemWidget,
+    calendar: CalendarWidget,
 
     pub fn intervalMs(self: Widget) i64 {
         return switch (self) {
@@ -1206,6 +1974,7 @@ pub const Widget = union(WidgetId) {
             .weather => WeatherWidget.interval_ms,
             .media => MediaWidget.interval_ms,
             .system => SystemWidget.interval_ms,
+            .calendar => CalendarWidget.interval_ms,
         };
     }
 
@@ -1228,6 +1997,9 @@ pub const Widget = union(WidgetId) {
             .media => |*m| blk: {
                 break :blk m.tick();
             },
+            .calendar => |*k| blk: {
+                break :blk k.tick();
+            },
         };
     }
 
@@ -1236,6 +2008,7 @@ pub const Widget = union(WidgetId) {
         return switch (self.*) {
             .weather => |w| w.fetch.fd(),
             .media => |m| m.fetch.fd(),
+            .calendar => |k| k.fetch.fd(),
             else => -1,
         };
     }
@@ -1246,18 +2019,20 @@ pub const Widget = union(WidgetId) {
         return switch (self.*) {
             .weather => |*w| w.onPipe(),
             .media => |*m| m.onPipe(),
+            .calendar => |*k| k.onPipe(),
             else => false,
         };
     }
 
-    /// Left-click action. Media gets the click point plus its rect so the
-    /// transport controls hit-test; every other widget ignores the extras.
+    /// Left-click action. Media and calendar get the click point plus their
+    /// rect so their controls hit-test; every other widget ignores the extras.
     pub fn click(self: *Widget, font: *font_mod.Font, r: Rect, x: i32, y: i32) void {
         switch (self.*) {
             .clock => |c| c.click(),
             .weather => |w| w.click(),
             .media => |*m| m.clickAt(r, font, x, y),
             .system => |s| s.click(),
+            .calendar => |*k| k.clickAt(r, font, x, y),
         }
     }
 
@@ -1268,6 +2043,7 @@ pub const Widget = union(WidgetId) {
             .weather => |w| w.paint(c, r),
             .media => |w| w.paint(c, r),
             .system => |w| w.paint(c, r),
+            .calendar => |w| w.paint(c, r),
         }
     }
 };

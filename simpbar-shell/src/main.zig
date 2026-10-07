@@ -1,12 +1,12 @@
 //! simpbar-shell — desktop widgets for Wayland, the Event-Horizon-Shell idea
 //! rewritten in Zig.
 //!
-//! One full-output layer-shell surface per monitor on the `background` layer
-//! (so widgets float behind your windows, rainmeter-style), painted entirely
-//! in software into wl_shm ARGB buffers. Each configured widget is a small
-//! paint-only object (see widgets.zig) drawn into that shared surface; the
-//! host repaints lazily — it poll()s with a timeout computed from the
-//! earliest widget cadence deadline, never a fixed animation loop.
+//! One full-output layer-shell surface per monitor on the `bottom` layer
+//! (above the wallpaper, behind your windows, rainmeter-style), painted
+//! entirely in software into wl_shm ARGB buffers. Each configured widget is
+//! a small paint-only object (see widgets.zig) drawn into that shared
+//! surface; the host repaints lazily — it poll()s with a timeout computed
+//! from the earliest widget cadence deadline, never a fixed animation loop.
 //!
 //! Input is limited to the widget rects (surface set_input_region), so the
 //! rest of the desktop passes clicks straight through to windows.
@@ -58,6 +58,8 @@ const JsonConfig = struct {
     font_path: ?[]const u8 = null,
     card_bg_opacity: ?u8 = null,
     card_corner_radius: ?u32 = null,
+    holiday_country: ?[]const u8 = null,
+    holiday_region: ?[]const u8 = null,
     widgets: ?[]const JsonWidgetCfg = null,
 };
 
@@ -66,6 +68,7 @@ const JsonMatugenColors = struct {
     text_color: ?[]const u8 = null,
     border_color: ?[]const u8 = null,
     hover_color: ?[]const u8 = null,
+    holiday_color: ?[]const u8 = null,
 };
 
 const WidgetCfg = struct {
@@ -78,6 +81,8 @@ const ShellConfig = struct {
     font_path: []const u8 = "",
     card_bg_opacity: u8 = 55,
     corner_radius: u32 = 12,
+    holiday_country: []const u8 = "AU",
+    holiday_region: []const u8 = "",
     widget_cfgs: [MAX_WIDGETS]WidgetCfg = undefined,
     widget_count: usize = 0,
 };
@@ -89,12 +94,17 @@ const DEFAULT_WIDGETS = [_]WidgetCfg{
     // Media is a tall card (cover + progress + controls ≈ 156px at the
     // 13px font); system sits below it with a gap.
     .{ .id = .system, .x = 24, .y = 350 },
+    // Calendar below the stack (≈ 215px tall); drag anywhere with
+    // Ctrl+left-click once running.
+    .{ .id = .calendar, .x = 24, .y = 470 },
 };
 
 var shell_config_path_buf: [512]u8 = undefined;
 var shell_config_path: [:0]const u8 = "";
 var matugen_path_buf: [512]u8 = undefined;
 var matugen_path: [:0]const u8 = "";
+var reminders_path_buf: [512]u8 = undefined;
+var reminders_path: [:0]const u8 = "";
 
 fn resolveConfigPaths() void {
     const home = std.mem.span(getenv("HOME") orelse return);
@@ -103,6 +113,7 @@ fn resolveConfigPaths() void {
     _ = posix.system.mkdir(dir.ptr, 0o755); // EEXIST on a normal first boot — best-effort
     shell_config_path = std.fmt.bufPrintZ(&shell_config_path_buf, "{s}/shell.json", .{dir}) catch "";
     matugen_path = std.fmt.bufPrintZ(&matugen_path_buf, "{s}/matugen.json", .{dir}) catch "";
+    reminders_path = std.fmt.bufPrintZ(&reminders_path_buf, "{s}/reminders.txt", .{dir}) catch "";
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
@@ -130,12 +141,22 @@ fn parseHexColor(s: []const u8) !u32 {
     return 0xFF000000 | rgb;
 }
 
+/// The startup config, kept around so config writes (drag-persisted widget
+/// positions) can round-trip every other key untouched.
+var g_shell_cfg: ShellConfig = blk: {
+    var c = ShellConfig{};
+    for (DEFAULT_WIDGETS, 0..) |dw, i| c.widget_cfgs[i] = dw;
+    c.widget_count = DEFAULT_WIDGETS.len;
+    break :blk c;
+};
+
 /// Reads shell.json (missing/malformed → defaults). Read once at startup —
 /// no live reload in v1.
 fn loadConfig(gpa: std.mem.Allocator) ShellConfig {
     var cfg = ShellConfig{};
     for (DEFAULT_WIDGETS, 0..) |dw, i| cfg.widget_cfgs[i] = dw;
     cfg.widget_count = DEFAULT_WIDGETS.len;
+    g_shell_cfg = cfg;
     if (shell_config_path.len == 0) return cfg;
 
     const bytes = readFileAlloc(gpa, shell_config_path) catch |err| {
@@ -158,9 +179,14 @@ fn loadConfig(gpa: std.mem.Allocator) ShellConfig {
     }
     if (parsed.card_bg_opacity) |a| cfg.card_bg_opacity = @min(a, 100);
     if (parsed.card_corner_radius) |r| cfg.corner_radius = r;
+    if (parsed.holiday_country) |hc| {
+        if (hc.len > 0) cfg.holiday_country = hc;
+    }
+    if (parsed.holiday_region) |hr| cfg.holiday_region = hr;
     if (parsed.widgets) |ws| {
         if (ws.len == 0) {
             cfg.widget_count = 0; // explicit empty list = all widgets off
+            g_shell_cfg = cfg;
             return cfg;
         }
         var count: usize = 0;
@@ -175,6 +201,7 @@ fn loadConfig(gpa: std.mem.Allocator) ShellConfig {
         }
         cfg.widget_count = count;
     }
+    g_shell_cfg = cfg;
     return cfg;
 }
 
@@ -207,6 +234,9 @@ fn tryApplyMatugenColors(gpa: std.mem.Allocator, theme: *widgets_mod.Theme) bool
     if (colors.hover_color) |hex| {
         theme.hover_color = parseHexColor(hex) catch theme.hover_color;
     }
+    if (colors.holiday_color) |hex| {
+        theme.holiday_color = parseHexColor(hex) catch theme.holiday_color;
+    }
     return true;
 }
 
@@ -229,6 +259,7 @@ const Globals = struct {
     layer_shell: ?*zwlr.LayerShellV1 = null,
     seat: ?*wl.Seat = null,
     seat_has_pointer: bool = false,
+    seat_has_keyboard: bool = false,
     output_count: usize = 0,
     outputs: [MAX_OUTPUTS]*wl.Output = undefined,
 };
@@ -259,7 +290,10 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
 
 fn seatListener(_: *wl.Seat, event: wl.Seat.Event, globals: *Globals) void {
     switch (event) {
-        .capabilities => |caps| globals.seat_has_pointer = caps.capabilities.pointer,
+        .capabilities => |caps| {
+            globals.seat_has_pointer = caps.capabilities.pointer;
+            globals.seat_has_keyboard = caps.capabilities.keyboard;
+        },
         .name => {},
     }
 }
@@ -290,6 +324,16 @@ const Host = struct {
     pointer_desktop: ?usize = null,
     pointer_x: i32 = 0,
     pointer_y: i32 = 0,
+    // Ctrl+drag state. A press is held pending until release so the Ctrl
+    // decision survives the focus-on-click ordering (the modifiers event can
+    // arrive just after the press): press+Ctrl becomes a drag, anything else
+    // becomes a click on release.
+    ctrl_down: bool = false,
+    left_down: bool = false,
+    press_index: ?usize = null,
+    drag_index: ?usize = null,
+    drag_off_x: i32 = 0,
+    drag_off_y: i32 = 0,
 };
 
 fn initWidgets(host: *Host, cfg: ShellConfig) void {
@@ -300,7 +344,15 @@ fn initWidgets(host: *Host, cfg: ShellConfig) void {
             .weather => .{ .weather = .{} },
             .media => .{ .media = .{} },
             .system => .{ .system = .{} },
+            .calendar => .{ .calendar = .{} },
         };
+        if (wc.id == .calendar) {
+            host.widgets[host.widget_count].calendar.configure(
+                reminders_path,
+                cfg.holiday_country,
+                cfg.holiday_region,
+            );
+        }
         host.widget_rects[host.widget_count] = .{
             .x = wc.x,
             .y = wc.y,
@@ -321,6 +373,103 @@ fn setInputRegion(host: *Host, d: *Desktop) void {
         region.add(r.x, r.y, @intCast(r.w), @intCast(r.h));
     }
     d.surface.setInputRegion(region);
+}
+
+/// Applies the (possibly moved) widget rects to every output's input region.
+fn refreshInputRegions(host: *Host) void {
+    for (0..host.desktop_count) |i| setInputRegion(host, &host.desktops[i]);
+}
+
+/// Escapes a string into a JSON double-quoted value body.
+fn jsonEscape(s: []const u8, out: []u8) ?[]const u8 {
+    var n: usize = 0;
+    for (s) |ch| {
+        if (ch == '"' or ch == '\\') {
+            if (n + 2 > out.len) return null;
+            out[n] = '\\';
+            out[n + 1] = ch;
+            n += 2;
+        } else if (ch >= 0x20) {
+            if (n + 1 > out.len) return null;
+            out[n] = ch;
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+/// Writes shell.json with the current widget positions (after a drag),
+/// round-tripping every other key from the config loaded at startup.
+/// Temp file + rename so a crash mid-write can't corrupt the config.
+fn saveConfig(host: *Host) void {
+    if (shell_config_path.len == 0) return;
+
+    const W = struct {
+        buf: []u8,
+        len: usize = 0,
+        fn append(self: *@This(), s: []const u8) bool {
+            if (self.len + s.len > self.buf.len) return false;
+            @memcpy(self.buf[self.len..][0..s.len], s);
+            self.len += s.len;
+            return true;
+        }
+        fn appendFmt(self: *@This(), comptime fmt: []const u8, args: anytype) bool {
+            const s = std.fmt.bufPrint(self.buf[self.len..], fmt, args) catch return false;
+            self.len += s.len;
+            return true;
+        }
+    };
+
+    var out: [8192]u8 = undefined;
+    var w = W{ .buf = &out };
+    // One scratch escape buffer, reused per field — each escaped value is
+    // appended (copied into `out`) before the next escape overwrites it.
+    var esc: [600]u8 = undefined;
+
+    const font_esc = jsonEscape(g_shell_cfg.font_path, &esc) orelse return;
+    if (!w.appendFmt(
+        "{{\n  \"font_path\": \"{s}\",\n  \"card_bg_opacity\": {d},\n  \"card_corner_radius\": {d},\n",
+        .{ font_esc, g_shell_cfg.card_bg_opacity, g_shell_cfg.corner_radius },
+    )) return;
+    const country_esc = jsonEscape(g_shell_cfg.holiday_country, &esc) orelse return;
+    if (!w.appendFmt("  \"holiday_country\": \"{s}\",\n", .{country_esc})) return;
+    const region_esc = jsonEscape(g_shell_cfg.holiday_region, &esc) orelse return;
+    if (!w.appendFmt("  \"holiday_region\": \"{s}\",\n  \"widgets\": [\n", .{region_esc})) return;
+    for (0..host.widget_count) |i| {
+        const id = std.meta.activeTag(host.widgets[i]);
+        const r = host.widget_rects[i];
+        const tail: []const u8 = if (i + 1 == host.widget_count) "\n" else ",\n";
+        if (!w.appendFmt(
+            "    {{ \"id\": \"{s}\", \"x\": {d}, \"y\": {d} }}{s}",
+            .{ @tagName(id), r.x, r.y, tail },
+        )) return;
+    }
+    if (!w.append("  ]\n}\n")) return;
+
+    var tmp_buf: [532]u8 = undefined;
+    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{shell_config_path}) catch return;
+    const raw_fd = posix.system.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(posix.mode_t, 0o644));
+    if (raw_fd < 0) {
+        logging.warn("config: could not write {s}", .{tmp});
+        return;
+    }
+    const fd: posix.fd_t = @intCast(raw_fd);
+    var off: usize = 0;
+    while (off < w.len) {
+        const n = std.c.write(fd, out[off..w.len].ptr, w.len - off);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    _ = posix.system.close(fd);
+    if (off != w.len) {
+        logging.warn("config: short write to {s}", .{tmp});
+        return;
+    }
+    if (std.c.rename(tmp.ptr, shell_config_path.ptr) != 0) {
+        logging.warn("config: could not rename {s} into place", .{tmp});
+        return;
+    }
+    logging.step("config: saved widget positions to {s}", .{shell_config_path});
 }
 
 fn paintDesktop(host: *Host, d: *Desktop) !void {
@@ -430,7 +579,9 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
         },
         .leave => {
             host.pointer_desktop = null;
-            if (host.hovered_index != null) {
+            // While a button is held the implicit grab keeps events flowing,
+            // so a leave during a drag shouldn't (and normally can't) happen.
+            if (host.drag_index == null and host.hovered_index != null) {
                 host.hovered_index = null;
                 host.needs_repaint = true;
             }
@@ -438,13 +589,38 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
         .motion => |e| {
             host.pointer_x = e.surface_x.toInt();
             host.pointer_y = e.surface_y.toInt();
-            if (updateHover(host)) host.needs_repaint = true;
+            if (host.drag_index) |i| {
+                // Ctrl+drag in progress: the card follows the pointer,
+                // clamped to the output it's being moved on.
+                const r = &host.widget_rects[i];
+                r.x = host.pointer_x - host.drag_off_x;
+                r.y = host.pointer_y - host.drag_off_y;
+                clampWidget(host, i);
+                host.hovered_index = i;
+                host.needs_repaint = true;
+            } else if (updateHover(host)) host.needs_repaint = true;
         },
         .button => |e| {
-            if (e.state != .pressed or e.button != BTN_LEFT) return;
-            if (host.hovered_index) |i| {
-                host.widgets[i].click(host.font, host.widget_rects[i], host.pointer_x, host.pointer_y);
-                host.needs_repaint = true; // media flips control state optimistically
+            if (e.button != BTN_LEFT) return;
+            if (e.state == .pressed) {
+                host.left_down = true;
+                host.press_index = host.hovered_index;
+                // Ctrl already known → the press is a move, not a click. If
+                // the modifiers event lands after this press (focus is taken
+                // on click), keyboardListener starts the drag instead.
+                tryStartDrag(host);
+            } else {
+                host.left_down = false;
+                if (host.drag_index != null) {
+                    endDrag(host);
+                } else if (host.press_index) |i| {
+                    host.press_index = null;
+                    // A click is press + release over the same widget.
+                    if (host.widget_rects[i].contains(host.pointer_x, host.pointer_y)) {
+                        host.widgets[i].click(host.font, host.widget_rects[i], host.pointer_x, host.pointer_y);
+                        host.needs_repaint = true; // widgets flip state on click
+                    }
+                }
             }
         },
         .frame => {},
@@ -452,6 +628,67 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
         .axis_source => {},
         .axis_stop => {},
         .axis_discrete => {},
+    }
+}
+
+/// True when a Ctrl+drag may begin: button down, Ctrl held, no drag yet,
+/// and the press landed on a widget.
+fn tryStartDrag(host: *Host) void {
+    if (!host.left_down or !host.ctrl_down or host.drag_index != null) return;
+    const index = host.press_index orelse host.hovered_index orelse return;
+    const r = host.widget_rects[index];
+    host.drag_index = index;
+    host.drag_off_x = host.pointer_x - r.x;
+    host.drag_off_y = host.pointer_y - r.y;
+    host.press_index = null; // consumed: a drag is not a click
+    host.hovered_index = index;
+    host.needs_repaint = true;
+}
+
+/// Keeps widget `index` fully inside the output the pointer is on (surface
+/// coordinates — outputs all share one position set per widget).
+fn clampWidget(host: *Host, index: usize) void {
+    const d = &host.desktops[host.pointer_desktop orelse 0];
+    const r = &host.widget_rects[index];
+    const max_x: i32 = @max(@as(i32, @intCast(d.width)) - @as(i32, @intCast(r.w)), 0);
+    const max_y: i32 = @max(@as(i32, @intCast(d.height)) - @as(i32, @intCast(r.h)), 0);
+    r.x = std.math.clamp(r.x, 0, max_x);
+    r.y = std.math.clamp(r.y, 0, max_y);
+}
+
+/// Button released mid-drag: settle the position, re-arm the input regions
+/// (they still cover the pre-drag location), and persist to shell.json.
+fn endDrag(host: *Host) void {
+    const index = host.drag_index orelse return;
+    host.drag_index = null;
+    clampWidget(host, index);
+    host.needs_repaint = true;
+    refreshInputRegions(host);
+    saveConfig(host);
+}
+
+fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, host: *Host) void {
+    switch (event) {
+        .keymap => |e| {
+            // No xkb state is built — the compositor's mapping fd is ours
+            // to close once received (spec), so it can't accumulate.
+            _ = posix.system.close(e.fd);
+        },
+        // The compositor always follows enter with a modifiers event, so
+        // focus changes need no handling of their own.
+        .enter => {},
+        .leave => host.ctrl_down = false,
+        .key => {},
+        .modifiers => |e| {
+            // Control is real-mod index 2 in the depressed mask.
+            const ctrl = e.mods_depressed & (1 << 2) != 0;
+            host.ctrl_down = ctrl;
+            // A press can precede this event (clicking takes focus first);
+            // the moment Ctrl is known and the button is down over a widget,
+            // turn the pending press into a drag.
+            if (ctrl) tryStartDrag(host);
+        },
+        .repeat_info => {},
     }
 }
 
@@ -540,7 +777,11 @@ pub fn main() !void {
         };
         layer_surface.setAnchor(.{ .top = true, .bottom = true, .left = true, .right = true });
         layer_surface.setExclusiveZone(0);
-        layer_surface.setKeyboardInteractivity(.none);
+        // on_demand: clicking a card takes keyboard focus, which is the only
+        // way a client sees modifier state — Ctrl+drag needs it. Focus
+        // returns to the clicked window on its next click, like any other
+        // on_demand surface; keys are otherwise ignored.
+        layer_surface.setKeyboardInteractivity(.on_demand);
         host.desktops[host.desktop_count] = .{
             .host = &host,
             .surface = surface,
@@ -565,26 +806,31 @@ pub fn main() !void {
     defer if (pointer) |p| p.release();
     if (pointer) |p| p.setListener(*Host, pointerListener, &host);
 
+    // Keyboard exists purely for modifier state (Ctrl+drag); it gets focus
+    // on_demand when a card is clicked.
+    const keyboard: ?*wl.Keyboard = if (globals.seat) |seat|
+        (if (globals.seat_has_keyboard) seat.getKeyboard() catch null else null)
+    else
+        null;
+    defer if (keyboard) |kb| kb.release();
+    if (keyboard) |kb| kb.setListener(*Host, keyboardListener, &host);
+
+    // One poll slot per widget fetch pipe, after the display fd.
     var poll_fds = [_]posix.pollfd{
         .{ .fd = display.getFd(), .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // weather fetch pipe
-        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // media fetch pipe
-    };
+    } ++ [_]posix.pollfd{.{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }} ** MAX_WIDGETS;
 
     while (true) {
         // Refresh the pipe fds (they change across fetch cycles).
-        poll_fds[1].fd = -1;
-        poll_fds[2].fd = -1;
+        for (poll_fds[1..]) |*pf| pf.fd = -1;
         for (0..host.widget_count) |i| {
-            switch (host.widgets[i].pollFd()) {
-                -1 => {},
-                else => |other_fd| {
-                    if (poll_fds[1].fd < 0) {
-                        poll_fds[1].fd = other_fd;
-                    } else if (poll_fds[2].fd < 0) {
-                        poll_fds[2].fd = other_fd;
-                    }
-                },
+            const widget_fd = host.widgets[i].pollFd();
+            if (widget_fd < 0) continue;
+            for (poll_fds[1..]) |*pf| {
+                if (pf.fd < 0) {
+                    pf.fd = widget_fd;
+                    break;
+                }
             }
         }
 
@@ -610,12 +856,14 @@ pub fn main() !void {
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
                 if (display.dispatch() != .SUCCESS) return error.DispatchFailed;
             }
-            if (poll_fds[1].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
-                for (0..host.widget_count) |i| {
-                    if (host.widgets[i].onPipe()) host.needs_repaint = true;
+            var pipe_ready = false;
+            for (poll_fds[1..]) |pf| {
+                if (pf.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+                    pipe_ready = true;
+                    break;
                 }
             }
-            if (poll_fds[2].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+            if (pipe_ready) {
                 for (0..host.widget_count) |i| {
                     if (host.widgets[i].onPipe()) host.needs_repaint = true;
                 }

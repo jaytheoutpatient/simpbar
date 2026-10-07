@@ -52,6 +52,7 @@ pub fn build(b: *Build) !void {
         .link_libc = true,
     });
     widgets_mod.addImport("font", font_mod);
+    widgets_mod.addImport("logging", logging_mod);
 
     // Album-art decode for the media card: same gdk-pixbuf shim the bar
     // compiles for tray icons, referenced out of ../simpbar/src like the
