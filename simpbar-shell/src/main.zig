@@ -86,7 +86,9 @@ const DEFAULT_WIDGETS = [_]WidgetCfg{
     .{ .id = .clock, .x = 24, .y = 24 },
     .{ .id = .weather, .x = 24, .y = 106 },
     .{ .id = .media, .x = 24, .y = 176 },
-    .{ .id = .system, .x = 24, .y = 252 },
+    // Media is a tall card (cover + progress + controls ≈ 156px at the
+    // 13px font); system sits below it with a gap.
+    .{ .id = .system, .x = 24, .y = 350 },
 };
 
 var shell_config_path_buf: [512]u8 = undefined;
@@ -440,7 +442,10 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
         },
         .button => |e| {
             if (e.state != .pressed or e.button != BTN_LEFT) return;
-            if (host.hovered_index) |i| host.widgets[i].click();
+            if (host.hovered_index) |i| {
+                host.widgets[i].click(host.font, host.widget_rects[i], host.pointer_x, host.pointer_y);
+                host.needs_repaint = true; // media flips control state optimistically
+            }
         },
         .frame => {},
         .axis => {},

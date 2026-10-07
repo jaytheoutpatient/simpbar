@@ -50,6 +50,16 @@ const CARD_PAD: i64 = 14;
 const ROW_GAP: i64 = 5;
 const BAR_H: i64 = 6;
 
+// Media-card geometry. cardSizeFor and MediaWidget.paint share these so the
+// measured rect always fits the painted layout (13px font metrics).
+const MEDIA_W: i64 = 340;
+const MEDIA_COVER: i64 = 64;
+const MEDIA_HEAD_GAP: i64 = 10;
+const MEDIA_PROG_H: i64 = 4;
+const MEDIA_TIME_GAP: i64 = 8;
+const MEDIA_TITLE_GAP: i64 = 4;
+const MEDIA_CTRL_GAP: i64 = 10;
+
 /// 0xAARRGGBB with alpha rescaled to `alpha_pct` (0-100), RGB untouched.
 /// Used for card fills so only the background's opacity varies.
 pub fn withAlpha(color: u32, alpha_pct: u32) u32 {
@@ -73,7 +83,7 @@ pub fn cardSizeFor(id: WidgetId, font: *const font_mod.Font) [2]u32 {
     return switch (id) {
         .clock => .{ 190, @intCast(2 * CARD_PAD + 2 * lh + ROW_GAP) },
         .weather => .{ 170, @intCast(2 * CARD_PAD + lh) },
-        .media => .{ 250, @intCast(2 * CARD_PAD + lh) },
+        .media => .{ @intCast(MEDIA_W), @intCast(2 * CARD_PAD + MEDIA_COVER + MEDIA_HEAD_GAP + MEDIA_PROG_H + MEDIA_TIME_GAP + lh + MEDIA_CTRL_GAP + lh) },
         .system => .{ 190, @intCast(2 * CARD_PAD + 3 * lh + 2 * ROW_GAP + 2 * BAR_H) },
     };
 }
@@ -266,6 +276,8 @@ fn wttrIconFor(cp: u32) ?u32 {
         0x26C5 => 0xE302, // ⛅ partly cloudy
         0x2601 => 0xE335, // ☁ cloudy
         0x1F326 => 0xE304, // 🌦 partly cloudy w/ rain
+        0x1F324 => 0xE304, // 🌤 sun behind small cloud
+        0x1F325 => 0xE302, // 🌥 sun behind cloud (wttr.in uses this too)
         0x1F327 => 0xE319, // 🌧 rain
         0x26C8 => 0xE31D, // ⛈ thunderstorm
         0x1F329 => 0xE31D, // 🌩 lightning
@@ -486,16 +498,18 @@ pub const WeatherWidget = struct {
             self.temp_len = t.len;
             return true;
         };
+        // Skip variation-selector/ZWJ codepoints attached to the same emoji
+        // cluster before the plain text begins — even when the lead emoji is
+        // unmapped, so a stray U+FE0F can't leak into the temp text (it has
+        // no glyph and would render as tofu).
+        while (i < trimmed.len) {
+            const save = i;
+            const nc = nextUtf8Codepoint(trimmed, &i) orelse break;
+            if (nc == 0xFE0F or nc == 0x200D) continue;
+            i = save;
+            break;
+        }
         if (wttrIconFor(cp)) |ic| {
-            // Skip variation-selector/ZWJ codepoints attached to the same
-            // emoji cluster before the plain text begins.
-            while (i < trimmed.len) {
-                const save = i;
-                const nc = nextUtf8Codepoint(trimmed, &i) orelse break;
-                if (nc == 0xFE0F or nc == 0x200D) continue;
-                i = save;
-                break;
-            }
             self.icon_len = utf8Encode(ic, &self.icon_buf);
         } else {
             self.icon_len = 0;
@@ -528,17 +542,77 @@ pub const WeatherWidget = struct {
     }
 };
 
+// --- monotonic clock (same hand-bound libc approach as main.zig) -----------
+
+const libc_mono = struct {
+    extern "c" fn clock_gettime(clockid: c_int, tp: *posix.timespec) c_int;
+};
+
+/// Monotonic milliseconds — only deltas are meaningful. Used to interpolate
+/// the media progress bar between 2 s metadata refetches.
+fn monoMs() i64 {
+    var tp: posix.timespec = undefined;
+    if (libc_mono.clock_gettime(1, &tp) != 0) return 0; // 1 = CLOCK_MONOTONIC
+    const sec: i64 = @intCast(tp.sec);
+    const nsec: i64 = @intCast(tp.nsec);
+    return sec * 1000 + @divTrunc(nsec, 1_000_000);
+}
+
+/// Truncates `text` with an ellipsis so it fits `max_w`, writing into `dst`
+/// (which must hold text.len + 3). Returns the slice to draw.
+fn fitText(c: Canvas, text: []const u8, max_w: i64, dst: []u8) []const u8 {
+    if (c.textWidth(text) <= max_w) return text;
+    const ell: []const u8 = "\u{2026}";
+    const ell_w = c.textWidth(ell);
+    var end: usize = 0;
+    var w: i64 = 0;
+    var j: usize = 0;
+    while (nextUtf8Codepoint(text, &j)) |cp| {
+        const adv = (c.font.glyph(cp) catch continue).advance_x;
+        if (w + adv + ell_w > max_w) break;
+        w += adv;
+        end = j;
+    }
+    const total = end + ell.len;
+    if (total > dst.len) return text[0..0];
+    @memcpy(dst[0..end], text[0..end]);
+    @memcpy(dst[end..total], ell);
+    return dst[0..total];
+}
+
+/// Formats microseconds as m:ss into `buf`.
+fn fmtDur(us: u64, buf: []u8) []const u8 {
+    const s = us / 1_000_000;
+    return std.fmt.bufPrint(buf, "{d}:{d:0>2}", .{ s / 60, s % 60 }) catch buf[0..0];
+}
+
 // --- media -----------------------------------------------------------------
 
-const MPRIS_SCRIPT = "playerctl metadata --format '{{status}}|{{artist}}|{{title}}'";
+const MPRIS_SCRIPT = "playerctl metadata --format 'M\x1f{{status}}\x1f{{artist}}\x1f{{title}}\x1f{{position}}\x1f{{mpris:length}}' 2>/dev/null; printf '\\nS:'; playerctl shuffle 2>/dev/null; printf '\\nL:'; playerctl loop 2>/dev/null; printf '\\n'";
+
+pub const MediaLoop = enum { none, track, playlist };
+pub const MediaControl = enum { shuffle, prev, toggle, next, loop };
 
 pub const MediaWidget = struct {
-    line_buf: [256]u8 = undefined,
-    line_len: usize = 0,
+    artist_buf: [128]u8 = undefined,
+    artist_len: usize = 0,
+    title_buf: [256]u8 = undefined,
+    title_len: usize = 0,
+    has_track: bool = false,
     playing: bool = false,
+    shuffle_on: bool = false,
+    loop_mode: MediaLoop = .none,
+    pos_us: u64 = 0,
+    len_us: u64 = 0,
+    stamp_ms: i64 = 0,
+    next_fetch_ms: i64 = 0,
+    painted_sec: i64 = -1,
     fetch: Fetcher = .{},
 
-    pub const interval_ms: i64 = 2000; // event-driven; polled here like the bar
+    // Progress repaints while playing; the metadata refetch below runs every
+    // 2 s (gated by next_fetch_ms) so one playerctl child per second isn't
+    // spawned just to move the bar.
+    pub const interval_ms: i64 = 1000;
 
     pub fn refresh(self: *MediaWidget) void {
         if (self.fetch.busy()) return;
@@ -546,90 +620,281 @@ pub const MediaWidget = struct {
         self.fetch.start("/bin/sh", &argv);
     }
 
-    /// Call when the fetch pipe is readable. Returns true when the fetch
-    /// finished (state may have changed).
-    pub fn onPipe(self: *MediaWidget) bool {
-        var out: [256]u8 = undefined;
-        const n = self.fetch.onReadable(&out);
-        if (n == 0) return false;
-        self.fetch.closeFd();
-        const raw = out[0..n];
-        if (raw.len == 0) {
-            self.playing = false;
-            self.line_len = 0;
-            return true;
+    /// Position at `now_ms`, interpolating from the last fetch while playing
+    /// and clamping at the track length.
+    fn displayPosUs(self: *const MediaWidget, now_ms: i64) u64 {
+        if (!self.playing or self.stamp_ms == 0 or self.len_us == 0) return self.pos_us;
+        const delta_ms: u64 = if (now_ms > self.stamp_ms) @intCast(now_ms - self.stamp_ms) else 0;
+        const remaining = if (self.pos_us >= self.len_us) 0 else self.len_us - self.pos_us;
+        return self.pos_us + @min(delta_ms * 1000, remaining);
+    }
+
+    /// Cadence tick — refetch metadata every 2 s, repaint every second while
+    /// the position display advances. Returns true when pixels changed.
+    pub fn tick(self: *MediaWidget) bool {
+        const now = monoMs();
+        if (now >= self.next_fetch_ms) {
+            self.refresh();
+            self.next_fetch_ms = now + 2000;
         }
-        var it = std.mem.splitScalar(u8, raw, '|');
-        const status = it.next() orelse "";
-        const artist = std.mem.trim(u8, it.next() orelse "", " \t");
-        const title = std.mem.trim(u8, it.next() orelse "", " \t");
-        self.playing = std.ascii.eqlIgnoreCase(status, "Playing");
-        const glyph: []const u8 = if (self.playing) "\u{f04b}" else "\u{f04c}";
-        const full = if (artist.len > 0)
-            std.fmt.bufPrint(&self.line_buf, "{s} {s} \u{2014} {s}", .{ glyph, artist, title }) catch self.line_buf[0..0]
-        else
-            std.fmt.bufPrint(&self.line_buf, "{s} {s}", .{ glyph, title }) catch self.line_buf[0..0];
-        self.line_len = full.len;
+        if (!self.has_track or !self.playing or self.len_us == 0) return false;
+        const sec: i64 = @intCast(self.displayPosUs(now) / 1_000_000);
+        if (sec == self.painted_sec) return false;
+        self.painted_sec = sec;
         return true;
     }
 
-    /// Truncates the content after the leading glyph so the whole line fits
-    /// a `max_w`-wide space, writing the result into `dst`. Returns the
-    /// slice to draw.
-    fn clippedLine(self: *const MediaWidget, c: Canvas, dst: []u8, max_w: i64) []const u8 {
-        const line = self.line_buf[0..self.line_len];
-        var i: usize = 0;
-        _ = nextUtf8Codepoint(line, &i) orelse return line;
-        const glyph_end = i;
-        // skip the single space before the text
-        while (i < line.len and line[i] == ' ') i += 1;
-        const text = line[i..];
-        const glyph_slice = line[0..glyph_end];
-        const glyph_w = c.textWidth(glyph_slice);
-        const max_text_w = max_w - glyph_w - 6;
-        if (c.textWidth(text) <= max_text_w) return line;
-        var end: usize = 0;
-        var w: i64 = 0;
-        var j: usize = 0;
-        while (nextUtf8Codepoint(text, &j)) |cp2| {
-            const adv = (c.font.glyph(cp2) catch continue).advance_x;
-            if (w + adv + c.textWidth("\u{2026}") > max_text_w) break;
-            w += adv;
-            end = j;
+    /// Call when the fetch pipe is readable. Returns true when the fetch
+    /// finished (state may have changed).
+    pub fn onPipe(self: *MediaWidget) bool {
+        var out: [1024]u8 = undefined;
+        const n = self.fetch.onReadable(&out);
+        if (n == 0) return false;
+        self.fetch.closeFd();
+        const now = monoMs();
+        var meta: ?[]const u8 = null;
+        var shuffle_s: ?[]const u8 = null;
+        var loop_s: ?[]const u8 = null;
+        var lines = std.mem.splitScalar(u8, out[0..n], '\n');
+        while (lines.next()) |ln| {
+            const t = std.mem.trim(u8, ln, " \t\r");
+            if (t.len == 0) continue;
+            if (t.len > 1 and t[0] == 'M' and t[1] == 0x1F) {
+                meta = t[2..];
+            } else if (std.mem.startsWith(u8, t, "S:")) {
+                shuffle_s = std.mem.trim(u8, t[2..], " \t");
+            } else if (std.mem.startsWith(u8, t, "L:")) {
+                loop_s = std.mem.trim(u8, t[2..], " \t");
+            }
         }
-        const sep: []const u8 = " ";
-        const ell: []const u8 = "\u{2026}";
-        const rest_prefix = text[0..end];
-        var n: usize = 0;
-        @memcpy(dst[0..glyph_end], line[0..glyph_end]);
-        n = glyph_end;
-        @memcpy(dst[n .. n + sep.len], sep);
-        n += sep.len;
-        @memcpy(dst[n .. n + rest_prefix.len], rest_prefix);
-        n += rest_prefix.len;
-        @memcpy(dst[n .. n + ell.len], ell);
-        n += ell.len;
-        return dst[0..n];
+        if (meta == null) {
+            self.has_track = false;
+            self.playing = false;
+            self.shuffle_on = false;
+            self.loop_mode = .none;
+            self.pos_us = 0;
+            self.len_us = 0;
+            self.stamp_ms = 0;
+            self.painted_sec = -1;
+            return true;
+        }
+        var parts = std.mem.splitScalar(u8, meta.?, 0x1F);
+        const status = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const artist = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const title = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const pos_s = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const len_s = std.mem.trim(u8, parts.next() orelse "", " \t");
+        const a = artist[0..@min(artist.len, self.artist_buf.len)];
+        @memcpy(self.artist_buf[0..a.len], a);
+        self.artist_len = a.len;
+        const t = title[0..@min(title.len, self.title_buf.len)];
+        @memcpy(self.title_buf[0..t.len], t);
+        self.title_len = t.len;
+        self.playing = std.ascii.eqlIgnoreCase(status, "Playing");
+        const paused = std.ascii.eqlIgnoreCase(status, "Paused");
+        self.pos_us = std.fmt.parseInt(u64, pos_s, 10) catch 0;
+        self.len_us = std.fmt.parseInt(u64, len_s, 10) catch 0;
+        if (shuffle_s) |s| {
+            if (std.ascii.eqlIgnoreCase(s, "On")) self.shuffle_on = true //
+            else self.shuffle_on = false;
+        } else self.shuffle_on = false;
+        if (loop_s) |s| {
+            if (std.ascii.eqlIgnoreCase(s, "Track")) self.loop_mode = .track //
+            else if (std.ascii.eqlIgnoreCase(s, "Playlist")) self.loop_mode = .playlist //
+            else self.loop_mode = .none;
+        } else self.loop_mode = .none;
+        self.has_track = self.title_len > 0 or self.artist_len > 0 or self.len_us > 0 or self.playing or paused;
+        if (!self.has_track) {
+            self.pos_us = 0;
+            self.len_us = 0;
+            self.stamp_ms = 0;
+            self.painted_sec = -1;
+            return true;
+        }
+        self.stamp_ms = now;
+        self.painted_sec = @intCast(self.displayPosUs(now) / 1_000_000);
+        return true;
+    }
+
+    /// Absolute layout of the media card's rows, shared by paint and click
+    /// hit-testing so the control zones always match the drawn glyphs.
+    const MediaLayout = struct {
+        inner_x: i64,
+        inner_w: i64,
+        title_b: i64,
+        artist_b: i64,
+        prog_y: i64,
+        times_b: i64,
+        ctrl_top: i64,
+        ctrl_base: i64,
+        ctrl_bottom: i64,
+    };
+
+    fn mediaLayout(r: Rect, font: *font_mod.Font) MediaLayout {
+        const ascent: i64 = font.ascentPx();
+        const descent: i64 = font.descentPx();
+        const inner_x = r.x + CARD_PAD;
+        const inner_w = @as(i64, @intCast(r.w)) - 2 * CARD_PAD;
+        const title_b = r.y + CARD_PAD + ascent;
+        const artist_b = title_b + ascent + descent + MEDIA_TITLE_GAP;
+        const prog_y = r.y + CARD_PAD + MEDIA_COVER + MEDIA_HEAD_GAP;
+        const times_b = prog_y + MEDIA_PROG_H + MEDIA_TIME_GAP + ascent;
+        const ctrl_top = times_b + descent + MEDIA_CTRL_GAP;
+        return .{
+            .inner_x = inner_x,
+            .inner_w = inner_w,
+            .title_b = title_b,
+            .artist_b = artist_b,
+            .prog_y = prog_y,
+            .times_b = times_b,
+            .ctrl_top = ctrl_top,
+            .ctrl_base = ctrl_top + ascent,
+            .ctrl_bottom = ctrl_top + ascent + descent,
+        };
+    }
+
+    /// Which transport control (if any) sits under surface point (px, py).
+    /// Slots run shuffle / prev / play-pause / next / repeat left to right.
+    fn controlAt(r: Rect, font: *font_mod.Font, px: i32, py: i32) ?MediaControl {
+        const l = mediaLayout(r, font);
+        if (py < l.ctrl_top or py > l.ctrl_bottom) return null;
+        if (px < l.inner_x or px >= l.inner_x + l.inner_w) return null;
+        return switch (@divTrunc((@as(i64, px) - l.inner_x) * 5, l.inner_w)) {
+            0 => .shuffle,
+            1 => .prev,
+            2 => .toggle,
+            3 => .next,
+            4 => .loop,
+            else => null,
+        };
     }
 
     pub fn paint(self: *const MediaWidget, c: Canvas, r: Rect) void {
-        const b = r.y + CARD_PAD + c.font.ascentPx();
-        const padx: i64 = r.x + CARD_PAD;
-        if (self.line_len == 0) {
-            _ = c.drawText(padx, b, "no media playing", dim(c.theme.text_color, 0x99));
+        if (!self.has_track) {
+            const b = r.y + CARD_PAD + c.font.ascentPx();
+            _ = c.drawText(r.x + CARD_PAD, b, "no media playing", dim(c.theme.text_color, 0x99));
             return;
         }
-        const inner_w: i64 = @as(i64, @intCast(r.w)) - 2 * CARD_PAD;
-        var clip: [256]u8 = undefined;
-        const drawn = self.clippedLine(c, &clip, inner_w);
-        _ = c.drawText(padx, b, drawn, c.theme.text_color);
+        const l = mediaLayout(r, c.font);
+        const ascent: i64 = c.font.ascentPx();
+        const descent: i64 = c.font.descentPx();
+
+        // Cover tile — no image decoder in the shell, so a rounded tile with
+        // a music glyph stands in for album art (mpris:artUrl is fetched but
+        // not rendered).
+        const tile = Rect{
+            .x = @intCast(l.inner_x),
+            .y = @intCast(r.y + CARD_PAD),
+            .w = @intCast(MEDIA_COVER),
+            .h = @intCast(MEDIA_COVER),
+        };
+        c.card(tile, c.theme.hover_color, c.theme.border_color);
+        const note: []const u8 = "\u{f001}";
+        const note_w = c.textWidth(note);
+        _ = c.drawText(
+            l.inner_x + @divTrunc(MEDIA_COVER - note_w, 2),
+            r.y + CARD_PAD + @divTrunc(MEDIA_COVER + ascent - descent, 2),
+            note,
+            dim(c.theme.text_color, 0xAA),
+        );
+
+        // Title over artist, truncated to the space right of the cover.
+        const text_x = l.inner_x + MEDIA_COVER + 10;
+        const text_w = r.x + @as(i64, @intCast(r.w)) - CARD_PAD - text_x;
+        var tclip: [300]u8 = undefined;
+        var aclip: [160]u8 = undefined;
+        const title = if (self.title_len > 0) self.title_buf[0..self.title_len] else "Unknown title";
+        _ = c.drawText(text_x, l.title_b, fitText(c, title, text_w, &tclip), c.theme.text_color);
+        if (self.artist_len > 0) {
+            _ = c.drawText(text_x, l.artist_b, fitText(c, self.artist_buf[0..self.artist_len], text_w, &aclip), dim(c.theme.text_color, 0xCC));
+        }
+
+        // Progress bar with knob, elapsed left and remaining right.
+        const pos = self.displayPosUs(monoMs());
+        const clamped = @min(pos, self.len_us);
+        const fill_w: u64 = if (self.len_us == 0) 0 else clamped * @as(u64, @intCast(l.inner_w)) / self.len_us;
+        c.fillRect(l.inner_x, l.prog_y, @intCast(l.inner_w), @intCast(MEDIA_PROG_H), dim(c.theme.text_color, 0x44));
+        if (fill_w > 0) c.fillRect(l.inner_x, l.prog_y, @intCast(fill_w), @intCast(MEDIA_PROG_H), c.theme.text_color);
+        if (self.len_us > 0) {
+            const kw: i64 = 7;
+            const kx = std.math.clamp(l.inner_x + @as(i64, @intCast(fill_w)) - @divTrunc(kw, 2), l.inner_x, l.inner_x + l.inner_w - kw);
+            c.fillRect(kx, l.prog_y - 1, @intCast(kw), @intCast(kw), c.theme.text_color);
+        }
+        var ebuf: [16]u8 = undefined;
+        _ = c.drawText(l.inner_x, l.times_b, fmtDur(pos, &ebuf), dim(c.theme.text_color, 0xAA));
+        var rbuf: [24]u8 = undefined;
+        const right: []const u8 = if (self.len_us > 0) blk: {
+            var tmp: [16]u8 = undefined;
+            break :blk std.fmt.bufPrint(&rbuf, "-{s}", .{fmtDur(self.len_us - clamped, &tmp)}) catch rbuf[0..0];
+        } else "--:--";
+        _ = c.drawText(l.inner_x + l.inner_w - c.textWidth(right), l.times_b, right, dim(c.theme.text_color, 0xAA));
+
+        // Transport controls: shuffle / prev / play-pause / next / repeat.
+        // Font Awesome codepoints, all verified in the bundled Nerd Font.
+        const glyphs = [_][]const u8{
+            "\u{f074}", // shuffle
+            "\u{f048}", // previous
+            if (self.playing) "\u{f04c}" else "\u{f04b}", // pause / play
+            "\u{f051}", // next
+            "\u{f01e}", // repeat
+        };
+        var i: usize = 0;
+        while (i < glyphs.len) : (i += 1) {
+            const cx = l.inner_x + @divTrunc(l.inner_w * (2 * @as(i64, @intCast(i)) + 1), 10);
+            const gw = c.textWidth(glyphs[i]);
+            const col = switch (i) {
+                0 => if (self.shuffle_on) c.theme.text_color else dim(c.theme.text_color, 0x66),
+                4 => if (self.loop_mode != .none) c.theme.text_color else dim(c.theme.text_color, 0x66),
+                else => c.theme.text_color,
+            };
+            _ = c.drawText(cx - @divTrunc(gw, 2), l.ctrl_base, glyphs[i], col);
+        }
     }
 
-    pub fn click(self: *const MediaWidget) void {
-        _ = self;
-        var cmd_buf: [32]u8 = undefined;
-        const cmd = std.fmt.bufPrintZ(&cmd_buf, "playerctl play-pause", .{}) catch return;
-        spawnDetached(cmd);
+    /// Left-click inside the card: transport controls act, anything else is a
+    /// play-pause toggle like before. State flips optimistically; the next
+    /// metadata refetch (<= 2 s) confirms it.
+    pub fn clickAt(self: *MediaWidget, r: Rect, font: *font_mod.Font, px: i32, py: i32) void {
+        const now = monoMs();
+        if (self.has_track) {
+            if (controlAt(r, font, px, py)) |ctl| {
+                switch (ctl) {
+                    .shuffle => {
+                        spawnDetached("playerctl shuffle Toggle");
+                        self.shuffle_on = !self.shuffle_on;
+                    },
+                    .prev => spawnDetached("playerctl previous"),
+                    .toggle => {
+                        spawnDetached("playerctl play-pause");
+                        self.pos_us = self.displayPosUs(now);
+                        self.playing = !self.playing;
+                        self.stamp_ms = now;
+                        self.painted_sec = @intCast(self.pos_us / 1_000_000);
+                    },
+                    .next => spawnDetached("playerctl next"),
+                    .loop => {
+                        const target: MediaLoop = switch (self.loop_mode) {
+                            .none => .track,
+                            .track => .playlist,
+                            .playlist => .none,
+                        };
+                        const arg: []const u8 = switch (target) {
+                            .none => "None",
+                            .track => "Track",
+                            .playlist => "Playlist",
+                        };
+                        var cmd_buf: [32]u8 = undefined;
+                        const cmd = std.fmt.bufPrintZ(&cmd_buf, "playerctl loop {s}", .{arg}) catch return;
+                        spawnDetached(cmd);
+                        self.loop_mode = target;
+                    },
+                }
+                self.next_fetch_ms = 0;
+                return;
+            }
+        }
+        spawnDetached("playerctl play-pause");
+        self.next_fetch_ms = 0;
     }
 };
 
@@ -808,8 +1073,7 @@ pub const Widget = union(WidgetId) {
                 break :blk false;
             },
             .media => |*m| blk: {
-                m.refresh();
-                break :blk false;
+                break :blk m.tick();
             },
         };
     }
@@ -833,12 +1097,13 @@ pub const Widget = union(WidgetId) {
         };
     }
 
-    /// Left-click action.
-    pub fn click(self: *const Widget) void {
+    /// Left-click action. Media gets the click point plus its rect so the
+    /// transport controls hit-test; every other widget ignores the extras.
+    pub fn click(self: *Widget, font: *font_mod.Font, r: Rect, x: i32, y: i32) void {
         switch (self.*) {
             .clock => |c| c.click(),
             .weather => |w| w.click(),
-            .media => |m| m.click(),
+            .media => |*m| m.clickAt(r, font, x, y),
             .system => |s| s.click(),
         }
     }

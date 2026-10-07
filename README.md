@@ -83,14 +83,14 @@ A second native Zig binary beside the bar: `simpbar-shell` paints desktop widget
     { "id": "clock",   "x": 24, "y": 24 },
     { "id": "weather", "x": 24, "y": 106 },
     { "id": "media",   "x": 24, "y": 176 },
-    { "id": "system",  "x": 24, "y": 252 }
+    { "id": "system",  "x": 24, "y": 350 }
   ]
 }
 ```
 
 Missing or malformed keys keep the defaults above (`font_path` empty defaults to the bar's JetBrainsMono Nerd). Cards are translucent (55% opacity by default) so the wallpaper shows through, frosted by a Hyprland layer rule for the `simpbar-shell` namespace — like the bar, a Wayland client can't blur what's behind its own surface, so the desktop config supplies it.
 
-Each card repaints on its own lazy schedule — clock every second, system every 2s, media every 2s, weather every 20 minutes — and the shell only commits a new frame when something changed. Clicks do something where there's something to do: media toggles play/pause via `playerctl`, weather opens wttr.in. The surface's input region is exactly the union of the cards, so the rest of the desktop passes clicks straight through.
+Each card repaints on its own lazy schedule — clock every second, system every 2s, media progress every second while playing (metadata refetched every 2s), weather every 20 minutes — and the shell only commits a new frame when something changed. Clicks do something where there's something to do: the media card has shuffle / previous / play-pause / next / repeat controls (cover art stays a placeholder tile — the shell has no image decoder), weather opens wttr.in. The surface's input region is exactly the union of the cards, so the rest of the desktop passes clicks straight through.
 
 ## Wallpapers
 
