@@ -78,12 +78,13 @@ const CAL_WD_GAP: i64 = 4;
 const CAL_FOOT_GAP: i64 = 6;
 const CAL_ARROW_ZONE: i64 = 20; // clickable width of the < / > header zones
 
-// Analog watch (Seiko 5 style) geometry: a square whose content IS the
-// widget — the host skips its frosted card for this one, the steel case and
-// bracelet stubs are the chrome. cardSizeFor and WatchWidget.paint share
-// these so the measured rect always fits the painted watch.
+// Analog watch (Seiko diver style) geometry: a compact tile whose content
+// IS the widget — the host skips its frosted card for this one, the steel
+// case and bezel are the chrome. No bracelet: just the head, with short
+// lug stubs top and bottom. cardSizeFor and WatchWidget.paint share these
+// so the measured rect always fits the painted watch.
 const WATCH_W: i64 = 190;
-const WATCH_H: i64 = 240;
+const WATCH_H: i64 = 200;
 const WATCH_CASE_R: f64 = 86;
 
 /// 0xAARRGGBB with alpha rescaled to `alpha_pct` (0-100), RGB untouched.
@@ -2102,34 +2103,35 @@ pub const CalendarWidget = struct {
 
 // --- analog watch (Seiko 5 automatic) --------------------------------------
 
-/// An analog clock drawn like a Seiko 5 automatic: brushed steel case on
-/// bracelet stubs, applied baton indices (double at 12, none at 3 — the
-/// day-date window takes that spot), and a seconds hand stepping in
-/// 1/6-second beats — the 21,600 vph sweep of the 7S26 movement rather
-/// than a dead-beat tick.
+/// An analog clock drawn like a Seiko SKX diver: knurled steel case with a
+/// black 60-minute bezel (numerals, triangle pip at 12), lume plots
+/// (triangle at 12, bars at 6/9, dots elsewhere), a Mercedes hour hand, and
+/// a day-date window at 3 — no bracelet, just the head on short lug stubs.
+/// The seconds hand steps in 1/6-second beats — the 21,600 vph sweep of the
+/// 7S26 movement rather than a dead-beat tick.
 ///
-/// Clicking anywhere on the watch flips between the classic white dial and
-/// a black (SNK809-flavoured) one. Every paint reads the wall clock fresh —
-/// no hand-angle state, nothing to drift.
+/// Clicking anywhere on the watch flips between the black (SKX007) and a
+/// deep-blue dial. Every paint reads the wall clock fresh — no hand-angle
+/// state, nothing to drift.
 pub const WatchWidget = struct {
-    /// 0 = white dial, 1 = black dial.
+    /// 0 = black diver, 1 = blue diver.
     dial: u8 = 0,
 
     /// Six repaints a second = six beats (21,600 vibrations/hour).
     pub const interval_ms: i64 = 167; // six beats per second (21,600 vph)
 
     /// Colours for one dial variant (0xAARRGGBB). The steel of the case
-    /// and bracelet is shared between both variants.
+    /// and the lume are shared between both variants.
     const Palette = struct {
         dial: u32,
+        bezel: u32,
+        bezel_text: u32,
         minute_tick: u32,
         five_tick: u32,
-        index: u32,
-        hand: u32,
         lume: u32,
+        hand: u32,
         seconds: u32,
-        shield_bg: u32,
-        shield_fg: u32,
+        brand: u32,
         window_fg: u32,
     };
 
@@ -2138,34 +2140,33 @@ pub const WatchWidget = struct {
     const STEEL_BEZEL: u32 = 0xFFBEC3CA;
     const STEEL_SHADOW: u32 = 0xFF7C818A;
     const STEEL_CAP: u32 = 0xFFC8CDD4;
-    const STRAP: u32 = 0xFF8E939B;
-    const STRAP_LINK: u32 = 0xFF6E737A;
-    const STRAP_EDGE: u32 = 0xFFB7BCC3;
+    const BEZEL_DIM: u32 = 0xFF8B9098;
+    const PLOT_EDGE: u32 = 0xFF2E3238; // surround that lifts lume plots off the dial
     const WINDOW_BG: u32 = 0xFFFFFFFF;
     const WINDOW_BORDER: u32 = 0xFF1C1C1F;
 
-    const WHITE_DIAL: Palette = .{
-        .dial = 0xFFF7F6F1,
-        .minute_tick = 0xFFB4B3AB,
-        .five_tick = 0xFF3C3C38,
-        .index = 0xFF26262A,
-        .hand = 0xFF1B1C20,
-        .lume = 0xFFE9F2C6,
-        .seconds = 0xFF575D66,
-        .shield_bg = 0xFF26262A,
-        .shield_fg = 0xFFF7F6F1,
+    const BLACK_DIVER: Palette = .{
+        .dial = 0xFF121418,
+        .bezel = 0xFF16181D,
+        .bezel_text = 0xFFE9EBEF,
+        .minute_tick = 0xFF6E737C,
+        .five_tick = 0xFFC9CED6,
+        .lume = 0xFFDCE6B8,
+        .hand = 0xFFDCE0E6,
+        .seconds = 0xFFB4BAC2,
+        .brand = 0xFFE9EBEF,
         .window_fg = 0xFF17171A,
     };
-    const BLACK_DIAL: Palette = .{
-        .dial = 0xFF17191D,
-        .minute_tick = 0xFF494C52,
-        .five_tick = 0xFFD8DBE0,
-        .index = 0xFFE3E6EA,
-        .hand = 0xFFECEEF2,
-        .lume = 0xFFC9E48F,
-        .seconds = 0xFFB8BEC6,
-        .shield_bg = 0xFFE3E6EA,
-        .shield_fg = 0xFF17191D,
+    const BLUE_DIVER: Palette = .{
+        .dial = 0xFF152A45,
+        .bezel = 0xFF13263E,
+        .bezel_text = 0xFFE9EBEF,
+        .minute_tick = 0xFF6E7B8C,
+        .five_tick = 0xFFC9D2DE,
+        .lume = 0xFFDCE6B8,
+        .hand = 0xFFDCE0E6,
+        .seconds = 0xFFB4BAC2,
+        .brand = 0xFFE9EBEF,
         .window_fg = 0xFF17171A,
     };
 
@@ -2226,7 +2227,7 @@ pub const WatchWidget = struct {
     }
 
     pub fn paint(self: *const WatchWidget, c: Canvas, r: Rect) void {
-        const P: Palette = if (self.dial == 0) WHITE_DIAL else BLACK_DIAL;
+        const P: Palette = if (self.dial == 0) BLACK_DIVER else BLUE_DIVER;
         const cx_i: i64 = @as(i64, r.x) + WATCH_W / 2;
         const cy_i: i64 = @as(i64, r.y) + WATCH_H / 2;
         const cx: f64 = @floatFromInt(cx_i);
@@ -2251,99 +2252,177 @@ pub const WatchWidget = struct {
         const min_a = (@as(f64, @floatFromInt(tm.min)) + @as(f64, @floatFromInt(tm.sec)) / 60.0) * 6.0 * DEG;
         const hr_a = (@as(f64, @floatFromInt(@mod(tm.hour, 12))) + @as(f64, @floatFromInt(tm.min)) / 60.0) * 30.0 * DEG;
 
-        // Bracelet stubs first — the case laps over their inner ends.
-        const strap_x = cx_i - 27;
-        const strap_len: i64 = WATCH_H / 2;
+        // Short lug stubs top and bottom — the head without its bracelet,
+        // drawn first so the case laps over their inner ends.
         for ([2]bool{ true, false }) |is_top| {
-            const y0: i64 = if (is_top) @as(i64, r.y) else cy_i;
-            c.fillRect(strap_x, y0, 54, @intCast(strap_len), STRAP);
-            // Link grooves + side edges (the case overdraws the middle).
-            var gy = y0 + 9;
-            while (gy < y0 + strap_len) : (gy += 8) {
-                c.fillRect(strap_x + 4, gy, 46, 1, STRAP_LINK);
-            }
-            c.fillRect(strap_x, y0, 1, @intCast(strap_len), STRAP_EDGE);
-            c.fillRect(strap_x + 53, y0, 1, @intCast(strap_len), STRAP_LINK);
+            const s: f64 = if (is_top) -1.0 else 1.0;
+            const lugs = [4]Canvas.FPt{
+                .{ .x = cx - 23, .y = cy + s * 76 },
+                .{ .x = cx + 23, .y = cy + s * 76 },
+                .{ .x = cx + 17, .y = cy + s * 97 },
+                .{ .x = cx - 17, .y = cy + s * 97 },
+            };
+            c.fillConvex(&lugs, STEEL_BODY);
         }
 
-        // Crown at 3 o'clock, poking out from behind the case.
-        c.fillRect(cx_i + 81, cy_i - 5, 9, 10, STEEL_BODY);
-        c.fillCircleAA(cx + 88.5, cy, 4.6, STEEL_BODY);
-        c.fillRect(cx_i + 83, cy_i - 4, 1, 8, STEEL_SHADOW);
-        c.fillRect(cx_i + 86, cy_i - 4, 1, 8, STEEL_SHADOW);
+        // Crown at 4 o'clock (SKX puts it between 3 and 4), poking out
+        // from behind the case: a radial stem plus the knurled knob.
+        const crown_a = 120.0 * DEG;
+        baton(c, cx, cy, crown_a, 78, 90, 7.0, 7.0, STEEL_BODY);
+        const cd = radial(crown_a);
+        const kx = cx + cd[0] * 90;
+        const ky = cy + cd[1] * 90;
+        c.fillCircleAA(kx, ky, 5.2, STEEL_BODY);
+        c.fillRingAA(kx, ky, 3.0, 5.2, STEEL_SHADOW);
 
-        // Case: brushed body, polished outer band, bezel, then the step
-        // down into the dial.
+        // Case: brushed body, polished outer band, then the bezel stack.
         c.fillCircleAA(cx, cy, WATCH_CASE_R, STEEL_BODY);
         c.fillRingAA(cx, cy, WATCH_CASE_R - 3, WATCH_CASE_R, STEEL_POLISH);
-        c.fillRingAA(cx, cy, 77, 83, STEEL_BEZEL);
-        c.fillRingAA(cx, cy, 75, 77, STEEL_SHADOW);
-        c.fillCircleAA(cx, cy, 75, P.dial);
+        // Coin-edge knurling on the bezel flank.
+        var e: u32 = 0;
+        while (e < 60) : (e += 1) {
+            baton(c, cx, cy, @as(f64, @floatFromInt(e)) * 6.0 * DEG, 79.5, 83.0, 1.4, 1.4, STEEL_SHADOW);
+        }
+        // Black 60-minute insert.
+        c.fillRingAA(cx, cy, 60, 79, P.bezel);
 
-        // Minute track: 60 ticks, the 5-minute ones heavier, in the ring
-        // just outside the applied indices.
+        // Bezel minute ticks — every minute for the first quarter like the
+        // real insert, fives elsewhere — skipping the numeral/triangle spots.
         var i: u32 = 0;
         while (i < 60) : (i += 1) {
+            const a_deg: i32 = @intCast(i * 6);
+            const near_num = @abs(a_deg - 60) < 10 or @abs(a_deg - 120) < 10 or
+                @abs(a_deg - 180) < 10 or @abs(a_deg - 240) < 10 or @abs(a_deg - 300) < 10;
+            const near_pip = a_deg < 10 or a_deg > 350;
+            if (near_num or near_pip) continue;
             const a = @as(f64, @floatFromInt(i)) * 6.0 * DEG;
             if (i % 5 == 0) {
-                baton(c, cx, cy, a, 64, 71.5, 2.2, 2.6, P.five_tick);
-            } else {
-                baton(c, cx, cy, a, 66.5, 71.5, 1.0, 1.0, P.minute_tick);
+                baton(c, cx, cy, a, 72.5, 77.5, 2.0, 2.2, P.bezel_text);
+            } else if (i <= 15) {
+                baton(c, cx, cy, a, 74.5, 77.5, 1.0, 1.0, BEZEL_DIM);
             }
         }
 
-        // Applied baton indices — double at 12, none at 3.
+        // Triangle pip at 12 on the bezel, apex toward the dial.
+        {
+            const t_out = [3]Canvas.FPt{
+                at(cx, cy, 0, -1, 77.5, -4.5),
+                at(cx, cy, 0, -1, 77.5, 4.5),
+                at(cx, cy, 0, -1, 63.0, 0),
+            };
+            c.fillConvex(&t_out, P.bezel_text);
+            const t_in = [3]Canvas.FPt{
+                at(cx, cy, 0, -1, 75.5, -2.6),
+                at(cx, cy, 0, -1, 75.5, 2.6),
+                at(cx, cy, 0, -1, 65.5, 0),
+            };
+            c.fillConvex(&t_in, P.lume);
+        }
+
+        // Bezel numerals 10..50.
+        const numerals = [_]struct { deg: f64, label: *const [2]u8 }{
+            .{ .deg = 60, .label = "10" },
+            .{ .deg = 120, .label = "20" },
+            .{ .deg = 180, .label = "30" },
+            .{ .deg = 240, .label = "40" },
+            .{ .deg = 300, .label = "50" },
+        };
+        for (numerals) |n| {
+            const d = radial(n.deg * DEG);
+            const px = cx + d[0] * 68.5;
+            const py = cy + d[1] * 68.5;
+            const tw = c.textWidth(n.label);
+            _ = c.drawText(
+                @as(i64, @intFromFloat(px)) - @divTrunc(tw, 2),
+                @as(i64, @intFromFloat(py)) + @divTrunc(c.font.ascentPx(), 2),
+                n.label,
+                P.bezel_text,
+            );
+        }
+
+        // Dial with a stepped edge out of the bezel.
+        c.fillRingAA(cx, cy, 58.5, 60.5, 0x88000000);
+        c.fillCircleAA(cx, cy, 59, P.dial);
+
+        // Dial minute track just inside the edge.
+        var m: u32 = 0;
+        while (m < 60) : (m += 1) {
+            const a = @as(f64, @floatFromInt(m)) * 6.0 * DEG;
+            if (m % 5 == 0) {
+                baton(c, cx, cy, a, 53.5, 58.0, 1.8, 2.0, P.five_tick);
+            } else {
+                baton(c, cx, cy, a, 55.0, 58.0, 0.9, 0.9, P.minute_tick);
+            }
+        }
+
+        // Lume plots: triangle at 12, bars at 6 and 9, dots elsewhere —
+        // none at 3, where the day-date window sits.
         var k: i32 = 0;
         while (k < 12) : (k += 1) {
             if (k == 3) continue;
             const a = @as(f64, @floatFromInt(k)) * 30.0 * DEG;
+            const d = radial(a);
             if (k == 0) {
-                baton(c, cx, cy, a - 4.0 * DEG, 44, 61, 3.0, 4.2, P.index);
-                baton(c, cx, cy, a + 4.0 * DEG, 44, 61, 3.0, 4.2, P.index);
+                const tri_out = [3]Canvas.FPt{
+                    at(cx, cy, d[0], d[1], 50, -5.5),
+                    at(cx, cy, d[0], d[1], 50, 5.5),
+                    at(cx, cy, d[0], d[1], 37, 0),
+                };
+                c.fillConvex(&tri_out, PLOT_EDGE);
+                const tri_in = [3]Canvas.FPt{
+                    at(cx, cy, d[0], d[1], 48.5, -3.6),
+                    at(cx, cy, d[0], d[1], 48.5, 3.6),
+                    at(cx, cy, d[0], d[1], 38.5, 0),
+                };
+                c.fillConvex(&tri_in, P.lume);
+            } else if (k == 6 or k == 9) {
+                baton(c, cx, cy, a, 38, 50, 9.0, 9.0, PLOT_EDGE);
+                baton(c, cx, cy, a, 39.5, 48.5, 6.2, 6.2, P.lume);
             } else {
-                baton(c, cx, cy, a, 44, 61, 3.0, 4.2, P.index);
+                c.fillCircleAA(cx + d[0] * 44, cy + d[1] * 44, 5.4, PLOT_EDGE);
+                c.fillCircleAA(cx + d[0] * 44, cy + d[1] * 44, 4.1, P.lume);
             }
         }
 
-        // Day-date window at 3 o'clock — the Seiko signature.
-        const win_x = cx_i + 14;
-        const win_y = cy_i - 11;
-        const win_w = 58;
-        const win_h = 22;
+        // Day-date window at 3 o'clock — smaller here to sit inside the
+        // diver dial.
+        const win_x = cx_i + 10;
+        const win_y = cy_i - 10;
+        const win_w = 47;
+        const win_h = 20;
         c.fillRect(win_x - 1, win_y - 1, win_w + 2, win_h + 2, WINDOW_BORDER);
         c.fillRect(win_x, win_y, win_w, win_h, WINDOW_BG);
-        c.fillRect(win_x + 36, win_y + 1, 1, win_h - 2, 0xFF3A3A3E);
+        c.fillRect(win_x + 28, win_y + 1, 1, win_h - 2, 0xFF3A3A3E);
         var date_buf: [4]u8 = undefined;
         const date_str = std.fmt.bufPrint(&date_buf, "{d}", .{tm.mday}) catch " ";
         const day_str = DAYS_UPPER[@as(usize, @intCast(tm.wday))];
         const text_base = cy_i + @divTrunc(c.font.ascentPx(), 2);
         const day_w = c.textWidth(day_str);
-        _ = c.drawText(win_x + 1 + @divTrunc(34 - day_w, 2), text_base, day_str, P.window_fg);
+        _ = c.drawText(win_x + 1 + @divTrunc(26 - day_w, 2), text_base, day_str, P.window_fg);
         const date_w = c.textWidth(date_str);
-        _ = c.drawText(win_x + 37 + @divTrunc(20 - date_w, 2), text_base, date_str, P.window_fg);
+        _ = c.drawText(win_x + 29 + @divTrunc(17 - date_w, 2), text_base, date_str, P.window_fg);
 
-        // Branding: SEIKO under the 12, the "5" shield and AUTOMATIC above
-        // the 6.
-        drawSpaced(c, cx_i, cy_i - 31, "SEIKO", 2, P.index);
-        c.fillCircleAA(cx, cy + 23, 7.5, P.shield_bg);
-        const five = "5";
-        _ = c.drawText(
-            cx_i - @divTrunc(c.textWidth(five), 2),
-            cy_i + 23 + @divTrunc(c.font.ascentPx(), 2),
-            five,
-            P.shield_fg,
-        );
-        drawSpaced(c, cx_i, cy_i + 42, "AUTOMATIC", 1, P.index);
+        // Branding: SEIKO under the 12, Automatic above the 6 — no "5"
+        // shield on a diver.
+        drawSpaced(c, cx_i, cy_i - 24, "SEIKO", 2, P.brand);
+        drawSpaced(c, cx_i, cy_i + 31, "Automatic", 1, P.brand);
 
-        // Hands: tapered batons with lume stripes (minute over hour), then
-        // the thin seconds hand stepping exactly 1° per beat.
-        baton(c, cx, cy, hr_a, -7, 42, 6.0, 4.4, P.hand);
-        baton(c, cx, cy, hr_a, 2, 33, 2.4, 2.0, P.lume);
-        baton(c, cx, cy, min_a, -9, 63, 5.4, 3.6, P.hand);
-        baton(c, cx, cy, min_a, 2, 55, 2.2, 1.8, P.lume);
-        baton(c, cx, cy, sec_a, -14, 70, 1.8, 1.8, P.seconds);
+        // Hands: silver bodies with lume fill (sword minute over the
+        // Mercedes hour), then the thin seconds hand with its lollipop pip,
+        // stepping exactly 1° per beat.
+        baton(c, cx, cy, hr_a, -8, 30, 8.0, 6.0, P.hand);
+        baton(c, cx, cy, hr_a, -2, 26, 4.5, 3.5, P.lume);
+        const hd = radial(hr_a);
+        c.fillCircleAA(cx + hd[0] * 21, cy + hd[1] * 21, 6.2, P.hand);
+        c.fillCircleAA(cx + hd[0] * 21, cy + hd[1] * 21, 4.6, P.lume);
+        baton(c, cx, cy, hr_a, 15, 27, 1.4, 1.4, P.hand); // Mercedes bar
+        baton(c, cx, cy, min_a, -9, 50, 7.0, 4.5, P.hand);
+        baton(c, cx, cy, min_a, 0, 44, 3.6, 2.6, P.lume);
+        baton(c, cx, cy, sec_a, -14, 56, 1.8, 1.8, P.seconds);
         const sd = radial(sec_a);
-        c.fillCircleAA(cx - sd[0] * 12, cy - sd[1] * 12, 2.6, P.seconds); // counterweight
+        c.fillCircleAA(cx + sd[0] * 44, cy + sd[1] * 44, 4.6, P.seconds); // lollipop
+        c.fillCircleAA(cx + sd[0] * 44, cy + sd[1] * 44, 3.0, P.lume);
+        c.fillCircleAA(cx - sd[0] * 12, cy - sd[1] * 12, 2.8, P.seconds); // counterweight
         c.fillCircleAA(cx, cy, 4.4, STEEL_CAP);
         c.fillCircleAA(cx, cy, 1.8, P.hand);
     }
