@@ -1425,8 +1425,12 @@ MATUGENSVCEOF
             || warn "Could not enable matugen-wallpaper.path — wallpapers picked in azote won't auto-recolor the bar"
 
         if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
+            # Never let this step wedge the installer (see install.sh): any
+            # interactive prompt gets instant EOF from the closed stdin, and
+            # the 45 s cap bounds a hang while still printing matugen's
+            # captured output on failure for diagnosis.
             run_spinner "Generating the initial matugen scheme from the Bing wallpaper" \
-                "$MATUGEN_BIN" image "$BING_FILE" \
+                timeout 45 bash -c '"$0" "$@" </dev/null' "$MATUGEN_BIN" image "$BING_FILE" \
                 || warn "Could not generate the initial matugen scheme — it'll apply on the next wallpaper change"
         else
             warn "No wallpaper available for the initial matugen scheme — the bar keeps its configured colors until you pick a wallpaper"

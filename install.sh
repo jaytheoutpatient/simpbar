@@ -1119,8 +1119,16 @@ if [ "$INSTALL_MATUGEN" -eq 1 ]; then
             || warn "Could not install the simpbar-matugen helper to /usr/bin"
 
         if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
+            # Never let this step wedge the installer: run_spinner hides all
+            # output until failure, so if matugen stops to prompt (missing
+            # prefer/fallback in an older config.toml) or blocks on its
+            # network version check, the prompt is invisible and the install
+            # waits forever. Closing stdin turns any prompt into an instant
+            # EOF error; the 45 s cap (a healthy run takes <1 s) guarantees
+            # progress either way, and a failure prints matugen's captured
+            # output so the real cause is visible.
             run_spinner "Generating the initial matugen scheme from the Bing wallpaper" \
-                /usr/bin/simpbar-matugen "$BING_FILE" \
+                timeout 45 bash -c '"$0" "$@" </dev/null' /usr/bin/simpbar-matugen "$BING_FILE" \
                 || warn "Could not generate the initial matugen scheme — it'll apply on the next wallpaper change"
         else
             warn "No wallpaper available for the initial matugen scheme — the bar keeps its configured colors until you pick a wallpaper"
