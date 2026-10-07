@@ -350,6 +350,14 @@ const Host = struct {
     drag_index: ?usize = null,
     drag_off_x: i32 = 0,
     drag_off_y: i32 = 0,
+    // Bezel-timer grab on the watch: press (no Ctrl) on the bezel ring
+    // starts a circular turn. Angles are pointer angles about the dial
+    // center (0 at 12, clockwise); the widget folds the swept angle into
+    // its resting offset.
+    bezel_index: ?usize = null,
+    bezel_base: u8 = 0,
+    bezel_last_a: f64 = 0,
+    bezel_accum: f64 = 0,
 };
 
 fn initWidgets(host: *Host, cfg: ShellConfig) void {
@@ -674,7 +682,12 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
         .motion => |e| {
             host.pointer_x = e.surface_x.toInt();
             host.pointer_y = e.surface_y.toInt();
-            if (host.drag_index) |i| {
+            if (host.bezel_index) |i| {
+                // Bezel turn in progress: the insert follows the pointer
+                // around the dial. Tiles are position-independent here too —
+                // only the bezel offset changed, so just re-render it.
+                turnBezel(host, i);
+            } else if (host.drag_index) |i| {
                 // Ctrl+drag in progress: the card follows the pointer,
                 // clamped to the output it's being moved on. Tiles are
                 // position-independent — only the blit moves, so no
@@ -692,14 +705,20 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
             if (e.state == .pressed) {
                 host.left_down = true;
                 host.press_index = host.hovered_index;
-                // Ctrl already known → the press is a move, not a click. If
-                // the modifiers event lands after this press (focus is taken
-                // on click), keyboardListener starts the drag instead.
-                tryStartDrag(host);
+                // Bezel ring (no Ctrl) starts a timer turn; anywhere else
+                // the press is a move when Ctrl is known (see tryStartDrag)
+                // or a click on release.
+                if (!tryStartBezel(host)) tryStartDrag(host);
             } else {
                 host.left_down = false;
                 if (host.drag_index != null) {
                     endDrag(host);
+                } else if (host.bezel_index) |i| {
+                    host.bezel_index = null;
+                    // Settle with the release point, then arm (or clear).
+                    turnBezel(host, i);
+                    host.widgets[i].watch.releaseBezel(nowMs());
+                    markDirty(host, i);
                 } else if (host.press_index) |i| {
                     host.press_index = null;
                     // A click is press + release over the same widget.
@@ -718,10 +737,52 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
     }
 }
 
+/// Press (no Ctrl) landed on the watch's bezel ring: start a circular
+/// turn for the hidden timer instead of a click or a move. The press is
+/// consumed — releasing arms the timer, it never reaches click().
+fn tryStartBezel(host: *Host) bool {
+    if (!host.left_down or host.ctrl_down) return false;
+    if (host.drag_index != null or host.bezel_index != null) return false;
+    const index = host.press_index orelse host.hovered_index orelse return false;
+    if (std.meta.activeTag(host.widgets[index]) != .watch) return false;
+    const r = host.widget_rects[index];
+    if (!widgets_mod.WatchWidget.bezelHit(r, host.pointer_x, host.pointer_y)) return false;
+    host.bezel_index = index;
+    host.bezel_base = host.widgets[index].watch.bezel_min;
+    host.bezel_last_a = widgets_mod.WatchWidget.pointerAngle(r, host.pointer_x, host.pointer_y);
+    host.bezel_accum = 0;
+    host.press_index = null; // consumed: a turn is not a click
+    host.hovered_index = index;
+    host.needs_repaint = true;
+    return true;
+}
+
+/// Pointer moved mid bezel-turn: fold the swept angle into the widget's
+/// resting offset (1 minute per 6°, clamped 0..59 there).
+fn turnBezel(host: *Host, i: usize) void {
+    const W = widgets_mod.WatchWidget;
+    const r = host.widget_rects[i];
+    const ctr = W.dialCenter(r);
+    const dx = @as(f64, @floatFromInt(host.pointer_x)) - ctr[0];
+    const dy = @as(f64, @floatFromInt(host.pointer_y)) - ctr[1];
+    if (dx * dx + dy * dy < 16.0) return; // on the center pin — no angle
+    const a = W.pointerAngle(r, host.pointer_x, host.pointer_y);
+    var delta = a - host.bezel_last_a;
+    while (delta > std.math.pi) : (delta -= 2 * std.math.pi) {}
+    while (delta < -std.math.pi) : (delta += 2 * std.math.pi) {}
+    host.bezel_last_a = a;
+    host.bezel_accum += delta;
+    if (host.widgets[i].watch.turnBezel(host.bezel_base, host.bezel_accum)) {
+        markDirty(host, i);
+    }
+}
+
 /// True when a Ctrl+drag may begin: button down, Ctrl held, no drag yet,
-/// and the press landed on a widget.
+/// and the press landed on a widget. Never steals a bezel turn — Ctrl
+/// pressed mid-turn leaves the bezel alone.
 fn tryStartDrag(host: *Host) void {
     if (!host.left_down or !host.ctrl_down or host.drag_index != null) return;
+    if (host.bezel_index != null) return;
     const index = host.press_index orelse host.hovered_index orelse return;
     const r = host.widget_rects[index];
     host.drag_index = index;

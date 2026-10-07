@@ -2110,12 +2110,22 @@ pub const CalendarWidget = struct {
 /// The seconds hand steps in 1/6-second beats — the 21,600 vph sweep of the
 /// 7S26 movement rather than a dead-beat tick.
 ///
-/// Clicking anywhere on the watch flips between the black (SKX007) and a
-/// deep-blue dial. Every paint reads the wall clock fresh — no hand-angle
-/// state, nothing to drift.
+/// Clicking anywhere on the dial flips between the black (SKX007) and a
+/// deep-blue dial. Hidden extra: circular-dragging the bezel ring turns
+/// the insert into a countdown timer (see tryStartBezel in main.zig) —
+/// the pip marks the target minute, notify-send plus the freedesktop
+/// alarm sound fires at zero. Every paint reads the wall clock fresh —
+/// no hand-angle state, nothing to drift.
 pub const WatchWidget = struct {
     /// 0 = black diver, 1 = blue diver.
     dial: u8 = 0,
+    /// Hidden bezel timer: minutes the insert is turned clockwise off 12
+    /// (0 = home, timer off). Set by circular-dragging the bezel ring; the
+    /// host owns the grab, this is just the resting offset.
+    bezel_min: u8 = 0,
+    /// monoMs() deadline the countdown fires at, 0 = disarmed. Runtime
+    /// state only — never persisted, a restart clears it.
+    timer_end_ms: i64 = 0,
 
     /// Six repaints a second = six beats (21,600 vibrations/hour).
     pub const interval_ms: i64 = 167; // six beats per second (21,600 vph)
@@ -2177,13 +2187,81 @@ pub const WatchWidget = struct {
     const DEG = std.math.pi / 180.0;
 
     pub fn tick(self: *WatchWidget) bool {
-        _ = self;
+        self.pollTimer(monoMs());
         return true; // the hands move on every beat — always repaint
     }
 
-    /// Click the watch to swap the dial (the host repaints after any click).
+    /// Click the dial to swap it (the host repaints after any click).
+    /// A press that starts on the bezel ring never reaches here — the host
+    /// consumes it as a bezel turn (see tryStartBezel in main.zig).
     pub fn click(self: *WatchWidget) void {
         self.dial = (self.dial + 1) % 2;
+    }
+
+    /// Dial center in the same tile-local coordinates paint uses.
+    pub fn dialCenter(r: Rect) [2]f64 {
+        return .{
+            @as(f64, @floatFromInt(r.x)) + @as(f64, WATCH_W) / 2.0,
+            @as(f64, @floatFromInt(r.y)) + @as(f64, WATCH_H) / 2.0,
+        };
+    }
+
+    /// True when (px, py) lands on the bezel ring (insert + knurled flank).
+    pub fn bezelHit(r: Rect, px: i32, py: i32) bool {
+        const ctr = dialCenter(r);
+        const dx = @as(f64, @floatFromInt(px)) - ctr[0];
+        const dy = @as(f64, @floatFromInt(py)) - ctr[1];
+        const dist = @sqrt(dx * dx + dy * dy);
+        return dist >= 56.0 and dist <= 89.0;
+    }
+
+    /// Pointer angle about the dial center: 0 at 12, growing clockwise
+    /// (matches radial()). Undefined at the exact center — callers skip
+    /// tiny radii.
+    pub fn pointerAngle(r: Rect, px: i32, py: i32) f64 {
+        const ctr = dialCenter(r);
+        const dx = @as(f64, @floatFromInt(px)) - ctr[0];
+        const dy = @as(f64, @floatFromInt(py)) - ctr[1];
+        return std.math.atan2(dx, -dy);
+    }
+
+    /// Fold a grab-relative turn (radians, clockwise positive) into the
+    /// resting offset: 1 minute per 6°, clamped 0..59 so an armed timer
+    /// always shows the pip visibly off 12. Returns true when it moved.
+    pub fn turnBezel(self: *WatchWidget, base: u8, accum_rad: f64) bool {
+        const mins = @as(f64, @floatFromInt(base)) + accum_rad * 180.0 / std.math.pi / 6.0;
+        const clamped: u8 = @intCast(std.math.clamp(@as(i64, @intFromFloat(@round(mins))), 0, 59));
+        if (clamped == self.bezel_min) return false;
+        self.bezel_min = clamped;
+        return true;
+    }
+
+    /// Button released after a bezel turn: arm the countdown, or clear it
+    /// when the pip came home to 12.
+    pub fn releaseBezel(self: *WatchWidget, now_ms: i64) void {
+        if (self.bezel_min == 0) {
+            self.timer_end_ms = 0;
+            return;
+        }
+        self.timer_end_ms = now_ms + @as(i64, self.bezel_min) * 60_000;
+        logging.step("watch: timer armed for {d} min", .{self.bezel_min});
+    }
+
+    /// Countdown expiry check for tick(): fires once — notify-send plus the
+    /// freedesktop alarm sound — and snaps the bezel home.
+    fn pollTimer(self: *WatchWidget, now_ms: i64) void {
+        if (self.timer_end_ms == 0 or now_ms < self.timer_end_ms) return;
+        const mins = self.bezel_min;
+        self.timer_end_ms = 0;
+        self.bezel_min = 0;
+        logging.step("watch: timer done ({d} min)", .{mins});
+        var nb: [256]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(
+            &nb,
+            "notify-send -a simpbar -u critical 'Timer done' '{d}-minute timer up' && canberra-gtk-play -f /usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga 2>/dev/null || paplay /usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga 2>/dev/null || true",
+            .{mins},
+        ) catch return;
+        spawnDetached(msg);
     }
 
     /// Radial unit direction for angle `a` in radians: 0 = 12 o'clock,
@@ -2288,6 +2366,8 @@ pub const WatchWidget = struct {
 
         // Bezel minute ticks — every minute for the first quarter like the
         // real insert, fives elsewhere — skipping the numeral/triangle spots.
+        // The whole insert rides `bez_off`: the turned offset in radians.
+        const bez_off = @as(f64, @floatFromInt(self.bezel_min)) * 6.0 * DEG;
         var i: u32 = 0;
         while (i < 60) : (i += 1) {
             const a_deg: i32 = @intCast(i * 6);
@@ -2295,7 +2375,7 @@ pub const WatchWidget = struct {
                 @abs(a_deg - 180) < 10 or @abs(a_deg - 240) < 10 or @abs(a_deg - 300) < 10;
             const near_pip = a_deg < 10 or a_deg > 350;
             if (near_num or near_pip) continue;
-            const a = @as(f64, @floatFromInt(i)) * 6.0 * DEG;
+            const a = @as(f64, @floatFromInt(i)) * 6.0 * DEG + bez_off;
             if (i % 5 == 0) {
                 baton(c, cx, cy, a, 72.5, 77.5, 2.0, 2.2, P.bezel_text);
             } else if (i <= 15) {
@@ -2303,18 +2383,20 @@ pub const WatchWidget = struct {
             }
         }
 
-        // Triangle pip at 12 on the bezel, apex toward the dial.
+        // Triangle pip at 12 on the bezel, apex toward the dial. Rides the
+        // bezel offset like the rest of the insert.
         {
+            const pd = radial(bez_off);
             const t_out = [3]Canvas.FPt{
-                at(cx, cy, 0, -1, 77.5, -4.5),
-                at(cx, cy, 0, -1, 77.5, 4.5),
-                at(cx, cy, 0, -1, 63.0, 0),
+                at(cx, cy, pd[0], pd[1], 77.5, -4.5),
+                at(cx, cy, pd[0], pd[1], 77.5, 4.5),
+                at(cx, cy, pd[0], pd[1], 63.0, 0),
             };
             c.fillConvex(&t_out, P.bezel_text);
             const t_in = [3]Canvas.FPt{
-                at(cx, cy, 0, -1, 75.5, -2.6),
-                at(cx, cy, 0, -1, 75.5, 2.6),
-                at(cx, cy, 0, -1, 65.5, 0),
+                at(cx, cy, pd[0], pd[1], 75.5, -2.6),
+                at(cx, cy, pd[0], pd[1], 75.5, 2.6),
+                at(cx, cy, pd[0], pd[1], 65.5, 0),
             };
             c.fillConvex(&t_in, P.lume);
         }
@@ -2328,7 +2410,7 @@ pub const WatchWidget = struct {
             .{ .deg = 300, .label = "50" },
         };
         for (numerals) |n| {
-            const d = radial(n.deg * DEG);
+            const d = radial(n.deg * DEG + bez_off);
             const px = cx + d[0] * 68.5;
             const py = cy + d[1] * 68.5;
             const tw = c.textWidth(n.label);
@@ -2523,3 +2605,49 @@ pub const Widget = union(WidgetId) {
         }
     }
 };
+
+// --- bezel-timer math tests ------------------------------------------------
+// Run from simpbar-shell/ with:
+//   zig test --dep font --dep logging --dep art -Mroot=src/widgets.zig
+//     -Mfont=../simpbar/src/font.zig -Mlogging=../simpbar/src/logging.zig
+//     -Mart=src/art.zig -I../simpbar/src -I/usr/include/freetype2
+//     -I/usr/include/libpng16 -lfreetype -lc
+// (freetype headers are for font.zig's @cImport; the tests below never
+// touch the font).
+
+test "watch bezel hit ring" {
+    const r = Rect{ .x = 840, .y = 12, .w = 190, .h = 200 }; // cx=935, cy=112
+    // On the ring at 12, 3, 6, 9 (r 60..79).
+    try std.testing.expect(WatchWidget.bezelHit(r, 935, 112 - 70));
+    try std.testing.expect(WatchWidget.bezelHit(r, 935 + 70, 112));
+    try std.testing.expect(WatchWidget.bezelHit(r, 935, 112 + 70));
+    try std.testing.expect(WatchWidget.bezelHit(r, 935 - 70, 112));
+    // Dial center and far outside are not bezel.
+    try std.testing.expect(!WatchWidget.bezelHit(r, 935, 112));
+    try std.testing.expect(!WatchWidget.bezelHit(r, 935, 112 - 40));
+    try std.testing.expect(!WatchWidget.bezelHit(r, 0, 0));
+}
+
+test "watch pointer angle quadrants" {
+    const r = Rect{ .x = 840, .y = 12, .w = 190, .h = 200 };
+    const eps = 1e-9;
+    try std.testing.expect(@abs(WatchWidget.pointerAngle(r, 935, 112 - 50) - 0.0) < eps); // 12
+    try std.testing.expect(@abs(WatchWidget.pointerAngle(r, 935 + 50, 112) - std.math.pi / 2.0) < eps); // 3
+    try std.testing.expect(@abs(WatchWidget.pointerAngle(r, 935, 112 + 50) - std.math.pi) < eps); // 6
+    try std.testing.expect(@abs(WatchWidget.pointerAngle(r, 935 - 50, 112) + std.math.pi / 2.0) < eps); // 9
+}
+
+test "watch bezel turn quantize + clamp" {
+    var w = WatchWidget{};
+    const sixth = std.math.pi / 30.0; // 6° in radians
+    // A clockwise 30° turn from home = 5 minutes.
+    try std.testing.expect(w.turnBezel(0, sixth * 5));
+    try std.testing.expectEqual(@as(u8, 5), w.bezel_min);
+    // Same input twice: second call reports no movement.
+    try std.testing.expect(!w.turnBezel(0, sixth * 5));
+    // Counter-clockwise past home clamps at 0, clockwise past the top at 59.
+    try std.testing.expect(w.turnBezel(5, -sixth * 10));
+    try std.testing.expectEqual(@as(u8, 0), w.bezel_min);
+    try std.testing.expect(w.turnBezel(0, sixth * 100));
+    try std.testing.expectEqual(@as(u8, 59), w.bezel_min);
+}
