@@ -19,7 +19,7 @@ const font_mod = @import("font");
 const art_mod = @import("art");
 const logging = @import("logging");
 
-pub const WidgetId = enum { clock, weather, media, system, calendar, watch, note1, note2, note3 };
+pub const WidgetId = enum { clock, weather, media, system, calendar, watch, note1 };
 
 /// Axis-aligned rect in surface coordinates. The host keeps one per widget
 /// (measured from the font at startup, placed from config).
@@ -115,8 +115,8 @@ pub fn cardSizeFor(id: WidgetId, font: *const font_mod.Font) [2]u32 {
         .media => .{ @intCast(MEDIA_W), @intCast(2 * CARD_PAD + MEDIA_COVER + MEDIA_HEAD_GAP + MEDIA_PROG_H + MEDIA_TIME_GAP + lh + MEDIA_CTRL_GAP + lh) },
         .system => .{ 190, @intCast(2 * CARD_PAD + 3 * lh + 2 * ROW_GAP + 2 * BAR_H) },
         .calendar => .{ @intCast(CAL_W), @intCast(2 * CARD_PAD + 3 * lh + CAL_HEAD_GAP + CAL_WD_GAP + CAL_ROWS * CAL_CELL_H + CAL_FOOT_GAP) },
-        // Sticky notes: a text card, tall enough for six wrapped lines.
-        .note1, .note2, .note3 => .{ @intCast(NoteWidget.NOTE_W), @intCast(2 * CARD_PAD + NoteWidget.VISIBLE_LINES * lh) },
+        // Sticky note: a text card, tall enough for six wrapped lines.
+        .note1 => .{ @intCast(NoteWidget.NOTE_W), @intCast(2 * CARD_PAD + NoteWidget.VISIBLE_LINES * lh) },
         // Fixed-size: the watch is drawn from its own geometry, not the font.
         .watch => .{ @intCast(WATCH_W), @intCast(WATCH_H) },
     };
@@ -2517,11 +2517,10 @@ pub const WatchWidget = struct {
 // --- sticky notes (KDE-Plasma style) --------------------------------------
 
 /// A note card holds plain text you type straight into the desktop widget.
-/// Each slot persists to ~/.config/simpbar/notes/note{N}.txt and reloads at
+/// The slot persists to ~/.config/simpbar/notes/note1.txt and reloads at
 /// startup, so a note lives until you erase its text — empty text is an
 /// empty note, never a missing one. There are no add/delete buttons: the
-/// three slots are ordinary config widgets, and "deleting" is clearing the
-/// buffer.
+/// note is an ordinary config widget, and "deleting" is clearing the buffer.
 ///
 /// Editing is whole-process single-slot: the host sets `edit_index` when a
 /// note card is clicked ([on_demand] keyboard interactivity grants focus),
@@ -2979,8 +2978,6 @@ pub const Widget = union(WidgetId) {
     calendar: CalendarWidget,
     watch: WatchWidget,
     note1: NoteWidget,
-    note2: NoteWidget,
-    note3: NoteWidget,
 
     pub fn intervalMs(self: Widget) i64 {
         return switch (self) {
@@ -2990,7 +2987,7 @@ pub const Widget = union(WidgetId) {
             .system => SystemWidget.interval_ms,
             .calendar => CalendarWidget.interval_ms,
             // Editing notes blink every half second; idle ones never repaint.
-            .note1, .note2, .note3 => |n| if (n.editing) NoteWidget.interval_ms else NoteWidget.idle_interval_ms,
+            .note1 => |n| if (n.editing) NoteWidget.interval_ms else NoteWidget.idle_interval_ms,
             .watch => WatchWidget.interval_ms,
         };
     }
@@ -3017,7 +3014,7 @@ pub const Widget = union(WidgetId) {
             .calendar => |*k| blk: {
                 break :blk k.tick();
             },
-            .note1, .note2, .note3 => |*n| blk: {
+            .note1 => |*n| blk: {
                 break :blk n.tick();
             },
             .watch => |*w| blk: {
@@ -3056,7 +3053,7 @@ pub const Widget = union(WidgetId) {
             .media => |*m| m.clickAt(r, font, x, y),
             .system => |s| s.click(),
             .calendar => |*k| k.clickAt(r, font, x, y),
-            .note1, .note2, .note3 => |*n| n.clickAt(r, font, x, y),
+            .note1 => |*n| n.clickAt(r, font, x, y),
             .watch => |*w| w.click(),
         }
     }
@@ -3069,7 +3066,7 @@ pub const Widget = union(WidgetId) {
             .media => |w| w.paint(c, r),
             .system => |w| w.paint(c, r),
             .calendar => |w| w.paint(c, r),
-            .note1, .note2, .note3 => |n| n.paint(c, r),
+            .note1 => |n| n.paint(c, r),
             .watch => |w| w.paint(c, r),
         }
     }
@@ -3080,8 +3077,6 @@ pub const Widget = union(WidgetId) {
 pub fn noteSlot(w: *const Widget) ?u8 {
     return switch (w.*) {
         .note1 => 1,
-        .note2 => 2,
-        .note3 => 3,
         else => null,
     };
 }

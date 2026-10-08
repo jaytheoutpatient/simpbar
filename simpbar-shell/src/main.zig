@@ -25,7 +25,7 @@ pub const panic = std.debug.FullPanic(logging.panicHandler);
 const MAX_OUTPUTS: usize = 8;
 // 6 base widgets + 3 sticky notes = 9 ≤ 12. Only bits tell you a tile is
 // stale, without scanning every widget for changes.
-const MAX_WIDGETS: usize = 12;
+const MAX_WIDGETS: usize = 8;
 const FONT_PIXEL_SIZE: u32 = 13;
 const BTN_LEFT: u32 = 0x110;
 
@@ -99,11 +99,10 @@ const DEFAULT_WIDGETS = [_]WidgetCfg{
     // Calendar below the stack (≈ 215px tall); drag anywhere with
     // Ctrl+left-click once running.
     .{ .id = .calendar, .x = 24, .y = 470 },
-    // Sticky notes along the middle-left, clear of the watch (right) and the
-    // weather/media/calendar stack (left column) at the 13px default font.
+    // The single sticky note along the middle-left, clear of the watch
+    // (right) and the weather/media/calendar stack (left column) at the
+    // 13px default font. Drag it anywhere with Ctrl+left-click.
     .{ .id = .note1, .x = 24, .y = 700 },
-    .{ .id = .note2, .x = 264, .y = 700 },
-    .{ .id = .note3, .x = 504, .y = 700 },
     // The analog watch stands alone on the right — it draws its own steel
     // case instead of a frosted card.
     .{ .id = .watch, .x = 1711, .y = 24 },
@@ -419,8 +418,6 @@ fn initWidgets(host: *Host, cfg: ShellConfig) void {
             .system => .{ .system = .{} },
             .calendar => .{ .calendar = .{} },
             .note1 => .{ .note1 = .{} },
-            .note2 => .{ .note2 = .{} },
-            .note3 => .{ .note3 = .{} },
             .watch => .{ .watch = .{} },
         };
         if (wc.id == .calendar) {
@@ -430,10 +427,8 @@ fn initWidgets(host: *Host, cfg: ShellConfig) void {
                 cfg.holiday_region,
             );
         } else switch (wc.id) {
-            // Sticky notes load their text (possibly empty) from disk.
+            // Sticky note loads its text (possibly empty) from disk.
             .note1 => host.widgets[host.widget_count].note1.configure(notes_dir_path, 1),
-            .note2 => host.widgets[host.widget_count].note2.configure(notes_dir_path, 2),
-            .note3 => host.widgets[host.widget_count].note3.configure(notes_dir_path, 3),
             else => {},
         }
         host.widget_rects[host.widget_count] = .{
@@ -785,6 +780,7 @@ fn pointerButton(host: *Host, btn: u32, pressed: bool) void {
         // is a move when Ctrl is known (see tryStartDrag) or a click on
         // release.
         if (!tryStartBezel(host)) tryStartDrag(host);
+        logging.step("ptr: press hovered={?} ctrl={}", .{ host.hovered_index, host.ctrl_down });
     } else {
         host.left_down = false;
         if (host.drag_index != null) {
@@ -808,6 +804,7 @@ fn pointerButton(host: *Host, btn: u32, pressed: bool) void {
                     host.edit_index = i;
                     reschedule(host, i);
                 }
+                logging.step("ptr: click idx={d} edit={?}", .{ i, host.edit_index });
                 markDirty(host, i); // widgets flip state on click
             }
         }
@@ -926,15 +923,19 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, host: *Host) void
         },
         // The compositor always follows enter with a modifiers event, so
         // focus changes need no handling of their own.
-        .enter => {},
+        .enter => logging.step("kb: focus enter", .{}),
         .leave => {
+            logging.step("kb: focus leave", .{});
             host.ctrl_down = false;
             host.repeat_key = null;
             // Editing a note then clicking a window (our surface loses the
             // on_demand focus) commits it, Plasma-style.
             endEdit(host);
         },
-        .key => |e| onKeyboardKey(host, e.key, e.state == .pressed),
+        .key => |e| {
+            logging.step("kb: ev key={d} {s} edit={?}", .{ e.key, if (e.state == .pressed) "down" else "up", host.edit_index });
+            onKeyboardKey(host, e.key, e.state == .pressed);
+        },
         .modifiers => |e| {
             // Control is real-mod index 2 in the depressed mask.
             const ctrl = e.mods_depressed & (1 << 2) != 0;
@@ -976,9 +977,10 @@ fn keyPress(host: *Host, keycode: u32) void {
     var utf32: u32 = 0;
     if (g_xkb_state) |st| utf32 = xkb.xkb_state_key_get_utf32(st, keycode + 8);
     const res = switch (host.widgets[i]) {
-        .note1, .note2, .note3 => |*n| n.keyPress(widgets_mod.FontMeasure{ .font = host.font }, noteMaxW(host, i), keycode, utf32),
+        .note1 => |*n| n.keyPress(widgets_mod.FontMeasure{ .font = host.font }, noteMaxW(host, i), keycode, utf32),
         else => .ignored,
     };
+    logging.step("kb: key={d} U+{x:0>4} edit={d} -> {s}", .{ keycode, utf32, i, @tagName(res) });
     switch (res) {
         .ignored => {},
         .handled => {
@@ -1024,7 +1026,7 @@ fn endEdit(host: *Host) void {
     host.repeat_key = null;
     host.repeat_next_ms = 0;
     switch (host.widgets[i]) {
-        .note1, .note2, .note3 => |*n| {
+        .note1 => |*n| {
             n.commit();
             n.endEditing();
         },
