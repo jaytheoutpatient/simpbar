@@ -136,7 +136,7 @@ pub const Canvas = struct {
     /// Straight-alpha OVER blend of a 0xAARRGGBB src onto dst, preserving
     /// dst alpha — cards are translucent, so glyph coverage must composite
     /// instead of assuming an opaque backdrop like the bar can.
-    fn blendOver(dst: u32, src: u32) u32 {
+    pub fn blendOver(dst: u32, src: u32) u32 {
         const sa: u32 = (src >> 24) & 0xFF;
         if (sa == 255) return src;
         if (sa == 0) return dst;
@@ -468,7 +468,7 @@ const libc_proc = struct {
 
 /// Runs `command` through `sh -c`, detached via the standard double-fork so
 /// it survives us and doesn't leave a zombie.
-fn spawnDetached(command: [:0]const u8) void {
+pub fn spawnDetached(command: [:0]const u8) void {
     const pid = libc_proc.fork();
     if (pid < 0) return;
     if (pid == 0) {
@@ -784,7 +784,7 @@ fn monoMs() i64 {
 
 /// Truncates `text` with an ellipsis so it fits `max_w`, writing into `dst`
 /// (which must hold text.len + 3). Returns the slice to draw.
-fn fitText(c: Canvas, text: []const u8, max_w: i64, dst: []u8) []const u8 {
+pub fn fitText(c: Canvas, text: []const u8, max_w: i64, dst: []u8) []const u8 {
     if (c.textWidth(text) <= max_w) return text;
     const ell: []const u8 = "\u{2026}";
     const ell_w = c.textWidth(ell);

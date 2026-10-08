@@ -19,6 +19,7 @@ const zwlr = wayland.client.zwlr;
 const font_mod = @import("font");
 const logging = @import("logging");
 const widgets_mod = @import("widgets");
+const overview_mod = @import("overview");
 
 pub const panic = std.debug.FullPanic(logging.panicHandler);
 
@@ -62,6 +63,7 @@ const JsonConfig = struct {
     card_corner_radius: ?u32 = null,
     holiday_country: ?[]const u8 = null,
     holiday_region: ?[]const u8 = null,
+    overview_favorites: ?[]const []const u8 = null,
     widgets: ?[]const JsonWidgetCfg = null,
 };
 
@@ -85,6 +87,9 @@ const ShellConfig = struct {
     corner_radius: u32 = 12,
     holiday_country: []const u8 = "AU",
     holiday_region: []const u8 = "",
+    /// Overview dash launch commands (shell.json `overview_favorites`).
+    fav_cmds: [overview_mod.MAX_FAVS][]const u8 = undefined,
+    fav_count: usize = 0,
     widget_cfgs: [MAX_WIDGETS]WidgetCfg = undefined,
     widget_count: usize = 0,
 };
@@ -199,6 +204,9 @@ fn loadConfig(gpa: std.mem.Allocator) ShellConfig {
     var cfg = ShellConfig{};
     for (DEFAULT_WIDGETS, 0..) |dw, i| cfg.widget_cfgs[i] = dw;
     cfg.widget_count = DEFAULT_WIDGETS.len;
+    // Dash defaults until shell.json lists its own overview_favorites.
+    for (overview_mod.DEFAULT_FAVS, 0..) |f, i| cfg.fav_cmds[i] = f;
+    cfg.fav_count = overview_mod.DEFAULT_FAVS.len;
     g_shell_cfg = cfg;
     if (shell_config_path.len == 0) return cfg;
 
@@ -231,6 +239,18 @@ fn loadConfig(gpa: std.mem.Allocator) ShellConfig {
         if (hc.len > 0) cfg.holiday_country = hc;
     }
     if (parsed.holiday_region) |hr| cfg.holiday_region = hr;
+    if (parsed.overview_favorites) |fs| {
+        // An explicit list replaces the defaults entirely (including an
+        // explicit empty list = no dash). Strings are alloc_always, so they
+        // live for the process — saveConfig round-trips them later.
+        var n: usize = 0;
+        for (fs) |f| {
+            if (f.len == 0 or n >= overview_mod.MAX_FAVS) continue;
+            cfg.fav_cmds[n] = f;
+            n += 1;
+        }
+        cfg.fav_count = n;
+    }
     if (parsed.widgets) |ws| {
         if (ws.len == 0) {
             cfg.widget_count = 0; // explicit empty list = all widgets off
@@ -305,11 +325,16 @@ const Globals = struct {
     compositor: ?*wl.Compositor = null,
     shm: ?*wl.Shm = null,
     layer_shell: ?*zwlr.LayerShellV1 = null,
+    /// zwlr_screencopy_manager_v1 (bound at v1, see overview.zig): the
+    /// overview's real window thumbnails. Absent on compositors without it
+    /// — the overview falls back to icon cards.
+    screencopy: ?*zwlr.ScreencopyManagerV1 = null,
     seat: ?*wl.Seat = null,
     seat_has_pointer: bool = false,
     seat_has_keyboard: bool = false,
-    output_count: usize = 0,
-    outputs: [MAX_OUTPUTS]*wl.Output = undefined,
+    /// Outputs + their wl_output.name (v4) — the names tie hyprctl's JSON
+    /// ("focused monitor") to a real wl_output for screencopy/layer mapping.
+    outputs: overview_mod.OutputSet = .{},
 };
 
 fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *Globals) void {
@@ -327,9 +352,14 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.seat = seat;
                 seat.setListener(*Globals, seatListener, globals);
             } else if (std.mem.eql(u8, iface, "wl_output")) {
-                if (globals.output_count >= globals.outputs.len) return;
-                globals.outputs[globals.output_count] = registry.bind(g.name, wl.Output, 4) catch return;
-                globals.output_count += 1;
+                const output = registry.bind(g.name, wl.Output, 4) catch return;
+                const slot = globals.outputs.add(output) orelse return;
+                output.setListener(*overview_mod.OutputSet.Slot, overview_mod.OutputSet.listener, slot);
+            } else if (std.mem.eql(u8, iface, "zwlr_screencopy_manager_v1")) {
+                // v1 is all the overview needs (buffer/copy/ready/failed),
+                // and skipping v3's buffer_done handshake keeps the capture
+                // state machine trivial — bind below whatever's advertised.
+                globals.screencopy = registry.bind(g.name, zwlr.ScreencopyManagerV1, @min(g.version, 1)) catch return;
             }
         },
         .global_remove => {},
@@ -406,6 +436,13 @@ const Host = struct {
     bezel_base: u8 = 0,
     bezel_last_a: f64 = 0,
     bezel_accum: f64 = 0,
+    // Overview mode (Alt+W): a second layer surface on the overlay layer,
+    // created on open and destroyed on close. Null when construction
+    // failed — that degrades the feature, never the shell.
+    overview: ?*overview_mod.Overview = null,
+    /// True while pointer focus sits on the overview surface rather than a
+    /// desktop surface (routes motion/clicks there instead of widgets).
+    pointer_over_ov: bool = false,
 };
 
 fn initWidgets(host: *Host, cfg: ShellConfig) void {
@@ -523,7 +560,17 @@ fn saveConfig(host: *Host) void {
     const country_esc = jsonEscape(g_shell_cfg.holiday_country, &esc) orelse return;
     if (!w.appendFmt("  \"holiday_country\": \"{s}\",\n", .{country_esc})) return;
     const region_esc = jsonEscape(g_shell_cfg.holiday_region, &esc) orelse return;
-    if (!w.appendFmt("  \"holiday_region\": \"{s}\",\n  \"widgets\": [\n", .{region_esc})) return;
+    if (!w.appendFmt("  \"holiday_region\": \"{s}\",\n", .{region_esc})) return;
+    // overview_favorites round-trips too — saveConfig must not drop keys it
+    // didn't just write (that's the whole round-trip contract here).
+    if (!w.append("  \"overview_favorites\": [")) return;
+    for (0..g_shell_cfg.fav_count) |i| {
+        const fav_esc = jsonEscape(g_shell_cfg.fav_cmds[i], &esc) orelse return;
+        const tail: []const u8 = if (i + 1 == g_shell_cfg.fav_count) "],\n" else ", ";
+        if (!w.appendFmt("\"{s}\"{s}", .{ fav_esc, tail })) return;
+    }
+    if (g_shell_cfg.fav_count == 0 and !w.append("],\n")) return;
+    if (!w.append("  \"widgets\": [\n")) return;
     for (0..host.widget_count) |i| {
         const id = std.meta.activeTag(host.widgets[i]);
         const r = host.widget_rects[i];
@@ -713,6 +760,15 @@ fn updateHover(host: *Host) bool {
 fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
     switch (event) {
         .enter => |e| {
+            if (host.overview) |ov| {
+                if (ov.surface == e.surface) {
+                    host.pointer_over_ov = true;
+                    host.pointer_desktop = null;
+                    ov.motion(e.surface_x.toInt(), e.surface_y.toInt());
+                    return;
+                }
+            }
+            host.pointer_over_ov = false;
             for (0..host.desktop_count) |i| {
                 if (host.desktops[i].surface == e.surface) {
                     host.pointer_desktop = i;
@@ -724,6 +780,11 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
             if (updateHover(host)) markAllDirty(host);
         },
         .leave => {
+            if (host.pointer_over_ov) {
+                host.pointer_over_ov = false;
+                if (host.overview) |ov| ov.leave();
+                return;
+            }
             host.pointer_desktop = null;
             // While a button is held the implicit grab keeps events flowing,
             // so a leave during a drag shouldn't (and normally can't) happen.
@@ -733,6 +794,10 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
             }
         },
         .motion => |e| {
+            if (host.pointer_over_ov) {
+                if (host.overview) |ov| ov.motion(e.surface_x.toInt(), e.surface_y.toInt());
+                return;
+            }
             host.pointer_x = e.surface_x.toInt();
             host.pointer_y = e.surface_y.toInt();
             if (host.bezel_index) |i| {
@@ -753,7 +818,13 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
                 host.needs_repaint = true;
             } else if (updateHover(host)) markAllDirty(host);
         },
-        .button => |e| pointerButton(host, e.button, e.state == .pressed),
+        .button => |e| {
+            if (host.pointer_over_ov) {
+                if (host.overview) |ov| ov.button(e.button, e.state == .pressed);
+                return;
+            }
+            pointerButton(host, e.button, e.state == .pressed);
+        },
         .frame => {},
         .axis => {},
         .axis_source => {},
@@ -892,24 +963,42 @@ fn endDrag(host: *Host) void {
 fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, host: *Host) void {
     switch (event) {
         .keymap => |e| {
+            logging.step("kb: keymap event format={s} size={d}", .{ @tagName(e.format), e.size });
             // The keymap fd is ours to close once received (spec) — do that
             // no matter how far decoding gets.
             defer _ = posix.system.close(e.fd);
-            if (e.format != .xkb_v1) return;
+            if (e.format != .xkb_v1) {
+                logging.warn("kb: keymap format {s} not xkb_v1 — ignoring", .{@tagName(e.format)});
+                return;
+            }
+            // The keymap fd shares its file offset with whoever else holds
+            // the description (the compositor just finished writing it), so
+            // it can arrive sitting at EOF — rewind before reading.
+            _ = std.c.lseek(e.fd, 0, 0); // SEEK_SET
             const size: usize = e.size;
             const buf = host.gpa.alloc(u8, size + 2) catch return;
             defer host.gpa.free(buf);
             var got: usize = 0;
             while (got < size) {
-                const n = posix.read(e.fd, buf[got..size]) catch break;
+                const n = posix.read(e.fd, buf[got..size]) catch |rd_err| {
+                    logging.warn("kb: keymap read error: {}", .{rd_err});
+                    break;
+                };
                 if (n == 0) break;
                 got += n;
             }
-            if (got == 0) return;
+            if (got == 0) {
+                const off = std.c.lseek(e.fd, 0, 1); // SEEK_CUR
+                logging.warn("kb: keymap read 0 bytes (fd={d} size={d} off={d})", .{ e.fd, e.size, off });
+                return;
+            }
             buf[got] = 0; // xkb wants a NUL-terminated string
             if (g_xkb_ctx == null) g_xkb_ctx = xkb.xkb_context_new(xkb.CONTEXT_NO_FLAGS);
             const ctx = g_xkb_ctx orelse return;
-            const km = xkb.xkb_keymap_new_from_string(ctx, buf[0..got:0], xkb.KEYMAP_FORMAT_TEXT_V1, xkb.KEYMAP_COMPILE_NO_FLAGS) orelse return;
+            const km = xkb.xkb_keymap_new_from_string(ctx, buf[0..got:0], xkb.KEYMAP_FORMAT_TEXT_V1, xkb.KEYMAP_COMPILE_NO_FLAGS) orelse {
+                logging.warn("kb: keymap parse failed ({d} bytes read)", .{got});
+                return;
+            };
             const st = xkb.xkb_state_new(km) orelse {
                 xkb.xkb_keymap_unref(km);
                 return;
@@ -967,9 +1056,32 @@ fn keyRelease(host: *Host, keycode: u32) void {
     if (host.repeat_key == keycode) host.repeat_key = null;
 }
 
-/// Routes one keyboard press. Nothing happens unless a note is being edited;
-/// the key is decoded through xkb into UTF-32 and handed to the note editor.
+/// True while a held key should keep synthesizing repeats: a note edit or
+/// the overview's search box currently owns the keyboard.
+fn repeatWanted(host: *Host) bool {
+    if (host.edit_index != null) return true;
+    if (host.overview) |ov| return ov.takesKeys();
+    return false;
+}
+
+/// Routes one keyboard press. The overview owns the keyboard while its
+/// surface is up (exclusive focus for search); otherwise nothing happens
+/// unless a note is being edited. The key is decoded through xkb into
+/// UTF-32 before handing it on.
 fn keyPress(host: *Host, keycode: u32) void {
+    if (host.overview) |ov| {
+        if (ov.takesKeys()) {
+            var ov_utf32: u32 = 0;
+            if (g_xkb_state) |st| ov_utf32 = xkb.xkb_state_key_get_utf32(st, keycode + 8);
+            const ov_handled = ov.keyPress(keycode, ov_utf32, host.ctrl_down);
+            logging.step("kb: ov key={d} U+{x:0>4} ctrl={} handled={}", .{ keycode, ov_utf32, host.ctrl_down, ov_handled });
+            if (ov_handled) armRepeat(host, keycode);
+            return;
+        }
+        if (ov.surface != null) {
+            logging.step("kb: ov drops key={d} (anim not taking keys)", .{keycode});
+        }
+    }
     const i = host.edit_index orelse return;
     // Ctrl chords are ignored while editing (no text shortcuts) — except
     // Esc, which always commits.
@@ -1138,7 +1250,191 @@ fn runSelfTest(host: *Host) void {
     }
 }
 
-pub fn main() !void {
+// --- overview control socket (Alt+W) ---------------------------------------
+//
+// `simpbar-shell overview [toggle|open|close]` connects here. One daemon
+// per XDG_RUNTIME_DIR: a live socket makes the second instance exit
+// quietly (the bind probe below), stale files are unlinked and rebound.
+// Requests are one line ("overview toggle\n"), so accept + a bounded read +
+// reply all happen inside the poll loop — the daemon never blocks on a
+// client, and clients never need to know about Wayland.
+
+const IPC_PATH_LEN = 256;
+
+fn ipcSockPathZ(buf: []u8) ?[:0]const u8 {
+    const dir = std.mem.sliceTo(getenv("XDG_RUNTIME_DIR") orelse return null, 0);
+    return std.fmt.bufPrintZ(buf, "{s}/simpbar-shell.sock", .{dir}) catch null;
+}
+
+fn ipcUnixAddr(path: []const u8) !std.os.linux.sockaddr.un {
+    var addr: std.os.linux.sockaddr.un = .{ .path = undefined };
+    if (path.len >= addr.path.len) return error.PathTooLong;
+    @memset(&addr.path, 0);
+    @memcpy(addr.path[0..path.len], path);
+    return addr;
+}
+
+/// Creates (or takes over) the control socket. `error.AlreadyRunning` means
+/// a live daemon answered the connect probe — main exits 0 on it, which is
+/// what keeps autostart + the Alt+W bind from double-painting the desktop.
+fn ipcListen() !posix.fd_t {
+    var path_buf: [IPC_PATH_LEN]u8 = undefined;
+    const path = ipcSockPathZ(&path_buf) orelse return error.NoRuntimeDir;
+
+    const probe = std.c.socket(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    if (probe >= 0) {
+        const probe_fd: posix.fd_t = @intCast(probe);
+        const probe_addr = try ipcUnixAddr(path);
+        const alive = std.c.connect(probe_fd, @ptrCast(&probe_addr), @sizeOf(std.os.linux.sockaddr.un)) == 0;
+        _ = posix.system.close(probe_fd);
+        if (alive) return error.AlreadyRunning;
+    }
+
+    _ = std.c.unlink(path.ptr); // stale file from a crashed run
+    const raw = std.c.socket(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    if (raw < 0) return error.SocketCreateFailed;
+    const fd: posix.fd_t = @intCast(raw);
+    errdefer _ = posix.system.close(fd);
+    const addr = try ipcUnixAddr(path);
+    if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(std.os.linux.sockaddr.un)) != 0) return error.BindFailed;
+    if (std.c.listen(fd, 4) != 0) return error.ListenFailed;
+    return fd;
+}
+
+/// Handle one control-socket connection: read the request (the client
+/// writes immediately after connect, but the wakeup and that write race —
+/// poll briefly first; requests are <64 bytes so one read is the whole
+/// message) and reply. Static replies, so the client can gate on "ok".
+fn ipcAccept(listen_fd: posix.fd_t, host: *Host) void {
+    const raw = std.c.accept4(
+        listen_fd,
+        null,
+        null,
+        std.os.linux.SOCK.CLOEXEC | std.os.linux.SOCK.NONBLOCK,
+    );
+    if (raw < 0) return;
+    const fd: posix.fd_t = @intCast(raw);
+    defer _ = posix.system.close(fd);
+
+    var pfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    _ = posix.poll(&pfds, 200) catch 0;
+    if (pfds[0].revents & posix.POLL.IN == 0) return;
+
+    var buf: [256]u8 = undefined;
+    const n = std.c.read(fd, &buf, buf.len);
+    if (n <= 0) return;
+    const reply = ipcHandle(host, buf[0..@intCast(n)]);
+    _ = std.c.write(fd, reply.ptr, reply.len);
+}
+
+fn ipcHandle(host: *Host, data: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, data, " \t\r\n");
+    var it = std.mem.splitScalar(u8, trimmed, ' ');
+    const head = it.next() orelse return "err empty\n";
+    if (!std.mem.eql(u8, head, "overview")) return "err unknown command\n";
+    const verb = it.next() orelse "toggle";
+    const ov = host.overview orelse return "err overview unavailable\n";
+    if (std.mem.eql(u8, verb, "open")) {
+        return if (ov.open()) "ok\n" else "err open failed\n";
+    } else if (std.mem.eql(u8, verb, "close")) {
+        ov.close();
+        return "ok\n";
+    } else if (std.mem.eql(u8, verb, "toggle")) {
+        return if (ov.toggle()) "ok\n" else "err toggle failed\n";
+    }
+    return "err unknown action\n";
+}
+
+fn cliPrint(fd: c_int, msg: []const u8) void {
+    _ = std.c.write(fd, msg.ptr, msg.len);
+}
+
+/// Client side of the control socket: send, print the daemon's reply,
+/// exit 0 when it starts with "ok". Never returns.
+fn cliOverview(action: []const u8) noreturn {
+    if (!std.mem.eql(u8, action, "toggle") and
+        !std.mem.eql(u8, action, "open") and
+        !std.mem.eql(u8, action, "close"))
+    {
+        cliPrint(2, "usage: simpbar-shell overview [toggle|open|close]\n");
+        std.process.exit(2);
+    }
+    var path_buf: [IPC_PATH_LEN]u8 = undefined;
+    const path = ipcSockPathZ(&path_buf) orelse {
+        cliPrint(2, "simpbar-shell: XDG_RUNTIME_DIR not set\n");
+        std.process.exit(1);
+    };
+    const raw = std.c.socket(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    if (raw < 0) {
+        cliPrint(2, "simpbar-shell: socket() failed\n");
+        std.process.exit(1);
+    }
+    const fd: posix.fd_t = @intCast(raw);
+    const addr = ipcUnixAddr(path) catch {
+        _ = posix.system.close(fd);
+        cliPrint(2, "simpbar-shell: control path too long\n");
+        std.process.exit(1);
+    };
+    if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.os.linux.sockaddr.un)) != 0) {
+        _ = posix.system.close(fd);
+        cliPrint(2, "simpbar-shell: no running instance (start simpbar-shell first)\n");
+        std.process.exit(1);
+    }
+
+    var msg_buf: [64]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "overview {s}\n", .{action}) catch unreachable;
+    var off: usize = 0;
+    while (off < msg.len) {
+        const n = std.c.write(fd, msg[off..].ptr, msg.len - off);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+
+    // The daemon replies then closes, so read until EOF (it always answers
+    // or drops the connection — no hang risk beyond the daemon's own).
+    var reply: [512]u8 = undefined;
+    var got: usize = 0;
+    while (got < reply.len) {
+        const n = std.c.read(fd, reply[got..].ptr, reply.len - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    _ = posix.system.close(fd);
+
+    if (got == 0) {
+        cliPrint(2, "simpbar-shell: no reply from the running instance\n");
+        std.process.exit(1);
+    }
+    const out: []const u8 = reply[0..got];
+    if (std.mem.startsWith(u8, out, "ok")) {
+        cliPrint(1, out);
+        std.process.exit(0);
+    }
+    cliPrint(2, out);
+    std.process.exit(1);
+}
+
+pub fn main(init: std.process.Init.Minimal) !void {
+    // Client mode: `simpbar-shell overview [toggle|open|close]` sends the
+    // verb to the running daemon over its control socket and prints the
+    // reply — this is exactly what Alt+W runs (see hyprland.lua). Anything
+    // else as a first argument is a typo, not a daemon start.
+    var args_it = std.process.Args.Iterator.init(init.args);
+    _ = args_it.next(); // argv[0]
+    if (args_it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "overview")) {
+            cliOverview(args_it.next() orelse "toggle");
+        }
+        var ubuf: [256]u8 = undefined;
+        const usage = std.fmt.bufPrint(
+            &ubuf,
+            "simpbar-shell: unknown command \"{s}\"\nusage: simpbar-shell [overview [toggle|open|close]]\n",
+            .{arg},
+        ) catch "simpbar-shell: unknown command\n";
+        cliPrint(2, usage);
+        std.process.exit(2);
+    }
+
     logging.init("simpbar-shell");
     defer logging.deinit();
     var gpa_state = std.heap.DebugAllocator(.{}){};
@@ -1190,7 +1486,34 @@ pub fn main() !void {
     };
     initWidgets(&host, cfg);
     defer for (host.tiles) |t| if (t) |buf| gpa.free(buf); // leak-check clean
-    logging.step("widgets: {d} placed on {d} output(s)", .{ host.widget_count, globals.output_count });
+    logging.step("widgets: {d} placed on {d} output(s)", .{ host.widget_count, globals.outputs.count });
+
+    // Overview mode (Alt+W): constructed once, surface created/destroyed
+    // per open. Every reference stays valid for the process lifetime (the
+    // Host, the font, the Globals), which the listeners rely on. Failure
+    // degrades to "no overview", never to a dead shell.
+    const ov_ptr = gpa.create(overview_mod.Overview) catch |err| blk: {
+        logging.err("overview: init failed: {}", .{err});
+        break :blk null;
+    };
+    if (ov_ptr) |ov| {
+        ov.* = .{
+            .gpa = gpa,
+            .font = &font,
+            .theme = &host.theme,
+            .compositor = compositor,
+            .shm = shm,
+            .layer_shell = layer_shell,
+            .screencopy = globals.screencopy,
+            .outputs = &globals.outputs,
+            .favs = cfg.fav_cmds[0..cfg.fav_count],
+        };
+        host.overview = ov;
+    }
+    defer if (host.overview) |ov| {
+        ov.deinit();
+        gpa.destroy(ov);
+    };
 
     // One desktop layer surface per output (or a single compositor-picked
     // surface if the registry reported none), anchored edge-to-edge on the
@@ -1199,10 +1522,10 @@ pub fn main() !void {
     // swaybg (every wallpaper change) would bury .background widgets under
     // the new wallpaper surface; .bottom always composites above it while
     // staying below windows and the bar.
-    const desktop_count: usize = if (globals.output_count > 0) globals.output_count else 1;
+    const desktop_count: usize = if (globals.outputs.count > 0) globals.outputs.count else 1;
     for (0..desktop_count) |i| {
         const surface = compositor.createSurface() catch continue;
-        const output: ?*wl.Output = if (i < globals.output_count) globals.outputs[i] else null;
+        const output: ?*wl.Output = if (i < globals.outputs.count) globals.outputs.list[i] else null;
         const layer_surface = layer_shell.getLayerSurface(
             surface,
             output,
@@ -1256,18 +1579,33 @@ pub fn main() !void {
     if (g_selftest) logging.warn("selftest: SIMPBAR_SELFTEST set — note1 will be driven at startup", .{});
     g_st_start_ms = nowMs();
 
-    // One poll slot per widget fetch pipe, after the display fd.
+    // Control socket for `simpbar-shell overview ...` (Alt+W). A live daemon
+    // answering the probe makes this a clean 0-exit; an unusable socket just
+    // logs — the widgets must outlive a broken /run. The selftest runs
+    // alongside a live daemon, so it skips the socket entirely.
+    const ipc_fd: posix.fd_t = if (g_selftest) -1 else ipcListen() catch |err| blk: {
+        if (err == error.AlreadyRunning) {
+            logging.step("ipc: another simpbar-shell holds the control socket — exiting", .{});
+            return;
+        }
+        logging.warn("ipc: no control socket (overview toggle dead): {}", .{err});
+        break :blk -1;
+    };
+
+    // Slot 0: display fd, slot 1: control socket (fixed), slots 2+:
+    // widget fetch pipes (refreshed every loop).
     var poll_fds = [_]posix.pollfd{
         .{ .fd = display.getFd(), .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = ipc_fd, .events = posix.POLL.IN, .revents = 0 },
     } ++ [_]posix.pollfd{.{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }} ** MAX_WIDGETS;
 
     while (true) {
         // Refresh the pipe fds (they change across fetch cycles).
-        for (poll_fds[1..]) |*pf| pf.fd = -1;
+        for (poll_fds[2..]) |*pf| pf.fd = -1;
         for (0..host.widget_count) |i| {
             const widget_fd = host.widgets[i].pollFd();
             if (widget_fd < 0) continue;
-            for (poll_fds[1..]) |*pf| {
+            for (poll_fds[2..]) |*pf| {
                 if (pf.fd < 0) {
                     pf.fd = widget_fd;
                     break;
@@ -1285,12 +1623,18 @@ pub fn main() !void {
         for (0..host.widget_count) |i| {
             next_deadline = @min(next_deadline, host.next_tick_ms[i]);
         }
-        // A held editing key needs its auto-repeat fired on schedule too.
-        if (host.edit_index != null and host.repeat_key != null) {
+        // A held key (note edit, overview search) needs its auto-repeat
+        // fired on schedule too.
+        if (host.repeat_key != null and repeatWanted(&host)) {
             next_deadline = @min(next_deadline, host.repeat_next_ms);
         }
+        // Capture in flight: the screencopy answer (or its timeout) must
+        // wake the loop even with no widget cadence pending.
+        if (host.overview) |ov| {
+            if (ov.deadline()) |d| next_deadline = @min(next_deadline, d);
+        }
         const timeout: i32 = blk: {
-            if (host.widget_count == 0) break :blk -1; // nothing to wake for; wait for events only
+            if (next_deadline == std.math.maxInt(i64)) break :blk -1; // nothing to wake for; wait for events only
             const rel = next_deadline - now;
             break :blk @intCast(@max(@min(rel, std.math.maxInt(i32)), 0));
         };
@@ -1301,8 +1645,9 @@ pub fn main() !void {
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
                 if (display.dispatch() != .SUCCESS) return error.DispatchFailed;
             }
+            if (poll_fds[1].revents & posix.POLL.IN != 0) ipcAccept(ipc_fd, &host);
             var pipe_ready = false;
-            for (poll_fds[1..]) |pf| {
+            for (poll_fds[2..]) |pf| {
                 if (pf.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
                     pipe_ready = true;
                     break;
@@ -1319,6 +1664,18 @@ pub fn main() !void {
 
         // Fire any widget cadences that came due.
         const now2 = nowMs();
+
+        // Overview housekeeping: a screencopy that never answers must not
+        // leave Alt+W silently dead (maps with cards instead), and pointer
+        // focus needs hygiene once the surface is gone — a destroyed
+        // surface isn't guaranteed to produce a leave event, but the flag
+        // must not outlive it or desktop hover would stay routed to
+        // nowhere.
+        if (host.overview) |ov| {
+            ov.pollTimeout(now2);
+            if (ov.anim == .closed and host.pointer_over_ov) host.pointer_over_ov = false;
+        }
+
         for (0..host.widget_count) |i| {
             if (now2 >= host.next_tick_ms[i]) {
                 if (host.widgets[i].tick()) markDirty(&host, i);
@@ -1326,10 +1683,11 @@ pub fn main() !void {
             }
         }
 
-        // Hold-down auto-repeat while editing a note — synthesized from the
-        // compositor's rate/delay so Backspace/arrows/repeated letters feel
-        // like a native editor instead of a per-event text widget.
-        if (host.edit_index != null and host.repeat_key != null and now2 >= host.repeat_next_ms) {
+        // Hold-down auto-repeat while editing a note or the overview search
+        // — synthesized from the compositor's rate/delay so
+        // Backspace/arrows/repeated letters feel like a native editor
+        // instead of a per-event text widget.
+        if (host.repeat_key != null and repeatWanted(&host) and now2 >= host.repeat_next_ms) {
             keyPress(&host, host.repeat_key.?);
             host.repeat_next_ms = now2 + @max(@divTrunc(1000, @max(host.kb_rate, 1)), 10);
         }

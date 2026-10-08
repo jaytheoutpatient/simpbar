@@ -116,6 +116,8 @@ A reminder notifies once at its date minus `lead` days (via `notify-send`), deli
 
 **The sticky note** — one fixed slot (`note1`) lets you type straight onto the desktop, fridge-door style. Click the card and the shell takes the keyboard: it decodes raw evdev keycodes with **xkbcommon** rather than asking for a focused window, so your layout's symbols still land even though no window has focus. **Enter** starts a new line, the arrow keys move the caret (Home/End jump to the line, Up/Down walk to the same column on the wrapped line above/below), and **Escape** saves and exits the field. The note lives in `~/.config/simpbar/notes/note1.txt`, so text survives restarts — the note only dies when you erase its text. Emptying the card and pressing Escape empties the file and the card falls back to a dim "click to type" placeholder, which is what an untouched note shows. Saves also fire when you click away from the card and, while editing, automatically shortly after you stop typing — so a crash can't eat your last sentence. There are no add/remove buttons: one card, always there, Ctrl+dragged like any other.
 
+**Overview mode** — `Alt + W` folds the desktop into a GNOME-Shell-style overview on the focused monitor: windows as a centered grid of **real screenshots**, captured with `zwlr-screencopy` *before* the overlay maps (so the capture never includes the overlay itself), over a dimmed backdrop with the wallpaper still visible behind it — the blur itself comes from a Hyprland layer rule on the surface namespace, and the dim skips the bar strip so the bar stays bright and clickable. Across the top sits a **workspace strip** (live screenshot for the active workspace, mini window schematics for the others) and a **search box** that filters the grid as you type — Escape clears the query first, then closes; arrows/Tab move the selection, Enter focuses it. Along the bottom is a **favorites dash** that launches whatever `overview_favorites` lists in `shell.json`: an array of shell commands, defaulting to `foot`, `firefox`, `dolphin`, `mpv`, `steam` (up to 8). Click a window to focus it, click empty space or Escape to close. The mode runs over a tiny unix-socket control channel, so `simpbar-shell overview toggle|open|close` works from scripts too, and because the surface is created on open and destroyed on close, each open starts from a fresh capture. Compositors without screencopy (or a capture that misses its 600 ms deadline) degrade to icon cards instead of hanging invisible.
+
 ## Wallpapers
 
 The drawer's second tab is a wallpaper picker: a grid of thumbnails of everything in your wallpaper folder, the active one outlined in the accent colour, a **Random** button, and live filtering through the same search box as the app grid. Picking one swaps the wallpaper and re-themes the whole desktop behind the drawer, which stays open on purpose so you can watch the colors change. `appdrawer wallpapers` opens straight onto that tab — which is where the bar's wallpaper button goes.
@@ -209,7 +211,7 @@ There is no widget for this in **simpbar-config**, but it is round-tripped from 
 
 **Bar, compositor & theming**
 - simpbar (this repo's source, built from scratch during install), Hyprland, foot (terminal), rofi with its bundled Material theme, swaync (notifications)
-- simpbar-shell: desktop widget cards (clock/weather/media/system monitor/calendar/analog watch/sticky note) on a layer just above the wallpaper, themed from the same matugen colors (see [Desktop widgets](#desktop-widgets-simpbar-shell))
+- simpbar-shell: desktop widget cards (clock/weather/media/system monitor/calendar/analog watch/sticky note) on a layer just above the wallpaper, themed from the same matugen colors, plus the `Alt + W` overview mode (see [Desktop widgets](#desktop-widgets-simpbar-shell))
 - Dracula GTK theme, Zafiro-Dracula icon theme, Bibata Modern Classic cursor — all applied automatically via nwg-look's settings, no manual toggling needed
 - nwg-drawer, usable from rofi as a fallback app-menu (ArcMenu-style GNOME Shell extensions don't run under Hyprland at all)
 - fastfetch (also wired into every new bash/fish shell)
@@ -284,6 +286,7 @@ pages (Appearance, Modules, Shortcuts).
 | `SUPER + Tab` | Toggle the app drawer |
 | `SUPER + Shift + Tab` | Open the wallpaper picker |
 | `SUPER + W` | Restart the bar |
+| `Alt + W` | Toggle the desktop overview |
 | `SUPER + E` | Open Nautilus |
 | `SUPER + Q` | Exit the focused app |
 | `SUPER + [1–0]` | Switch workspaces |

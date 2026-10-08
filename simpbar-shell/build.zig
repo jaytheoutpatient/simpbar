@@ -19,12 +19,19 @@ pub fn build(b: *Build) !void {
 
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.addCustomProtocol(b.path("protocols/wlr-layer-shell-unstable-v1.xml"));
+    // Screenshot capture for the overview's window thumbnails (vendored
+    // from swaywm/wlr-protocols; Hyprland implements zwlr_screencopy too).
+    scanner.addCustomProtocol(b.path("protocols/wlr-screencopy-unstable-v1.xml"));
 
     scanner.generate("wl_compositor", 4);
     scanner.generate("wl_shm", 1);
     scanner.generate("wl_seat", 7);
     scanner.generate("wl_output", 4);
     scanner.generate("zwlr_layer_shell_v1", 4);
+    // Bound at v1 at runtime (see registryListener): v1 already has the
+    // buffer/copy/ready/failed flow the overview needs, and skipping v3's
+    // buffer_done handshake keeps the capture state machine trivial.
+    scanner.generate("zwlr_screencopy_manager_v1", 3);
     // xdg_wm_base is generated too (the scanner pulls it in for surface
     // role wiring) even though the shell itself never creates an xdg window.
 
@@ -66,6 +73,20 @@ pub fn build(b: *Build) !void {
     art_mod.addIncludePath(b.path("../simpbar/src")); // gdkpixbuf_shim.h lives with the bar's sources
     widgets_mod.addImport("art", art_mod);
 
+    // Overview mode (Alt+W): the second layer surface on the overlay layer,
+    // screencopy thumbnails, hyprctl window/workspace queries. Own module so
+    // main.zig stays the host/wiring file.
+    const overview_mod = b.createModule(.{
+        .root_source_file = b.path("src/overview.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    overview_mod.addImport("wayland", wayland_mod);
+    overview_mod.addImport("font", font_mod);
+    overview_mod.addImport("logging", logging_mod);
+    overview_mod.addImport("widgets", widgets_mod);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -76,6 +97,7 @@ pub fn build(b: *Build) !void {
     exe_mod.addImport("font", font_mod);
     exe_mod.addImport("logging", logging_mod);
     exe_mod.addImport("widgets", widgets_mod);
+    exe_mod.addImport("overview", overview_mod);
     // No EGL/GL stack: everything renders CPU-side into wl_shm ARGB buffers,
     // exactly like the bar.
     exe_mod.linkSystemLibrary("wayland-client", .{});
