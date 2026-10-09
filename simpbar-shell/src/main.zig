@@ -122,6 +122,21 @@ var reminders_path: [:0]const u8 = "";
 var notes_dir_path_buf: [512]u8 = undefined;
 var notes_dir_path: [:0]const u8 = "";
 
+/// SIGUSR1 live-reload flag: matugen's post_hook sends the shell the very
+/// same signal it sends the bar (see [templates.simpbar] in
+/// matugen/config.toml), so a wallpaper change reaches both at once. The
+/// handler only raises this — file I/O is not async-signal-safe — and the
+/// poll loop does the reading. The shell is single-threaded, so a plain flag
+/// is enough here; the bar needs a self-pipe only because it isn't.
+var g_reload_pending = std.atomic.Value(bool).init(false);
+
+fn reloadSignalHandler(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+    _ = sig;
+    _ = info;
+    _ = ctx;
+    g_reload_pending.store(true, .release);
+}
+
 // --- xkbcommon (hand-bound, like everything else in this shell) ------------
 
 // The sticky notes translate compositor key events back into text, and only
@@ -306,6 +321,30 @@ fn tryApplyMatugenColors(gpa: std.mem.Allocator, theme: *widgets_mod.Theme) bool
         theme.holiday_color = parseHexColor(hex) catch theme.holiday_color;
     }
     return true;
+}
+
+/// Re-reads the palette on SIGUSR1 so a wallpaper change reaches the widgets
+/// the same moment it reaches the bar. Rebuilt from defaults exactly like the
+/// startup path — never mutated — so a key dropped from the file falls back
+/// instead of carrying yesterday's value forward; shell.json's card alpha and
+/// corner radius are carried over untouched. Widget *placement* is
+/// deliberately not re-applied (that needs a rebuild, and the hook only ever
+/// fires for palette changes). With no readable file the current palette
+/// stays put rather than snapping back to grey defaults.
+fn reloadTheme(host: *Host) void {
+    var theme = widgets_mod.Theme{
+        .card_alpha = host.theme.card_alpha,
+        .radius_px = host.theme.radius_px,
+    };
+    if (!tryApplyMatugenColors(host.gpa, &theme)) {
+        logging.warn("theme: reload found no matugen colors — keeping the current palette", .{});
+        return;
+    }
+    host.theme = theme;
+    // Every cached tile still holds the old colours, so invalidate all of
+    // them — the same frame-wide reset the hover path uses.
+    markAllDirty(host);
+    logging.step("theme: reloaded matugen colors", .{});
 }
 
 fn setCloexec(fd: posix.fd_t) void {
@@ -1437,6 +1476,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     logging.init("simpbar-shell");
     defer logging.deinit();
+
+    // SIGUSR1 live-reload (g_reload_pending): matugen rewrites the palette
+    // file on every wallpaper change and signals both this shell and the bar
+    // so neither is left showing yesterday's colours.
+    {
+        const act = posix.Sigaction{
+            .handler = .{ .sigaction = reloadSignalHandler },
+            .mask = posix.sigemptyset(),
+            .flags = posix.SA.SIGINFO,
+        };
+        posix.sigaction(.USR1, &act, null);
+    }
     var gpa_state = std.heap.DebugAllocator(.{}){};
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -1640,6 +1691,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
 
         const ready = posix.poll(&poll_fds, timeout) catch 0;
+
+        // SIGUSR1 (matugen's post_hook) → re-read the palette. The signal
+        // interrupts poll() as well, which surfaces here as ready == 0, so a
+        // reload is picked up on this pass whether or not an event woke us —
+        // including when the loop was parked waiting for the next frame.
+        if (g_reload_pending.swap(false, .acquire)) reloadTheme(&host);
 
         if (ready > 0) {
             if (poll_fds[0].revents & posix.POLL.IN != 0) {

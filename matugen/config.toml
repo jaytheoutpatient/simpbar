@@ -42,9 +42,12 @@ command = "true"
 [templates.simpbar]
 input_path = "~/.config/matugen/templates/simpbar.json"
 output_path = "~/.config/simpbar/matugen.json"
-# Live-reload the running bar after the colors are written. Uses pgrep (the
-# bar's own pidfile can go stale across restarts); harmless when not running.
-post_hook = "sh -c 'PID=$(pgrep -x simpbar | head -n1); [ -n \"$PID\" ] && kill -USR1 \"$PID\" 2>/dev/null || true'"
+# Live-reload the running bar AND the desktop widgets after the colors are
+# written — simpbar-shell takes the same SIGUSR1 (see reloadTheme in its
+# main.zig), otherwise the widgets keep yesterday's palette while the bar
+# moves. Uses pgrep (the bar's own pidfile can go stale across restarts);
+# harmless when neither is running.
+post_hook = "sh -c 'for P in simpbar simpbar-shell; do PID=$(pgrep -x \"$P\" | head -n1); [ -n \"$PID\" ] && kill -USR1 \"$PID\" 2>/dev/null || true; done'"
 
 # ═══════════════════════════ Hyprland ═══════════════════════════
 # Generates ~/.config/hypr/matugen-colors.lua (exports the MD3 palette and
