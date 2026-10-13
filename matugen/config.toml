@@ -1,7 +1,7 @@
 # matugen — Material You colorscheme generator, wired into simpbar + a whole
-# desktop: simpbar, hyprland, foot terminal, GTK (nautilus/nemo), Qt/qt6ct
-# (dolphin), Vesktop & Equibop Discord clients, the Fluxer chat client, Zen
-# the swaync notification center.
+# desktop: simpbar, MangoWM + Hyprland, foot terminal, GTK (nautilus/nemo),
+# Qt/qt6ct (dolphin), Vesktop & Equibop Discord clients, the Fluxer chat
+# client, Zen and the swaync notification center.
 #
 # Two ways to use this:
 #
@@ -60,6 +60,15 @@ output_path = "~/.config/hypr/matugen-colors.lua"
 # Tolerant: reloads borders/colors when Hyprland is up, no-ops otherwise so a
 # wallpaper change from a cron/systemd context can't abort the whole run.
 post_hook = "sh -c 'hyprctl reload 2>/dev/null || true'"
+
+# ═══════════════════════════ MangoWM ═══════════════════════════
+# Renders the MangoWM border/tag colors to
+# ~/.config/mango/cfg/matugen-colors.conf, which config.conf sources last so
+# these win over appearance.conf. No-ops when Mango isn't running.
+[templates.mango]
+input_path = "~/.config/matugen/templates/mango-colors.conf"
+output_path = "~/.config/mango/cfg/matugen-colors.conf"
+post_hook = "sh -c 'mmsg dispatch reload_config 2>/dev/null || true'"
 
 # ═══════════════════════════ Vesktop ═══════════════════════════
 # Overwrites the already-enabled midnight.theme.css (kept the same name so
@@ -179,11 +188,3 @@ output_path = "~/.steam/steam/millennium/themes/matugen/steam-webkit.css"
 input_path = "~/.config/matugen/templates/swaync-style.css"
 output_path = "~/.config/swaync/style.css"
 post_hook = "sh -c 'swaync-client --reload-css 2>/dev/null || true'"
-
-# ═══════════════════════════ wlogout ═══════════════════════════
-# Renders the power menu's style to ~/.config/wlogout/style.css, which wlogout
-# checks before /etc/wlogout/style.css. No live reload — close and reopen
-# wlogout (the bar's power button) to see the new colors.
-[templates.wlogout]
-input_path = "~/.config/matugen/templates/wlogout-style.css"
-output_path = "~/.config/wlogout/style.css"

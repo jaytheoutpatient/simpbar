@@ -13,6 +13,8 @@
 #   appdrawer close      close the drawer
 #   appdrawer wallpapers open the drawer straight on the Wallpapers tab
 #   appdrawer apps       open the drawer straight on the Apps tab
+#   appdrawer power      open the drawer straight on the Power menu
+#                       (lock / log out / reboot / power off)
 #
 # Applying a wallpaper deliberately has no subcommand here: `simpbar-wallpaper
 # set <img>` is the engine that actually does the work (swaybg swap, matugen
@@ -35,11 +37,11 @@ if [ "$#" -gt 0 ]; then
             "$QS" -c "$CFG" -d >/dev/null 2>&1
             exit $?
             ;;
-        open|close|toggle|wallpapers|apps)
+        open|close|toggle|wallpapers|apps|power)
             ACTION="$1"
             ;;
         *)
-            printf 'usage: %s [toggle|open|close|start|wallpapers|apps]\n' "$0" >&2
+            printf 'usage: %s [toggle|open|close|start|wallpapers|apps|power]\n' "$0" >&2
             exit 2
             ;;
     esac
@@ -47,14 +49,13 @@ else
     ACTION=toggle
 fi
 
-# quickshell missing entirely (it is in Arch's `extra` repo but is not packaged
-# on Debian, where the installer skips the drawer). Fail with a clear message
-# rather than letting the shell print `quickshell: not found` on every keypress,
-# or worse: hanging through the 6s cold-path retry below on something that can
-# never succeed.
+# quickshell missing entirely (this installer puts it in place from Arch's
+# `extra` repo). Fail with a clear message rather than letting the shell print
+# `quickshell: not found` on every keypress, or worse: hanging through the 6s
+# cold-path retry below on something that can never succeed.
 if ! command -v "$QS" >/dev/null 2>&1; then
     printf 'appdrawer: %s is not installed, so the app drawer cannot run.\n' "$QS" >&2
-    printf '         On Debian it is not packaged at all; see https://quickshell.org to build it.\n' >&2
+    printf '         Install it with: sudo pacman -S quickshell\n' >&2
     exit 127
 fi
 

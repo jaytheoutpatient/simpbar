@@ -12,9 +12,10 @@
 //!
 //! Sequence on open (the snapshot is taken BEFORE the surface maps so we
 //! never capture our own dim):
-//!   1. hyprctl IPC: monitors -> focused output/origin, clients -> windows,
-//!      workspaces -> strip, layers -> the bar hole (that strip stays
-//!      un-dimmed and clickable-through, like the rest of the bar).
+//!   1. compositor IPC (hyprctl or mmsg): monitors -> focused output/origin,
+//!      clients -> windows, workspaces/tags -> strip, layers -> the bar hole
+//!      (that strip stays un-dimmed and clickable-through, like the rest of
+//!      the bar).
 //!   2. zwlr_screencopy capture_output on that wl_output: buffer/copy/ready
 //!      (bound at v1 so `buffer` alone means "go" — no buffer_done dance).
 //!   3. map the overlay surface (dim paint + exclusive keyboard), animate
@@ -257,9 +258,28 @@ fn connectUnixSocket(path: []const u8) !posix.fd_t {
     return fd;
 }
 
+/// Which compositor's IPC the overview talks to.
+const Compositor = enum { hyprland, mango };
+
+fn activeCompositor() Compositor {
+    if (getenv("HYPRLAND_INSTANCE_SIGNATURE") != null) return .hyprland;
+    if (getenv("MANGO_INSTANCE_SIGNATURE") != null) return .mango;
+    return .hyprland; // no IPC found; every request degrades gracefully either way
+}
+
 /// One request/response to Hyprland's `.socket.sock`: write `command`, read
 /// until the compositor closes (fresh connection per request, like hyprctl).
 fn hyprctlRequest(gpa: std.mem.Allocator, sock_path: []const u8, command: []const u8) ![]u8 {
+    return ipcRequest(gpa, sock_path, command, false);
+}
+
+/// Mango's `mmsg` framing: commands are newline-terminated; the compositor
+/// replies with a single JSON object and closes the connection.
+fn mangoRequest(gpa: std.mem.Allocator, sock_path: []const u8, command: []const u8) ![]u8 {
+    return ipcRequest(gpa, sock_path, command, true);
+}
+
+fn ipcRequest(gpa: std.mem.Allocator, sock_path: []const u8, command: []const u8, newline: bool) ![]u8 {
     const fd = try connectUnixSocket(sock_path);
     defer _ = posix.system.close(fd);
 
@@ -269,6 +289,7 @@ fn hyprctlRequest(gpa: std.mem.Allocator, sock_path: []const u8, command: []cons
         if (n < 0) return error.WriteFailed;
         written += @intCast(n);
     }
+    if (newline and std.c.write(fd, "\n", 1) != 1) return error.WriteFailed;
 
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
@@ -282,18 +303,34 @@ fn hyprctlRequest(gpa: std.mem.Allocator, sock_path: []const u8, command: []cons
     return list.toOwnedSlice(gpa);
 }
 
-/// `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock`.
-fn hyprSockPath(buf: []u8) ?[]const u8 {
+/// The overview's command socket on the active compositor:
+/// `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock` on
+/// Hyprland, or `$MANGO_INSTANCE_SIGNATURE` verbatim on Mango (mangowm).
+fn ipcSockPath(buf: []u8) ?[]const u8 {
+    if (getenv("MANGO_INSTANCE_SIGNATURE")) |sig| {
+        const s = std.mem.sliceTo(sig, 0);
+        return std.fmt.bufPrint(buf, "{s}", .{s}) catch null;
+    }
     const runtime_dir = std.mem.sliceTo(getenv("XDG_RUNTIME_DIR") orelse return null, 0);
     const sig = std.mem.sliceTo(getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null, 0);
     return std.fmt.bufPrint(buf, "{s}/hypr/{s}/.socket.sock", .{ runtime_dir, sig }) catch null;
 }
 
-/// Fire a Lua-bridge dispatch and report success (reply starts with "ok").
+/// Fire a dispatch and report compositor-specific success: Hyprland's Lua
+/// bridge replies "ok"; Mango replies `{"success":true}`.
 fn dispatchOk(sock_path: []const u8, cmd: []const u8) bool {
-    const resp = hyprctlRequest(std.heap.page_allocator, sock_path, cmd) catch return false;
-    defer std.heap.page_allocator.free(resp);
-    return std.mem.startsWith(u8, resp, "ok");
+    switch (activeCompositor()) {
+        .hyprland => {
+            const resp = hyprctlRequest(std.heap.page_allocator, sock_path, cmd) catch return false;
+            defer std.heap.page_allocator.free(resp);
+            return std.mem.startsWith(u8, resp, "ok");
+        },
+        .mango => {
+            const resp = mangoRequest(std.heap.page_allocator, sock_path, cmd) catch return false;
+            defer std.heap.page_allocator.free(resp);
+            return std.mem.indexOf(u8, resp, "\"success\":true") != null;
+        },
+    }
 }
 
 // --- hyprctl JSON shapes (only the fields we read; unknown keys ignored) ----
@@ -339,6 +376,42 @@ const LayerRect = struct {
 const LayerLevels = std.json.ArrayHashMap([]LayerRect);
 const LayerMonitor = struct { levels: LayerLevels = .{} };
 const LayersRoot = std.json.ArrayHashMap(LayerMonitor);
+
+// --- mmsg JSON shapes (`mmsg get all-*`) — only the fields we read ---------
+
+const MgMonitorsRoot = struct {
+    monitors: []MgMonitor = &.{},
+};
+const MgMonitor = struct {
+    name: []const u8 = "",
+    active: bool = false, // true on the focused monitor
+    x: i32 = 0,
+    y: i32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    scale: f64 = 1.0,
+    tags: []MgTag = &.{},
+};
+const MgTag = struct {
+    index: i32 = 0,
+    is_active: bool = false,
+};
+
+const MgClientsRoot = struct {
+    clients: []MgClient = &.{},
+};
+const MgClient = struct {
+    id: i32 = 0,
+    title: []const u8 = "",
+    appid: []const u8 = "",
+    monitor: []const u8 = "",
+    tags: []i32 = &.{},
+    is_visible: bool = false, // on the monitor's active tag
+    x: i32 = 0,
+    y: i32 = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+};
 
 // --- overview data model ----------------------------------------------------
 
@@ -500,8 +573,8 @@ pub const Overview = struct {
         return true;
     }
 
-    /// Open (no-op if already opening/open). Returns false when the hyprctl
-    /// side failed — the caller reports that to the CLI.
+    /// Open (no-op if already opening/open). Returns false when the compositor
+    /// IPC side failed — the caller reports that to the CLI.
     pub fn open(self: *Overview) bool {
         if (self.anim == .closing) return self.resumeOpening();
         if (self.anim != .closed) return true;
@@ -510,7 +583,7 @@ pub const Overview = struct {
             return false;
         }
         if (!self.fetchState()) {
-            logging.err("overview: hyprctl query failed — not opening", .{});
+            logging.err("overview: compositor state query failed — not opening", .{});
             return false;
         }
         // Snapshot BEFORE mapping: capturing after would screenshot our own
@@ -571,11 +644,19 @@ pub const Overview = struct {
     // --- state fetch --------------------------------------------------------
 
     /// Pull the focused monitor, its windows, the strip's workspaces, and the
-    /// bar hole from Hyprland IPC. Monitors are all-or-nothing; the rest
-    /// degrades (no bar hole, no schematics) instead of failing the open.
+    /// bar hole from the running compositor's IPC (Hyprland or Mango).
+    /// Monitors are all-or-nothing; the rest degrades (no bar hole, no
+    /// schematics) instead of failing the open.
     fn fetchState(self: *Overview) bool {
+        switch (activeCompositor()) {
+            .hyprland => return self.fetchHyprState(),
+            .mango => return self.fetchMangoState(),
+        }
+    }
+
+    fn fetchHyprState(self: *Overview) bool {
         var sock_buf: [256]u8 = undefined;
-        const sock = hyprSockPath(&sock_buf) orelse {
+        const sock = ipcSockPath(&sock_buf) orelse {
             logging.warn("overview: no Hyprland socket (XDG_RUNTIME_DIR/HYPRLAND_INSTANCE_SIGNATURE?)", .{});
             return false;
         };
@@ -777,6 +858,170 @@ pub const Overview = struct {
                 }
             }
         }
+        return true;
+    }
+
+    /// Mango backend — the same inputs as fetchHyprState, courtesy of mmsg:
+    ///   - `get all-monitors`: focused output (active==true), its geometry
+    ///     (dwlmango layout coordinates are logical already), and its tags;
+    ///   - `get all-clients`:  the grid + strip schematics. is_visible means
+    ///     "on the monitor's active tag"; clients carry a numeric `id` the
+    ///     overview stores as its focus handle;
+    ///   - tags come from the focused monitor's `tags[]`, so there is no
+    ///     third query. Mango tags have no names — the strip labels each pill
+    ///     with its number;
+    ///   - `all-layers` reports names only, no geometry, so there is no bar
+    ///     hole: the dim + input region cover the full output. (The bar sits
+    ///     above the overview's overlay layer anyway, so it stays visible;
+    ///     it's just not clickable-through while the overview is open.)
+    fn fetchMangoState(self: *Overview) bool {
+        var sock_buf: [256]u8 = undefined;
+        const sock = ipcSockPath(&sock_buf) orelse {
+            logging.warn("overview: no Mango socket (MANGO_INSTANCE_SIGNATURE?)", .{});
+            return false;
+        };
+
+        // 1) monitors — the focused output and its active tag.
+        const mon_bytes = mangoRequest(self.gpa, sock, "get all-monitors") catch |err| {
+            logging.err("overview: mango monitors failed: {}", .{err});
+            return false;
+        };
+        defer self.gpa.free(mon_bytes);
+        const mroot = std.json.parseFromSliceLeaky(MgMonitorsRoot, self.gpa, mon_bytes, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch |err| {
+            logging.err("overview: mango monitors JSON: {}", .{err});
+            return false;
+        };
+        defer {
+            for (mroot.monitors) |m| self.gpa.free(m.name);
+            self.gpa.free(mroot.monitors);
+        }
+        var focused: ?*const MgMonitor = null;
+        for (mroot.monitors) |*m| {
+            if (m.active) {
+                focused = m;
+                break;
+            }
+        }
+        if (focused == null and mroot.monitors.len > 0) focused = &mroot.monitors[0];
+        const mon = focused orelse {
+            logging.warn("overview: mango: no monitors reported", .{});
+            return false;
+        };
+        const n = @min(mon.name.len, self.out_name.len - 1);
+        @memcpy(self.out_name[0..n], mon.name[0..n]);
+        self.out_name[n] = 0;
+        self.out_x = mon.x;
+        self.out_y = mon.y;
+        self.logical_w = @intFromFloat(@max(@as(f64, @floatFromInt(mon.width)), 1.0));
+        self.logical_h = @intFromFloat(@max(@as(f64, @floatFromInt(mon.height)), 1.0));
+        self.active_ws = for (mon.tags) |t| {
+            if (t.is_active) break t.index;
+        } else 1;
+        self.out_output = self.outputs.find(std.mem.sliceTo(self.out_name[0..], 0)) orelse blk: {
+            if (self.outputs.count > 0) {
+                logging.warn("overview: wl_output \"{s}\" not in registry — using first", .{std.mem.sliceTo(self.out_name[0..], 0)});
+                break :blk self.outputs.list[0];
+            }
+            break :blk null;
+        };
+        if (self.out_output == null) return false;
+
+        // 2) clients — the grid (active tag) + strip schematics.
+        self.win_count = 0;
+        self.all_count = 0;
+        const cli_bytes = mangoRequest(self.gpa, sock, "get all-clients") catch |err| {
+            logging.err("overview: mango clients failed: {}", .{err});
+            return true; // monitors worked; an empty grid is a valid fallback
+        };
+        defer self.gpa.free(cli_bytes);
+        const croot = std.json.parseFromSliceLeaky(MgClientsRoot, self.gpa, cli_bytes, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch |err| {
+            logging.err("overview: mango clients JSON: {}", .{err});
+            return true;
+        };
+        defer {
+            for (croot.clients) |c| {
+                self.gpa.free(c.title);
+                self.gpa.free(c.appid);
+                self.gpa.free(c.monitor);
+                self.gpa.free(c.tags);
+            }
+            self.gpa.free(croot.clients);
+        }
+        for (croot.clients) |c| {
+            const ws = if (c.tags.len > 0) c.tags[0] else 0;
+            if (self.all_count < MAX_CLIENTS) {
+                self.all[self.all_count] = .{
+                    .ws = ws,
+                    .x = c.x,
+                    .y = c.y,
+                    .w = c.width,
+                    .h = c.height,
+                };
+                self.all_count += 1;
+            }
+            if (!c.is_visible) continue;
+            if (c.monitor.len > 0 and !std.mem.eql(u8, c.monitor, std.mem.sliceTo(self.out_name[0..], 0))) continue;
+            if (c.width <= 0 or c.height <= 0) continue;
+            if (self.win_count >= MAX_WINS) continue;
+            var win = Win{};
+            win.x = c.x;
+            win.y = c.y;
+            win.w = c.width;
+            win.h = c.height;
+            // Mango addresses windows by numeric id; store it as ASCII so
+            // activateTile can build `dispatch focusid,<id>`.
+            var id_buf: [16]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{c.id}) catch continue;
+            @memcpy(win.addr[0..id_str.len], id_str);
+            win.addr_len = id_str.len;
+            const cl = @min(c.appid.len, win.class.len);
+            @memcpy(win.class[0..cl], c.appid[0..cl]);
+            win.class_len = cl;
+            const tl = @min(c.title.len, win.title.len);
+            @memcpy(win.title[0..tl], c.title[0..tl]);
+            win.title_len = tl;
+            self.wins[self.win_count] = win;
+            self.win_count += 1;
+        }
+        // Left-to-right reading order for a stable grid.
+        std.sort.insertion(Win, self.wins[0..self.win_count], {}, struct {
+            fn less(_: void, a: Win, b: Win) bool {
+                if (a.x != b.x) return a.x < b.x;
+                return a.y < b.y;
+            }
+        }.less);
+
+        // 3) tags — this monitor's strip (fixed 1..9, numbered labels).
+        self.ws_count = 0;
+        for (mon.tags) |t| {
+            if (self.ws_count >= MAX_WS) break;
+            var ws = Ws{ .id = t.index, .active = t.is_active };
+            var num_buf: [8]u8 = undefined;
+            const num = std.fmt.bufPrint(&num_buf, "{d}", .{t.index}) catch continue;
+            const nl = @min(num.len, ws.name.len);
+            @memcpy(ws.name[0..nl], num[0..nl]);
+            ws.name_len = nl;
+            self.wss[self.ws_count] = ws;
+            self.ws_count += 1;
+        }
+        std.sort.insertion(Ws, self.wss[0..self.ws_count], {}, struct {
+            fn less(_: void, a: Ws, b: Ws) bool {
+                return a.id < b.id;
+            }
+        }.less);
+        if (self.ws_count == 0) { // paranoid: never an empty strip
+            self.wss[0] = .{ .id = self.active_ws, .active = true };
+            self.ws_count = 1;
+        }
+
+        // 4) layers — no geometry in mango's IPC; no bar hole.
+        self.bar = null;
         return true;
     }
 
@@ -1434,14 +1679,20 @@ pub const Overview = struct {
         if (t >= self.tile_count) return;
         const win = &self.wins[self.tiles[t].win];
         var sock_buf: [256]u8 = undefined;
-        const sock = hyprSockPath(&sock_buf) orelse {
+        const sock = ipcSockPath(&sock_buf) orelse {
             self.close();
             return;
         };
         var cmd_buf: [320]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&cmd_buf, "dispatch hl.dsp.focus({{ window = \"address:{s}\" }})", .{win.addrSlice()}) catch {
-            self.close();
-            return;
+        const cmd = switch (activeCompositor()) {
+            .hyprland => std.fmt.bufPrint(&cmd_buf, "dispatch hl.dsp.focus({{ window = \"address:{s}\" }})", .{win.addrSlice()}) catch {
+                self.close();
+                return;
+            },
+            .mango => std.fmt.bufPrint(&cmd_buf, "dispatch focusid,{s}", .{win.addrSlice()}) catch {
+                self.close();
+                return;
+            },
         };
         if (dispatchOk(sock, cmd)) {
             self.close();
@@ -1459,14 +1710,20 @@ pub const Overview = struct {
             return;
         }
         var sock_buf: [256]u8 = undefined;
-        const sock = hyprSockPath(&sock_buf) orelse {
+        const sock = ipcSockPath(&sock_buf) orelse {
             self.close();
             return;
         };
         var cmd_buf: [160]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&cmd_buf, "dispatch hl.dsp.focus({{ workspace = {d} }})", .{id}) catch {
-            self.close();
-            return;
+        const cmd = switch (activeCompositor()) {
+            .hyprland => std.fmt.bufPrint(&cmd_buf, "dispatch hl.dsp.focus({{ workspace = {d} }})", .{id}) catch {
+                self.close();
+                return;
+            },
+            .mango => std.fmt.bufPrint(&cmd_buf, "dispatch view,{d}", .{id}) catch {
+                self.close();
+                return;
+            },
         };
         if (dispatchOk(sock, cmd)) {
             self.close(); // the snapshot is stale after a switch — close, don't show it

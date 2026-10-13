@@ -276,6 +276,35 @@ fn hyprctlRequest(gpa: std.mem.Allocator, sock_path: []const u8, command: []cons
     return list.toOwnedSlice(gpa);
 }
 
+/// Mango (mangowm) IPC request — the same fresh-connection-per-request dance
+/// as hyprctlRequest, but commands are framed with a trailing newline (mmsg
+/// syntax). Like Hyprland, Mango closes the connection after a one-shot
+/// reply, so read-until-EOF holds here too. (`mmsg watch ...` is the one
+/// long-lived channel; that is a separate dedicated connection, see main.)
+fn mangoRequest(gpa: std.mem.Allocator, sock_path: []const u8, command: []const u8) ![]u8 {
+    const fd = try connectUnixSocket(sock_path);
+    defer _ = posix.system.close(fd);
+
+    var written: usize = 0;
+    while (written < command.len) {
+        const n = std.c.write(fd, command[written..].ptr, command.len - written);
+        if (n < 0) return error.WriteFailed;
+        written += @intCast(n);
+    }
+    if (std.c.write(fd, "\n", 1) != 1) return error.WriteFailed;
+
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try posix.read(fd, &buf);
+        if (n == 0) break;
+        try list.appendSlice(gpa, buf[0..n]);
+        if (list.items.len > 4 * 1024 * 1024) break; // sanity cap
+    }
+    return list.toOwnedSlice(gpa);
+}
+
 /// Finds the first `"id": N` in a Hyprland JSON reply. Hyprland's IDs are
 /// the only `id` key in its workspace JSON (`monitorID` etc. don't match the
 /// literal `"id":`), so a plain substring scan is enough — no need to pull
@@ -301,18 +330,27 @@ fn workspaceLessThan(_: void, a: Workspace, b: Workspace) bool {
     return a.id < b.id;
 }
 
-/// Tracks Hyprland's workspace list via IPC, matching waybar's
+/// Which compositor's IPC the workspace module talks to. Hyprland is the
+/// original home of this module; Mango (mangowm) is supported natively so
+/// the bar behaves identically on either desktop.
+const CompositorMode = enum { hyprland, mango };
+
+/// Tracks the compositor's workspace/tag list via IPC, matching waybar's
 /// "hyprland/workspaces" module ("all-outputs": true, "sort-by-number": true,
-/// "active-only": false from ~/.config/waybar/config).
+/// "active-only": false from ~/.config/waybar/config). The Hyprland backend
+/// reads `j/workspaces` (+ `j/activeworkspace`); the Mango backend reads
+/// `mmsg get all-tags`.
 const Workspaces = struct {
     gpa: std.mem.Allocator,
+    mode: CompositorMode,
     list: std.ArrayList(Workspace),
     sock_path_buf: [108]u8 = undefined,
     sock_path_len: usize,
 
-    fn init(gpa: std.mem.Allocator, sock_path: []const u8) !Workspaces {
+    fn init(gpa: std.mem.Allocator, mode: CompositorMode, sock_path: []const u8) !Workspaces {
         var self = Workspaces{
             .gpa = gpa,
+            .mode = mode,
             .list = .empty,
             .sock_path_len = sock_path.len,
         };
@@ -332,6 +370,13 @@ const Workspaces = struct {
     }
 
     fn refresh(self: *Workspaces) !void {
+        switch (self.mode) {
+            .hyprland => try self.refreshHyprland(),
+            .mango => try self.refreshMango(),
+        }
+    }
+
+    fn refreshHyprland(self: *Workspaces) !void {
         const ws_json = try hyprctlRequest(self.gpa, self.sockPath(), "j/workspaces");
         defer self.gpa.free(ws_json);
         const active_json = try hyprctlRequest(self.gpa, self.sockPath(), "j/activeworkspace");
@@ -352,39 +397,95 @@ const Workspaces = struct {
         std.sort.insertion(Workspace, self.list.items, {}, workspaceLessThan);
     }
 
-    /// Fire-and-forget a plain (non-JSON) hyprctl command, e.g.
-    /// "dispatch hl.dsp.focus({ workspace = 2 })" — this instance's IPC
-    /// socket routes `dispatch` through a Lua eval bridge (see
-    /// ~/.config/hypr/hyprland.lua), not stock hyprctl syntax. The resulting
-    /// workspace change comes back to us as an event on .socket2.sock, which
-    /// triggers the normal refresh+redraw — no need to update local state
-    /// here.
-    fn dispatchCommand(self: *const Workspaces, command: []const u8) !void {
-        if (self.sock_path_len == 0) return error.NoHyprland;
-        const resp = try hyprctlRequest(self.gpa, self.sockPath(), command);
-        self.gpa.free(resp);
+    /// Mango backend: `mmsg get all-tags` returns one JSON object with every
+    /// monitor's tags; each tag is `{"index":N,"is_active":b,"is_urgent":b,...
+    /// }`, `index` immediately followed by `is_active`, so a plain substring
+    /// scan (matching refreshHyprland's style) suffices. A tag counts as
+    /// active when any monitor reports it active.
+    fn refreshMango(self: *Workspaces) !void {
+        const tags_json = try mangoRequest(self.gpa, self.sockPath(), "get all-tags");
+        defer self.gpa.free(tags_json);
+
+        self.list.clearRetainingCapacity();
+        const needle = "\"index\":";
+        const active_needle = "\"is_active\":";
+        var idx: usize = 0;
+        while (std.mem.indexOfPos(u8, tags_json, idx, needle)) |pos| {
+            const after = pos + needle.len;
+            if (parseIdAt(tags_json, after)) |id| {
+                var active = false;
+                if (std.mem.indexOfPos(u8, tags_json, after, active_needle)) |p| {
+                    const v = p + active_needle.len;
+                    if (v < tags_json.len and tags_json[v] == 't') active = true;
+                }
+                try self.list.append(self.gpa, .{ .id = id, .active = active });
+            }
+            idx = after;
+        }
+        std.sort.insertion(Workspace, self.list.items, {}, workspaceLessThan);
     }
 
-    /// Moves to the adjacent EXISTING workspace, in `direction`.
+    /// Fire-and-forget a plain (non-JSON) dispatch command in the compositor's
+    /// own syntax. On Hyprland these route through a Lua eval bridge (see
+    /// ~/.config/hypr/hyprland.lua); on Mango they're `dispatch` functions.
+    /// The resulting change comes back to us as an event on the watch
+    /// connection, which triggers the normal refresh+redraw — no need to
+    /// update local state here.
+    fn dispatchCommand(self: *const Workspaces, command: []const u8) !void {
+        if (self.sock_path_len == 0) return error.NoCompositorIpc;
+        switch (self.mode) {
+            .hyprland => {
+                const resp = try hyprctlRequest(self.gpa, self.sockPath(), command);
+                self.gpa.free(resp);
+            },
+            .mango => {
+                const resp = try mangoRequest(self.gpa, self.sockPath(), command);
+                self.gpa.free(resp);
+            },
+        }
+    }
+
+    /// Switches to tag/workspace `id`, using whatever syntax the active
+    /// compositor understands.
+    fn switchTo(self: *const Workspaces, id: i32) !void {
+        switch (self.mode) {
+            .hyprland => {
+                var cmd_buf: [64]u8 = undefined;
+                const cmd = std.fmt.bufPrint(&cmd_buf, "dispatch hl.dsp.focus({{ workspace = {d} }})", .{id}) catch return error.CommandTooLong;
+                try self.dispatchCommand(cmd);
+            },
+            .mango => {
+                var cmd_buf: [32]u8 = undefined;
+                const cmd = std.fmt.bufPrint(&cmd_buf, "dispatch view,{d}", .{id}) catch return error.CommandTooLong;
+                try self.dispatchCommand(cmd);
+            },
+        }
+    }
+
+    /// Moves to the adjacent workspace/tag, in `direction`.
     ///
-    /// Uses the relative "e±1" form rather than picking a target id out of
-    /// `self.list` ourselves. Doing the arithmetic locally would mean
-    /// reimplementing Hyprland's own rules — skip empty numbers, clamp at the
-    /// ends, honour per-monitor workspace sets, special workspaces — and
-    /// getting any of it wrong fights the compositor. "e+1"/"e-1" is the same
-    /// relative form this desktop already binds its own scroll keys to
-    /// (hyprland.lua: mainMod+mouse_down/up -> focus({workspace="e±1"})), so
-    /// the bar and the keyboard agree on where "next" is by construction.
+    /// Uses the relative forms the desktop's own keybinds already use rather
+    /// than picking a target id out of `self.list` ourselves. Doing the
+    /// arithmetic locally would mean reimplementing the compositor's own
+    /// rules — skip empty numbers, clamp at the ends, honour per-monitor
+    /// tag sets — and getting any of it wrong fights the compositor.
+    /// Hyprland's "e+1"/"e-1" is the form hyprland.lua binds to
+    /// mainMod+mouse_down/up -> focus({workspace="e±1"}); Mango's
+    /// `viewtoright`/`viewtoleft` are what its SUPER+Right/Left binds use —
+    /// so the bar and the keyboard agree on where "next" is by construction.
     ///
     /// `direction` is +1 for "forward" (wheel down). It arrives from the
     /// compositor's axis sign, which is negative for down.
     fn stepWorkspace(self: *const Workspaces, direction: i32) void {
-        const cmd = if (direction > 0)
-            "dispatch hl.dsp.focus({ workspace = \"e+1\" })"
-        else
-            "dispatch hl.dsp.focus({ workspace = \"e-1\" })";
+        const cmd = switch (self.mode) {
+            .hyprland => if (direction > 0)
+                "dispatch hl.dsp.focus({ workspace = \"e+1\" })"
+            else
+                "dispatch hl.dsp.focus({ workspace = \"e-1\" })",
+            .mango => if (direction > 0) "dispatch viewtoright,0" else "dispatch viewtoleft,0",
+        };
         self.dispatchCommand(cmd) catch |err| {
-            logging.err("workspace step ({s}) failed: {}", .{ if (direction > 0) "e+1" else "e-1", err });
+            logging.err("workspace step ({s}) failed: {}", .{ if (direction > 0) "next" else "prev", err });
         };
     }
 };
@@ -579,7 +680,9 @@ const CENTER_LAUNCHERS = [_]LauncherButton{
 };
 
 // custom/power from "modules-right" — icon only in the real config, no text.
-const POWER_BUTTON = LauncherButton{ .label = "\u{f0425}", .command = "wlogout" };
+// The power menu lives in the app drawer (lock / log out / reboot / power
+// off); wlogout is no longer installed, so this opens that menu instead.
+const POWER_BUTTON = LauncherButton{ .label = "\u{f0425}", .command = "appdrawer power" };
 
 // custom/waypaper, one of the "group/tray-expander" drawer's children.
 // Icon only in the real config, no text. The module kind is still called
@@ -2133,31 +2236,54 @@ fn realMain() !void {
         target_count = 1;
     }
 
-    // Hyprland-specific, matching waybar's "hyprland/workspaces" module.
-    // Both IPC sockets live at $XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.
-    var hypr_sock_dir_buf: [92]u8 = undefined;
-    const hypr_sock_dir: ?[]const u8 = blk: {
-        const runtime_dir = std.mem.sliceTo(getenv("XDG_RUNTIME_DIR") orelse break :blk null, 0);
-        const instance_sig = std.mem.sliceTo(getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse break :blk null, 0);
-        break :blk std.fmt.bufPrint(&hypr_sock_dir_buf, "{s}/hypr/{s}", .{ runtime_dir, instance_sig }) catch null;
-    };
+    // Compositor IPC for the workspace module — matching waybar's
+    // "hyprland/workspaces" module. Hyprland keeps both sockets (command +
+    // event) at $XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/; Mango
+    // (mangowm) exposes a single socket at $MANGO_INSTANCE_SIGNATURE where
+    // `mmsg watch all-tags` streams tag updates on a long-lived connection.
+    const hypr_sig = getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    const mango_sig = getenv("MANGO_INSTANCE_SIGNATURE");
 
-    var cmd_sock_path_buf: [108]u8 = undefined;
+    var hypr_sock_dir_buf: [92]u8 = undefined;
+    const hypr_sock_dir: ?[]const u8 = if (hypr_sig) |sig| blk: {
+        const runtime_dir = std.mem.sliceTo(getenv("XDG_RUNTIME_DIR") orelse break :blk null, 0);
+        const instance_sig = std.mem.sliceTo(sig, 0);
+        break :blk std.fmt.bufPrint(&hypr_sock_dir_buf, "{s}/hypr/{s}", .{ runtime_dir, instance_sig }) catch null;
+    } else null;
+
+    var cmd_sock_path_buf: [128]u8 = undefined;
     var workspaces: Workspaces = blk: {
-        const empty = Workspaces{ .gpa = gpa, .list = .empty, .sock_path_len = 0 };
-        const dir = hypr_sock_dir orelse break :blk empty;
-        const cmd_path = std.fmt.bufPrint(&cmd_sock_path_buf, "{s}/.socket.sock", .{dir}) catch break :blk empty;
-        break :blk Workspaces.init(gpa, cmd_path) catch empty;
+        const empty = Workspaces{ .gpa = gpa, .mode = .hyprland, .list = .empty, .sock_path_len = 0 };
+        if (hypr_sock_dir) |dir| {
+            const cmd_path = std.fmt.bufPrint(&cmd_sock_path_buf, "{s}/.socket.sock", .{dir}) catch break :blk empty;
+            break :blk Workspaces.init(gpa, .hyprland, cmd_path) catch empty;
+        }
+        if (mango_sig) |sig| {
+            const sock = std.mem.sliceTo(sig, 0);
+            break :blk Workspaces.init(gpa, .mango, sock) catch empty;
+        }
+        break :blk empty;
     };
     defer workspaces.deinit();
 
-    var event_sock_path_buf: [108]u8 = undefined;
-    const hypr_event_fd: posix.fd_t = if (hypr_sock_dir) |dir| blk: {
+    var event_sock_path_buf: [128]u8 = undefined;
+    const comp_event_fd: posix.fd_t = if (hypr_sock_dir) |dir| blk: {
         const event_path = std.fmt.bufPrint(&event_sock_path_buf, "{s}/.socket2.sock", .{dir}) catch break :blk -1;
         break :blk connectUnixSocket(event_path) catch -1;
+    } else if (mango_sig) |sig| blk: {
+        // Mango's change channel: on the same socket as commands, sending
+        // "watch all-tags\n" keeps the connection open and streams a full
+        // refresh frame after every tag change.
+        const fd = connectUnixSocket(std.mem.sliceTo(sig, 0)) catch break :blk -1;
+        const cmd = "watch all-tags\n";
+        if (std.c.write(fd, cmd, cmd.len) != @as(isize, @intCast(cmd.len))) {
+            _ = posix.system.close(fd);
+            break :blk -1;
+        }
+        break :blk fd;
     } else -1;
-    defer if (hypr_event_fd >= 0) {
-        _ = posix.system.close(hypr_event_fd);
+    defer if (comp_event_fd >= 0) {
+        _ = posix.system.close(comp_event_fd);
     };
 
     var weather: PolledCommand = .{};
@@ -2376,14 +2502,15 @@ fn realMain() !void {
     if (findRightEntry(.cava) != null) startCavaFetch();
 
     // Main event loop: multiplex the Wayland display fd (compositor events),
-    // a 1s timerfd (clock ticks), and the Hyprland event socket (workspace
-    // changes) — a negative fd (Hyprland not running) is simply ignored by
+    // a 1s timerfd (clock ticks), and the compositor's workspace-event socket
+    // (Hyprland's .socket2.sock or Mango's `mmsg watch all-tags` stream) —
+    // a negative fd (no supported compositor running) is simply ignored by
     // poll(). Each redraws the same buffer; more modules later just mean
     // more fds feeding into the same poll() call.
     var poll_fds = [_]posix.pollfd{
         .{ .fd = display.getFd(), .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = timer_fd, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = hypr_event_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = comp_event_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = weather_timer_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // weather.pending_fd, refreshed below
         .{ .fd = pacman_timer_fd, .events = posix.POLL.IN, .revents = 0 },
@@ -2462,11 +2589,11 @@ fn realMain() !void {
         }
         if (poll_fds[2].revents & posix.POLL.IN != 0) {
             // Don't bother parsing which event(s) arrived — just drain
-            // what's queued and re-fetch the full workspace list. Simpler
-            // than tracking Hyprland's various workspace event payloads,
+            // what's queued and re-fetch the full workspace/tag list. Simpler
+            // than tracking the compositor's various workspace event payloads,
             // and cheap enough for something that only fires on user action.
             var drain_buf: [4096]u8 = undefined;
-            _ = posix.read(hypr_event_fd, &drain_buf) catch {};
+            _ = posix.read(comp_event_fd, &drain_buf) catch {};
             workspaces.refresh() catch |err| {
                 logging.warn("workspaces refresh failed: {}", .{err});
             };
@@ -4119,8 +4246,9 @@ fn drawLeftGroup(
 /// Draws the launcher buttons + clock as one centered group, matching
 /// waybar's "modules-center" (the whole group is centered together, not
 /// each item individually). Registers a click region per launcher button;
-/// the clock itself isn't clickable here (real config's clock#1 opens
-/// gnome-calendar on click — skipped for now).
+/// the clock itself isn't clickable here (a calendar popup is a possible
+/// future addition — the upstream clock module's calendar app is no longer
+/// installed).
 // Center holds a centered whole block, so every left/center-capable module
 // kind that may now live there composes into drawable segments: launcher
 // buttons and clock text (the original two), plus workspace number pills
@@ -4977,9 +5105,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
 fn handleAction(bar: *Bar, action: Action) void {
     switch (action) {
         .switch_workspace => |id| {
-            var cmd_buf: [64]u8 = undefined;
-            const cmd = std.fmt.bufPrint(&cmd_buf, "dispatch hl.dsp.focus({{ workspace = {d} }})", .{id}) catch return;
-            bar.workspaces.dispatchCommand(cmd) catch |err| {
+            bar.workspaces.switchTo(id) catch |err| {
                 logging.err("workspace switch failed: {}", .{err});
             };
         },

@@ -64,11 +64,13 @@ PanelWindow {
     readonly property var powerActions: [
         { label: "Lock",     cmd: ["loginctl", "lock-session"] },
         { label: "Suspend",  cmd: ["loginctl", "suspend"] },
-        // Hyprland 0.56 wraps `hyprctl dispatch` in a Lua `return`, so the plain
-        // two-word form is a Lua syntax error. Its argument has to be a Lua
-        // dispatcher expression, hence the single argv entry below. Same form as
-        // the logout bind in the user's own hyprland.lua.
-        { label: "Log out",  cmd: ["hyprctl", "dispatch", "hl.dsp.exit()"] },
+        // Compositor-aware logout: under Hyprland this is the Lua-wrapped
+        // `hyprctl dispatch` exit (plain `exit` parses as a Lua syntax error
+        // on 0.56+ — the dispatcher argument has to be a Lua expression, hence
+        // the single argv entry below). Under MangoWM, mmsg owns the dispatcher
+        // and MANGO_INSTANCE_SIGNATURE points at its socket, so the same menu
+        // row calls `mmsg dispatch quit` instead.
+        { label: "Log out",  cmd: ["sh", "-c", "if [ -n \"$MANGO_INSTANCE_SIGNATURE\" ] && command -v mmsg >/dev/null 2>&1; then mmsg dispatch quit; else hyprctl dispatch hl.dsp.exit(); fi"] },
         { label: "Restart",  cmd: ["systemctl", "reboot"] },
         { label: "Power off", cmd: ["systemctl", "poweroff"] }
     ]
@@ -156,6 +158,17 @@ PanelWindow {
             WallpaperModel.refresh()
             WallpaperModel.refreshCurrent()
         }
+    }
+
+    // Land straight on the Power menu (lock / log out / reboot / power off).
+    // Now that wlogout is no longer installed or shipped, this is the one
+    // power menu — reachable from the bar's power button and the Mango
+    // SUPER+SHIFT+Q bind via the `appdrawer power` IPC action.
+    function openPowerMenu() {
+        if (!win.open)
+            openDrawer()
+        win.optionsOpen = false
+        win.powerOpen = "menu"
     }
 
     // Flips the wallpapers-tab search box between filtering the local folder

@@ -25,15 +25,21 @@ const gtk = @import("welcome_gtk.zig");
 const hg = @import("hypr_gtk.zig");
 const hypr = @import("hyprland.zig");
 
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// True when running under MangoWM — the hyprland.lua pages then show a
+/// notice instead of live settings, and hypr.state is never touched.
+pub var g_mango: bool = false;
+
 // ---------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------
 
-const MAX_ZBUF = 512;
-const MAX_TITLE = 260;
+pub const MAX_ZBUF = 512;
+pub const MAX_TITLE = 260;
 
 /// Copies `s` into `buf` (must be >= s.len + 1) and returns it zero-terminated.
-fn zCopy(s: []const u8, buf: []u8) [*:0]const u8 {
+pub fn zCopy(s: []const u8, buf: []u8) [*:0]const u8 {
     const n = @min(s.len, buf.len - 1);
     @memcpy(buf[0..n], s[0..n]);
     buf[n] = 0;
@@ -41,12 +47,12 @@ fn zCopy(s: []const u8, buf: []u8) [*:0]const u8 {
 }
 
 /// bufPrintZ wrapper returning a zero-terminated pointer ("" on overflow).
-fn fmtZ(buf: []u8, comptime fmt: []const u8, args: anytype) [*:0]const u8 {
+pub fn fmtZ(buf: []u8, comptime fmt: []const u8, args: anytype) [*:0]const u8 {
     const s = std.fmt.bufPrintZ(buf, fmt, args) catch return "";
     return s.ptr;
 }
 
-fn pageBox() *gtk.GtkBox {
+pub fn pageBox() *gtk.GtkBox {
     const outer = gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 18);
     gtk.gtk_widget_set_margin_top(@ptrCast(outer), 24);
     gtk.gtk_widget_set_margin_bottom(@ptrCast(outer), 24);
@@ -55,20 +61,20 @@ fn pageBox() *gtk.GtkBox {
     return outer;
 }
 
-fn sectionHeading(outer: *gtk.GtkBox, title: [:0]const u8) void {
+pub fn sectionHeading(outer: *gtk.GtkBox, title: [:0]const u8) void {
     const h = gtk.gtk_label_new(title);
     gtk.gtk_widget_add_css_class(@ptrCast(h), "heading");
     gtk.gtk_label_set_xalign(h, 0);
     gtk.gtk_box_append(outer, @ptrCast(h));
 }
 
-fn newListBox() *gtk.GtkListBox {
+pub fn newListBox() *gtk.GtkListBox {
     const lb = gtk.gtk_list_box_new();
     gtk.gtk_widget_add_css_class(@ptrCast(lb), "boxed-list");
     return lb;
 }
 
-fn appendActionButton(parent: *gtk.GtkBox, label: [:0]const u8, cb: gtk.GCallback, user_data: ?*anyopaque) void {
+pub fn appendActionButton(parent: *gtk.GtkBox, label: [:0]const u8, cb: gtk.GCallback, user_data: ?*anyopaque) void {
     const row = gtk.gtk_box_new(gtk.ORIENTATION_HORIZONTAL, 0);
     gtk.gtk_widget_set_halign(@ptrCast(row), gtk.ALIGN_CENTER);
     gtk.gtk_widget_set_margin_top(@ptrCast(row), 6);
@@ -79,14 +85,14 @@ fn appendActionButton(parent: *gtk.GtkBox, label: [:0]const u8, cb: gtk.GCallbac
     gtk.gtk_box_append(parent, @ptrCast(row));
 }
 
-fn addRowButton(row: *gtk.AdwActionRow, label: [:0]const u8, cb: gtk.GCallback, user_data: ?*anyopaque) void {
+pub fn addRowButton(row: *gtk.AdwActionRow, label: [:0]const u8, cb: gtk.GCallback, user_data: ?*anyopaque) void {
     const btn = gtk.gtk_button_new_with_label(label);
     gtk.gtk_widget_set_valign(@ptrCast(btn), gtk.ALIGN_CENTER);
     _ = gtk.g_signal_connect_data(@ptrCast(btn), "clicked", cb, user_data, null, 0);
     gtk.adw_action_row_add_suffix(row, @ptrCast(btn));
 }
 
-fn addRowSwitch(row: *gtk.AdwActionRow, active: bool, cb: gtk.GCallback, user_data: ?*anyopaque) void {
+pub fn addRowSwitch(row: *gtk.AdwActionRow, active: bool, cb: gtk.GCallback, user_data: ?*anyopaque) void {
     const sw = gtk.gtk_switch_new();
     gtk.gtk_switch_set_active(sw, if (active) 1 else 0);
     gtk.gtk_widget_set_valign(@ptrCast(sw), gtk.ALIGN_CENTER);
@@ -95,7 +101,7 @@ fn addRowSwitch(row: *gtk.AdwActionRow, active: bool, cb: gtk.GCallback, user_da
 }
 
 // Hex <-> GdkRGBA (accepts "#rrggbb", "#rrggbbaa", "0xrrggbbaa").
-fn hexToRgba(hex: []const u8) ?gtk.GdkRGBA {
+pub fn hexToRgba(hex: []const u8) ?gtk.GdkRGBA {
     var strip = hex;
     if (strip.len > 0 and strip[0] == '#') {
         strip = strip[1..];
@@ -132,7 +138,7 @@ fn rgbaToShadowHex(c: gtk.GdkRGBA, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "0x{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ a, r, g, b }) catch "0xee1a1a1a";
 }
 
-fn setEntryZ(buffer: *gtk.GtkEntryBuffer, s: []const u8) void {
+pub fn setEntryZ(buffer: *gtk.GtkEntryBuffer, s: []const u8) void {
     var buf: [300]u8 = undefined;
     const n = @min(s.len, buf.len - 1);
     @memcpy(buf[0..n], s[0..n]);
@@ -140,7 +146,7 @@ fn setEntryZ(buffer: *gtk.GtkEntryBuffer, s: []const u8) void {
     gtk.gtk_entry_buffer_set_text(buffer, buf[0..n :0].ptr, @intCast(n));
 }
 
-fn entryText(entry: *gtk.GtkEntry) []const u8 {
+pub fn entryText(entry: *gtk.GtkEntry) []const u8 {
     return std.mem.span(gtk.gtk_entry_buffer_get_text(gtk.gtk_entry_get_buffer(entry)));
 }
 
@@ -281,7 +287,7 @@ fn onBorderColorChanged(button: *gtk.GtkColorDialogButton, _: *gtk.GParamSpec, u
 // doesn't fire a spurious saveAll/rebuild.
 // ---------------------------------------------------------------------
 
-fn addEntryRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, initial: []const u8, width: c_int, cb: gtk.GCallback, user_data: ?*anyopaque) void {
+pub fn addEntryRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, initial: []const u8, width: c_int, cb: gtk.GCallback, user_data: ?*anyopaque) void {
     const row = gtk.adw_action_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(row), title);
     const entry = gtk.gtk_entry_new();
@@ -298,7 +304,7 @@ fn addTextRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, target: *hyp
     addEntryRow(group, title, target.slice(), width, @ptrCast(&onTextChanged), @ptrCast(target));
 }
 
-fn addSpinRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, min: f64, max: f64, step: f64, initial: f64, cb: gtk.GCallback, user_data: ?*anyopaque) void {
+pub fn addSpinRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, min: f64, max: f64, step: f64, initial: f64, cb: gtk.GCallback, user_data: ?*anyopaque) void {
     const row = gtk.adw_action_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(row), title);
     const spin = gtk.gtk_spin_button_new_with_range(min, max, step);
@@ -309,7 +315,7 @@ fn addSpinRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, min: f64, ma
     gtk.adw_preferences_group_add(group, @ptrCast(row));
 }
 
-fn addComboRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, labels: []const [*:0]const u8, selected: c_uint, cb: gtk.GCallback, user_data: ?*anyopaque) void {
+pub fn addComboRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, labels: []const [*:0]const u8, selected: c_uint, cb: gtk.GCallback, user_data: ?*anyopaque) void {
     var arr: [128]?[*:0]const u8 = undefined;
     const n = @min(labels.len, arr.len - 1);
     for (labels[0..n], 0..) |l, i| arr[i] = l;
@@ -322,7 +328,7 @@ fn addComboRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, labels: []c
     gtk.adw_preferences_group_add(group, @ptrCast(row));
 }
 
-fn addSwitchRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, subtitle: [:0]const u8, active: bool, cb: gtk.GCallback, user_data: ?*anyopaque) void {
+pub fn addSwitchRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, subtitle: [:0]const u8, active: bool, cb: gtk.GCallback, user_data: ?*anyopaque) void {
     const row = gtk.adw_action_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(row), title);
     gtk.adw_action_row_set_subtitle(row, subtitle);
@@ -346,7 +352,7 @@ fn onDialogDoneClicked(button: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void
     }
 }
 
-fn addDialogFooter(box: *gtk.GtkBox, dialog: *hg.AdwDialog) void {
+pub fn addDialogFooter(box: *gtk.GtkBox, dialog: *hg.AdwDialog) void {
     const row = gtk.gtk_box_new(gtk.ORIENTATION_HORIZONTAL, 0);
     gtk.gtk_widget_set_halign(@ptrCast(row), gtk.ALIGN_CENTER);
     gtk.gtk_widget_set_margin_top(@ptrCast(row), 12);
@@ -358,7 +364,7 @@ fn addDialogFooter(box: *gtk.GtkBox, dialog: *hg.AdwDialog) void {
     gtk.gtk_box_append(box, @ptrCast(row));
 }
 
-fn newDialogBox() *gtk.GtkBox {
+pub fn newDialogBox() *gtk.GtkBox {
     const content = gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 12);
     gtk.gtk_widget_set_margin_top(@ptrCast(content), 12);
     gtk.gtk_widget_set_margin_bottom(@ptrCast(content), 12);
@@ -367,7 +373,7 @@ fn newDialogBox() *gtk.GtkBox {
     return content;
 }
 
-fn presentDialog(parent: *anyopaque, title: [:0]const u8, content: *gtk.GtkBox, on_closed: gtk.GCallback) void {
+pub fn presentDialog(parent: *anyopaque, title: [:0]const u8, content: *gtk.GtkBox, on_closed: gtk.GCallback) void {
     const d = hg.adw_dialog_new();
     hg.adw_dialog_set_title(d, title);
     hg.adw_dialog_set_content_width(d, 560);
@@ -381,7 +387,7 @@ fn presentDialog(parent: *anyopaque, title: [:0]const u8, content: *gtk.GtkBox, 
 // Array mutation helpers (fixed-capacity model arrays)
 // ---------------------------------------------------------------------
 
-fn removeAt(comptime T: type, arr: [*]T, len: *usize, idx: usize) void {
+pub fn removeAt(comptime T: type, arr: [*]T, len: *usize, idx: usize) void {
     if (idx >= len.*) return;
     var i = idx;
     while (i + 1 < len.*) : (i += 1) arr[i] = arr[i + 1];
@@ -1379,9 +1385,22 @@ pub fn buildEnvPage() *gtk.GtkBox {
 // ---------------------------------------------------------------------
 
 pub fn init() void {
+    g_mango = getenv("MANGO_INSTANCE_SIGNATURE") != null;
+    if (g_mango) return; // nothing here applies under MangoWM; leave hypr.state alone
     hypr.loadOrInit();
     _ = hypr.ensureBootstrapped();
     discoverMonitorsExternal();
+}
+
+/// A placeholder page shown under MangoWM, where hyprland.lua settings have
+/// no effect.
+fn mangoNoticePage() *gtk.GtkBox {
+    const outer = pageBox();
+    const group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(group, "Hyprland settings (not available)");
+    gtk.adw_preferences_group_set_description(group, "This section edits hyprland.lua, which MangoWM (mangowm) does not run. The bar's own settings live on the Bar pages; the desktop itself is configured from ~/.config/mango instead.");
+    gtk.gtk_box_append(outer, @ptrCast(group));
+    return outer;
 }
 
 pub const pages = struct {
@@ -1389,6 +1408,13 @@ pub const pages = struct {
     pub const icons = [_][:0]const u8{ "emblem-system-symbolic", "video-display-symbolic", "media-playlist-repeat-symbolic", "input-keyboard-symbolic", "preferences-system-windows-symbolic", "gnome-panel-window-list-symbolic", "layer-group-symbolic", "system-run-symbolic", "preferences-system-symbolic" };
 
     pub fn widgets() [9]*gtk.GtkBox {
+        // Under MangoWM none of the hyprland.lua pages apply — fill every
+        // sidebar slot with the notice so the nav structure stays intact.
+        if (g_mango) return .{
+            mangoNoticePage(), mangoNoticePage(), mangoNoticePage(),
+            mangoNoticePage(), mangoNoticePage(), mangoNoticePage(),
+            mangoNoticePage(), mangoNoticePage(), mangoNoticePage(),
+        };
         return .{
             buildGeneralPage(),
             buildMonitorsPage(),

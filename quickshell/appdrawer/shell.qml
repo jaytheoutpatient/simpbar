@@ -39,6 +39,13 @@ ShellRoot {
             drawer.openTab("apps")
         }
 
+        // Open straight onto the Power menu (lock / log out / reboot / power
+        // off). This is what the bar's power button and the Mango
+        // SUPER+SHIFT+Q bind call — the same menu wlogout used to provide.
+        function power() {
+            drawer.openPowerMenu()
+        }
+
         // Apply a random wallpaper with the drawer staying shut. Note there is
         // deliberately no `setWallpaper(path)`: Quickshell's IPC cannot marshal
         // a string argument across the boundary, and `simpbar-wallpaper set <img>`

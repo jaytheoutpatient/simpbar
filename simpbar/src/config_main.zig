@@ -25,6 +25,7 @@ const gtk = @import("welcome_gtk.zig");
 const hg = @import("hypr_gtk.zig");
 const hypr = @import("hyprland.zig");
 const hypr_pages = @import("hypr_pages.zig");
+const mango_pages = @import("mango_pages.zig");
 const logging = @import("logging.zig");
 const desktop_entries = @import("desktop_entries.zig");
 
@@ -1562,11 +1563,13 @@ fn buildFontRow(group: *gtk.AdwPreferencesGroup) void {
 }
 
 // ---------------------------------------------------------------------
-// Monitor selection — discovers connected outputs via `hyprctl monitors -j`
-// (the only live-system-query mechanism in this file, same runCaptured
-// fork/exec/pipe-capture already used for fc-list above; NOT std.json —
-// this file hand-parses external command output everywhere, matching
-// main.zig's own hand-rolled substring-scan style for Hyprland JSON).
+// Monitor selection — discovers connected outputs via the running
+// compositor's IPC (`hyprctl monitors -j` on Hyprland, `mmsg get
+// all-monitors` on MangoWM; the only live-system-query mechanism in this
+// file, same runCaptured fork/exec/pipe-capture already used for fc-list
+// above; NOT std.json — this file hand-parses external command output
+// everywhere, matching main.zig's own hand-rolled substring-scan style for
+// compositor JSON).
 // Restart-required, unlike every other Appearance control: creating/
 // destroying Wayland surfaces live is out of scope (see the plan), so this
 // only takes effect the next time the bar process starts.
@@ -1609,7 +1612,12 @@ var monitor_entry_count: usize = 0;
 /// dropdown degrades to just its two fixed entries rather than crashing.
 fn discoverMonitors() void {
     monitor_entry_count = 0;
-    const output = runCaptured(&.{ "hyprctl", "monitors", "-j" }, 3000) orelse return;
+    const mango = getenv("MANGO_INSTANCE_SIGNATURE") != null;
+    const argv: []const [:0]const u8 = if (mango)
+        &.{ "mmsg", "get", "all-monitors" }
+    else
+        &.{ "hyprctl", "monitors", "-j" };
+    const output = runCaptured(argv, 3000) orelse return;
     defer gpa.free(output);
 
     const needle = "\"name\"";
@@ -2603,11 +2611,25 @@ const PAGE_NAMES = [_][:0]const u8{ "Appearance", "Modules", "Shortcuts" };
 const PAGE_ICONS = [_][:0]const u8{ "applications-graphics-symbolic", "view-list-symbolic", "user-bookmarks-symbolic" };
 const BAR_COUNT = PAGE_NAMES.len;
 
-// "Bar" pages + Hyprland pages, in sidebar order. The two header rows
-// ("Bar" / "Hyprland") are inserted between them at build time.
-const SB_NAMES = PAGE_NAMES ++ hypr_pages.pages.names;
-const SB_ICONS = PAGE_ICONS ++ hypr_pages.pages.icons;
-const SB_COUNT = SB_NAMES.len;
+// "Bar" pages + compositor pages, in sidebar order. The compositor section is
+// Hyprland on Hyprland and Mango on MangoWM; both decks have the same number
+// of pages (9), so only the names/icons and the section header change at
+// runtime. The header rows ("Bar" / "Hyprland"|"Mango") are inserted between
+// the two groups at build time.
+const SB_COUNT = BAR_COUNT + hypr_pages.pages.names.len;
+var g_sb_names: [SB_COUNT][:0]const u8 = undefined;
+var g_sb_icons: [SB_COUNT][:0]const u8 = undefined;
+
+fn setupSidebarNames() void {
+    for (PAGE_NAMES, 0..) |n, i| {
+        g_sb_names[i] = n;
+        g_sb_icons[i] = PAGE_ICONS[i];
+    }
+    const names = if (hypr_pages.g_mango) &mango_pages.pages.names else &hypr_pages.pages.names;
+    const icons = if (hypr_pages.g_mango) &mango_pages.pages.icons else &hypr_pages.pages.icons;
+    for (names.*, 0..) |n, i| g_sb_names[BAR_COUNT + i] = n;
+    for (icons.*, 0..) |ic, i| g_sb_icons[BAR_COUNT + i] = ic;
+}
 
 var g_sidebar_rows: [SB_COUNT]*gtk.GtkListBoxRow = undefined;
 var g_content_stack: ?*gtk.GtkStack = null;
@@ -2617,7 +2639,7 @@ fn onSidebarRowSelected(_: *gtk.GtkListBox, row: ?*gtk.GtkListBoxRow, _: ?*anyop
     const r = row orelse return;
     for (g_sidebar_rows, 0..) |sr, i| {
         if (sr == r) {
-            gtk.gtk_stack_set_visible_child_name(g_content_stack.?, SB_NAMES[i]);
+            gtk.gtk_stack_set_visible_child_name(g_content_stack.?, g_sb_names[i]);
             return;
         }
     }
@@ -2649,8 +2671,17 @@ fn onReloadClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     _ = hypr.reloadHyprland();
 }
 
+fn onReloadMangoClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    mango_pages.reload();
+}
+
 fn buildWindow(app: *anyopaque) *gtk.AdwApplicationWindow {
     hypr_pages.init();
+    if (hypr_pages.g_mango) {
+        mango_pages.init();
+    }
+    setupSidebarNames();
+    const section_title: [:0]const u8 = if (hypr_pages.g_mango) "Mango" else "Hyprland";
 
     const window = gtk.adw_application_window_new(app);
     gtk.gtk_window_set_title(@ptrCast(window), "Simpbar Config");
@@ -2681,17 +2712,17 @@ fn buildWindow(app: *anyopaque) *gtk.AdwApplicationWindow {
     for (0..BAR_COUNT) |i| {
         addSidebarRow(sidebar_list, PAGE_NAMES[i], PAGE_ICONS[i], true, i);
     }
-    addSidebarRow(sidebar_list, "Hyprland", "", false, SB_COUNT);
+    addSidebarRow(sidebar_list, section_title, "", false, SB_COUNT);
     for (BAR_COUNT..SB_COUNT) |i| {
-        addSidebarRow(sidebar_list, SB_NAMES[i], SB_ICONS[i], true, i);
+        addSidebarRow(sidebar_list, g_sb_names[i], g_sb_icons[i], true, i);
     }
 
-    const hypr_widgets = hypr_pages.pages.widgets();
+    const sec_widgets = if (hypr_pages.g_mango) mango_pages.pages.widgets() else hypr_pages.pages.widgets();
     var page_widgets: [SB_COUNT]*gtk.GtkBox = undefined;
     for (bar_pages, 0..) |p, i| page_widgets[i] = p;
-    for (hypr_widgets, 0..) |p, i| page_widgets[BAR_COUNT + i] = p;
+    for (sec_widgets, 0..) |p, i| page_widgets[BAR_COUNT + i] = p;
 
-    for (SB_NAMES, 0..) |name, i| {
+    for (g_sb_names, 0..) |name, i| {
         const scrolled = gtk.gtk_scrolled_window_new();
         gtk.gtk_scrolled_window_set_policy(scrolled, gtk.POLICY_NEVER, gtk.POLICY_AUTOMATIC);
         gtk.gtk_widget_set_vexpand(@ptrCast(scrolled), 1);
@@ -2710,9 +2741,15 @@ fn buildWindow(app: *anyopaque) *gtk.AdwApplicationWindow {
 
 
     const content_header_bar = gtk.adw_header_bar_new();
-    const reload_btn = gtk.gtk_button_new_with_label("Reload Hyprland");
-    _ = gtk.g_signal_connect_data(@ptrCast(reload_btn), "clicked", @ptrCast(&onReloadClicked), null, null, 0);
-    hg.adw_header_bar_pack_end(content_header_bar, @ptrCast(reload_btn));
+    if (hypr_pages.g_mango) {
+        const reload_btn = gtk.gtk_button_new_with_label("Reload Mango");
+        _ = gtk.g_signal_connect_data(@ptrCast(reload_btn), "clicked", @ptrCast(&onReloadMangoClicked), null, null, 0);
+        hg.adw_header_bar_pack_end(content_header_bar, @ptrCast(reload_btn));
+    } else { // hyprctl reload is meaningless under MangoWM
+        const reload_btn = gtk.gtk_button_new_with_label("Reload Hyprland");
+        _ = gtk.g_signal_connect_data(@ptrCast(reload_btn), "clicked", @ptrCast(&onReloadClicked), null, null, 0);
+        hg.adw_header_bar_pack_end(content_header_bar, @ptrCast(reload_btn));
+    }
     const content_toolbar = gtk.adw_toolbar_view_new();
     gtk.adw_toolbar_view_add_top_bar(content_toolbar, @ptrCast(content_header_bar));
     gtk.adw_toolbar_view_set_content(content_toolbar, @ptrCast(content_stack));
@@ -2759,3 +2796,4 @@ fn realMain() !void {
     logging.step("gtk main loop exited with code {d}", .{code});
     exit(code);
 }
+

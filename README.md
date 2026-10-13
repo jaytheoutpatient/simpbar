@@ -1,10 +1,8 @@
 # Simpbar
 
-A status bar for Hyprland — simpbar, a native Zig/Wayland bar built for this repo — that's simple, looks nice, and isn't distracting, plus an install script that sets up a whole ricing-friendly Arch desktop around it, and a companion GTK app to manage it all afterward.
+A status bar for Hyprland **and MangoWM** — simpbar, a native Zig/Wayland bar built for this repo — that's simple, looks nice, and isn't distracting, plus an install script that sets up a whole ricing-friendly Arch desktop around it, and a companion GTK app to manage it all afterward.
 
-Built for **Arch Linux** (and Arch-based distros like EndeavourOS, CachyOS, Garuda, XeroLinux — your mileage may vary depending on how much those ship pre-configured). Assumes **Hyprland 0.55+** (Lua config, `~/.config/hypr/hyprland.lua`).
-
-A **Debian** edition of the installer (`install-debian.sh`) is also available — see [Debian install](#debian-install) below.
+Built for **Arch Linux** (and Arch-based distros like EndeavourOS, CachyOS, Garuda, XeroLinux — your mileage may vary depending on how much those ship pre-configured). The installer asks up front which window manager you want — **Hyprland** (Lua config, `~/.config/hypr/hyprland.lua`) or **MangoWM** (`~/.config/mango`, flat config files under `cfg/`) — and which package-repo setup to use (**CachyOS** or **Chaotic-AUR**).
 
 ## Install
 
@@ -12,27 +10,7 @@ A **Debian** edition of the installer (`install-debian.sh`) is also available �
 curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash
 ```
 
-The script is interactive — it'll ask a handful of questions (browser, Discord client, whether you want OBS/a video editor/game launchers/falcond/matugen, etc.) and needs your sudo password partway through. Grab a coffee; it installs a lot.
-
-## Debian install
-
-```
-curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install-debian.sh | bash
-```
-
-Same interactive flow as the Arch script, adapted to apt. It's regularly tested against **Debian sid/testing**; older releases may be missing newer packages (notably Hyprland). Differences from the Arch installer:
-
-- i386 architecture is enabled automatically for Steam (apt's equivalent of multilib)
-- zig 0.16.0 and the JetBrainsMono Nerd Font aren't in Debian repos — they're fetched from the official upstream tarball/zip and installed to `/usr/local/zig` (symlinked into `/usr/local/bin`) and `/usr/share/fonts/TTF`
-- The bar, `simpbar-welcome`, and `simpbar-config` are built once with zig during install into `/usr/bin`
-- No Chaotic-AUR (not a thing on Debian) — explicit repositories are added only for the browser you pick (Brave/Vivaldi/Microsoft Edge/LibreWolf official apt repos, or Firefox ESR straight from Debian)
-- AUR-only items are skipped with working replacements: `sway-notification-center` instead of swaync, `mate-polkit` autostart instead of the Arch polkit path, `wlogout`/`steam-devices` from apt, azote instead of waypaper as an extra picker (the wallpaper engine itself is distro-agnostic — see [Wallpapers](#wallpapers)), and rofi's bundled Material theme instead of installing one
-- Dropped in favour of a fast AUR package set on Arch; on Debian, matugen (the Material You colorscheme generator) isn't packaged either — the installer offers a `cargo install matugen` route instead (see [Auto-theming with matugen](#auto-theming-with-matugen))
-- Heroic takes the Flatpak route (`com.heroicgameslauncher.hgl`), Discord the official `.deb`; ProtonPlus, falcond, nwg-drawer, and the dracula/zafiro themes aren't packaged on Debian and are skipped with a warning
-- The app drawer needs **quickshell**, which is in Arch's `extra` repo but isn't packaged on Debian in any suite (checked bookworm/trixie/sid). The Debian installer skips the drawer with a warning and rofi remains the launcher, but it still places the QML and the toggle script ready to go, so installing quickshell later is all it takes to switch over (see [App drawer](#app-drawer))
-- The GPU detection picks Debian's actual driver/repo names: `nvidia-driver` + `libnvidia-egl-wayland` (with a prompt to enable `non-free` if unavailable), `mesa-vulkan-drivers`/`intel-media-va-driver` for AMD/Intel
-
-The shipped binaries are distro-aware — `simpbar`, `simpbar-welcome`, `simpbar-config`, `simpbar-check-updates`, and `simpbar-launch-browser` detect apt vs pacman at runtime, so a single build works on either family.
+The script is interactive — it'll ask a handful of questions up front (whether to use the CachyOS or Chaotic-AUR repos, Hyprland or MangoWM, browser, Discord client, whether you want OBS/a video editor/game launchers/falcond/matugen, etc.) and needs your sudo password **once**, at the start — it's held and reused for the whole run. Grab a coffee; it installs a lot.
 
 ## Auto-theming with matugen
 
@@ -51,22 +29,21 @@ How it works — matugen never touches your bar config, wallpaper, or anything e
 
    > **The bug worth knowing about**, if you ever see your bar themed to a different image than the one on screen: waypaper writes `~/Pictures/...` into its `config.ini` with a literal tilde, and expands it itself on read (`pathlib.Path(...).expanduser()`). Anything reimplementing that parsing in shell has to expand it too — and `"$IMG"` where `IMG` is `~/Pictures/x.jpg` never matches a file, because a tilde inside double quotes is just a character. The helper used to bail out there, the Bing-only fallback caught it, and the desktop stayed themed to the Bing picture no matter what you picked. Both halves are fixed: the tilde is expanded, and paths are read out of `/proc/<pid>/cmdline` (NUL-separated argv) rather than `pgrep -a`, because every AI-generated wallpaper has spaces in its filename and a space-joined `ps` line can't tell you where the path ends.
 
-The chosen scheme type lives in `~/.config/simpbar/matugen-type` (a simpbar-owned file, since matugen 4.x only accepts `--type` on the command line and **ignores** a `type` key in its own config.toml); `simpbar-matugen` reads it on every run. The installer wires all of this when you opt into matugen: Arch pulls it from the AUR, Debian from crates.io (rustc + cargo), then places the config + template, installs `simpbar-matugen`, adds the picker hook, and pre-generates a scheme from that day's Bing wallpaper.
+The chosen scheme type lives in `~/.config/simpbar/matugen-type` (a simpbar-owned file, since matugen 4.x only accepts `--type` on the command line and **ignores** a `type` key in its own config.toml); `simpbar-matugen` reads it on every run. The installer wires all of this when you opt into matugen: it pulls matugen from the enabled repo (Chaotic-AUR or CachyOS) or the AUR, then places the config + templates, installs `simpbar-matugen`, adds the picker hook, and pre-generates a scheme from that day's Bing wallpaper. On MangoWM installs it also themes Mango itself (`~/.config/mango/cfg/matugen-colors.conf`).
 
 ## App drawer
 
-An ArcMenu-style launcher that slides up from under the bar — app grid, categories, search, pinned favourites, and a power menu (lock / suspend / log out / restart / power off). It reads the same `matugen.json` as the bar, so both repaint together when you change wallpaper.
+An ArcMenu-style launcher that slides up from under the bar — app grid, categories, search, pinned favourites, and a power menu (lock / suspend / log out / restart / power off). It reads the same `matugen.json` as the bar, so both repaint together when you change wallpaper. The bar's power button and Mango's `SUPER + SHIFT + Q` both open this power menu (`appdrawer power`) — wlogout is no longer installed or shipped.
 
 Three ways to open it:
 
 - **Click empty bar space** (see below)
 - **`SUPER + Tab`**
-- **`appdrawer`** by hand — `toggle` (default), `open`, `close`, `wallpapers`, `apps`, or `start`. It's in `/usr/bin`, so no path needed.
+- **`appdrawer`** by hand — `toggle` (default), `open`, `close`, `wallpapers`, `apps`, `power`, or `start`. It's in `/usr/bin`, so no path needed.
 
 It's a [quickshell](https://quickshell.org) panel living in `~/.config/quickshell/appdrawer/`, not a plain Qt/QML app: layer-shell support (the thing that lets a window dock to a screen edge like a panel) lives in quickshell's QtWayland fork rather than upstream `qt6-wayland`, so a stock Qt6 QML app has no way to make one.
 
 - **Arch**: quickshell is in the official `extra` repo, so the installer pulls it and deploys the panel.
-- **Debian**: quickshell isn't packaged in any suite, and building it isn't a good option — it uses private Qt APIs and must be compiled against the exact Qt version it ships with or it crashes on ABI mismatch. The installer skips the drawer with a warning and leaves rofi as the launcher, but still stages the QML in `~/.local/share/simpbar/appdrawer/` and the toggle script, so installing quickshell yourself is all that's needed afterwards.
 
 Your pinned apps live in `favourites.json` next to the panel — under `$XDG_CONFIG_HOME/quickshell/appdrawer/` when `XDG_CONFIG_HOME` is set, `~/.config/quickshell/appdrawer/` otherwise. That is the same place quickshell itself searches for configs, so the panel and its state can never drift apart. The installer never overwrites an existing `favourites.json`.
 
@@ -182,7 +159,7 @@ Only the fetch subcommands need `curl` and `python3`; `list`, `set`, `random` an
 
 **How a wallpaper gets applied.** The new swaybg is started *before* the old one is killed (with a short pause in between), so the screen never flashes black — the reverse order shows bare desktop for a frame on every switch. Then matugen runs (its output goes to `~/.local/state/simpbar/matugen.log`; it's ~140 lines of post-hook chatter per run, which would otherwise drown out this script's machine-readable output), and finally the path is written to `~/.config/simpbar/wallpaper`. Remembering it *before* theming means a matugen crash still leaves a restorable wallpaper.
 
-**Across reboots.** `simpbar-restore-wallpaper` runs from your Hyprland autostart and replays `~/.config/simpbar/wallpaper` through the engine — so the wallpaper comes back *and* the colors match it from the first frame, instead of showing last session's palette until you change it. If you never used the engine it falls back to azote's restore script (`~/.azotebg-hyprland` or `~/.azotebg`), and does nothing at all if neither exists. Because of this, the installer no longer writes a `swaybg.service`: that unit baked today's Bing path into `ExecStart`, which cannot express "whatever was last picked", and its `Restart=on-failure` meant it could resurrect the Bing picture over the top of a newer choice. Any existing one is disabled on install.
+**Across reboots.** `simpbar-restore-wallpaper` runs from your WM's autostart (hyprland.lua or the mango autostart.conf) and replays `~/.config/simpbar/wallpaper` through the engine — so the wallpaper comes back *and* the colors match it from the first frame, instead of showing last session's palette until you change it. If you never used the engine it falls back to azote's restore script (`~/.azotebg-hyprland` or `~/.azotebg`), and does nothing at all if neither exists. Because of this, the installer no longer writes a `swaybg.service`: that unit baked today's Bing path into `ExecStart`, which cannot express "whatever was last picked", and its `Restart=on-failure` meant it could resurrect the Bing picture over the top of a newer choice. Any existing one is disabled on install.
 
 **Which folders.** `~/Pictures/Wallpaper` by default. For more, create `~/.config/simpbar/wallpaper-dirs` with one path per line (`~` is expanded, blank lines and `#` comments ignored):
 
@@ -210,15 +187,15 @@ There is no widget for this in **simpbar-config**, but it is round-tripped from 
 ## What the install script sets up
 
 **Bar, compositor & theming**
-- simpbar (this repo's source, built from scratch during install), Hyprland, foot (terminal), rofi with its bundled Material theme, swaync (notifications)
+- simpbar (this repo's source, built from scratch during install), Hyprland **or MangoWM** (your choice, with its desktop portal), foot (terminal), rofi with its bundled Material theme, swaync (notifications)
 - simpbar-shell: desktop widget cards (clock/weather/media/system monitor/calendar/analog watch/sticky note) on a layer just above the wallpaper, themed from the same matugen colors, plus the `Alt + W` overview mode (see [Desktop widgets](#desktop-widgets-simpbar-shell))
 - Dracula GTK theme, Zafiro-Dracula icon theme, Bibata Modern Classic cursor — all applied automatically via nwg-look's settings, no manual toggling needed
-- nwg-drawer, usable from rofi as a fallback app-menu (ArcMenu-style GNOME Shell extensions don't run under Hyprland at all)
+- nwg-drawer, usable from rofi as a fallback app-menu (ArcMenu-style GNOME Shell extensions don't run under a tiling Wayland compositor at all)
 - fastfetch (also wired into every new bash/fish shell)
 
 **Wallpaper**
 - Downloads that day's Bing wallpaper into `~/Pictures/Wallpaper` (through the wallpaper engine, so it's verified and de-duplicated like every other fetch — see [Wallpapers](#wallpapers)) (via the wallpaper engine, so the download is verified and de-duplicated the same way as every other fetch)
-- Seeds the wallpaper engine's state file with it, so the wallpaper you had at logout is the one that comes back at login — nothing to add to your Hyprland autostart yourself (see [Wallpapers](#wallpapers))
+- Seeds the wallpaper engine's state file with it, so the wallpaper you had at logout is the one that comes back at login — nothing to add to your WM's autostart yourself (see [Wallpapers](#wallpapers))
 - Installs `simpbar-wallpaper` (the engine) and `simpbar-restore-wallpaper` (the login-time restore) to `/usr/bin`
 - Optional **matugen** auto-theming — the bar recolors to match whatever wallpaper is up (see [Auto-theming with matugen](#auto-theming-with-matugen))
 
@@ -240,13 +217,13 @@ There is no widget for this in **simpbar-config**, but it is round-tripped from 
 
 **Extras**
 - OBS Studio and a video editor (Kdenlive, Shotcut, or Flowblade), both optional
-- cliphist (clipboard history), grim + slurp + xdg-desktop-portal-hyprland (screenshots/screen-share)
-- Hyprland settings built into **Simpbar Config** — a native GTK4/libadwaita manager for keybinds, monitors, animations, window/workspace/layer rules, autostart, and environment, without hand-editing `hyprland.lua`
-- Chaotic-AUR set up automatically for faster package installs
+- cliphist (clipboard history), grim + slurp (screenshots) + your WM's desktop portal (screen-share)
+- WM settings built into **Simpbar Config** — a native GTK4/libadwaita manager for keybinds, monitors, animations, window/workspace/layer rules, autostart, and environment. On Hyprland it writes `hyprland-simpbar.lua`; on MangoWM it reads/writes `~/.config/mango/cfg/*.conf` directly — no hand-editing either way
+- Your choice of repo set up automatically for faster package installs — **CachyOS** (optimized packages) or **Chaotic-AUR** (binary AUR packages), picked at the very start. yay/paru are only used for whatever the chosen repo doesn't carry
 - A background update checker (systemd timer, runs every 6h) that notifies you when there's a new Arch/AUR update or a new commit on this repo
 
 **Pinned apps in the bar**
-simpbar ships with quick-launch icons: Browser, Discord, Files (Nautilus), Terminal, Steam, Config (Hyprland settings), and Simpbar Welcome. Browser and Discord are smart about it — whichever one you actually installed is what launches by default, and you can change your mind later from the Welcome app without needing to touch any config directly.
+simpbar ships with quick-launch icons: Browser, Discord, Files (Nautilus), Terminal, Steam, Config (WM settings), and Simpbar Welcome. Browser and Discord are smart about it — whichever one you actually installed is what launches by default, and you can change your mind later from the Welcome app without needing to touch any config directly.
 
 ## Simpbar Welcome
 
@@ -255,7 +232,7 @@ A small GTK4 + libadwaita app that pops up once on first login (and is always re
 - **Welcome** — quick intro, plus a "Launch on startup" switch (toggles whether the app opens automatically each login)
 - **Setup**
   - Update Simpbar & Arch Linux in one click, or just check for updates now
-  - Quick launchers for the wallpaper picker, nwg-look, the Hyprland settings (simpbar-config), and pavucontrol
+  - Quick launchers for the wallpaper picker, nwg-look, the WM settings (simpbar-config), and pavucontrol
   - Install or remove text editors (Neovim/Gedit/Kate/Zed/VS Code)
   - Set which browser and Discord client the bar's pinned buttons should launch
 - **Keybindings** — the list below, always at hand
@@ -264,19 +241,27 @@ A small GTK4 + libadwaita app that pops up once on first login (and is always re
 ## Simpbar Config
 
 Simpbar Config is the app in the "Tweak Hyprland settings" card: a sidebar of nine
-Hyprland pages (General, Monitors, Animations, Keybinds, Window Rules, Workspace
+WM pages (General, Monitors, Animations, Keybinds, Window Rules, Workspace
 Rules, Layer Rules, Autostart, Environment) sitting next to the original bar
-pages (Appearance, Modules, Shortcuts).
+pages (Appearance, Modules, Shortcuts). On a MangoWM install the same nine pages
+read and write your Mango config instead.
 
-- Settings are saved to `~/.config/simpbar/hyprland.json` (the source of truth).
-- Each change regenerates `~/.config/hypr/hyprland-simpbar.lua` and both files are
-  written atomically, then Hyprland is reloaded automatically.
-- `hyprland-simpbar.lua` is loaded from `hyprland.lua` via an idempotent
+- **Hyprland**: settings are saved to `~/.config/simpbar/hyprland.json` (the
+  source of truth). Each change regenerates `~/.config/hypr/hyprland-simpbar.lua`
+  and both files are written atomically, then Hyprland is reloaded automatically.
+  `hyprland-simpbar.lua` is loaded from `hyprland.lua` via an idempotent
   `pcall(require, "hyprland-simpbar")` line — the first app run adds it if missing,
   and install.sh adds it to fresh configs, so a manual `hyprland.lua` stays yours.
-- Hit the header-bar **Reload Hyprland** button to re-apply from disk at any time.
+- **MangoWM**: the same pages read/write the flat config files under
+  `~/.config/mango/cfg/` directly, and the header-bar **Reload** button runs
+  `mmsg dispatch reload_config` to re-apply them live.
+- Hit the header-bar **Reload** button to re-apply from disk at any time.
 
 ## Keybindings
+
+The table below is the Hyprland set; MangoWM ships its own in
+`~/.config/mango/cfg/keybinds.conf` (same spirit — `SUPER + Space` opens the app
+drawer, `SUPER + SHIFT + Q` opens the power menu, screenshots on `Print`/`SUPER + P`).
 
 | Keys | Action |
 |---|---|
@@ -294,7 +279,11 @@ pages (Appearance, Modules, Shortcuts).
 To change keybindings or your monitor setup:
 
 ```
+# Hyprland
 nvim ~/.config/hypr/hyprland.lua
+
+# MangoWM
+nvim ~/.config/mango/cfg/keybinds.conf      # monitors: ~/.config/mango/cfg/monitors.conf
 ```
 
 Don't forget to reboot once the install finishes (`systemctl reboot`) so everything (shell, theme, services) is fully in effect.

@@ -14,7 +14,7 @@ else
     C_RESET=""; C_BOLD=""; C_BLUE=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_CYAN=""; C_MAGENTA=""
 fi
 
-TOTAL_STEPS=7
+TOTAL_STEPS=9
 STEP=0
 
 banner() {
@@ -173,10 +173,18 @@ prompt_choice() {
     printf -v "$result_var" '%s' "$choice"
 }
 
-# Try installing an AUR package with whichever helper is available.
+# Try installing a "would-be-AUR" package from the enabled pacman repos
+# first (Chaotic-AUR in particular carries these as binary packages, and
+# CachyOS carries a good chunk too), falling back to an AUR helper only when
+# the repos don't have it.
 # install_aur_pkg <display name> <package>
 install_aur_pkg() {
     local name="$1" pkg="$2"
+    if pacman -Si "$pkg" >/dev/null 2>&1; then
+        run_spinner "pacman: $pkg (${REPO_NAME})" sudo pacman -S --noconfirm --needed "$pkg" \
+            || { warn "Could not install $name from ${REPO_NAME} — install manually: sudo pacman -S $pkg"; return 1; }
+        return 0
+    fi
     if command -v yay >/dev/null; then
         run_spinner "yay: $pkg (AUR)" yay -S --noconfirm --needed "$pkg" \
             || { warn "Could not install $name via yay — install manually: yay -S $pkg"; return 1; }
@@ -184,7 +192,54 @@ install_aur_pkg() {
         run_spinner "paru: $pkg (AUR)" paru -S --noconfirm --needed "$pkg" \
             || { warn "Could not install $name via paru — install manually: paru -S $pkg"; return 1; }
     else
-        warn "No AUR helper available — install $name manually: yay -S $pkg"
+        warn "Could not install $name from ${REPO_NAME} and no AUR helper is available — install manually: yay -S $pkg"
+        return 1
+    fi
+}
+
+# Install a batch of packages from the enabled pacman repos when possible,
+# falling back to an AUR helper for anything the repos don't carry. Only asks
+# to install yay/paru when it is actually needed.
+#   install_repo_or_aur <pkg> [<pkg> ...]
+# Returns 0 when everything installed.
+install_repo_or_aur() {
+    local repo=() aur=() pkg count="$#"
+    for pkg in "$@"; do
+        if pacman -Si "$pkg" >/dev/null 2>&1; then
+            repo+=("$pkg")
+        else
+            aur+=("$pkg")
+        fi
+    done
+
+    if [ "${#repo[@]}" -gt 0 ]; then
+        run_spinner "pacman: ${#repo[@]} of $count packages from ${REPO_NAME}" \
+            sudo pacman -S --noconfirm --needed "${repo[@]}" \
+            || { warn "Some ${REPO_NAME} installs failed: ${repo[*]}"; return 1; }
+    fi
+
+    if [ "${#aur[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    printf '  %d package(s) are not in %s: %s\n' "${#aur[@]}" "$REPO_NAME" "${aur[*]}"
+    if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
+        prompt_choice AUR_CHOICE 1 "No AUR helper found — ${#aur[@]} package(s) need the AUR. Install which one?" "yay" "paru" "skip"
+        case "$AUR_CHOICE" in
+            2) install_paru || warn "Could not install paru automatically — install manually: ${aur[*]}" ;;
+            3) warn "Skipping AUR helper install — install manually: ${aur[*]}" ;;
+            *) install_yay || warn "Could not install yay automatically — install manually: ${aur[*]}" ;;
+        esac
+    fi
+
+    if command -v yay >/dev/null; then
+        run_spinner "yay: installing ${#aur[@]} AUR packages" yay -S --noconfirm --needed "${aur[@]}" \
+            || { warn "Some AUR packages failed via yay — install manually: yay -S ${aur[*]}"; return 1; }
+    elif command -v paru >/dev/null; then
+        run_spinner "paru: installing ${#aur[@]} AUR packages" paru -S --noconfirm --needed "${aur[@]}" \
+            || { warn "Some AUR packages failed via paru — install manually: paru -S ${aur[*]}"; return 1; }
+    else
+        warn "No AUR helper available — install manually: ${aur[*]}"
         return 1
     fi
 }
@@ -194,17 +249,101 @@ banner
 # ── Step 0: platform check ─────────────────────────────────────────
 command -v pacman >/dev/null || die "This script is Arch-only (pacman not found)."
 
-# Authenticate sudo up front so the password prompt never lands in the
-# middle of a spinner later on. Keep it alive in the background for the
-# rest of the script, and make sure that background loop dies with us.
-printf '\n%sThis installer needs sudo access.%s\n' "$C_BOLD" "$C_RESET"
-sudo -v || die "Could not authenticate with sudo."
-( while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) &
-SUDO_KEEPALIVE_PID=$!
-trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null' EXIT
+# ── Step 1: package repositories ─────────────────────────────────────
+step "Choosing package repositories"
 
-# ── Step 1: prerequisites ──────────────────────────────────────────
+printf '\n  %sBoth options add a binary repo to pacman so most packages —\n' "$C_BOLD"
+printf '  including things that are AUR-only on plain Arch — install through\n'
+printf '  %ssudo pacman -S%s instead of being compiled by an AUR helper (yay/\n' "$C_CYAN" "$C_RESET"
+printf '  paru only gets used for the few stragglers the repo does not carry).\n\n'
+printf '  %sCachyOS repos:%s performance-optimized, recompiled Arch packages.\n' "$C_YELLOW" "$C_RESET"
+printf '    Opinionated: it swaps in a tuned pacman and rebuilds core packages\n'
+printf '    for your CPU (x86-64-v3/v4 or AMD Zen).\n'
+printf '  %sChaotic-AUR:%s a binary mirror of AUR packages layered on plain\n' "$C_YELLOW" "$C_RESET"
+printf '    Arch — closest to what this installer used to do.\n'
+
+prompt_choice REPO_CHOICE 2 "Which repository setup would you like?" "CachyOS" "Chaotic-AUR"
+case "$REPO_CHOICE" in
+    1) REPO_NAME="CachyOS";    REPO_LABEL="CachyOS" ;;
+    *) REPO_NAME="Chaotic-AUR"; REPO_LABEL="Chaotic-AUR" ;;
+esac
+ok "Selected ${REPO_NAME} repositories"
+
+# ── Step 2: window manager ───────────────────────────────────────────
+step "Choosing your window manager"
+
+printf '\n  %sHyprland%s is the default setup (Lua config, %s~/.config/hypr%s).\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$C_RESET"
+printf '  %sMangoWM%s uses your shipped %s~/.config/mango%s config (flat files\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$C_RESET"
+printf '  under %scfg/%s — where simpbar-config writes its Mango pages).\n' "$C_CYAN" "$C_RESET"
+
+prompt_choice WM_CHOICE 1 "Which window manager would you like to install?" "Hyprland" "MangoWM"
+case "$WM_CHOICE" in
+    2) WM_NAME="MangoWM"; WM_IS_HYPRLAND=0; WM_IS_MANGO=1
+       CONFIG_DIRS=(mango swaync fastfetch matugen) ;;
+    *) WM_NAME="Hyprland"; WM_IS_HYPRLAND=1; WM_IS_MANGO=0
+       CONFIG_DIRS=(hypr swaync fastfetch matugen) ;;
+esac
+ok "Selected ${WM_NAME}"
+
+# ── Step 3: prerequisites ────────────────────────────────────────────
 step "Checking prerequisites"
+
+# ── Sudo: authenticate ONCE, then hold the password ────────────────
+# The script asks for the sudo password exactly once, up front, then serves
+# every later `sudo` from that stored copy through an askpass helper. A `sudo`
+# wrapper placed first on PATH means child processes (pacman, makepkg,
+# yay/paru, the CachyOS repo installer) inherit it too, so nothing re-prompts
+# for the rest of the run.
+SUDO_PASS=""
+SUDO_KEEPALIVE_PID=""
+SUDO_TMP_DIR=""
+
+printf '\n%sThis installer needs sudo access — enter the password once and\n' "$C_BOLD"
+printf 'it will be held for the whole run.%s\n' "$C_RESET"
+if [ ! -r /dev/tty ]; then
+    die "No interactive terminal available — run this script from a real TTY."
+fi
+printf '  %sPassword: %s' "$C_BOLD" "$C_RESET"
+IFS= read -rs SUDO_PASS < /dev/tty
+printf '\n'
+[ -n "$SUDO_PASS" ] || die "No password entered."
+
+SUDO_TMP_DIR=$(mktemp -d)
+chmod 700 "$SUDO_TMP_DIR"
+export SIMPBAR_SUDO_PASS="$SUDO_PASS"
+
+cat > "$SUDO_TMP_DIR/askpass.sh" <<'SUDOASKPASS'
+#!/bin/bash
+printf '%s\n' "$SIMPBAR_SUDO_PASS"
+SUDOASKPASS
+chmod 700 "$SUDO_TMP_DIR/askpass.sh"
+
+cat > "$SUDO_TMP_DIR/sudo" <<'SUDOWRAPPER'
+#!/bin/bash
+exec /usr/bin/sudo -A "$@"
+SUDOWRAPPER
+chmod 755 "$SUDO_TMP_DIR/sudo"
+
+export SUDO_ASKPASS="$SUDO_TMP_DIR/askpass.sh"
+export PATH="$SUDO_TMP_DIR:$PATH"
+
+cleanup_sudo() {
+    [ -n "$SUDO_KEEPALIVE_PID" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    [ -n "$SUDO_TMP_DIR" ] && rm -rf "$SUDO_TMP_DIR"
+    unset SIMPBAR_SUDO_PASS
+}
+trap 'cleanup_sudo' EXIT
+
+# Verify the password now so a wrong one fails loudly at the start, not in the
+# middle of a spinner. The keepalive loop refreshes the sudo timestamp every
+# minute (via the same askpass path) so expiry can never cause a prompt.
+if ! sudo -v >/dev/null 2>&1; then
+    die "Could not authenticate with sudo (wrong password?)."
+fi
+ok "Sudo access confirmed — one prompt, held for the whole run"
+( while true; do sudo -v >/dev/null 2>&1 || exit 1; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) &
+SUDO_KEEPALIVE_PID=$!
+
 MISSING_PREREQS=()
 command -v curl  >/dev/null || MISSING_PREREQS+=(curl)
 command -v unzip >/dev/null || MISSING_PREREQS+=(unzip)
@@ -220,7 +359,7 @@ HOME_DIRS=(Pictures Videos Documents Music Projects)
 mkdir -p "${HOME_DIRS[@]/#/$HOME/}"
 ok "Created ~/{${HOME_DIRS[*]// /,}}"
 
-# ── Step 2: fetch simpbar config + source ─────────────────────────────
+# ── Step 4: fetch simpbar config + source ─────────────────────────────
 step "Fetching simpbar theme"
 mkdir -p ~/.config
 
@@ -233,7 +372,8 @@ run_spinner "Extracting archive" \
     || die "Could not extract simpbar archive."
 rm -f /tmp/simpbar.zip
 
-CONFIG_DIRS=(hypr swaync fastfetch matugen)
+# CONFIG_DIRS was chosen in Step 2 (hypr… for Hyprland, mango… for MangoWM);
+# verify the archive actually carries the whole set.
 for d in "${CONFIG_DIRS[@]}" simpbar; do
     if [ ! -d "/tmp/simpbar-temp/simpbar-main/$d" ]; then
         rm -rf /tmp/simpbar-temp
@@ -252,6 +392,14 @@ if [ -d ~/.config/matugen ]; then
     done
 fi
 ok "Configs placed in ~/.config/{${CONFIG_DIRS[*]// /,}}"
+
+# The shipped Mango config keeps user-specific paths as the __HOME__
+# placeholder (the repo can't know the target user's home); substitute the
+# real home directory into the deployed copy now.
+if [ "$WM_IS_MANGO" -eq 1 ]; then
+    sed -i "s|__HOME__|$HOME|g" ~/.config/mango/config.conf ~/.config/mango/cfg/*.conf
+    ok "Mango config deployed (~/.config/mango)"
+fi
 
 # simpbar is source, not a config dir — kept out of CONFIG_DIRS/~/.config on
 # purpose, and copied somewhere persistent (rather than built straight out
@@ -318,35 +466,62 @@ cp /tmp/simpbar-temp/simpbar-main/appdrawer.desktop ~/.local/share/simpbar/appdr
 
 rm -rf /tmp/simpbar-temp
 
-# ── Step 3: set up Chaotic-AUR ───────────────────────────────────────
-step "Setting up Chaotic-AUR"
+# ── Step 5: set up the chosen repo ───────────────────────────────────
+step "Setting up ${REPO_NAME}"
 
-if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
-    ok "Chaotic-AUR already configured"
+if [ "$REPO_CHOICE" = 1 ]; then
+    # ── CachyOS ─────────────────────────────────────────────────────
+    if grep -qE '^\[cachyos' /etc/pacman.conf 2>/dev/null; then
+        ok "CachyOS repos already configured"
+    else
+        run_spinner "Downloading the CachyOS repo installer" \
+            curl -fsSL -o /tmp/cachyos-repo.tar.xz https://mirror.cachyos.org/cachyos-repo.tar.xz \
+            || die "Could not download the CachyOS repo installer (check your network connection)."
+
+        run_spinner "Extracting the CachyOS repo installer" \
+            bash -c 'rm -rf /tmp/cachyos-repo && mkdir -p /tmp/cachyos-repo && tar xf /tmp/cachyos-repo.tar.xz -C /tmp/cachyos-repo --strip-components=1' \
+            || die "Could not extract the CachyOS repo installer."
+        rm -f /tmp/cachyos-repo.tar.xz
+
+        # The official script detects your CPU's ISA level, adds the matching
+        # [cachyos*] sections, installs the keyring/mirrorlists, swaps in its
+        # tuned pacman, and runs pacman -Syu. It is non-interactive; the sudo
+        # wrapper/askpass set up earlier feeds it the stored password.
+        run_spinner "Installing the CachyOS repos (tuned pacman + core packages)" \
+            bash -c 'cd /tmp/cachyos-repo && sudo ./cachyos-repo.sh --install' \
+            || die "CachyOS repo setup failed (see output above)."
+        rm -rf /tmp/cachyos-repo
+        ok "CachyOS repos enabled"
+    fi
 else
-    run_spinner "Importing Chaotic-AUR signing key" \
-        sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com \
-        || die "Failed to import the Chaotic-AUR signing key."
+    # ── Chaotic-AUR ─────────────────────────────────────────────────
+    if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
+        ok "Chaotic-AUR already configured"
+    else
+        run_spinner "Importing Chaotic-AUR signing key" \
+            sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com \
+            || die "Failed to import the Chaotic-AUR signing key."
 
-    run_spinner "Trusting Chaotic-AUR signing key" \
-        sudo pacman-key --lsign-key 3056513887B78AEB \
-        || die "Failed to locally sign the Chaotic-AUR key."
+        run_spinner "Trusting Chaotic-AUR signing key" \
+            sudo pacman-key --lsign-key 3056513887B78AEB \
+            || die "Failed to locally sign the Chaotic-AUR key."
 
-    run_spinner "Installing Chaotic-AUR keyring & mirrorlist" \
-        sudo pacman -U --noconfirm \
-            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
-            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
-        || die "Failed to install the Chaotic-AUR keyring/mirrorlist packages."
+        run_spinner "Installing Chaotic-AUR keyring & mirrorlist" \
+            sudo pacman -U --noconfirm \
+                'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
+                'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
+            || die "Failed to install the Chaotic-AUR keyring/mirrorlist packages."
 
-    printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
+        printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
 
-    run_spinner "Syncing package databases" sudo pacman -Sy \
-        || die "Failed to sync package databases after enabling Chaotic-AUR."
+        run_spinner "Syncing package databases" sudo pacman -Sy \
+            || die "Failed to sync package databases after enabling Chaotic-AUR."
 
-    ok "Chaotic-AUR enabled"
+        ok "Chaotic-AUR enabled"
+    fi
 fi
 
-# ── Step 4: detect GPU and install packages ──────────────────────────
+# ── Step 6: detect GPU and install packages ──────────────────────────
 step "Detecting GPU"
 
 GPU_INFO=$(lspci 2>/dev/null | grep -Ei 'vga compatible controller|3d controller')
@@ -376,7 +551,7 @@ else
     mapfile -t GPU_PKGS < <(printf '%s\n' "${GPU_PKGS[@]}" | sort -u)
 fi
 
-step "Installing packages"
+printf '\n%sInstalling packages%s\n' "$C_BLUE$C_BOLD" "$C_RESET"
 
 # Steam lives in the multilib repo, which isn't enabled by default.
 if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
@@ -396,17 +571,29 @@ fi
 # (checkupdates) and wireplumber (wpctl) were already here for other
 # reasons but simpbar's pacman-update-count and volume widgets need them too.
 # grim + slurp + wl-clipboard + libnotify + gawk cover the screenshot binds
-# in hyprland.lua (region/window/fullscreen capture, clipboard copy via
-# wl-copy, notify-send for the toast, and awk to parse `hyprctl activewindow`
-# for the window-only capture). gawk ships in Arch's base group already on
-  # quickshell (official extra repo) runs the app drawer panel. Plain Qt6/QML
-  # cannot do this: layer-shell support lives in quickshell's QtWayland fork
-  # rather than upstream qt6-wayland, so a hand-rolled QML panel has no way to
-  # make a layer-shell surface at all. See the "App drawer" section below for
-  # what actually gets deployed.
+# (region/window/fullscreen capture, clipboard copy via wl-copy, notify-send
+# for the toast, and awk to parse the compositor's active-window info for the
+# window-only capture) — the binds are spelled the same in hyprland.lua and
+# the shipped mango keybinds.conf. gawk ships in Arch's base group already on
 # almost every install, but it's listed explicitly rather than assumed.
-PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl gnome-calendar mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji hyprland foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp xdg-desktop-portal-hyprland cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell)
+# quickshell (official extra repo) runs the app drawer panel. Plain Qt6/QML
+# cannot do this: layer-shell support lives in quickshell's QtWayland fork
+# rather than upstream qt6-wayland, so a hand-rolled QML panel has no way to
+# make a layer-shell surface at all. See the "App drawer" section below for
+# what actually gets deployed.
+# brightnessctl backs both WMs' XF86MonBrightness* binds.
+PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
 PACMAN_PKGS+=("${GPU_PKGS[@]}")
+
+# The compositor itself plus its desktop portal, chosen in Step 2. MangoWM
+# also needs the apps the shipped mango config starts/binds on login
+# (alacritty terminal, easyeffects from autostart).
+if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
+    PACMAN_PKGS+=(hyprland xdg-desktop-portal-hyprland)
+else
+    PACMAN_PKGS+=(mangowm xdg-desktop-portal-wlr xdg-desktop-portal-gtk)
+    PACMAN_PKGS+=(alacritty easyeffects)
+fi
 
 prompt_choice FILE_MANAGER_CHOICE 1 "Which file manager would you like to use?" \
     "Nautilus" "Nemo" "Dolphin"
@@ -416,10 +603,19 @@ case "$FILE_MANAGER_CHOICE" in
     *) FILE_MANAGER_NAME="Nautilus"; FILE_MANAGER_BIN="nautilus"; PACMAN_PKGS+=(nautilus) ;;
 esac
 
-# hyprland.lua (copied to ~/.config/hypr in Step 2) hardcodes its
-# fileManager variable to nautilus — point it at whichever one was chosen.
-if [ -e ~/.config/hypr/hyprland.lua ]; then
-    sed -i "s/^local fileManager = \".*\"/local fileManager = \"$FILE_MANAGER_BIN\"/" ~/.config/hypr/hyprland.lua
+# Point whichever config the chosen WM ships at the picked file manager.
+if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
+    # hyprland.lua (copied to ~/.config/hypr in Step 4) hardcodes its
+    # fileManager variable to nautilus — point it at whichever one was chosen.
+    if [ -e ~/.config/hypr/hyprland.lua ]; then
+        sed -i "s/^local fileManager = \".*\"/local fileManager = \"$FILE_MANAGER_BIN\"/" ~/.config/hypr/hyprland.lua
+    fi
+else
+    # The shipped mango keybinds.conf binds SUPER+E to dolphin — match it to
+    # the user's pick so the bind works regardless of the choice above.
+    if [ -e ~/.config/mango/cfg/keybinds.conf ]; then
+        sed -i "s/bind = SUPER, e, spawn, dolphin/bind = SUPER, e, spawn, $FILE_MANAGER_BIN/" ~/.config/mango/cfg/keybinds.conf
+    fi
 fi
 
 prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
@@ -529,7 +725,8 @@ run_spinner "Installing simpbar-config to /usr/bin" \
 ok "simpbar-config built and installed to /usr/bin/simpbar-config"
 
 # Build simpbar-shell (the desktop widgets) too — same zig, against the bar's
-# source layout it was staged next to above. Started by hyprland.lua on login.
+# source layout it was staged next to above. Autostarted on login by whichever
+# WM was chosen (hyprland.lua or the mango autostart.conf).
 run_spinner "Building simpbar-shell" bash -c 'cd ~/.local/share/simpbar/simpbar-shell && zig build -Doptimize=ReleaseFast' \
     || die "Failed to build simpbar-shell — check zig, freetype2, gdk-pixbuf2, wayland, and wayland-protocols installed correctly."
 
@@ -892,45 +1089,29 @@ FOOTEOF
     ok "foot config placed in ~/.config/foot/foot.ini"
 fi
 
-# wlogout, waypaper & protonplus are AUR-only — need an AUR helper
-AUR_PKGS=(wlogout waypaper protonplus dracula-gtk-theme bibata-cursor-theme game-devices-udev zafiro-icon-theme)
+# waypaper, protonplus etc. used to mean an AUR helper — with Chaotic-AUR
+# (or CachyOS) enabled most of these are now binary packages, so they install
+# through pacman from the chosen repo, and yay/paru are only reached for the
+# stragglers the repo doesn't carry. wlogout is deliberately gone: the app
+# drawer's Power menu (bar power button / SUPER+SHIFT+Q) replaces it.
+AUR_PKGS=(waypaper protonplus dracula-gtk-theme bibata-cursor-theme game-devices-udev zafiro-icon-theme)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 [ "$INSTALL_FALCOND" -eq 1 ] && AUR_PKGS+=(falcond falcond-gui)
 [ "$INSTALL_MATUGEN" -eq 1 ] && AUR_PKGS+=(matugen)
 
-if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
-    prompt_choice AUR_CHOICE 1 "No AUR helper found. Install which one?" "yay" "paru" "skip"
-    case "$AUR_CHOICE" in
-        2) install_paru || warn "Could not install paru automatically — install manually: ${AUR_PKGS[*]}" ;;
-        3) warn "Skipping AUR helper install — install manually: ${AUR_PKGS[*]}" ;;
-        1) install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}" ;;
-        *)
-            warn "Unrecognized choice — defaulting to yay"
-            install_yay || warn "Could not install yay automatically — install manually: ${AUR_PKGS[*]}"
-            ;;
-    esac
-fi
-
-printf '  Installing %d AUR packages:\n    %s\n' "${#AUR_PKGS[@]}" "${AUR_PKGS[*]}"
-if command -v yay >/dev/null; then
-    run_spinner "yay: installing ${#AUR_PKGS[@]} AUR packages" yay -S --noconfirm --needed "${AUR_PKGS[@]}" \
-        || warn "Some AUR packages failed via yay — install manually: yay -S ${AUR_PKGS[*]}"
-elif command -v paru >/dev/null; then
-    run_spinner "paru: installing ${#AUR_PKGS[@]} AUR packages" paru -S --noconfirm --needed "${AUR_PKGS[@]}" \
-        || warn "Some AUR packages failed via paru — install manually: paru -S ${AUR_PKGS[*]}"
-else
-    warn "No AUR helper available — install manually: yay -S ${AUR_PKGS[*]}"
-fi
+printf '  Installing %d packages (%s first, AUR helper only if needed):\n    %s\n' "${#AUR_PKGS[@]}" "$REPO_NAME" "${AUR_PKGS[*]}"
+install_repo_or_aur "${AUR_PKGS[@]}" \
+    || warn "Some packages were not installed — install them manually if needed"
 
 MISSING_AUR=()
 for pkg in "${AUR_PKGS[@]}"; do
     pacman -Qq "$pkg" >/dev/null 2>&1 || MISSING_AUR+=("$pkg")
 done
 if [ "${#MISSING_AUR[@]}" -gt 0 ]; then
-    warn "AUR packages not installed: ${MISSING_AUR[*]} — install manually if needed"
+    warn "Packages not installed: ${MISSING_AUR[*]} — install manually if needed"
 else
-    ok "Verified all AUR packages are installed"
+    ok "Verified all requested packages are installed"
 fi
 
 
@@ -1179,10 +1360,11 @@ else
     warn "gsettings not found — select the Bibata cursor theme manually in nwg-look"
 fi
 
-# qt6ct is the Qt6 settings app; QT_QPA_PLATFORMTHEME=qt6ct (set in
-# hypr/hyprland.lua) is what makes Qt6 apps actually read its config instead
-# of falling back to their own default style. breeze ships both the Breeze
-# widget style and the BreezeDark.colors scheme qt6ct points at below.
+# qt6ct is the Qt6 settings app; QT_QPA_PLATFORMTHEME=qt6ct (set in the chosen
+# WM's env — hyprland.lua or the mango env.conf) is what makes Qt6 apps read
+# its config instead of falling back to their own default style. breeze ships
+# both the Breeze widget style and the BreezeDark.colors scheme qt6ct points
+# at below.
 BREEZE_DARK_SCHEME="/usr/share/color-schemes/BreezeDark.colors"
 if pacman -Qq qt6ct >/dev/null 2>&1 && pacman -Qq breeze >/dev/null 2>&1; then
     if [ -e "$BREEZE_DARK_SCHEME" ]; then
@@ -1279,11 +1461,15 @@ if command -v quickshell >/dev/null 2>&1; then
     fi
 else
     warn "quickshell isn't installed — skipping the app drawer. Install it with 'sudo pacman -S quickshell' and re-run this script."
-    warn "  The SUPER+Tab bind in hyprland.lua and the 'App Drawer' menu entry do nothing until then."
+    if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
+        warn "  The SUPER+Tab bind in hyprland.lua and the 'App Drawer' menu entry do nothing until then."
+    else
+        warn "  The SUPER+Space bind in keybinds.conf and the 'App Drawer' menu entry do nothing until then."
+    fi
     warn "  Empty bar clicks are unaffected: empty_click_command defaults to off."
 fi
 
-# ── Step 5: choose a browser ─────────────────────────────────────────
+# ── Step 7: choose a browser ─────────────────────────────────────────
 step "Choosing a browser"
 
 prompt_choice BROWSER_CHOICE 6 "Which browser would you like to install?" \
@@ -1322,7 +1508,7 @@ if pacman -Qq firefox >/dev/null 2>&1; then
     esac
 fi
 
-# ── Step 6: LazyVim ─────────────────────────────────────────────────
+# ── Step 8: LazyVim ─────────────────────────────────────────────────
 step "Setting up LazyVim"
 
 if [ -e ~/.config/nvim ]; then
@@ -1585,14 +1771,19 @@ fi
 run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfirm \
     || warn "Full system update failed — run 'sudo pacman -Syu' manually to check for issues"
 
-# ── Step 7: done ────────────────────────────────────────────────────
+# ── Step 9: done ────────────────────────────────────────────────────
 step "Done"
 ok "Full system updated (pacman -Syu)"
-ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, gnome-calendar, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, hyprland, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, cava, pipewire, gnome-disk-utility, nwg-drawer, kdeconnect installed (pacman)"
+ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, foot, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, cava, pipewire, gnome-disk-utility, nwg-drawer, kdeconnect, brightnessctl installed (pacman)"
+if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
+    ok "Hyprland + xdg-desktop-portal-hyprland installed (pacman)"
+else
+    ok "MangoWM + xdg-desktop-portal-wlr installed (pacman) — start it with 'mango' from a TTY or via your display manager"
+fi
 ok "$FILE_MANAGER_NAME installed and bound to SUPER + E"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 if pacman -Qq cliphist >/dev/null 2>&1; then
-    ok "cliphist installed (bind a key to it yourself, e.g. in hyprland.lua)"
+    ok "cliphist installed (bind a key to it yourself — e.g. SUPER+C in the config)"
 fi
 if pacman -Qq obs-studio >/dev/null 2>&1; then
     ok "OBS Studio installed"
@@ -1606,7 +1797,7 @@ if pacman -Qq lutris >/dev/null 2>&1; then
     ok "Lutris installed"
 fi
 if pacman -Qq heroic-games-launcher-bin >/dev/null 2>&1; then
-    ok "Heroic Games Launcher installed via AUR helper (if available)"
+    ok "Heroic Games Launcher installed (from ${REPO_NAME} or AUR helper)"
 fi
 if [ -n "$DISCORD_NAME" ]; then
     ok "$DISCORD_NAME installed"
@@ -1624,8 +1815,11 @@ fi
 if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
     ok "Bibata Modern Classic cursor installed and applied"
 fi
-if [ -e ~/.config/hypr/hyprland-simpbar.lua ]; then
+if [ "$WM_IS_HYPRLAND" -eq 1 ] && [ -e ~/.config/hypr/hyprland-simpbar.lua ]; then
     ok "Hyprland settings active — simpbar-config manages hyprland-simpbar.lua (first run bootstrapped it into hyprland.lua via pcall)"
+fi
+if [ "$WM_IS_MANGO" -eq 1 ]; then
+    ok "Mango settings active — simpbar-config writes its Mango pages straight to ~/.config/mango/cfg/*.conf"
 fi
 if pacman -Qq game-devices-udev >/dev/null 2>&1; then
     ok "game-devices-udev installed — Xbox/PlayStation/generic controllers get proper permissions"
@@ -1645,13 +1839,15 @@ fi
 if [ -e ~/.config/rofi/config.rasi ]; then
     ok "rofi configured with the Material theme"
 fi
-ok "wlogout, waypaper, protonplus installed via AUR helper (if available)"
+ok "waypaper, protonplus and the theme packages installed (from ${REPO_NAME} or AUR helper)"
 if [ -n "$BROWSER_NAME" ]; then
-    ok "$BROWSER_NAME installed via AUR helper (if available)"
+    ok "$BROWSER_NAME installed (from ${REPO_NAME} or AUR helper)"
 else
     ok "Browser install skipped, as requested"
 fi
-if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
+if [ "$REPO_CHOICE" = 1 ]; then
+    ok "CachyOS repos enabled"
+else
     ok "Chaotic-AUR repo enabled"
 fi
 if [ -e ~/.config/waypaper/config.ini ]; then
@@ -1676,9 +1872,17 @@ if [ -x /usr/bin/simpbar-shell ]; then
     ok "simpbar-shell installed to /usr/bin/simpbar-shell — desktop widget cards on every output"
 fi
 if command -v quickshell >/dev/null 2>&1; then
-    ok "App drawer installed — SUPER+Tab, or click empty bar space, to open it (themed from matugen)"
+    if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
+        ok "App drawer installed — SUPER+Tab, or click empty bar space, to open it (themed from matugen)"
+    else
+        ok "App drawer installed — SUPER+Space, or click empty bar space, to open it (themed from matugen); SUPER+SHIFT+Q opens its Power menu"
+    fi
 fi
-ok "hypr config in ~/.config/hypr"
+if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
+    ok "hypr config in ~/.config/hypr"
+else
+    ok "mango config in ~/.config/mango (monitors shipped blank, so Mango auto-detects your display — set them in simpbar-config anytime)"
+fi
 ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
 ok "fastfetch runs automatically in new terminal sessions (~/.bashrc)"
@@ -1688,6 +1892,9 @@ fi
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
+if [ "$WM_IS_MANGO" -eq 1 ]; then
+    printf '  %smango%s                       # start MangoWM from a TTY (or configure your display manager)\n' "$C_CYAN" "$C_RESET"
+fi
 printf '  %ssimpbar &%s\n' "$C_CYAN" "$C_RESET"
 printf '  %ssimpbar-shell &%s          # desktop widget cards (clock/weather/media/system)\n' "$C_CYAN" "$C_RESET"
 if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
@@ -1704,37 +1911,45 @@ printf '  %s/usr/lib/mate-polkit/polkit-mate-authentication-agent-1 &%s   # need
 printf '\n%sKeybindings:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %sSUPER%s                    = Windows key\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + Enter%s            = Open terminal\n' "$C_CYAN" "$C_RESET"
-printf '  %sSUPER + Space%s            = Open Rofi\n' "$C_CYAN" "$C_RESET"
 printf '  %sSUPER + E%s                = Open %s\n' "$C_CYAN" "$C_RESET" "$FILE_MANAGER_NAME"
-printf '  %sSUPER + Q%s                = Exit the application\n' "$C_CYAN" "$C_RESET"
-printf '  %sSUPER + [1-0]%s            = Switch workspaces\n' "$C_CYAN" "$C_RESET"
-printf '  %sPrint%s                     = Screenshot: region\n' "$C_CYAN" "$C_RESET"
-printf '  %sSUPER + Print%s             = Screenshot: active window\n' "$C_CYAN" "$C_RESET"
-printf '  %sSUPER + SHIFT + Print%s     = Screenshot: full screen\n' "$C_CYAN" "$C_RESET"
+printf '  %sSUPER + Q%s                = Close / exit the focused window\n' "$C_CYAN" "$C_RESET"
+printf '  %sSUPER + [1-0]%s            = Switch workspaces/tags\n' "$C_CYAN" "$C_RESET"
+if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
+    printf '  %sSUPER + Space%s            = Open Rofi (app launcher)\n' "$C_CYAN" "$C_RESET"
+    printf '  %sSUPER + Tab%s              = Open the app drawer (begin typing to search)\n' "$C_CYAN" "$C_RESET"
+    printf '  %sPrint%s                     = Screenshot: region\n' "$C_CYAN" "$C_RESET"
+    printf '  %sSUPER + Print%s             = Screenshot: active window\n' "$C_CYAN" "$C_RESET"
+    printf '  %sSUPER + SHIFT + Print%s     = Screenshot: full screen\n' "$C_CYAN" "$C_RESET"
+else
+    printf '  %sSUPER + Space%s            = Open the app drawer (begin typing to search)\n' "$C_CYAN" "$C_RESET"
+    printf '  %sSUPER + SHIFT + Q%s        = Power menu (lock / log out / reboot / power off)\n' "$C_CYAN" "$C_RESET"
+    printf '  %sSUPER + S%s                = Toggle notifications (SwayNC)\n' "$C_CYAN" "$C_RESET"
+    printf '  %sSUPER + SHIFT + S%s        = Open simpbar-config (bar settings + Mango pages)\n' "$C_CYAN" "$C_RESET"
+    printf '  %sPrint%s / %sSUPER + P%s       = Screenshot: region (saved + copied)\n' "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf '  %sSUPER + SHIFT + P%s        = Screenshot: full screen\n' "$C_CYAN" "$C_RESET"
+fi
 printf '\n%sTo change your keybindings or set your monitor resolution, edit the config with:%s\n' "$C_BOLD" "$C_RESET"
-printf '  %snvim ~/.config/hypr/hyprland.lua%s\n' "$C_CYAN" "$C_RESET"
+if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
+    printf '  %snvim ~/.config/hypr/hyprland.lua%s\n' "$C_CYAN" "$C_RESET"
+else
+    printf '  %snvim ~/.config/mango/cfg/keybinds.conf%s   (monitors: ~/.config/mango/cfg/monitors.conf)\n' "$C_CYAN" "$C_RESET"
+fi
 printf '\n%sEnjoy your new home & workflow! :)%s\n' "$C_GREEN$C_BOLD" "$C_RESET"
 printf '\n%sDon'"'"'t forget to reboot! Please use: systemctl reboot%s\n' "$C_YELLOW" "$C_RESET"
 
-# Switch the default login shell to fish. This runs last, on its own, with
-# stdin/stdout attached directly to /dev/tty — chsh needs a real interactive
-# terminal to prompt for your password, which it doesn't have if this
-# script is being run as `curl ... | bash` (stdin is the piped script, not
-# your keyboard). Running it through run_spinner earlier made this worse,
-# since that also backgrounds the command and swallows its output.
+# Switch the default login shell to fish. This runs last, on its own; since
+# the script already holds sudo (askpass, no re-prompt), it runs as root and
+# needs no password from the user at all.
 if [ -z "$FISH_PATH" ]; then
     warn "Could not find the fish binary — skipping default shell switch"
 elif [ "$SHELL" = "$FISH_PATH" ]; then
     ok "fish is already the default shell"
-elif [ ! -r /dev/tty ]; then
-    warn "No interactive terminal available — run 'chsh -s $FISH_PATH' manually to switch your default shell"
 else
     grep -qx "$FISH_PATH" /etc/shells 2>/dev/null \
         || printf '%s\n' "$FISH_PATH" | sudo tee -a /etc/shells >/dev/null
-    printf '\n%sSwitching your default shell to fish — enter your password if asked:%s\n' "$C_BOLD" "$C_RESET"
-    if chsh -s "$FISH_PATH" < /dev/tty > /dev/tty 2>&1; then
+    if sudo usermod -s "$FISH_PATH" "$USER" 2>/dev/null; then
         ok "Default login shell switched to fish (takes effect next login)"
     else
-        warn "Could not switch the default shell — run 'chsh -s $FISH_PATH' manually"
+        warn "Could not switch the default shell — run 'sudo usermod -s $FISH_PATH $USER' manually"
     fi
 fi

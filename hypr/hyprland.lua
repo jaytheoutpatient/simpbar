@@ -43,7 +43,6 @@ hl.on("hyprland.start", function()
 	hl.exec_cmd("simpbar-welcome")
 	-- This Line here ^^
 	hl.exec_cmd("swaync")
-	hl.exec_cmd("gnome-calendar -silent")
 	-- Restore the wallpaper from simpbar-wallpaper's state file, which also
 	-- re-runs matugen so the whole desktop starts themed to match. This
 	-- replaces `waypaper --restore`: waypaper's GUI still works as a picker,
