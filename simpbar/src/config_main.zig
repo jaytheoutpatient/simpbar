@@ -198,6 +198,7 @@ const JsonAppearance = struct {
     text_color: []const u8 = "#DCDCDC",
     border_color: []const u8 = "#454545",
     hover_color: []const u8 = "#3A3A3A",
+    module_bg_color: []const u8 = "#1E1E1E",
     cava_color: []const u8 = "#DCDCDC",
     workspace_active_color: []const u8 = "#DCDCDC",
     workspace_inactive_color: []const u8 = "#505050",
@@ -217,6 +218,12 @@ const JsonAppearance = struct {
     font_path: []const u8 = "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
     bg_opacity_percent: u8 = 100,
     position: []const u8 = "bottom",
+    // "taskbar" (default) or "dock" — see the Bar mode row. Matches
+    // main.zig's JsonAppearance.bar_mode exactly.
+    bar_mode: []const u8 = "taskbar",
+    // Auto-hide the bar, collapsing to an edge strip. Matches main.zig's
+    // JsonAppearance.auto_hide exactly.
+    auto_hide: bool = false,
     corner_radius_px: u32 = 0,
     clock_format: []const u8 = "date_24h",
     // "" = compositor default (today's original single-bar behavior),
@@ -237,6 +244,18 @@ const JsonAppearance = struct {
     // re-serializing what it read, so any key absent from this struct is
     // silently deleted on the next save.
     empty_click_command: []const u8 = "",
+    // Hover/active-pill animation master switch. Matches main.zig's
+    // JsonAppearance.animations_enabled exactly.
+    animations_enabled: bool = true,
+    // "matugen" (default) or "rainbow-puke" — the hover/active bezel style.
+    // Matches main.zig's JsonAppearance.bezel_style exactly.
+    bezel_style: []const u8 = "matugen",
+    // Resting module pills on/off. Matches main.zig's
+    // JsonAppearance.module_pills exactly.
+    module_pills: bool = true,
+    // Bezel rings on/off wherever they appear. Matches main.zig's
+    // JsonAppearance.pill_borders exactly.
+    pill_borders: bool = true,
 };
 
 const JsonModules = struct {
@@ -439,7 +458,7 @@ fn rgbaToHex(c: gtk.GdkRGBA, buf: []u8) []const u8 {
 // Live in-memory config state
 // ---------------------------------------------------------------------
 
-const ColorField = enum { bg, text, border, hover, cava, ws_active, ws_inactive, popup_bg, popup_hover, popup_separator, popup_disabled };
+const ColorField = enum { bg, text, border, hover, module_bg, cava, ws_active, ws_inactive, popup_bg, popup_hover, popup_separator, popup_disabled };
 
 const ColorSpec = struct {
     field: ColorField,
@@ -455,6 +474,7 @@ const COLOR_SPECS = [_]ColorSpec{
     .{ .field = .text, .default_hex = "#DCDCDC", .title = "Text", .group = .bar },
     .{ .field = .border, .default_hex = "#454545", .title = "Border", .group = .bar },
     .{ .field = .hover, .default_hex = "#3A3A3A", .title = "Hover Highlight", .group = .bar },
+    .{ .field = .module_bg, .default_hex = "#1E1E1E", .title = "Module Background", .group = .bar },
     .{ .field = .cava, .default_hex = "#DCDCDC", .title = "Audio Visualizer (cava)", .group = .bar },
     .{ .field = .ws_active, .default_hex = "#DCDCDC", .title = "Active Workspace", .group = .bar },
     .{ .field = .ws_inactive, .default_hex = "#505050", .title = "Inactive Workspace", .group = .bar },
@@ -477,6 +497,10 @@ var live_corner_radius_px: u32 = 0;
 // so — like live_font_path's own note about avoiding self-referential
 // hazards — reassigning this outright on every change is always safe.
 var live_position: []const u8 = "bottom";
+// "taskbar" or "dock", always a static literal like live_position.
+var live_bar_mode: []const u8 = "taskbar";
+// Auto-hide on/off.
+var live_auto_hide: bool = false;
 // Same "always a static string literal, safe to reassign outright" note as
 // live_position above.
 var live_clock_format: []const u8 = "date_24h";
@@ -498,6 +522,15 @@ var live_monitor: []const u8 = "";
 // so — like live_position's own note about avoiding self-referential
 // hazards — reassigning this outright on every toggle is always safe.
 var live_auto_theme: []const u8 = "matugen";
+// Hover/active-pill animation master switch (static literals, same safe
+// reassignment as live_auto_theme).
+var live_animations_enabled: bool = true;
+// Bezel style, one of BEZEL_STYLE_CHOICES below (static literals).
+var live_bezel_style: []const u8 = "matugen";
+// Resting module pills on/off.
+var live_module_pills: bool = true;
+// Bezel rings on/off wherever they appear.
+var live_pill_borders: bool = true;
 // Arena-backed from config.json and stable for this GUI's process lifetime,
 // same reasoning as live_monitor (which is also assigned straight from a
 // parsed value) — so assigning it outright on load is safe. No widget edits
@@ -844,7 +877,8 @@ fn loadConfigFromDisk() void {
     const hexes = [_][]const u8{
         j.bg_color,                    j.text_color,
         j.border_color,                j.hover_color,
-        j.cava_color,                  j.workspace_active_color,
+        j.module_bg_color,             j.cava_color,
+        j.workspace_active_color,
         j.workspace_inactive_color,
         j.popup_bg_color,              j.popup_hover_color,
         j.popup_separator_color,       j.popup_disabled_color,
@@ -862,10 +896,16 @@ fn loadConfigFromDisk() void {
     live_bg_opacity_percent = @min(j.bg_opacity_percent, 100);
     live_corner_radius_px = j.corner_radius_px;
     live_position = if (std.mem.eql(u8, j.position, "top")) "top" else "bottom";
+    live_bar_mode = if (std.mem.eql(u8, j.bar_mode, "dock")) "dock" else "taskbar";
+    live_auto_hide = j.auto_hide;
     live_clock_format = validClockFormatChoice(j.clock_format);
     live_monitor = j.monitor;
     live_auto_theme = if (std.mem.eql(u8, j.auto_theme, "manual")) "manual" else "matugen";
     live_empty_click_command = j.empty_click_command;
+    live_animations_enabled = j.animations_enabled;
+    live_bezel_style = if (std.mem.eql(u8, j.bezel_style, "rainbow-puke")) "rainbow-puke" else "matugen";
+    live_module_pills = j.module_pills;
+    live_pill_borders = j.pill_borders;
     // Scheme type lives in its own simpbar-owned file (not config.json, not
     // matugen's config.toml — see matugen_type_path). Ignore anything that
     // isn't a known matugen --type value rather than handing matugen junk.
@@ -1000,6 +1040,7 @@ fn buildConfigJson() ![]u8 {
             .text => "text_color",
             .border => "border_color",
             .hover => "hover_color",
+            .module_bg => "module_bg_color",
             .cava => "cava_color",
             .ws_active => "workspace_active_color",
             .ws_inactive => "workspace_inactive_color",
@@ -1033,6 +1074,10 @@ fn buildConfigJson() ![]u8 {
     try appendJsonInt(&list, u32, live_corner_radius_px);
     try list.appendSlice(gpa, ",\"position\":");
     try appendJsonString(&list, live_position);
+    try list.appendSlice(gpa, ",\"bar_mode\":");
+    try appendJsonString(&list, live_bar_mode);
+    try list.appendSlice(gpa, ",\"auto_hide\":");
+    try list.appendSlice(gpa, if (live_auto_hide) "true" else "false");
     try list.appendSlice(gpa, ",\"clock_format\":");
     try appendJsonString(&list, live_clock_format);
     try list.appendSlice(gpa, ",\"monitor\":");
@@ -1041,6 +1086,14 @@ fn buildConfigJson() ![]u8 {
     try appendJsonString(&list, live_auto_theme);
     try list.appendSlice(gpa, ",\"empty_click_command\":");
     try appendJsonString(&list, live_empty_click_command);
+    try list.appendSlice(gpa, ",\"animations_enabled\":");
+    try list.appendSlice(gpa, if (live_animations_enabled) "true" else "false");
+    try list.appendSlice(gpa, ",\"bezel_style\":");
+    try appendJsonString(&list, live_bezel_style);
+    try list.appendSlice(gpa, ",\"module_pills\":");
+    try list.appendSlice(gpa, if (live_module_pills) "true" else "false");
+    try list.appendSlice(gpa, ",\"pill_borders\":");
+    try list.appendSlice(gpa, if (live_pill_borders) "true" else "false");
 
     try list.appendSlice(gpa, "},\"modules\":{\"left\":");
     try appendModuleGroup(&list, &live_left);
@@ -1216,6 +1269,48 @@ fn onPositionChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) 
     saveAndSignal();
 }
 
+fn onBarModeChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    live_bar_mode = if (gtk.adw_combo_row_get_selected(row) == 0) "taskbar" else "dock";
+    saveAndSignal();
+}
+
+fn buildBarModeRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Bar mode");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "Taskbar spans the full edge and reserves it; dock floats with margins and lets windows slide under. Applies instantly.");
+
+    var buf: [3]?[*:0]const u8 = .{ "Taskbar", "Dock", null };
+    gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+    gtk.adw_combo_row_set_selected(row, if (std.mem.eql(u8, live_bar_mode, "dock")) 1 else 0);
+    _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onBarModeChanged), null, null, 0);
+
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+/// Flips auto-hide (appearance.auto_hide): the bar collapses to a 2px hint
+/// strip at the screen edge ~300ms after the pointer leaves, releasing its
+/// exclusive zone so windows use the space; touching or clicking the strip
+/// brings it straight back.
+fn onAutoHideChanged(sw: *gtk.GtkSwitch, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    live_auto_hide = gtk.gtk_switch_get_active(sw) != 0;
+    saveAndSignal();
+}
+
+fn buildAutoHideRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Auto-hide");
+    gtk.adw_action_row_set_subtitle(row, "Collapse the bar to a thin edge strip when the pointer leaves, and bring it back on touch. Works in taskbar and dock mode.");
+    gtk.adw_action_row_set_icon_name(row, "applications-graphics-symbolic");
+
+    const sw = gtk.gtk_switch_new();
+    gtk.gtk_switch_set_active(sw, if (live_auto_hide) 1 else 0);
+    gtk.gtk_widget_set_valign(@ptrCast(sw), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(sw), "notify::active", @ptrCast(&onAutoHideChanged), null, null, 0);
+
+    gtk.adw_action_row_add_suffix(row, @ptrCast(sw));
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
 fn buildPositionRow(group: *gtk.AdwPreferencesGroup) void {
     const row = gtk.adw_combo_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(row), "Position");
@@ -1317,6 +1412,109 @@ fn buildMatugenTypeRow(group: *gtk.AdwPreferencesGroup) void {
     gtk.adw_combo_row_set_selected(row, selected_idx);
     _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onMatugenTypeChanged), null, null, 0);
 
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+/// Flips the hover/active-pill animation master switch
+/// (appearance.animations_enabled). Off = highlights snap instantly and the
+/// bezel sits still; the look is unchanged, only the motion stops.
+fn onAnimationsEnabledChanged(sw: *gtk.GtkSwitch, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    live_animations_enabled = gtk.gtk_switch_get_active(sw) != 0;
+    saveAndSignal();
+}
+
+fn buildAnimationsRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Animations");
+    gtk.adw_action_row_set_subtitle(row, "Fade and rotate the hover highlight and active-workspace pill. Turning this off snaps highlights instantly and freezes the bezel.");
+    gtk.adw_action_row_set_icon_name(row, "applications-graphics-symbolic");
+
+    const sw = gtk.gtk_switch_new();
+    gtk.gtk_switch_set_active(sw, if (live_animations_enabled) 1 else 0);
+    gtk.gtk_widget_set_valign(@ptrCast(sw), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(sw), "notify::active", @ptrCast(&onAnimationsEnabledChanged), null, null, 0);
+
+    gtk.adw_action_row_add_suffix(row, @ptrCast(sw));
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+// Bezel style choices (values must stay byte-for-byte in sync with main.zig's
+// BEZEL_STYLE_* — they are written straight into config.json).
+const BEZEL_STYLE_CHOICES = [_][]const u8{ "matugen", "rainbow-puke" };
+const BEZEL_STYLE_LABELS = [_][*:0]const u8{ "Matugen", "Rainbow puke" };
+
+/// Picks the hover/active bezel style (appearance.bezel_style). Applies on
+/// the next SIGUSR1 reload like every other config.json change.
+fn onBezelStyleChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx >= BEZEL_STYLE_CHOICES.len) return;
+    live_bezel_style = BEZEL_STYLE_CHOICES[idx];
+    saveAndSignal();
+}
+
+fn buildBezelStyleRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Bezel style");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "What travels around the hover highlight and active-workspace pill: the wallpaper palette, or the full hue wheel.");
+
+    var buf: [BEZEL_STYLE_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (BEZEL_STYLE_LABELS, 0..) |label, i| buf[i] = label;
+    buf[BEZEL_STYLE_LABELS.len] = null;
+    gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+
+    var selected_idx: c_uint = 0;
+    for (BEZEL_STYLE_CHOICES, 0..) |choice, i| {
+        if (std.mem.eql(u8, choice, live_bezel_style)) selected_idx = @intCast(i);
+    }
+    gtk.adw_combo_row_set_selected(row, selected_idx);
+    _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onBezelStyleChanged), null, null, 0);
+
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+/// Flips resting module pills on/off (appearance.module_pills). Off =
+/// modules sit directly on the bar background; hover/active treatments
+/// still draw their own pill when lit.
+fn onModulePillsChanged(sw: *gtk.GtkSwitch, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    live_module_pills = gtk.gtk_switch_get_active(sw) != 0;
+    saveAndSignal();
+}
+
+fn buildModulePillsRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Module pills");
+    gtk.adw_action_row_set_subtitle(row, "Give every module its own pill background. Turning this off leaves modules directly on the bar background.");
+    gtk.adw_action_row_set_icon_name(row, "applications-graphics-symbolic");
+
+    const sw = gtk.gtk_switch_new();
+    gtk.gtk_switch_set_active(sw, if (live_module_pills) 1 else 0);
+    gtk.gtk_widget_set_valign(@ptrCast(sw), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(sw), "notify::active", @ptrCast(&onModulePillsChanged), null, null, 0);
+
+    gtk.adw_action_row_add_suffix(row, @ptrCast(sw));
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+/// Flips bezel rings on/off wherever they appear — resting pills, hover,
+/// active workspace, popup rows (appearance.pill_borders). Off = flat fills
+/// and dash only, no rings.
+fn onPillBordersChanged(sw: *gtk.GtkSwitch, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    live_pill_borders = gtk.gtk_switch_get_active(sw) != 0;
+    saveAndSignal();
+}
+
+fn buildPillBordersRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Pill borders");
+    gtk.adw_action_row_set_subtitle(row, "Draw the bezel ring around pills. Turning this off leaves flat fills with no rings anywhere.");
+    gtk.adw_action_row_set_icon_name(row, "applications-graphics-symbolic");
+
+    const sw = gtk.gtk_switch_new();
+    gtk.gtk_switch_set_active(sw, if (live_pill_borders) 1 else 0);
+    gtk.gtk_widget_set_valign(@ptrCast(sw), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(sw), "notify::active", @ptrCast(&onPillBordersChanged), null, null, 0);
+
+    gtk.adw_action_row_add_suffix(row, @ptrCast(sw));
     gtk.adw_preferences_group_add(group, @ptrCast(row));
 }
 
@@ -1875,6 +2073,14 @@ fn buildAppearancePage() *gtk.GtkBox {
     buildMatugenTypeRow(theming_group);
     gtk.gtk_box_append(outer, @ptrCast(theming_group));
 
+    const animation_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(animation_group, "Animation");
+    buildAnimationsRow(animation_group);
+    buildBezelStyleRow(animation_group);
+    buildModulePillsRow(animation_group);
+    buildPillBordersRow(animation_group);
+    gtk.gtk_box_append(outer, @ptrCast(animation_group));
+
     const widgets_group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(widgets_group, "Desktop Widgets");
     buildWidgetRows(widgets_group);
@@ -1897,6 +2103,8 @@ fn buildAppearancePage() *gtk.GtkBox {
     const position_group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(position_group, "Position and Clock");
     buildPositionRow(position_group);
+    buildBarModeRow(position_group);
+    buildAutoHideRow(position_group);
     buildClockFormatRow(position_group);
     buildMonitorRow(position_group);
     gtk.gtk_box_append(outer, @ptrCast(position_group));

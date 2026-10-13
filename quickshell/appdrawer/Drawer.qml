@@ -244,10 +244,23 @@ PanelWindow {
                 border.width: 1
                 border.color: search.activeFocus ? Theme.accent : Theme.separator
 
+                // Distro logo (auto-detected from /etc/os-release): sits
+                // where a magnifier would, in the bar's own Nerd Font so the
+                // glyph is guaranteed present. Text metrics shift right to
+                // clear it (40px).
+                Text {
+                    x: 12
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: Distro.logo
+                    color: Theme.accent
+                    font.family: "JetBrainsMono Nerd Font"
+                    font.pixelSize: 20
+                }
+
                 TextInput {
                     id: search
                     anchors.fill: parent
-                    anchors.leftMargin: 16
+                    anchors.leftMargin: 44
                     anchors.rightMargin: 16
                     verticalAlignment: TextInput.AlignVCenter
                     color: Theme.text
@@ -292,7 +305,7 @@ PanelWindow {
                 Text {
                     anchors.fill: parent
                     verticalAlignment: Text.AlignVCenter
-                    leftPadding: 16
+                    leftPadding: 44
                     visible: search.text.length === 0
                     text: win.whOnline
                           ? "search wallhaven.cc…"

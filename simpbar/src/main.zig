@@ -136,7 +136,144 @@ const LauncherIconCache = struct {
     pixels: [LAUNCHER_ICON_SIZE * LAUNCHER_ICON_SIZE]u32 = [_]u32{0} ** (LAUNCHER_ICON_SIZE * LAUNCHER_ICON_SIZE),
     has_icon: bool = false,
     resolved: bool = false,
+    /// Nerd Font codepoint for the distro logo (0 = not a distro-logo
+    /// launcher). Set instead of a decoded PNG when the launcher opens the
+    /// app drawer — the drawer brands itself with the distro logo (see
+    /// quickshell/appdrawer/Distro.qml), so a pinned App Drawer button
+    /// matches it. Drawn as text, so it follows the label baseline rather
+    /// than the 16px icon box.
+    distro_glyph: u32 = 0,
 };
+
+/// Distro ID -> Nerd Font linux-* logo codepoint. Mirrors
+/// quickshell/appdrawer/Distro.qml's table (same codepoints, same fallback
+/// order) — keep the two in sync when adding a distro. All values verified
+/// present in JetBrainsMonoNerdFont-Regular.ttf.
+const DISTRO_GLYPHS = std.StaticStringMap(u32).initComptime(.{
+    .{ "cachyos", 0xF385 },
+    .{ "arch", 0xF303 }, .{ "archarm", 0xF303 }, .{ "archlinux", 0xF303 },
+    .{ "artix", 0xF31F }, .{ "endeavouros", 0xF322 }, .{ "garuda", 0xF337 },
+    .{ "manjaro", 0xF312 }, .{ "arcolinux", 0xF346 }, .{ "archcraft", 0xF345 },
+    .{ "crystal", 0xF348 }, .{ "xerolinux", 0xF34A }, .{ "biglinux", 0xF347 },
+    .{ "debian", 0xF306 }, .{ "ubuntu", 0xF31B }, .{ "pop", 0xF32A },
+    .{ "pop_os", 0xF32A }, .{ "linuxmint", 0xF30E }, .{ "zorin", 0xF32F },
+    .{ "elementary", 0xF309 }, .{ "kubuntu", 0xF333 }, .{ "kde_neon", 0xF331 },
+    .{ "neon", 0xF331 }, .{ "fedora", 0xF30A }, .{ "nobara", 0xF380 },
+    .{ "rhel", 0xF316 }, .{ "redhat", 0xF316 }, .{ "centos", 0xF304 },
+    .{ "rocky", 0xF32B }, .{ "almalinux", 0xF31D },
+    .{ "opensuse", 0xF314 }, .{ "tumbleweed", 0xF37D },
+    .{ "opensuse-tumbleweed", 0xF37D }, .{ "opensuse-leap", 0xF37E },
+    .{ "leap", 0xF37E }, .{ "nixos", 0xF313 }, .{ "gentoo", 0xF30D },
+    .{ "slackware", 0xF318 }, .{ "void", 0xF32E }, .{ "alpine", 0xF300 },
+    .{ "solus", 0xF32D }, .{ "mx", 0xF33F }, .{ "mxlinux", 0xF33F },
+});
+
+/// ID_LIKE family token -> codepoint, for distros with no direct entry.
+const DISTRO_FAMILY_GLYPHS = std.StaticStringMap(u32).initComptime(.{
+    .{ "arch", 0xF303 }, .{ "debian", 0xF306 }, .{ "ubuntu", 0xF31B },
+    .{ "fedora", 0xF30A }, .{ "rhel", 0xF316 }, .{ "centos", 0xF304 },
+    .{ "suse", 0xF314 }, .{ "opensuse", 0xF314 }, .{ "nixos", 0xF313 },
+    .{ "gentoo", 0xF30D }, .{ "slackware", 0xF318 }, .{ "void", 0xF32E },
+    .{ "alpine", 0xF300 }, .{ "solus", 0xF32D },
+});
+
+/// Generic Linux glyph: the universal fallback. Also BMP, always present.
+const DISTRO_FALLBACK_GLYPH: u32 = 0xF17C;
+
+var g_distro_glyph: ?u32 = null;
+var g_os_id_buf: [64]u8 = undefined;
+var g_os_like_buf: [128]u8 = undefined;
+
+/// Reads one `KEY=...` value (unquoted, lowercased) from /etc/os-release
+/// into a static buffer. Runs once per bar start; the two keys asked (ID,
+/// ID_LIKE) have separate slots so neither clobbers the other.
+fn osReleaseValue(key: []const u8, out: []u8) ?[]const u8 {
+    const raw = posix.system.open("/etc/os-release", .{ .ACCMODE = .RDONLY }, @as(posix.mode_t, 0));
+    if (raw < 0) return null;
+    defer _ = posix.system.close(raw);
+    var fbuf: [256]u8 = undefined;
+    const n = posix.system.read(raw, &fbuf, fbuf.len);
+    if (n <= 0) return null;
+    const text = fbuf[0..@as(usize, @intCast(n))];
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        if (line.len <= key.len or line[key.len] != '=') continue;
+        var v = std.mem.trim(u8, line[key.len + 1 ..], " \t\r\"");
+        const len = @min(v.len, out.len);
+        @memcpy(out[0..len], v[0..len]);
+        // Lowercase for the table lookup (IDs are lowercase by spec, but
+        // be liberal).
+        for (out[0..len]) |*c| {
+            if (c.* >= 'A' and c.* <= 'Z') c.* += 'a' - 'A';
+        }
+        return out[0..len];
+    }
+    return null;
+}
+
+/// This machine's distro logo codepoint: direct ID hit, then each ID_LIKE
+/// token through both tables, then the generic glyph. Cached — the answer
+/// can't change under a running bar.
+fn distroLogoCodepoint() u32 {
+    if (g_distro_glyph) |cp| return cp;
+    var cp: u32 = DISTRO_FALLBACK_GLYPH;
+    if (osReleaseValue("ID", &g_os_id_buf)) |id| {
+        if (DISTRO_GLYPHS.get(id)) |hit| {
+            cp = hit;
+        } else if (osReleaseValue("ID_LIKE", &g_os_like_buf)) |like| {
+            var toks = std.mem.splitScalar(u8, like, ' ');
+            while (toks.next()) |tok| {
+                if (tok.len == 0) continue;
+                if (DISTRO_GLYPHS.get(tok)) |hit| {
+                    cp = hit;
+                    break;
+                }
+                if (DISTRO_FAMILY_GLYPHS.get(tok)) |hit| {
+                    cp = hit;
+                    break;
+                }
+            }
+        }
+    }
+    g_distro_glyph = cp;
+    return cp;
+}
+
+/// True when `command` launches the app drawer: the first
+/// whitespace-separated token's basename is "appdrawer" ("appdrawer",
+/// "/usr/bin/appdrawer", "appdrawer open", ...). Renaming the pin's label
+/// doesn't fool it, and a hypothetical "my-appdrawer-fork" correctly does
+/// NOT match.
+fn launcherLaunchesAppdrawer(command: []const u8) bool {
+    // Trimmed on the left only in effect: trailing whitespace ends the first
+    // token at the split below, so a both-sides trim is equivalent here
+    // (std.mem has no trimLeft in this Zig version).
+    var s = std.mem.trim(u8, command, " \t");
+    if (s.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, s, ' ')) |sp| s = s[0..sp];
+    if (std.mem.indexOfScalar(u8, s, '\t')) |t| s = s[0..t];
+    var base = s;
+    if (std.mem.lastIndexOfScalar(u8, s, '/')) |sl| base = s[sl + 1 ..];
+    return std.mem.eql(u8, base, "appdrawer");
+}
+
+/// Encodes a BMP codepoint as UTF-8 (all distro glyphs are BMP PUA).
+fn encodeBmpCodepoint(cp: u32, out: *[4]u8) []const u8 {
+    if (cp < 0x80) {
+        out[0] = @intCast(cp);
+        return out[0..1];
+    } else if (cp < 0x800) {
+        out[0] = @intCast(0xC0 | (cp >> 6));
+        out[1] = @intCast(0x80 | (cp & 0x3F));
+        return out[0..2];
+    } else {
+        out[0] = @intCast(0xE0 | (cp >> 12));
+        out[1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = @intCast(0x80 | (cp & 0x3F));
+        return out[0..3];
+    }
+}
 
 var launcher_icons: [MAX_LAUNCHERS]LauncherIconCache = undefined;
 
@@ -177,7 +314,17 @@ fn ensureLauncherIcons() void {
         if (cache.resolved) continue;
         cache.resolved = true;
         cache.has_icon = false;
+        cache.distro_glyph = 0;
         @memset(cache.pixels[0..], 0);
+
+        // A pinned App Drawer button wears the distro logo (same glyph the
+        // drawer brands itself with) instead of whatever generic icon the
+        // pin names — detected from the command so renaming the pin or
+        // changing its icon field can't break it.
+        if (launcherLaunchesAppdrawer(btn.command)) {
+            cache.distro_glyph = distroLogoCodepoint();
+            continue;
+        }
 
         const icon = btn.icon orelse continue;
         if (icon.len == 0) continue;
@@ -631,6 +778,17 @@ const MAX_CLICK_REGIONS = 32;
 const ClickRegions = struct {
     items: [MAX_CLICK_REGIONS]ClickRegion = undefined,
     len: usize = 0,
+    /// Per-region hover fade level (0 = no highlight .. 1 = full pill +
+    /// underline), eased toward (hovered ? 1 : 0) on the scroll-timer tick.
+    /// Indexed parallel to items; slots at/after len are ignored. Regions
+    /// are rebuilt in deterministic order every frame, so a region keeps its
+    /// level across rebuilds — except when the list itself changes under a
+    /// static pointer (workspace added/removed mid-hover), where the level
+    /// briefly belongs to a neighbor. Settles within one fade; accepted.
+    hover: [MAX_CLICK_REGIONS]f32 = [_]f32{0} ** MAX_CLICK_REGIONS,
+    /// Index into items of the region under the pointer, maintained by the
+    /// pointer handlers. Null when the pointer is off every region.
+    hovered: ?usize = null,
 
     fn clear(self: *ClickRegions) void {
         self.len = 0;
@@ -667,6 +825,23 @@ const ClickRegions = struct {
             if (x >= r.x_start and x < r.x_end) return r;
         }
         return null;
+    }
+
+    /// Index form of hitTest for the hover fade machinery (hovered/hover are
+    /// index-addressed; the pointer-returning form above stays for clicks).
+    fn hitTestIndex(self: *const ClickRegions, x: i32) ?usize {
+        for (self.items[0..self.len], 0..) |*r, i| {
+            if (x >= r.x_start and x < r.x_end) return i;
+        }
+        return null;
+    }
+
+    /// Fade level for the region a draw site is about to draw + register.
+    /// Every drawModulePill call site draws BEFORE its push/add (verified
+    /// per site), so len is the incoming region's index. Clamped for the
+    /// scaffold-full case where push drops the region rather than growing.
+    fn nextHover(self: *const ClickRegions) f32 {
+        return self.hover[@min(self.len, MAX_CLICK_REGIONS - 1)];
     }
 };
 
@@ -863,6 +1038,28 @@ const Appearance = struct {
     popup_separator_color: u32,
     popup_disabled_color: u32,
     cava_color: u32,
+    /// Resting background for every module's pill. Hover/active states layer
+    /// their pill + bezel + underline on top of this — the resting pill is
+    /// always plain (no rim, no underline, no fade), so the lit states read
+    /// by contrast rather than competing with a ring on every module.
+    module_bg_color: u32,
+    /// Resting module pills on/off. Off = modules sit directly on the bar
+    /// background (pre-pill look); hover/active treatments still draw their
+    /// own pill when lit, so nothing interactive goes blind.
+    module_pills: bool,
+    /// Bezel rings on/off wherever they appear (resting pills, hover, active
+    /// workspace, popup rows). Off = flat fills + dash only, no rings.
+    pill_borders: bool,
+    /// Master switch for hover/active-pill animation (fade + bezel rotation).
+    /// Off = highlights snap instantly and the bezel sits still — same look,
+    /// none of the motion. Drawer/ticker animation is untouched; this covers
+    /// only the hover treatment.
+    animations_enabled: bool,
+    /// Hover/active bezel style: "matugen" (default) wears the wallpaper
+    /// palette ring; "rainbow-puke" wears the full hue wheel. Anything
+    /// unrecognized falls back to "matugen", same permissive spirit as
+    /// `position`.
+    bezel_style: []const u8,
     bar_height: u32,
     /// Four independent edges (px), replacing the old single top-only
     /// border_px — which edge "faces the desktop" flips with `position`, but
@@ -887,6 +1084,18 @@ const Appearance = struct {
     /// rather than erroring, same permissive-fallback spirit as every other
     /// config field.
     position: []const u8,
+    /// "taskbar" or "dock" — taskbar spans the full edge and reserves it
+    /// (windows stop above it); dock floats with margins on three sides and
+    /// reserves nothing (windows slide under it). Anything unrecognized
+    /// falls back to "taskbar". Applies live over SIGUSR1 via
+    /// applyLayerGeometry, same as position/bar_height.
+    bar_mode: []const u8,
+    /// Auto-hide the bar (both modes): when the pointer leaves the bar (and
+    /// any open popup), the bar collapses to a 2px hint strip at the screen
+    /// edge after a short grace period and releases its exclusive zone, so
+    /// windows use the space; touching the strip (or clicking it) brings it
+    /// back instantly. No slide animation — instant show/hide only.
+    auto_hide: bool,
     /// Rounds all 4 corners by this many px, applied as the very last step
     /// of every draw (after background/borders/every module): pixels outside
     /// each corner's rounding circle are zeroed out (fully transparent, not
@@ -976,6 +1185,9 @@ fn defaultConfig() Config {
             .popup_separator_color = 0xFF444444,
             .popup_disabled_color = 0xFF707070,
             .cava_color = 0xFFDCDCDC,
+            .module_bg_color = 0xFF1E1E1E,
+            .module_pills = true,
+            .pill_borders = true,
             .bar_height = 28,
             .border_top_px = 2, // window#waybar border-width: 2px 0px 0px 0px
             .border_bottom_px = 0,
@@ -985,10 +1197,14 @@ fn defaultConfig() Config {
             .font_path = font_mod.FONT_PATH,
             .bg_opacity_percent = 100,
             .position = "bottom",
+            .bar_mode = "taskbar",
+            .auto_hide = false,
             .corner_radius_px = 0,
             .clock_format = CLOCK_FORMAT_DATE_24H,
             .monitor = "",
             .empty_click_command = "",
+            .animations_enabled = true,
+            .bezel_style = BEZEL_STYLE_MATUGEN,
         },
         .modules = .{
             .left = &DEFAULT_LEFT,
@@ -1120,6 +1336,11 @@ const JsonAppearance = struct {
     popup_separator_color: []const u8 = "#444444",
     popup_disabled_color: []const u8 = "#707070",
     cava_color: []const u8 = "#DCDCDC",
+    module_bg_color: []const u8 = "#1E1E1E",
+    module_pills: bool = true,
+    pill_borders: bool = true,
+    animations_enabled: bool = true,
+    bezel_style: []const u8 = "matugen",
     bar_height: u32 = 28,
     border_top_px: u32 = 2,
     border_bottom_px: u32 = 0,
@@ -1129,6 +1350,8 @@ const JsonAppearance = struct {
     font_path: []const u8 = font_mod.FONT_PATH,
     bg_opacity_percent: u8 = 100,
     position: []const u8 = "bottom",
+    bar_mode: []const u8 = "taskbar",
+    auto_hide: bool = false,
     corner_radius_px: u32 = 0,
     clock_format: []const u8 = CLOCK_FORMAT_DATE_24H,
     monitor: []const u8 = "",
@@ -1194,6 +1417,7 @@ const JsonMatugenColors = struct {
     popup_separator_color: ?[]const u8 = null,
     popup_disabled_color: ?[]const u8 = null,
     cava_color: ?[]const u8 = null,
+    module_bg_color: ?[]const u8 = null,
 };
 
 /// Applies the colors matugen wrote to ~/.config/simpbar/matugen.json into
@@ -1238,6 +1462,7 @@ fn tryApplyMatugenColors(allocator: std.mem.Allocator, appearance: *Appearance) 
     _ = mergeMatugenColor(appearance, "popup_separator_color", colors.popup_separator_color) orelse return false;
     _ = mergeMatugenColor(appearance, "popup_disabled_color", colors.popup_disabled_color) orelse return false;
     _ = mergeMatugenColor(appearance, "cava_color", colors.cava_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "module_bg_color", colors.module_bg_color) orelse return false;
 
     return true;
 }
@@ -1297,6 +1522,9 @@ fn parseAppearance(j: JsonAppearance) ?Appearance {
         .popup_separator_color = parseHexColor(j.popup_separator_color) catch return null,
         .popup_disabled_color = parseHexColor(j.popup_disabled_color) catch return null,
         .cava_color = parseHexColor(j.cava_color) catch return null,
+        .module_bg_color = parseHexColor(j.module_bg_color) catch return null,
+        .module_pills = j.module_pills,
+        .pill_borders = j.pill_borders,
         .bar_height = j.bar_height,
         .border_top_px = j.border_top_px,
         .border_bottom_px = j.border_bottom_px,
@@ -1306,6 +1534,8 @@ fn parseAppearance(j: JsonAppearance) ?Appearance {
         .font_path = j.font_path,
         .bg_opacity_percent = @min(j.bg_opacity_percent, 100),
         .position = if (std.mem.eql(u8, j.position, "top")) "top" else "bottom",
+        .bar_mode = if (std.mem.eql(u8, j.bar_mode, BAR_MODE_DOCK)) BAR_MODE_DOCK else BAR_MODE_TASKBAR,
+        .auto_hide = j.auto_hide,
         .corner_radius_px = j.corner_radius_px,
         .clock_format = validClockFormat(j.clock_format),
         // No validation against currently-connected outputs here — parsing
@@ -1315,6 +1545,8 @@ fn parseAppearance(j: JsonAppearance) ?Appearance {
         // behavior for a name that doesn't match any connected output.
         .monitor = j.monitor,
         .empty_click_command = j.empty_click_command,
+        .animations_enabled = j.animations_enabled,
+        .bezel_style = if (std.mem.eql(u8, j.bezel_style, BEZEL_STYLE_RAINBOW_PUKE)) BEZEL_STYLE_RAINBOW_PUKE else BEZEL_STYLE_MATUGEN,
     };
 }
 
@@ -1867,6 +2099,13 @@ const POPUP_PADDING_X: i32 = 10;
 const POPUP_MIN_WIDTH: i32 = 80;
 const POPUP_MAX_WIDTH: i32 = 320;
 const MAX_POPUP_ROWS = 40;
+/// Horizontal inset of a hovered row's pill from the popup edges.
+const POPUP_ROW_PAD_X: i32 = 4;
+/// Vertical inset of a hovered row's pill from the row edges.
+const POPUP_ROW_PAD_Y: i32 = 2;
+/// Corner radius of a hovered row's pill (row pills are 16px tall, so this
+/// lands on full capsule ends).
+const POPUP_ROW_RADIUS: i32 = 8;
 /// Horizontal space between a layout-picker row's icon and its name.
 const LAYOUT_ICON_GAP: i32 = 8;
 /// Marks the active layout's row in the layout picker (fa-check).
@@ -1911,6 +2150,11 @@ const PopupMenu = struct {
     pointer_y: i32 = -1,
     rows: [MAX_POPUP_ROWS]PopupRow = undefined,
     row_count: usize = 0,
+    /// Per-row hover fade level (0..1), eased on the scroll-timer tick like
+    /// the bar's own hover anims. Indexed parallel to rows.
+    row_hover: [MAX_POPUP_ROWS]f32 = [_]f32{0} ** MAX_POPUP_ROWS,
+    /// Row under the pointer, maintained by the pointer handlers.
+    hovered_row: ?usize = null,
 
     fn dest(self: *const PopupMenu) []const u8 {
         return self.dest_buf[0..self.dest_len];
@@ -1922,6 +2166,14 @@ const PopupMenu = struct {
     fn hitTestRow(self: *const PopupMenu, y: i32) ?PopupRow {
         for (self.rows[0..self.row_count]) |row| {
             if (y >= row.y_start and y < row.y_end) return row;
+        }
+        return null;
+    }
+
+    /// Index form of hitTestRow for the row-fade machinery.
+    fn hitTestRowIndex(self: *const PopupMenu, y: i32) ?usize {
+        for (self.rows[0..self.row_count], 0..) |row, i| {
+            if (y >= row.y_start and y < row.y_end) return i;
         }
         return null;
     }
@@ -2176,6 +2428,8 @@ fn drawDbusMenuRows(bar: *Bar, pm: *PopupMenu, pixels: [*]u32) void {
         const row_h: i32 = if (it.is_separator) POPUP_SEPARATOR_HEIGHT else POPUP_ROW_HEIGHT;
         const y_start = y;
         const y_end = y + row_h;
+        // This child's row number (== its hit-test index) if recorded.
+        const row_i = pm.row_count;
 
         if (pm.row_count < pm.rows.len) {
             pm.rows[pm.row_count] = .{
@@ -2193,9 +2447,8 @@ fn drawDbusMenuRows(bar: *Bar, pm: *PopupMenu, pixels: [*]u32) void {
                 while (x < pm.width) : (x += 1) pixels[@as(u32, @intCast(line_y)) * pm.width + x] = current_config.appearance.popup_separator_color;
             }
         } else {
-            const hovered = pm.pointer_y >= y_start and pm.pointer_y < y_end;
-            if (hovered and it.enabled) {
-                fillPopupRowBand(pixels, pm, y_start, y_end);
+            if (it.enabled) {
+                fillPopupRowBand(pixels, pm, y_start, y_end, pm.row_hover[row_i]);
             }
             const color = if (it.enabled) current_config.appearance.text_color else current_config.appearance.popup_disabled_color;
             drawPopupLabel(pixels, pm, bar, y_start, POPUP_PADDING_X, it.label(), color);
@@ -2205,13 +2458,19 @@ fn drawDbusMenuRows(bar: *Bar, pm: *PopupMenu, pixels: [*]u32) void {
     }
 }
 
-/// Fills a row's band with the hover colour so a row reads as interactive.
-fn fillPopupRowBand(pixels: [*]u32, pm: *PopupMenu, y_start: i32, y_end: i32) void {
-    var py: i32 = y_start;
-    while (py < y_end and py < pm.height) : (py += 1) {
-        if (py < 0) continue;
-        var x: u32 = 0;
-        while (x < pm.width) : (x += 1) pixels[@as(u32, @intCast(py)) * pm.width + x] = current_config.appearance.popup_hover_color;
+/// Hover pill for one popup row: an inset rounded rect in the hover color,
+/// faded by `anim` (0 = invisible .. 1 = full) — the menu-sized version of
+/// the bar's hover pill, minus the underline (menus don't underline).
+/// No text-brightening: row labels keep text_color throughout the fade.
+fn fillPopupRowBand(pixels: [*]u32, pm: *PopupMenu, y_start: i32, y_end: i32, anim: f32) void {
+    if (anim <= 0.0) return;
+    const a = anim * HOVER_MAX_ALPHA;
+    const pill = lerpColor(current_config.appearance.popup_bg_color, current_config.appearance.popup_hover_color, a);
+    if (current_config.appearance.pill_borders) {
+        strokeBezel(pixels, pm.width, pm.height, POPUP_ROW_PAD_X, y_start + POPUP_ROW_PAD_Y, pm.width - POPUP_ROW_PAD_X, y_end - POPUP_ROW_PAD_Y, POPUP_ROW_RADIUS, current_config.appearance.popup_bg_color, anim);
+        fillRoundedRect(pixels, pm.width, pm.height, POPUP_ROW_PAD_X + 1, y_start + POPUP_ROW_PAD_Y + 1, pm.width - POPUP_ROW_PAD_X - 1, y_end - POPUP_ROW_PAD_Y - 1, POPUP_ROW_RADIUS - 1, pill);
+    } else {
+        fillRoundedRect(pixels, pm.width, pm.height, POPUP_ROW_PAD_X, y_start + POPUP_ROW_PAD_Y, pm.width - POPUP_ROW_PAD_X, y_end - POPUP_ROW_PAD_Y, POPUP_ROW_RADIUS, pill);
     }
 }
 
@@ -2251,8 +2510,10 @@ fn drawLayoutPickerRows(bar: *Bar, pm: *PopupMenu, pixels: [*]u32) void {
         }
 
         const is_active = active_symbol.len > 0 and std.mem.eql(u8, active_symbol, layout.symbol);
-        const hovered = pm.pointer_y >= y_start and pm.pointer_y < y_end;
-        if (hovered or is_active) fillPopupRowBand(pixels, pm, y_start, y_end);
+        // The active row keeps a persistent full-strength pill (a selection
+        // marker, not hover); the pointer's row fades in on top of it.
+        if (is_active) fillPopupRowBand(pixels, pm, y_start, y_end, 1.0);
+        fillPopupRowBand(pixels, pm, y_start, y_end, pm.row_hover[i]);
 
         // Icon, then the name, then — for the active row — a check.
         const baseline = y_start + @divTrunc(POPUP_ROW_HEIGHT + bar.font.ascentPx() - bar.font.descentPx(), 2);
@@ -2346,6 +2607,24 @@ const Bar = struct {
     last_pointer_serial: u32 = 0,
     drawer_expanded: bool = false, // target state, flipped instantly on click
     drawer_anim: f32 = 0.0, // 0=collapsed..1=expanded, eased toward drawer_expanded each tick
+    /// Dock-mode packing: last frame's per-group content widths. The pack
+    /// origin for this frame derives from these (not from measuring up
+    /// front, which would duplicate every module's width logic), so a width
+    /// change settles one frame later — imperceptible, self-correcting.
+    dock_left_w: i64 = 0,
+    dock_center_w: i64 = 0,
+    dock_right_w: i64 = 0,
+    /// Dock input-region bookkeeping: whether a region is currently set, and
+    /// the rect it covers (re-set only on change; cleared when leaving dock).
+    dock_input_set: bool = false,
+    dock_input_x: i64 = 0,
+    dock_input_w: i64 = 0,
+    /// Auto-hide state (appearance.auto_hide): hidden = collapsed to the
+    /// edge strip, exclusive zone released. hide_grace counts scroll ticks
+    /// down to hiding after the pointer leaves (a short delay so brushing
+    /// past the bar doesn't flicker it).
+    autohide_hidden: bool = false,
+    autohide_grace: u32 = 0,
     /// Running total of vertical scroll distance accumulated over the hovered
     /// region, in Wayland surface units. Crosses WORKSPACE_SCROLL_STEP to fire
     /// one step; the remainder is kept so continuous scroll keeps flowing
@@ -2371,15 +2650,97 @@ const Bar = struct {
 /// responds, the same as it does for the initial configure and for any
 /// compositor-initiated resize, so no separate handling is needed here.
 fn applyLayerGeometry(bar: *Bar) void {
-    if (std.mem.eql(u8, current_config.appearance.position, "top")) {
+    const is_top = std.mem.eql(u8, current_config.appearance.position, "top");
+    const is_dock = std.mem.eql(u8, current_config.appearance.bar_mode, BAR_MODE_DOCK);
+    if (is_top) {
         bar.layer_surface.setAnchor(.{ .top = true, .left = true, .right = true });
     } else {
         bar.layer_surface.setAnchor(.{ .bottom = true, .left = true, .right = true });
     }
     bar.layer_surface.setSize(0, current_config.appearance.bar_height);
-    bar.layer_surface.setExclusiveZone(@intCast(current_config.appearance.bar_height));
-    bar.layer_surface.setMargin(0, MARGIN_SIDE, 0, MARGIN_SIDE);
+    if (is_dock) {
+        // Floating dock: margins on three sides, and no exclusive zone so
+        // windows slide under it instead of stopping at it.
+        bar.layer_surface.setExclusiveZone(0);
+        if (is_top) {
+            bar.layer_surface.setMargin(DOCK_MARGIN_EDGE, DOCK_MARGIN_SIDE, 0, DOCK_MARGIN_SIDE);
+        } else {
+            bar.layer_surface.setMargin(0, DOCK_MARGIN_SIDE, DOCK_MARGIN_EDGE, DOCK_MARGIN_SIDE);
+        }
+    } else {
+        bar.layer_surface.setExclusiveZone(@intCast(current_config.appearance.bar_height));
+        bar.layer_surface.setMargin(0, MARGIN_SIDE, 0, MARGIN_SIDE);
+    }
     bar.surface.commit();
+}
+
+/// Auto-hide hint-strip rect (x, w) for the current frame: full width in
+/// taskbar mode (the bar spans the edge), or the last packed pill span in
+/// dock mode so the strip sits centered under the dock instead of ruling a
+/// stray line across the whole screen. Falls back to a modest centered
+/// segment while degenerate (no measured content yet).
+fn autohideStripRect(bar: *const Bar) struct {
+    x: i64,
+    w: i64,
+} {
+    if (!std.mem.eql(u8, current_config.appearance.bar_mode, BAR_MODE_DOCK)) {
+        return .{ .x = 0, .w = @intCast(bar.width) };
+    }
+    var total: i64 = bar.dock_left_w + bar.dock_center_w + bar.dock_right_w;
+    if (bar.dock_left_w > 0 and bar.dock_center_w > 0) total += DOCK_GAP;
+    if (bar.dock_center_w > 0 and bar.dock_right_w > 0) total += DOCK_GAP;
+    if (bar.dock_left_w > 0 and bar.dock_center_w == 0 and bar.dock_right_w > 0) total += DOCK_GAP;
+    if (total <= 0) total = 160;
+    const buf_w: i64 = @intCast(bar.width);
+    return .{ .x = @divTrunc(buf_w - total, 2), .w = total };
+}
+
+/// Shows a hidden bar (auto-hide): clears the hidden flag and grace timer,
+/// restores the exclusive zone + margins for the current mode, and forces
+/// the input region to be re-established (dock) or released (taskbar) below.
+/// No-op unless hidden, so enter handlers can call it unconditionally.
+fn autohideShow(bar: *Bar) void {
+    bar.autohide_grace = 0;
+    if (!bar.autohide_hidden) return;
+    bar.autohide_hidden = false;
+    applyLayerGeometry(bar);
+    // The pill/strip region below is re-decided every frame from these, so
+    // stale values would leave the wrong one in place.
+    bar.dock_input_set = false;
+    if (!std.mem.eql(u8, current_config.appearance.bar_mode, BAR_MODE_DOCK)) {
+        bar.surface.setInputRegion(null);
+    }
+    drawAndCommit(bar) catch |err| {
+        logging.err("draw failed: {}", .{err});
+    };
+}
+
+/// Hides the bar (auto-hide): releases the exclusive zone so windows use the
+/// space, narrows input to the edge strip, clears stale hover/click state,
+/// and closes any open popup (it belongs to a visible bar). The strip paint
+/// itself happens in paintFrame's hidden branch on the redraw below.
+fn autohideHide(bar: *Bar) void {
+    if (bar.autohide_hidden) return;
+    if (!current_config.appearance.auto_hide) return;
+    bar.autohide_hidden = true;
+    bar.autohide_grace = 0;
+    bar.layer_surface.setExclusiveZone(0);
+    // Input follows the strip (same rect the hidden branch paints), so only
+    // the strip — not the whole transparent surface — stays clickable.
+    const strip = autohideStripRect(bar);
+    const strip_y: i32 = if (std.mem.eql(u8, current_config.appearance.position, "top")) 0 else @intCast(bar.height - @as(u32, @intCast(AUTOHIDE_STRIP_PX)));
+    if (bar.compositor.createRegion()) |region| {
+        region.add(@intCast(@max(0, strip.x)), strip_y, @intCast(@max(0, strip.w)), AUTOHIDE_STRIP_PX);
+        bar.surface.setInputRegion(region);
+        region.destroy();
+    } else |_| {}
+    bar.click_regions.hovered = null;
+    bar.click_regions.hover = [_]f32{0} ** MAX_CLICK_REGIONS;
+    bar.click_regions.clear();
+    if (bar.popup != null) closePopup(bar);
+    drawAndCommit(bar) catch |err| {
+        logging.err("draw failed: {}", .{err});
+    };
 }
 
 /// Redraws every currently-running bar, logging (not propagating) any
@@ -2913,6 +3274,9 @@ fn realMain() !void {
         if (poll_fds[11].revents & posix.POLL.IN != 0) {
             var expirations: u64 = undefined;
             _ = posix.read(scroll_timer_fd, std.mem.asBytes(&expirations)) catch {};
+            // The hover bezel's rotation clock — advances whether or not
+            // anything is hovered (wrapping is fine; phase math is modulo).
+            hover_frame +%= 1;
             // Only bother animating (and redrawing) when there's actually
             // something to show — no point burning a redraw every 60ms
             // while nothing's playing and the drawer's fade isn't mid-flight.
@@ -2925,6 +3289,11 @@ fn realMain() !void {
                     b.mpris_scroll_step += SCROLL_STEP_PX;
                     needs_redraw = true;
                 }
+                // Auto-hide grace countdown (see the leave handler).
+                if (b.autohide_grace > 0) {
+                    b.autohide_grace -= 1;
+                    if (b.autohide_grace == 0) autohideHide(b);
+                }
                 const drawer_target: f32 = if (b.drawer_expanded) 1.0 else 0.0;
                 if (b.drawer_anim != drawer_target) {
                     b.drawer_anim = if (b.drawer_anim < drawer_target)
@@ -2933,10 +3302,77 @@ fn realMain() !void {
                         @max(drawer_target, b.drawer_anim - DRAWER_ANIM_STEP);
                     needs_redraw = true;
                 }
+                // Hover fade: every region's pill+underline eases toward lit
+                // (under the pointer) or dark. Same needs_redraw gating as
+                // the drawer — settled regions cost nothing per tick. With
+                // animations off the level snaps straight to target instead
+                // (the pointer handlers already redraw on change, so the
+                // snap still paints its single frame).
+                const anim_on = current_config.appearance.animations_enabled;
+                var hi: usize = 0;
+                while (hi < b.click_regions.len) : (hi += 1) {
+                    const hover_target: f32 = if (b.click_regions.hovered == hi) 1.0 else 0.0;
+                    if (b.click_regions.hover[hi] != hover_target) {
+                        b.click_regions.hover[hi] = if (!anim_on) hover_target else if (b.click_regions.hover[hi] < hover_target)
+                            @min(hover_target, b.click_regions.hover[hi] + HOVER_ANIM_STEP)
+                        else
+                            @max(hover_target, b.click_regions.hover[hi] - HOVER_ANIM_STEP);
+                        needs_redraw = true;
+                    }
+                }
+                // A settled-but-lit hover still rotates its bezel, so it
+                // needs a redraw every tick until it goes fully dark — but
+                // only while animations are on (off = frozen bezel = static).
+                // Same for the active-workspace pill below: its bezel never
+                // stops while animations are on, so the bar redraws every
+                // tick while one exists (practically always). Same cost class
+                // as any animated bar — one full CPU frame per 60ms tick.
+                if (anim_on) {
+                    var hj: usize = 0;
+                    while (hj < b.click_regions.len) : (hj += 1) {
+                        if (b.click_regions.hover[hj] > 0.0) {
+                            needs_redraw = true;
+                            break;
+                        }
+                    }
+                    if (!needs_redraw) {
+                        for (b.workspaces.list.items) |ws| {
+                            if (ws.active) {
+                                needs_redraw = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if (needs_redraw) {
                     drawAndCommit(b) catch |err| {
                         logging.err("draw failed: {}", .{err});
                     };
+                }
+                // An open popup's row pills ride the same tick — easing plus,
+                // like the bar, a redraw every tick while any row stays lit
+                // (the bezel keeps rotating under a parked pointer). Both
+                // collapse to snap + no forced redraws with animations off.
+                if (b.popup) |*pm| {
+                    var popup_redraw = false;
+                    var ri: usize = 0;
+                    while (ri < pm.row_count) : (ri += 1) {
+                        const row_target: f32 = if (pm.hovered_row == ri) 1.0 else 0.0;
+                        if (pm.row_hover[ri] != row_target) {
+                            pm.row_hover[ri] = if (!anim_on) row_target else if (pm.row_hover[ri] < row_target)
+                                @min(row_target, pm.row_hover[ri] + HOVER_ANIM_STEP)
+                            else
+                                @max(row_target, pm.row_hover[ri] - HOVER_ANIM_STEP);
+                            popup_redraw = true;
+                        } else if (anim_on and pm.row_hover[ri] > 0.0) {
+                            popup_redraw = true;
+                        }
+                    }
+                    if (popup_redraw) {
+                        drawPopup(b) catch |err| {
+                            logging.err("popup draw failed: {}", .{err});
+                        };
+                    }
                 }
             }
         }
@@ -2978,11 +3414,28 @@ fn realMain() !void {
                 const font_changed = !std.mem.eql(u8, old_font_path, cfg.appearance.font_path);
                 const old_position = current_config.appearance.position;
                 const old_bar_height = current_config.appearance.bar_height;
+                const old_bar_mode = current_config.appearance.bar_mode;
                 const geometry_changed = !std.mem.eql(u8, old_position, cfg.appearance.position) or
-                    old_bar_height != cfg.appearance.bar_height;
+                    old_bar_height != cfg.appearance.bar_height or
+                    !std.mem.eql(u8, old_bar_mode, cfg.appearance.bar_mode);
                 current_config = cfg;
                 invalidateLauncherIcons();
                 logging.step("config: reloaded {s}", .{config_json_path});
+                // Toggling auto-hide off while hidden must reveal the bar —
+                // otherwise it stays invisible with the feature disabled.
+                // Conversely, a reload while hidden re-applies geometry
+                // (restoring the exclusive zone), so re-hide to put the
+                // release + strip back in place.
+                if (!cfg.appearance.auto_hide) {
+                    for (bars[0..bar_count]) |*b| autohideShow(b);
+                } else {
+                    for (bars[0..bar_count]) |*b| {
+                        if (b.autohide_hidden) {
+                            b.autohide_hidden = false;
+                            autohideHide(b);
+                        }
+                    }
+                }
 
                 // Closes a previously-known gap: bar_height (and now
                 // position) used to only take effect on the next bar
@@ -4285,7 +4738,6 @@ fn drawWorkspaces(
     font: *font_mod.Font,
     workspaces: []const Workspace,
     x0_start: i64,
-    pointer_x: i32,
     click_regions: *ClickRegions,
 ) i64 {
     const y0: i64 = baselineY(buf_height, font);
@@ -4301,7 +4753,8 @@ fn drawWorkspaces(
         // — same bounds for the hover highlight as for the click region.
         const hover_start = region_start - @divTrunc(workspace_gap, 2);
         const hover_end = region_start + textPixelWidth(font, text) + @divTrunc(workspace_gap, 2);
-        _ = drawHoverHighlight(pixels, buf_width, buf_height, hover_start, hover_end, pointer_x);
+        if (ws.active) drawActivePill(pixels, buf_width, buf_height, hover_start, hover_end);
+        drawModulePill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
         var i: usize = 0;
         while (nextUtf8Codepoint(text, &i)) |cp| {
             x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, color, 0, buf_width);
@@ -4329,7 +4782,6 @@ fn drawMprisControls(
     font: *font_mod.Font,
     x0_start: i64,
     playing: bool,
-    pointer_x: i32,
     click_regions: *ClickRegions,
 ) i64 {
     const y0: i64 = baselineY(buf_height, font);
@@ -4345,7 +4797,7 @@ fn drawMprisControls(
         // lets the highlight go down before the glyph — same cached
         // lookup drawGlyphAt makes right after, so no extra rasterizing.
         const advance = if (font.glyph(btn.icon)) |g| g.advance_x else |_| 0;
-        _ = drawHoverHighlight(pixels, buf_width, buf_height, region_start - 2, region_start + advance + 2, pointer_x);
+        _ = drawModulePill(pixels, buf_width, buf_height, region_start - 2, region_start + advance + 2, click_regions.nextHover());
         x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, btn.icon, current_config.appearance.text_color, 0, buf_width);
         click_regions.add(@intCast(region_start - 2), @intCast(x0 + 2), .{ .mpris_control = btn.action });
         x0 += MPRIS_CONTROL_GAP;
@@ -4413,11 +4865,11 @@ fn drawLeftGroup(
     mpris_playing: bool,
     mpris_scroll_step: i64,
     center_start_x: i64,
-    pointer_x: i32,
+    x0_start: i64,
     click_regions: *ClickRegions,
-) void {
+) i64 {
     const y0: i64 = baselineY(buf_height, font);
-    var x0: i64 = WORKSPACE_LEFT_MARGIN;
+    var x0: i64 = x0_start;
     var any_drawn = false;
     for (current_config.modules.left) |entry| {
         if (!entry.enabled) continue;
@@ -4431,7 +4883,7 @@ fn drawLeftGroup(
         if (any_drawn) x0 += MODULE_GAP;
         switch (entry.kind) {
             .workspaces => {
-                x0 = drawWorkspaces(pixels, buf_width, buf_height, font, workspaces, x0, pointer_x, click_regions);
+                x0 = drawWorkspaces(pixels, buf_width, buf_height, font, workspaces, x0, click_regions);
             },
             .clock => {
                 // Static text, identical treatment to the center's clock
@@ -4444,6 +4896,8 @@ fn drawLeftGroup(
                 // pen, so the glyph run starts at the centered position
                 // while the pen jumps straight to the cell's right edge.
                 const cell = reserveLeftCell(x0, textPixelWidth(font, time_text), center_start_x);
+                // Resting pill over the cell — static text, so no hover.
+                drawRestingPill(pixels, buf_width, buf_height, cell.content_start, cell.content_end);
                 var cx = cell.content_start;
                 var i: usize = 0;
                 while (nextUtf8Codepoint(time_text, &i)) |cp| {
@@ -4462,17 +4916,35 @@ fn drawLeftGroup(
                 for (current_config.launchers, 0..) |btn, li| {
                     const mode = launcherDisplayMode(btn.display);
                     const has_icon = li < launcher_icons.len and launcher_icons[li].has_icon;
-                    const draw_icon = has_icon and mode != .label;
-                    const draw_label = mode != .icon or !has_icon;
-                    const icon_w: i64 = if (draw_icon) @as(i64, LAUNCHER_ICON_SIZE) + LAUNCHER_ICON_TEXT_GAP else 0;
+                    const distro: u32 = if (li < launcher_icons.len) launcher_icons[li].distro_glyph else 0;
+                    const draw_png = has_icon and distro == 0 and mode != .label;
+                    const draw_glyph = distro != 0 and mode != .label;
+                    const draw_icon = draw_png or draw_glyph;
+                    const draw_label = mode != .icon or (!has_icon and distro == 0);
+                    // The text gap only separates an icon from a following
+                    // label — in icon-only mode it would be 5px of dead space
+                    // trailing the icon, sitting the icon left-of-center in
+                    // its pill.
+                    var dg_buf: [4]u8 = undefined;
+                    const dg_str: []const u8 = if (distro != 0) encodeBmpCodepoint(distro, &dg_buf) else "";
+                    const icon_unit: i64 = if (draw_png) LAUNCHER_ICON_SIZE else if (draw_glyph) textPixelWidth(font, dg_str) else 0;
+                    const icon_w: i64 = if (draw_icon) icon_unit + (if (draw_label) LAUNCHER_ICON_TEXT_GAP else 0) else 0;
                     const label_w = (if (draw_label) textPixelWidth(font, btn.label) else 0) + icon_w;
                     const region_start = x0;
                     const hover_start = region_start - @divTrunc(LAUNCHER_GAP, 2);
                     const hover_end = region_start + label_w + @divTrunc(LAUNCHER_GAP, 2);
-                    _ = drawHoverHighlight(pixels, buf_width, buf_height, hover_start, hover_end, pointer_x);
+                    _ = drawModulePill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
                     if (draw_icon and li < launcher_icons.len) {
-                        drawLauncherIcon(pixels, buf_width, buf_height, x0, &launcher_icons[li]);
-                        x0 += icon_w;
+                        if (draw_glyph) {
+                            var gi: usize = 0;
+                            while (nextUtf8Codepoint(dg_str, &gi)) |cp| {
+                                x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
+                            }
+                            x0 += icon_w - textPixelWidth(font, dg_str);
+                        } else {
+                            drawLauncherIcon(pixels, buf_width, buf_height, x0, &launcher_icons[li]);
+                            x0 += icon_w;
+                        }
                     }
                     if (draw_label) {
                         var i: usize = 0;
@@ -4487,15 +4959,31 @@ fn drawLeftGroup(
             .mpris => {
                 // Controls then a ticker filling the space up to the center
                 // group's left edge (original behavior; see fn doc comment).
+                // In dock mode there is no dead stretch to fill — the pack
+                // is tight — so the track renders as static text (like the
+                // center's mpris segment) and the pen advances past exactly
+                // what drew, keeping the pack free of empty space.
                 if (mpris_text.len > 0) {
-                    x0 = drawMprisControls(pixels, buf_width, buf_height, font, x0, mpris_playing, pointer_x, click_regions);
+                    x0 = drawMprisControls(pixels, buf_width, buf_height, font, x0, mpris_playing, click_regions);
                 }
-                drawMpris(pixels, buf_width, buf_height, font, x0, center_start_x - LAUNCHER_GAP, mpris_text, mpris_scroll_step);
+                if (std.mem.eql(u8, current_config.appearance.bar_mode, BAR_MODE_DOCK)) {
+                    var i: usize = 0;
+                    while (nextUtf8Codepoint(mpris_text, &i)) |cp| {
+                        x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
+                    }
+                } else {
+                    drawMpris(pixels, buf_width, buf_height, font, x0, center_start_x - LAUNCHER_GAP, mpris_text, mpris_scroll_step);
+                }
             },
             else => {}, // RIGHT-only kind in left: no left-anchored render for it
         }
         any_drawn = true;
     }
+    // Pen end = content end, with one taskbar-only exception: a playing
+    // ticker paints past the pen into the gap without advancing it (in dock
+    // mode the track is static text, so the pen advances past exactly what
+    // drew and the pack stays tight).
+    return x0;
 }
 
 /// Draws the launcher buttons + clock as one centered group, matching
@@ -4555,7 +5043,7 @@ const CenterSegments = struct {
 /// Cross-group drag lets any left/center-capable module kind live here now,
 /// so beyond the original clock + launchers this also emits workspace
 /// pills (colored, clickable) and a static mpris track label.
-fn composeCenterSegments(out: *CenterSegments, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8) void {
+fn composeCenterSegments(out: *CenterSegments, font: *font_mod.Font, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8) void {
     out.* = .{};
     var emitted_any = false;
     for (current_config.modules.center) |entry| {
@@ -4582,13 +5070,21 @@ fn composeCenterSegments(out: *CenterSegments, time_text: []const u8, workspaces
                     if (out.len >= out.items.len) break;
                     const mode = launcherDisplayMode(btn.display);
                     const has_icon = i < launcher_icons.len and launcher_icons[i].has_icon;
-                    const draw_icon = has_icon and mode != .label;
-                    const draw_label = mode != .icon or !has_icon;
+                    const distro: u32 = if (i < launcher_icons.len) launcher_icons[i].distro_glyph else 0;
+                    const draw_png = has_icon and distro == 0 and mode != .label;
+                    const draw_glyph = distro != 0 and mode != .label;
+                    const draw_icon = draw_png or draw_glyph;
+                    const draw_label = mode != .icon or (!has_icon and distro == 0);
+                    // A distro logo is a font glyph, not a 16px PNG: measure
+                    // it so icon_w (and everything downstream — centering,
+                    // hover bounds, pen advance) stays exact.
+                    var dg_buf: [4]u8 = undefined;
+                    const icon_unit: i64 = if (draw_png) LAUNCHER_ICON_SIZE else if (draw_glyph) textPixelWidth(font, encodeBmpCodepoint(distro, &dg_buf)) else 0;
                     out.items[out.len] = .{
                         .label = if (draw_label) btn.label else "",
                         .command = btn.command,
                         .gap_after = LAUNCHER_GAP,
-                        .icon_w = if (draw_icon) @as(i64, LAUNCHER_ICON_SIZE) + LAUNCHER_ICON_TEXT_GAP else 0,
+                        .icon_w = if (draw_icon) icon_unit + (if (draw_label) LAUNCHER_ICON_TEXT_GAP else 0) else 0,
                         .launcher_idx = i,
                     };
                     out.len += 1;
@@ -4629,7 +5125,7 @@ fn composeCenterSegments(out: *CenterSegments, time_text: []const u8, workspaces
 
 fn centerGroupWidth(font: *font_mod.Font, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8) i64 {
     var segs: CenterSegments = .{};
-    composeCenterSegments(&segs, time_text, workspaces, mpris_text);
+    composeCenterSegments(&segs, font, time_text, workspaces, mpris_text);
     var total: i64 = 0;
     for (segs.items[0..segs.len]) |seg| total += seg.icon_w + textPixelWidth(font, seg.label) + seg.gap_after;
     return total;
@@ -4650,13 +5146,13 @@ fn drawCenterGroup(
     time_text: []const u8,
     workspaces: []const Workspace,
     mpris_text: []const u8,
-    pointer_x: i32,
+    x0_start: i64,
     click_regions: *ClickRegions,
-) void {
+) i64 {
     const y0: i64 = baselineY(buf_height, font);
-    var x0: i64 = centerGroupStartX(buf_width, font, time_text, workspaces, mpris_text);
+    var x0: i64 = x0_start;
     var segs: CenterSegments = .{};
-    composeCenterSegments(&segs, time_text, workspaces, mpris_text);
+    composeCenterSegments(&segs, font, time_text, workspaces, mpris_text);
 
     for (segs.items[0..segs.len]) |seg| {
         if (seg.ws_id) |ws_id| {
@@ -4665,7 +5161,8 @@ fn drawCenterGroup(
             const region_start = x0;
             const hover_start = region_start - @divTrunc(workspace_gap, 2);
             const hover_end = region_start + textPixelWidth(font, seg.label) + @divTrunc(workspace_gap, 2);
-            _ = drawHoverHighlight(pixels, buf_width, buf_height, hover_start, hover_end, pointer_x);
+            if (seg.ws_active) drawActivePill(pixels, buf_width, buf_height, hover_start, hover_end);
+            drawModulePill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
             var i: usize = 0;
             while (nextUtf8Codepoint(seg.label, &i)) |cp| {
                 x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, color, 0, buf_width);
@@ -4676,10 +5173,23 @@ fn drawCenterGroup(
             const label_w = seg.icon_w + textPixelWidth(font, seg.label);
             const hover_start = region_start - @divTrunc(LAUNCHER_GAP, 2);
             const hover_end = region_start + label_w + @divTrunc(LAUNCHER_GAP, 2);
-            _ = drawHoverHighlight(pixels, buf_width, buf_height, hover_start, hover_end, pointer_x);
+            _ = drawModulePill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
             if (seg.icon_w > 0 and seg.launcher_idx < launcher_icons.len) {
-                drawLauncherIcon(pixels, buf_width, buf_height, x0, &launcher_icons[seg.launcher_idx]);
-                x0 += seg.icon_w;
+                const distro = launcher_icons[seg.launcher_idx].distro_glyph;
+                if (distro != 0) {
+                    // Distro logo: same glyph the drawer brands itself with,
+                    // drawn on the text baseline (not the 16px icon box).
+                    var dg_buf: [4]u8 = undefined;
+                    const dg_str = encodeBmpCodepoint(distro, &dg_buf);
+                    var gi: usize = 0;
+                    while (nextUtf8Codepoint(dg_str, &gi)) |cp| {
+                        x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
+                    }
+                    x0 += seg.icon_w - textPixelWidth(font, dg_str);
+                } else {
+                    drawLauncherIcon(pixels, buf_width, buf_height, x0, &launcher_icons[seg.launcher_idx]);
+                    x0 += seg.icon_w;
+                }
             }
             var i: usize = 0;
             while (nextUtf8Codepoint(seg.label, &i)) |cp| {
@@ -4687,6 +5197,10 @@ fn drawCenterGroup(
             }
             click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .spawn = cmd });
         } else {
+            // Static segment (clock, plain label): resting pill over the
+            // content bounds, matching the interactive modules' rhythm.
+            const st_w = seg.icon_w + textPixelWidth(font, seg.label);
+            drawRestingPill(pixels, buf_width, buf_height, x0 - @divTrunc(LAUNCHER_GAP, 2), x0 + st_w + @divTrunc(LAUNCHER_GAP, 2));
             if (seg.icon_w > 0 and seg.launcher_idx < launcher_icons.len) {
                 drawLauncherIcon(pixels, buf_width, buf_height, x0, &launcher_icons[seg.launcher_idx]);
                 x0 += seg.icon_w;
@@ -4698,6 +5212,7 @@ fn drawCenterGroup(
         }
         x0 += seg.gap_after;
     }
+    return x0;
 }
 
 /// Blits a launcher's decoded app icon (a LAUNCHER_ICON_SIZE square, row-0
@@ -4737,15 +5252,13 @@ fn drawRightAligned(
     label: []const u8,
     color: u32,
     action: ?Action,
-    pointer_x: i32,
     click_regions: *ClickRegions,
 ) i64 {
     const region_start = x_end - textPixelWidth(font, label);
-    // Only clickable labels (action != null) get a hover highlight — a
-    // static readout like the volume/pacman text shouldn't look pressable.
-    if (action != null) {
-        _ = drawHoverHighlight(pixels, buf_width, buf_height, region_start - 4, x_end + 4, pointer_x);
-    }
+    // Every module gets its resting pill; only clickable labels can light it
+    // — static readouts pass a zero fade level outright, since they register
+    // no region and must not mirror a neighbor's animation.
+    drawModulePill(pixels, buf_width, buf_height, region_start - 4, x_end + 4, if (action != null) click_regions.nextHover() else 0.0);
     var x0 = region_start;
     var i: usize = 0;
     while (nextUtf8Codepoint(label, &i)) |cp| {
@@ -4757,22 +5270,295 @@ fn drawRightAligned(
     return region_start;
 }
 
-/// Fills a full-height rect between `x_start`/`x_end` with the configured
-/// hover color when
-/// `pointer_x` falls inside it — the same treatment the popup menu already
-/// gives its hovered row, applied to the bar's own buttons. Callers draw
-/// this *before* their glyphs so text/icons land on top. Returns whether it
-/// hovered, in case a caller also wants to react (none currently do).
-fn drawHoverHighlight(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64, x_end: i64, pointer_x: i32) bool {
-    if (pointer_x < x_start or pointer_x >= x_end) return false;
-    const xs: usize = @intCast(@max(0, x_start));
-    const xe: usize = @intCast(@min(@as(i64, @intCast(buf_width)), x_end));
-    var y: u32 = 0;
-    while (y < buf_height) : (y += 1) {
-        var x = xs;
-        while (x < xe) : (x += 1) pixels[y * buf_width + x] = current_config.appearance.hover_color;
+/// Bar modes (appearance.bar_mode values).
+const BAR_MODE_TASKBAR = "taskbar";
+const BAR_MODE_DOCK = "dock";
+/// Dock-mode gaps: edge = space between the dock and its screen edge,
+/// side = inset from the left/right screen edges. Taskbar keeps today's
+/// exact zeros (MARGIN_SIDE).
+const DOCK_MARGIN_EDGE: i32 = 10;
+const DOCK_MARGIN_SIDE: i32 = 16;
+/// Gap between packed groups in dock mode (same rhythm as MODULE_GAP).
+const DOCK_GAP: i64 = 12;
+/// Padding around the packed content for the dock's background pill.
+const DOCK_PILL_PAD: i64 = 8;
+/// Auto-hide hint strip thickness (px) at the screen edge while hidden.
+const AUTOHIDE_STRIP_PX: i32 = 2;
+/// Hide delay after the pointer leaves, in scroll-timer ticks
+/// (5 × 60ms ≈ 300ms — calm, not flickery).
+const AUTOHIDE_GRACE_TICKS: u32 = 5;
+/// Hover fade pacing: fraction per 60ms scroll-timer tick (~150ms full fade —
+/// deliberately snappier than the drawer's ~240ms, since hover tracks the
+/// pointer and must never feel laggy).
+const HOVER_ANIM_STEP: f32 = 0.4;
+/// Opacity ceiling for the hover treatment: even fully faded in, the pill
+/// and underline only blend this far from the background toward their
+/// colors, keeping the highlight a subtle glow rather than a solid block.
+const HOVER_MAX_ALPHA: f32 = 0.55;
+/// Vertical inset of the hover pill from the bar's top/bottom edges.
+const HOVER_PILL_PAD_Y: i32 = 4;
+/// Corner radius of the hover pill (clamped to half the pill height, so a
+/// large value degrades gracefully to capsule ends instead of breaking).
+const HOVER_PILL_RADIUS: i32 = 12;
+/// Thickness of the accent underline.
+const HOVER_UNDERLINE_H: i32 = 3;
+/// Gap between the underline's bottom edge and the bar's bottom edge.
+const HOVER_UNDERLINE_BOTTOM_GAP: i32 = 2;
+
+/// Frames elapsed on the scroll-timer tick — the clock for the hover bezel
+/// rotation below. Wraps rather than resetting; phase math is modulo-based.
+var hover_frame: u32 = 0;
+
+/// Hover/active bezel styles (appearance.bezel_style values).
+const BEZEL_STYLE_MATUGEN = "matugen";
+const BEZEL_STYLE_RAINBOW_PUKE = "rainbow-puke";
+
+/// Rotation period of the hover bezel, in ticks (40 × 60ms ≈ 2.4s per turn).
+const HOVER_BEZEL_PERIOD: u32 = 40;
+
+/// HSV → opaque 0xAARRGGBB. s,v in 0..1; h wraps (negative and >1 fold back
+/// onto the wheel via floored modulo, so callers never need to normalize).
+/// Used only by the "rainbow-puke" bezel style.
+fn hsvToRgb(h: f32, s: f32, v: f32) u32 {
+    const c = v * s;
+    const hh = @mod(h, 1.0) * 6.0;
+    const x = c * (1.0 - @abs(@mod(hh, 2.0) - 1.0));
+    const i: u32 = @as(u32, @intFromFloat(@floor(hh))) % 6;
+    var r: f32 = 0;
+    var g: f32 = 0;
+    var b: f32 = 0;
+    switch (i) {
+        0 => {
+            r = c;
+            g = x;
+        },
+        1 => {
+            r = x;
+            g = c;
+        },
+        2 => {
+            g = c;
+            b = x;
+        },
+        3 => {
+            g = x;
+            b = c;
+        },
+        4 => {
+            r = x;
+            b = c;
+        },
+        else => {
+            r = c;
+            b = x;
+        },
     }
-    return true;
+    const m = v - c;
+    return 0xFF000000 |
+        (@as(u32, @intFromFloat((r + m) * 255.0)) << 16) |
+        (@as(u32, @intFromFloat((g + m) * 255.0)) << 8) |
+        @as(u32, @intFromFloat((b + m) * 255.0));
+}
+
+/// Palette-ring color at ring position `frac` (turns around the border):
+/// four matugen stops — accent, text, hover-fill, inactive — with smooth
+/// blends between neighbors, wrapping at the seam. Pure (no config access)
+/// so the GUI-side round-trip harness can pin it.
+fn bezelColorAt(stops: [4]u32, frac: f32) u32 {
+    const pos = @mod(frac, 1.0) * 4.0;
+    const seg: u32 = @as(u32, @intFromFloat(@floor(pos))) % 4;
+    const f = pos - @floor(pos);
+    return lerpColor(stops[seg], stops[(seg + 1) % 4], f);
+}
+
+/// Rounded-rect containment in doubled coordinates: pixel centers are exact
+/// integers, so (2*px+1, 2*py+1) tests against the continuous rect
+/// [X0,X1)×[Y0,Y1) with corner radius R (all doubled). Shared by the fill
+/// below and the bezel stroke, so both agree pixel-for-pixel on the shape.
+fn inRoundedRect2(cx: i64, cy: i64, X0: i64, Y0: i64, X1: i64, Y1: i64, R: i64) bool {
+    const ix0 = X0 + R;
+    const ix1 = X1 - R;
+    const iy0 = Y0 + R;
+    const iy1 = Y1 - R;
+    const qx: i64 = if (cx < ix0) ix0 - cx else if (cx > ix1) cx - ix1 else 0;
+    const qy: i64 = if (cy < iy0) iy0 - cy else if (cy > iy1) cy - iy1 else 0;
+    return qx * qx + qy * qy <= R * R;
+}
+
+/// Fills the rounded rect [x0,x1)×[y0,y1) with `color`, clipped to the
+/// buffer. Radius clamps to half the smaller dimension so short pills
+/// degrade to capsules instead of breaking.
+fn fillRoundedRect(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, y0: i64, x1: i64, y1: i64, radius: i32, color: u32) void {
+    if (x1 <= x0 or y1 <= y0) return;
+    const w = x1 - x0;
+    const h = y1 - y0;
+    const half_min: i32 = @intCast(@divTrunc(@min(w, h), 2));
+    const r = @min(radius, half_min);
+    if (r < 0) return;
+    const xs: i64 = @max(0, x0);
+    const xe: i64 = @min(@as(i64, @intCast(buf_width)), x1);
+    const ys: i64 = @max(0, y0);
+    const ye: i64 = @min(@as(i64, @intCast(buf_height)), y1);
+    // Doubled coordinates so pixel centers are exact integers: pixel
+    // (px,py) is tested at (2*px+1, 2*py+1) against the continuous rect.
+    // (Exclusive bounds would otherwise collapse the inner rect
+    // asymmetrically when the radius reaches half the height.)
+    const X0 = 2 * x0;
+    const X1 = 2 * x1;
+    const Y0 = 2 * y0;
+    const Y1 = 2 * y1;
+    const R: i64 = 2 * @as(i64, r);
+    var py = ys;
+    while (py < ye) : (py += 1) {
+        var px = xs;
+        while (px < xe) : (px += 1) {
+            if (inRoundedRect2(2 * px + 1, 2 * py + 1, X0, Y0, X1, Y1, R)) {
+                pixels[@as(usize, @intCast(py)) * buf_width + @as(usize, @intCast(px))] = color;
+            }
+        }
+    }
+}
+
+/// 1px animated bezel around the rounded rect [x0,x1)×[y0,y1): the ring wears
+/// the matugen palette itself — accent, text, hover-fill, inactive in
+/// quarter turns, blending smoothly between neighbors — traveling around the
+/// border (one turn per HOVER_BEZEL_PERIOD ticks). Every hue on the ring
+/// comes straight out of appearance, so it reads as the wallpaper's colors,
+/// never rainbow; on manual (non-matugen) themes it reads as that theme's
+/// four roles instead. Faded by `a` toward `bg`.
+/// NOTE: callers pass the UNcapped fade level here (not × HOVER_MAX_ALPHA):
+/// the bezel needs full brightness to read at 1px wide — capping it along
+/// with the pill wash renders the hue swing nearly invisible on a dark bar.
+fn strokeBezel(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, y0: i64, x1: i64, y1: i64, radius: i32, bg: u32, a: f32) void {
+    if (x1 <= x0 or y1 <= y0) return;
+    const stops = [_]u32{
+        current_config.appearance.workspace_active_color,
+        current_config.appearance.text_color,
+        current_config.appearance.hover_color,
+        current_config.appearance.workspace_inactive_color,
+    };
+    const w = x1 - x0;
+    const h = y1 - y0;
+    const r = @min(radius, @as(i32, @intCast(@divTrunc(@min(w, h), 2))));
+    if (r < 0) return;
+    // Doubled coordinates (see fillRoundedRect); the inner shape is the
+    // outer shrunk 1px per side with radius 1px smaller.
+    const X0 = 2 * x0;
+    const X1 = 2 * x1;
+    const Y0 = 2 * y0;
+    const Y1 = 2 * y1;
+    const R: i64 = 2 * @as(i64, r);
+    const ccx = x0 + x1; // rect center, already in doubled units
+    const ccy = y0 + y1;
+    // Frozen at 0 while animations are off (static bezel); advancing phase
+    // is what the per-tick redraws below are actually animating.
+    const phase = if (current_config.appearance.animations_enabled)
+        @as(f32, @floatFromInt(hover_frame % HOVER_BEZEL_PERIOD)) / @as(f32, HOVER_BEZEL_PERIOD)
+    else
+        0.0;
+    const xs: i64 = @max(0, x0);
+    const xe: i64 = @min(@as(i64, @intCast(buf_width)), x1);
+    const ys: i64 = @max(0, y0);
+    const ye: i64 = @min(@as(i64, @intCast(buf_height)), y1);
+    var py = ys;
+    while (py < ye) : (py += 1) {
+        var px = xs;
+        while (px < xe) : (px += 1) {
+            const cx = 2 * px + 1;
+            const cy = 2 * py + 1;
+            if (!inRoundedRect2(cx, cy, X0, Y0, X1, Y1, R)) continue;
+            if (inRoundedRect2(cx, cy, X0 + 2, Y0 + 2, X1 - 2, Y1 - 2, R - 2)) continue;
+            const ang = std.math.atan2(@as(f32, @floatFromInt(cy - ccy)), @as(f32, @floatFromInt(cx - ccx)));
+            // Ring position in turns (floored modulo keeps negatives in
+            // range); the palette quarters travel with the frame phase.
+            const frac = @mod(ang / (std.math.pi * 2.0) + phase, 1.0);
+            // "rainbow-puke" runs the full hue wheel at fixed vividness;
+            // the default matugen ring wears the wallpaper palette instead.
+            const ring = if (std.mem.eql(u8, current_config.appearance.bezel_style, BEZEL_STYLE_RAINBOW_PUKE))
+                hsvToRgb(frac, 0.85, 1.0)
+            else
+                bezelColorAt(stops, frac);
+            const col = lerpColor(bg, ring, a);
+            pixels[@as(usize, @intCast(py)) * buf_width + @as(usize, @intCast(px))] = col;
+        }
+    }
+}
+
+/// One pill per module: the resting layer (bezel + module_bg fill, skipped
+/// while module_pills/pill_borders are off — see drawRestingPill) with the
+/// hover treatment (wash + dash, faded by `anim`) layered on top. `anim` is the region's fade level from
+/// click_regions.nextHover() — eased toward 1/0 on the scroll-timer tick —
+/// so the highlight blooms in over ~150ms instead of snapping. Colors lerp
+/// from the bar background (the opaque stand-in for translucency this file
+/// already uses for the drawer fade). Callers draw this *before* their
+/// glyphs so text/icons land on top. Static (action-less) readouts still get
+/// their resting pill (they just never light up) — and hover only ever shows
+/// where a click region exists, since hit-testing lives in the pointer
+/// handlers.
+fn drawModulePill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64, x_end: i64, anim: f32) void {
+    drawRestingPill(pixels, buf_width, buf_height, x_start, x_end);
+    drawPill(pixels, buf_width, buf_height, x_start, x_end, anim);
+}
+
+/// Active-workspace marker: the hover pill + rotating bezel + accent dash at
+/// full strength, drawn under the hover layer so a hovered active workspace
+/// simply overdraws the identical shape (same geometry, same global phase —
+/// invisible). The bright workspace_active_color digits still carry
+/// active-vs-inactive; the pill carries "this one is live". Shared by the
+/// left and center workspace loops.
+fn drawActivePill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64, x_end: i64) void {
+    drawPill(pixels, buf_width, buf_height, x_start, x_end, 1.0);
+}
+
+/// Pill + rotating bezel + centered dash at fade level `anim` (0 = invisible
+/// .. 1 = full): fill and dash honor the opacity ceiling, bezel takes the
+/// raw level so its 1px ring stays vivid. The single shape behind both hover
+/// (faded) and active-workspace (full) states. The dash wears the matugen
+/// accent (workspace_active_color) solid so the wallpaper palette reads at
+/// a glance; the bezel shimmers around the accent hue around it.
+/// Resting module pill: the living bezel outside, flat module_bg_color
+/// inside. Every module wears one, so the whole bar shares one rotating
+/// phase (synchronized rings, and no extra redraw cost past what the active
+/// pill already pays). Hover/active layer their wash + dash on top via
+/// drawPill below. Skipped entirely while module_pills is off (bare bar);
+/// the bezel is skipped while pill_borders is off (flat fills), in which
+/// case the fill spans the full bounds since there is no rim to inset for.
+fn drawRestingPill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64, x_end: i64) void {
+    if (!current_config.appearance.module_pills) return;
+    const h: i64 = @intCast(buf_height);
+    if (!current_config.appearance.pill_borders) {
+        fillRoundedRect(pixels, buf_width, buf_height, x_start, HOVER_PILL_PAD_Y, x_end, h - HOVER_PILL_PAD_Y, HOVER_PILL_RADIUS, current_config.appearance.module_bg_color);
+        return;
+    }
+    strokeBezel(pixels, buf_width, buf_height, x_start, HOVER_PILL_PAD_Y, x_end, h - HOVER_PILL_PAD_Y, HOVER_PILL_RADIUS, current_config.appearance.bg_color, 1.0);
+    fillRoundedRect(pixels, buf_width, buf_height, x_start + 1, HOVER_PILL_PAD_Y + 1, x_end - 1, h - HOVER_PILL_PAD_Y - 1, HOVER_PILL_RADIUS - 1, current_config.appearance.module_bg_color);
+}
+
+fn drawPill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64, x_end: i64, anim: f32) void {
+    if (anim <= 0.0) return;
+    // The fill and dash honor the opacity ceiling (see strokeBezel for why
+    // the bezel takes the raw level instead).
+    const bg = current_config.appearance.bg_color;
+    const a = anim * HOVER_MAX_ALPHA;
+    const pill = lerpColor(bg, current_config.appearance.hover_color, a);
+    const line = lerpColor(bg, current_config.appearance.workspace_active_color, a);
+    const h: i64 = @intCast(buf_height);
+    // The ring lives on the outermost drawn layer: resting owns it while
+    // pills are on, otherwise the lit wash draws its own (same geometry and
+    // global phase either way, so the two configurations never double-draw).
+    if (current_config.appearance.pill_borders and !current_config.appearance.module_pills) {
+        strokeBezel(pixels, buf_width, buf_height, x_start, HOVER_PILL_PAD_Y, x_end, h - HOVER_PILL_PAD_Y, HOVER_PILL_RADIUS, bg, anim);
+    }
+    // Wash inset inside the resting ring, then the underline on top.
+    fillRoundedRect(pixels, buf_width, buf_height, x_start + 1, HOVER_PILL_PAD_Y + 1, x_end - 1, h - HOVER_PILL_PAD_Y - 1, HOVER_PILL_RADIUS - 1, pill);
+    // Centered dash, ~a third of the region wide (min 8px so narrow pills
+    // like workspace digits still read), sitting just above the bottom edge.
+    const w = x_end - x_start;
+    const uw = @max(@as(i64, 8), @divTrunc(w, 3));
+    const cx = @divTrunc(x_start + x_end, 2);
+    const ux0 = cx - @divTrunc(uw, 2);
+    const uy1 = h - HOVER_UNDERLINE_BOTTOM_GAP;
+    fillRoundedRect(pixels, buf_width, buf_height, ux0, uy1 - HOVER_UNDERLINE_H, ux0 + uw, uy1, @divTrunc(HOVER_UNDERLINE_H + 1, 2), line);
 }
 
 /// Linearly interpolates between two 0xAARRGGBB colors (alpha always comes
@@ -4799,13 +5585,13 @@ fn lerpColor(from: u32, to: u32, t: f32) u32 {
 /// pixel's own alpha for the drawer's fade animation — real blending here
 /// (via blendPixel), not the hard alpha cutoff a static icon would get
 /// away with, since a faded-in icon needs to show through partially.
-fn drawTrayIconEndingAt(pixels: [*]u32, buf_width: u32, buf_height: u32, x_end: i64, icon: []const u32, progress: f32, pointer_x: i32) i64 {
+fn drawTrayIconEndingAt(pixels: [*]u32, buf_width: u32, buf_height: u32, x_end: i64, icon: []const u32, progress: f32, anim: f32) i64 {
     const x0 = x_end - TRAY_ICON_SIZE;
     const y0 = @divTrunc(@as(i64, @intCast(buf_height)) - TRAY_ICON_SIZE, 2);
     const p = std.math.clamp(progress, 0.0, 1.0);
     // Same -2/+2 padding as the click region this icon gets at the call
     // site, so the highlight and the clickable area agree.
-    _ = drawHoverHighlight(pixels, buf_width, buf_height, x0 - 2, x_end + 2, pointer_x);
+    _ = drawModulePill(pixels, buf_width, buf_height, x0 - 2, x_end + 2, anim);
     for (0..TRAY_ICON_SIZE) |iy| {
         for (0..TRAY_ICON_SIZE) |ix| {
             const px = x0 + @as(i64, @intCast(ix));
@@ -4897,11 +5683,11 @@ fn drawRightGroup(
     tray: *const Tray,
     workspaces: *const Workspaces,
     center_start_x: i64,
-    pointer_x: i32,
+    x_end_start: i64,
     click_regions: *ClickRegions,
-) void {
+) i64 {
     const y0: i64 = baselineY(buf_height, font);
-    var x_end: i64 = @as(i64, @intCast(buf_width)) - RIGHT_MARGIN;
+    var x_end: i64 = x_end_start;
     var first = true;
     var custom_script_draw_index: usize = 0;
     const text_color = current_config.appearance.text_color;
@@ -4923,14 +5709,14 @@ fn drawRightGroup(
                 first = false;
                 const cell = reserveRightCell(x_end, textPixelWidth(font, POWER_BUTTON.label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, POWER_BUTTON.label, text_color, .{ .spawn = POWER_BUTTON.command }, pointer_x, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, POWER_BUTTON.label, text_color, .{ .spawn = POWER_BUTTON.command }, click_regions);
             },
             .drawer_toggle => {
                 if (!first) x_end -= MODULE_GAP;
                 first = false;
                 const cell = reserveRightCell(x_end, textPixelWidth(font, DRAWER_TOGGLE_LABEL), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, DRAWER_TOGGLE_LABEL, text_color, .toggle_drawer, pointer_x, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, DRAWER_TOGGLE_LABEL, text_color, .toggle_drawer, click_regions);
             },
             .volume => {
                 if (!first) x_end -= MODULE_GAP;
@@ -4943,14 +5729,14 @@ fn drawRightGroup(
                 const vol_label = std.fmt.bufPrint(&vol_buf, "{s} {s}", .{ vol_icon, volume_text }) catch vol_icon;
                 const cell = reserveRightCell(x_end, textPixelWidth(font, vol_label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, vol_label, drawer_color, null, pointer_x, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, vol_label, drawer_color, null, click_regions);
             },
             .waypaper => {
                 if (!first) x_end -= MODULE_GAP;
                 first = false;
                 const cell = reserveRightCell(x_end, textPixelWidth(font, WAYPAPER_BUTTON.label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, WAYPAPER_BUTTON.label, drawer_color, .{ .spawn = WAYPAPER_BUTTON.command }, pointer_x, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, WAYPAPER_BUTTON.label, drawer_color, .{ .spawn = WAYPAPER_BUTTON.command }, click_regions);
             },
             .pacman => {
                 if (!first) x_end -= MODULE_GAP;
@@ -4964,7 +5750,7 @@ fn drawRightGroup(
                 const pac_label = std.fmt.bufPrint(&pac_buf, "\u{f306} {s}", .{pacman_text}) catch "\u{f306}";
                 const cell = reserveRightCell(x_end, textPixelWidth(font, pac_label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, pac_label, drawer_color, null, pointer_x, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, pac_label, drawer_color, null, click_regions);
             },
             .tray => {
                 // icon-only items, no text label; skipped entirely if an
@@ -4973,7 +5759,7 @@ fn drawRightGroup(
                     if (!item.has_icon) continue;
                     if (!first) x_end -= LAUNCHER_GAP;
                     first = false;
-                    const icon_left = drawTrayIconEndingAt(pixels, buf_width, buf_height, x_end, &item.pixels, drawer_anim, pointer_x);
+                    const icon_left = drawTrayIconEndingAt(pixels, buf_width, buf_height, x_end, &item.pixels, drawer_anim, click_regions.nextHover());
                     click_regions.addWithRight(@intCast(icon_left - 2), @intCast(x_end + 2), .{ .activate_tray = i }, .{ .context_menu_tray = i });
                     x_end = icon_left;
                 }
@@ -4987,7 +5773,7 @@ fn drawRightGroup(
                     first = false;
                     const cell = reserveRightCell(x_end, textPixelWidth(font, weather_text), center_start_x);
                     x_end = cell.next_pen;
-                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, weather_text, text_color, null, pointer_x, click_regions);
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, weather_text, text_color, null, click_regions);
                 }
             },
             .cpu => {
@@ -4997,7 +5783,7 @@ fn drawRightGroup(
                 const cpu_label = std.fmt.bufPrint(&cpu_buf, "\u{f2db} {d}%", .{sys_stats.cpu_pct}) catch "\u{f2db}";
                 const cell = reserveRightCell(x_end, textPixelWidth(font, cpu_label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, cpu_label, color, null, pointer_x, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, cpu_label, color, null, click_regions);
             },
             .ram => {
                 if (!first) x_end -= MODULE_GAP;
@@ -5006,7 +5792,7 @@ fn drawRightGroup(
                 const ram_label = std.fmt.bufPrint(&ram_buf, "\u{f538} {d}%", .{sys_stats.ram_pct}) catch "\u{f538}";
                 const cell = reserveRightCell(x_end, textPixelWidth(font, ram_label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, ram_label, color, null, pointer_x, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, ram_label, color, null, click_regions);
             },
             .disk => {
                 if (!first) x_end -= MODULE_GAP;
@@ -5015,7 +5801,7 @@ fn drawRightGroup(
                 const disk_label = std.fmt.bufPrint(&disk_buf, "\u{f0a0} {d}%", .{disk_pct}) catch "\u{f0a0}";
                 const cell = reserveRightCell(x_end, textPixelWidth(font, disk_label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, disk_label, color, null, pointer_x, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, disk_label, color, null, click_regions);
             },
             .battery => {
                 if (battery_state.found) {
@@ -5026,7 +5812,7 @@ fn drawRightGroup(
                     const bat_label = std.fmt.bufPrint(&bat_buf, "{s} {d}%", .{ bat_icon, battery_state.capacity }) catch bat_icon;
                     const cell = reserveRightCell(x_end, textPixelWidth(font, bat_label), center_start_x);
                     x_end = cell.next_pen;
-                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, bat_label, color, null, pointer_x, click_regions);
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, bat_label, color, null, click_regions);
                 }
             },
             .cpu_temp => {
@@ -5038,7 +5824,7 @@ fn drawRightGroup(
                     const temp_label = std.fmt.bufPrint(&temp_buf, "\u{f2c9} {d}\u{00b0}C", .{celsius}) catch "\u{f2c9}";
                     const cell = reserveRightCell(x_end, textPixelWidth(font, temp_label), center_start_x);
                     x_end = cell.next_pen;
-                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, temp_label, color, null, pointer_x, click_regions);
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, temp_label, color, null, click_regions);
                 }
             },
             .network => {
@@ -5055,7 +5841,7 @@ fn drawRightGroup(
                     const net_label = std.fmt.bufPrint(&net_buf, "\u{f1eb} {s}", .{value}) catch "\u{f1eb}";
                     const cell = reserveRightCell(x_end, textPixelWidth(font, net_label), center_start_x);
                     x_end = cell.next_pen;
-                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, net_label, color, null, pointer_x, click_regions);
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, net_label, color, null, click_regions);
                 }
             },
             .layout => {
@@ -5069,7 +5855,7 @@ fn drawRightGroup(
                     first = false;
                     const cell = reserveRightCell(x_end, textPixelWidth(font, l.icon), center_start_x);
                     x_end = cell.next_pen;
-                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, l.icon, color, .open_layout_picker, pointer_x, click_regions);
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, l.icon, color, .open_layout_picker, click_regions);
                 }
             },
             .custom_script => {
@@ -5087,7 +5873,7 @@ fn drawRightGroup(
                             text;
                         const cell = reserveRightCell(x_end, textPixelWidth(font, script_label), center_start_x);
                         x_end = cell.next_pen;
-                        _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, script_label, color, null, pointer_x, click_regions);
+                        _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, script_label, color, null, click_regions);
                     }
                 }
             },
@@ -5106,6 +5892,8 @@ fn drawRightGroup(
             .workspaces, .mpris, .clock, .launchers => {}, // not valid in the right group; ignore defensively
         }
     }
+    // Pen end = content start (right edge of the leftmost drawn module).
+    return x_end;
 }
 
 fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *Globals) void {
@@ -5203,12 +5991,21 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
             router.current = found;
             const bar = &router.bars[found orelse return]; // entered a surface we don't own — shouldn't happen
 
+            // Touching any surface cancels a pending hide and reveals a
+            // hidden bar (the strip is part of the bar surface, so this is
+            // also the reveal path). No-op when fully shown.
+            autohideShow(bar);
+
             bar.pointer_over_popup = if (bar.popup) |*pm| e.surface == pm.surface else false;
             if (bar.pointer_over_popup) {
                 bar.popup.?.pointer_x = e.surface_x.toInt();
                 bar.popup.?.pointer_y = e.surface_y.toInt();
+                // The tick eases the fade from here; no immediate redraw
+                // needed (one arrives within a tick anyway).
+                if (bar.popup) |*pm| pm.hovered_row = pm.hitTestRowIndex(pm.pointer_y);
             } else {
                 bar.pointer_x = e.surface_x.toInt();
+                bar.click_regions.hovered = bar.click_regions.hitTestIndex(bar.pointer_x);
                 // Redraw for the hover highlight — entering already over a
                 // button (e.g. the pointer didn't move but focus/workspace
                 // did) needs this same as motion does below.
@@ -5219,15 +6016,23 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
         },
         .leave => {
             const bar = &router.bars[router.current orelse return];
+            // Start the hide grace period (autohideHide fires it from the
+            // scroll tick). A re-enter before it lapses cancels it — see
+            // the enter handler above.
+            if (current_config.appearance.auto_hide and !bar.autohide_hidden) {
+                bar.autohide_grace = AUTOHIDE_GRACE_TICKS;
+            }
             if (bar.pointer_over_popup) {
                 if (bar.popup) |*pm| {
                     pm.pointer_x = -1;
                     pm.pointer_y = -1;
+                    pm.hovered_row = null; // tick fades the row out from here
                     drawPopup(bar) catch {};
                 }
             } else {
                 bar.pointer_x = -1;
-                drawAndCommit(bar) catch |err| { // clears any lingering hover highlight
+                bar.click_regions.hovered = null; // tick fades the pill out
+                drawAndCommit(bar) catch |err| { // first fade-out frame
                     logging.err("draw failed: {}", .{err});
                 };
             }
@@ -5245,17 +6050,19 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                     const new_y = e.surface_y.toInt();
                     if (new_y != pm.pointer_y) {
                         pm.pointer_y = new_y;
-                        drawPopup(bar) catch {}; // redraw for hover highlight
+                        pm.hovered_row = pm.hitTestRowIndex(new_y);
+                        drawPopup(bar) catch {}; // first fade frame
                     }
                 }
             } else {
                 // Only redraw when the hovered button actually changes —
-                // motion fires on every pixel of movement, but the
-                // highlight only needs to update when it'd look different.
-                const old_region = bar.click_regions.hitTest(bar.pointer_x);
+                // motion fires on every pixel of movement, but the fade
+                // only needs its first frame here; the tick animates the rest.
+                const old_idx = bar.click_regions.hitTestIndex(bar.pointer_x);
                 bar.pointer_x = e.surface_x.toInt();
-                const new_region = bar.click_regions.hitTest(bar.pointer_x);
-                if (old_region != new_region) {
+                const new_idx = bar.click_regions.hitTestIndex(bar.pointer_x);
+                bar.click_regions.hovered = new_idx;
+                if (old_idx != new_idx) {
                     drawAndCommit(bar) catch |err| {
                         logging.err("draw failed: {}", .{err});
                     };
@@ -5266,6 +6073,13 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
             const bar = &router.bars[router.current orelse return];
             bar.last_pointer_serial = e.serial;
             if (e.state != .pressed) return;
+
+            // A press on the hidden strip reveals the bar instead of doing
+            // anything else (there are no modules to hit-test while hidden).
+            if (bar.autohide_hidden) {
+                autohideShow(bar);
+                return;
+            }
 
             if (bar.pointer_over_popup) {
                 if (e.button != BTN_LEFT) return;
@@ -5510,6 +6324,71 @@ fn logClickRegionLayout(bar: *Bar) void {
 var g_last_region_log: [1024]u8 = undefined;
 var g_last_region_log_len: usize = 0;
 
+/// Dock-mode frame (appearance.bar_mode == "dock"): packs left/center/right
+/// into one centered pill with no dead space, instead of taskbar's
+/// edge-anchored full-width layout. Pack geometry comes from LAST frame's
+/// measured widths (bar.dock_*_w) — never from measuring up front, which
+/// would duplicate every module's width logic — so a width change settles
+/// one frame later: imperceptible and self-correcting. Draw order is left →
+/// center → right so each block starts from stable last-frame origins; the
+/// background pill and the input region both cover the stable pack span, so
+/// a change-frame's content may peek past the pill for a single frame at
+/// most. The mpris ticker renders static here (a scrolling ticker needs the
+/// dead stretch dock mode exists to remove); see drawLeftGroup.
+fn paintDock(bar: *Bar, pixels: [*]u32, time_text: []const u8, mpris_text: []const u8, mpris_playing: bool, volume_text: []const u8, weather_text: []const u8) void {
+    const buf_w: i64 = @intCast(bar.width);
+    const buf_h: i64 = @intCast(bar.height);
+    const bg_fill: u32 = (@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100 << 24) | (current_config.appearance.bg_color & 0x00FFFFFF);
+
+    // Last-frame pack span, with gaps only between non-empty groups.
+    const lw = bar.dock_left_w;
+    const cw = bar.dock_center_w;
+    const rw = bar.dock_right_w;
+    var total: i64 = lw + cw + rw;
+    if (lw > 0 and cw > 0) total += DOCK_GAP;
+    if (cw > 0 and rw > 0) total += DOCK_GAP;
+    if (lw > 0 and cw == 0 and rw > 0) total += DOCK_GAP;
+    const pack_start = @divTrunc(buf_w - total, 2);
+    const center_start_last = pack_start + lw + (if (lw > 0 and (cw > 0 or rw > 0)) DOCK_GAP else 0);
+    const right_end_last = pack_start + total;
+
+    // Background capsule over the pack span (skipped while degenerate —
+    // groups still draw below so widths get measured for the next frame).
+    if (total > 0) {
+        fillRoundedRect(pixels, bar.width, bar.height, pack_start - DOCK_PILL_PAD, 0, pack_start + total + DOCK_PILL_PAD, buf_h, @intCast(@divTrunc(buf_h, 2)), bg_fill);
+    }
+
+    // Groups left to right; pens recorded back for the next frame.
+    const left_end = drawLeftGroup(pixels, bar.width, bar.height, bar.font, bar.workspaces.list.items, time_text, mpris_text, mpris_playing, bar.mpris_scroll_step, center_start_last, pack_start, &bar.click_regions);
+    bar.dock_left_w = @max(0, left_end - pack_start);
+    const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, center_start_last, &bar.click_regions);
+    bar.dock_center_w = @max(0, center_end - center_start_last);
+    const right_start = drawRightGroup(pixels, bar.width, bar.height, bar.font, weather_text, bar.pacman.text(), volume_text, bar.drawer_anim, bar.tray, bar.workspaces, center_end, right_end_last, &bar.click_regions);
+    bar.dock_right_w = @max(0, right_end_last - right_start);
+
+    // Input follows the pill: without this the full-width transparent
+    // surface would eat clicks meant for windows beneath it. Re-set only on
+    // change; the region object itself is compositor-copied on commit, so
+    // destroying it right away is safe.
+    if (total > 0) {
+        const rx = @max(0, pack_start - DOCK_PILL_PAD);
+        const region_w: i64 = total + DOCK_PILL_PAD * 2;
+        if (!bar.dock_input_set or bar.dock_input_x != rx or bar.dock_input_w != region_w) {
+            if (bar.compositor.createRegion()) |region| {
+                region.add(@intCast(rx), 0, @intCast(region_w), @intCast(bar.height));
+                bar.surface.setInputRegion(region);
+                region.destroy();
+            } else |_| {}
+            bar.dock_input_set = true;
+            bar.dock_input_x = rx;
+            bar.dock_input_w = region_w;
+        }
+    } else if (bar.dock_input_set) {
+        bar.surface.setInputRegion(null);
+        bar.dock_input_set = false;
+    }
+}
+
 fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     const pixel_count: usize = @as(usize, bar.width) * bar.height;
     // Only the fill's alpha varies with bg_opacity_percent — text/icons/
@@ -5519,8 +6398,30 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     // fading the whole bar's contents uniformly.
     const bg_alpha: u32 = (@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100) << 24;
     const bg_fill: u32 = bg_alpha | (current_config.appearance.bg_color & 0x00FFFFFF);
+    const is_dock = std.mem.eql(u8, current_config.appearance.bar_mode, BAR_MODE_DOCK);
     var i: usize = 0;
-    while (i < pixel_count) : (i += 1) pixels[i] = bg_fill;
+    // Dock mode leaves the surface transparent outside the packed pill
+    // (paintDock, below); taskbar fills edge to edge as before.
+    while (i < pixel_count) : (i += 1) pixels[i] = if (is_dock) 0 else bg_fill;
+
+    // Auto-hide collapsed state: transparent surface with just the 2px hint
+    // strip at the screen edge. No modules, no regions (autohideHide already
+    // cleared them and narrowed input to the strip); strip clicks reach the
+    // button handler, which shows the bar instead of hit-testing.
+    if (bar.autohide_hidden) {
+        var j: usize = 0;
+        while (j < pixel_count) : (j += 1) pixels[j] = 0;
+        const strip = autohideStripRect(bar);
+        const strip_u: u32 = @intCast(AUTOHIDE_STRIP_PX);
+        const sy: u32 = if (std.mem.eql(u8, current_config.appearance.position, "top")) 0 else bar.height - strip_u;
+        var yy: u32 = sy;
+        while (yy < sy + strip_u and yy < bar.height) : (yy += 1) {
+            var xx: i64 = @max(0, strip.x);
+            const xe: i64 = @min(@as(i64, @intCast(bar.width)), strip.x + strip.w);
+            while (xx < xe) : (xx += 1) pixels[yy * bar.width + @as(usize, @intCast(xx))] = current_config.appearance.border_color;
+        }
+        return;
+    }
 
     // Decode any pinned-launcher icons that haven't been resolved since the
     // last config load, before any width measuring or drawing consults them.
@@ -5535,10 +6436,12 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     // impossible combination, same "first configured wins" spirit as
     // everything else that clamps rather than errors).
     const bc = current_config.appearance.border_color;
-    const top_px = @min(current_config.appearance.border_top_px, bar.height);
-    const bottom_px = @min(current_config.appearance.border_bottom_px, bar.height - top_px);
-    const left_px = @min(current_config.appearance.border_left_px, bar.width);
-    const right_px = @min(current_config.appearance.border_right_px, bar.width - left_px);
+    // No full-width borders in dock mode — the packed pill carries its own
+    // bezel, and border rects would stripe across the transparent gaps.
+    const top_px = if (is_dock) 0 else @min(current_config.appearance.border_top_px, bar.height);
+    const bottom_px = if (is_dock) 0 else @min(current_config.appearance.border_bottom_px, bar.height - top_px);
+    const left_px = if (is_dock) 0 else @min(current_config.appearance.border_left_px, bar.width);
+    const right_px = if (is_dock) 0 else @min(current_config.appearance.border_right_px, bar.width - left_px);
 
     var row: u32 = 0;
     while (row < top_px) : (row += 1) {
@@ -5600,40 +6503,58 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
         }
     }
     const center_start_x = centerGroupStartX(bar.width, bar.font, time_text, bar.workspaces.list.items, mpris_text);
-    drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, bar.pointer_x, &bar.click_regions);
-    drawLeftGroup(
-        pixels,
-        bar.width,
-        bar.height,
-        bar.font,
-        bar.workspaces.list.items,
-        time_text,
-        mpris_text,
-        mpris_playing,
-        bar.mpris_scroll_step,
-        center_start_x,
-        bar.pointer_x,
-        &bar.click_regions,
-    );
     var volume_buf: [16]u8 = undefined;
     const volume_text = parseVolumePercent(bar.volume.text(), &volume_buf);
     var weather_buf: [32]u8 = undefined;
     const weather_text = formatWeatherText(bar.weather.text(), &weather_buf);
-    drawRightGroup(
-        pixels,
-        bar.width,
-        bar.height,
-        bar.font,
-        weather_text,
-        bar.pacman.text(),
-        volume_text,
-        bar.drawer_anim,
-        bar.tray,
-        bar.workspaces,
-        center_start_x,
-        bar.pointer_x,
-        &bar.click_regions,
-    );
+    if (is_dock) {
+        paintDock(bar, pixels, time_text, mpris_text, mpris_playing, volume_text, weather_text);
+    } else {
+        // Leaving dock mode must release the input region, or the bar keeps
+        // only its last pill clickable.
+        if (bar.dock_input_set) {
+            bar.surface.setInputRegion(null);
+            bar.dock_input_set = false;
+        }
+        const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, center_start_x, &bar.click_regions);
+        // Record content widths even in taskbar mode, so flipping to dock
+        // packs correctly on the very first frame instead of piling up at
+        // center for a frame. Anchor-subtracted, so identical values would
+        // come out of either layout.
+        bar.dock_center_w = @max(0, center_end - center_start_x);
+        const left_end = drawLeftGroup(
+            pixels,
+            bar.width,
+            bar.height,
+            bar.font,
+            bar.workspaces.list.items,
+            time_text,
+            mpris_text,
+            mpris_playing,
+            bar.mpris_scroll_step,
+            center_start_x,
+            WORKSPACE_LEFT_MARGIN,
+            &bar.click_regions,
+        );
+        bar.dock_left_w = @max(0, left_end - WORKSPACE_LEFT_MARGIN);
+        const right_anchor: i64 = @as(i64, @intCast(bar.width)) - RIGHT_MARGIN;
+        const right_start = drawRightGroup(
+            pixels,
+            bar.width,
+            bar.height,
+            bar.font,
+            weather_text,
+            bar.pacman.text(),
+            volume_text,
+            bar.drawer_anim,
+            bar.tray,
+            bar.workspaces,
+            center_start_x,
+            right_anchor,
+            &bar.click_regions,
+        );
+        bar.dock_right_w = @max(0, right_anchor - right_start);
+    }
 
     // Region layout changes only when module widths change (a workspace
     // appears, a tray icon arrives, the clock's digits change width), so
@@ -5658,7 +6579,9 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     // both adjacent sides gets no band (pure clipping, old behavior).
     // Squared-distance comparisons avoid a sqrt per pixel.
     const radius = @min(current_config.appearance.corner_radius_px, @min(bar.width, bar.height) / 2);
-    if (radius > 0) {
+    // Skipped in dock mode: the surface corners are already transparent
+    // there, and the packed pill carries its own capsule rounding.
+    if (radius > 0 and !is_dock) {
         const r_i: i32 = @intCast(radius);
         const r_sq: i32 = r_i * r_i;
         // Inner edge of each corner's border band: the circle shrunk by that
