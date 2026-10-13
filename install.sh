@@ -147,13 +147,110 @@ run_spinner() {
     fi
 }
 
+# ── Saved-answer machinery ─────────────────────────────────────────────
+# The installer is normally run as `curl ... | bash`, so every run starts from
+# a blank script with no memory of the last one. To keep re-runs (updates)
+# from re-asking the whole questionnaire, every choice is persisted as a
+# key=value line in ANSWERS_FILE. On the next run the same questions are
+# skipped and their previous answer is replayed — see prompt_choice below.
+#
+# The file lives under ~/.config/simpbar/ (already the installer's home for
+# reminders.txt / wallpaper / browser-choice). A prompt only auto-replays an
+# answer when the remembered choice is still a valid option AND (for prompts
+# where "skip/none" is an option) when it isn't a skip — so an old "Skip the
+# browser" never quietly suppresses a browser you now want, and a prompt whose
+# options ever change upstream falls back to asking rather than picking blindly.
+ANSWERS_FILE="$HOME/.config/simpbar/install-answers"
+
+# force_ask=1 makes every prompt ask again instead of replaying a saved
+# answer (set by the re-run review prompt). Declared here, before any
+# prompt_choice call, so it's always defined even if the review block is
+# skipped on a first run.
+force_ask=0
+
+# Record one answer: key=value. Appends/updates in place so a re-run refreshes
+# the stored value instead of piling up duplicates.
+save_answer() {
+    local key="$1" value="$2" tmp
+    mkdir -p "$(dirname "$ANSWERS_FILE")"
+    tmp="${ANSWERS_FILE}.tmp.$$"
+    if [ -r "$ANSWERS_FILE" ]; then
+        grep -v "^${key}=" "$ANSWERS_FILE" > "$tmp" 2>/dev/null || true
+    fi
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    mv -f "$tmp" "$ANSWERS_FILE"
+}
+
+# Read back a previously saved answer, or empty if none/unknown.
+load_answer() {
+    local key="$1"
+    [ -r "$ANSWERS_FILE" ] || return 0
+    sed -n "s/^${key}=//p" "$ANSWERS_FILE" | head -n1
+}
+
+# True when the installer is being re-run over an existing saved setup. Used
+# once, up front, to offer a review of the remembered answers before skipping
+# them all (see the review block after Step 0).
+has_saved_answers() {
+    [ -r "$ANSWERS_FILE" ] && [ -s "$ANSWERS_FILE" ]
+}
+
 # Print a numbered menu, read one choice from /dev/tty, and fall back to
 # a default when input isn't available or left blank.
 #   prompt_choice RESULT_VAR DEFAULT "Question?" "Option 1" "Option 2" ...
 # RESULT_VAR is set to the chosen number (as a string), or DEFAULT.
+#
+# When RESULT_VAR has a previously saved answer (keyed by the variable name
+# itself) that answer is still a valid option, the question is skipped
+# entirely: the saved value is replayed and a one-line note shown. Press Enter
+# at the review prompt (or delete the answers file) to force every question to
+# be asked again.
+#
+# Prompts whose LAST option means "skip / install nothing" (browser, Discord,
+# launcher, video editor) pass the literal token _HAS_SKIP_ as the final
+# argument. Those skip answers are never replayed, so a remembered "skip the
+# browser" can't quietly suppress a browser the user now wants — only real
+# selections are remembered. Every other prompt (repo, WM, file manager,
+# OBS, falcond, matugen, …) has no skip option, so all of its answers replay.
 prompt_choice() {
     local result_var="$1" default="$2" question="$3"; shift 3
-    local n=1 opt choice
+    local n=1 opt choice saved opt_count=$#
+
+    # Detect (and strip) the trailing _HAS_SKIP_ marker.
+    local has_skip=0
+    if [ "$opt_count" -gt 0 ] && [ "${!opt_count}" = "_HAS_SKIP_" ]; then
+        has_skip=1
+        opt_count=$((opt_count - 1))
+        set -- "${@:1:$opt_count}"
+    fi
+
+    saved="$(load_answer "$result_var")"
+
+    # Replay a saved answer only when it's a real selection: a number inside
+    # the current option range, and (for skip-capable prompts) not the skip
+    # option itself. Anything else — stale index after the option list grew,
+    # a remembered skip — falls through and asks normally.
+    if [ -n "$saved" ] && [ "$saved" -eq "$saved" ] 2>/dev/null \
+        && [ "$saved" -ge 1 ] && [ "$saved" -le "$opt_count" ] \
+        && { [ "$has_skip" -eq 0 ] || [ "$saved" -lt "$opt_count" ]; }; then
+        :
+    else
+        saved=""
+    fi
+
+    if [ -n "$saved" ] && [ "$force_ask" != 1 ]; then
+        # Resolve the saved number to its label purely for the note, so the
+        # user can see what was reused without re-reading the menu.
+        local idx=1 label=""
+        for opt in "$@"; do
+            [ "$idx" -eq "$saved" ] && { label="$opt"; break; }
+            idx=$((idx + 1))
+        done
+        printf '  %s·%s %s — using saved answer %s(%s)%s\n' \
+            "$C_GREEN" "$C_RESET" "$question" "$C_BOLD" "$label" "$C_RESET"
+        printf -v "$result_var" '%s' "$saved"
+        return 0
+    fi
 
     printf '\n  %s%s%s\n' "$C_YELLOW" "$question" "$C_RESET"
     for opt in "$@"; do
@@ -170,6 +267,8 @@ prompt_choice() {
     fi
     [ -z "$choice" ] && choice="$default"
 
+    # Remember the answer so a future re-run/update doesn't ask it again.
+    save_answer "$result_var" "$choice"
     printf -v "$result_var" '%s' "$choice"
 }
 
@@ -248,6 +347,33 @@ banner
 
 # ── Step 0: platform check ─────────────────────────────────────────
 command -v pacman >/dev/null || die "This script is Arch-only (pacman not found)."
+
+# ── Re-run review ──────────────────────────────────────────────────
+# If a previous run saved answers (curl|bash has no other memory between
+# runs), offer to review them before they're silently replayed. Pressing
+# Enter (default No) keeps every remembered answer and skips all the
+# questions; answering Yes sets force_ask=1 so every question is asked
+# again this run, and whatever is chosen overwrites the saved answer.
+#
+# This reads the answer directly instead of going through prompt_choice:
+# the review menu must stay reachable on every re-run, and prompt_choice
+# would replay a stale saved answer and hide it forever.
+force_ask=0
+if has_saved_answers; then
+    printf '\n  %sExisting simpbar setup found%s — your previous answers will be\n' "$C_YELLOW" "$C_RESET"
+    printf '  reused and the questions below will be skipped.\n'
+    printf '  %s·%s repository     %s\n' "$C_GREEN" "$C_RESET" "$(load_answer REPO_CHOICE | sed 's/^1$/CachyOS/;s/^2$/Chaotic-AUR/')"
+    printf '  %s·%s window manager %s\n' "$C_GREEN" "$C_RESET" "$(load_answer WM_CHOICE | sed 's/^1$/Hyprland/;s/^2$/MangoWM/')"
+    printf '\n  %sReview and change these answers? [y/N]: %s' "$C_BOLD" "$C_RESET"
+    if [ -r /dev/tty ]; then
+        IFS= read -r review_reply < /dev/tty || review_reply=""
+    else
+        review_reply=""
+    fi
+    case "$review_reply" in
+        [Yy]*) force_ask=1 ;;
+    esac
+fi
 
 # ── Step 1: package repositories ─────────────────────────────────────
 step "Choosing package repositories"
@@ -629,7 +755,7 @@ else
 fi
 
 prompt_choice LAUNCHER_CHOICE 4 "Would you like to install any game launchers?" \
-    "Lutris" "Heroic" "Both" "Neither"
+    "Lutris" "Heroic" "Both" "Neither" _HAS_SKIP_
 
 INSTALL_HEROIC=0
 case "$LAUNCHER_CHOICE" in
@@ -640,7 +766,7 @@ case "$LAUNCHER_CHOICE" in
 esac
 
 prompt_choice DISCORD_CHOICE 4 "Which Discord client would you like to install?" \
-    "Discord" "Vesktop" "Equibop" "Skip — don't install a Discord client"
+    "Discord" "Vesktop" "Equibop" "Skip — don't install a Discord client" _HAS_SKIP_
 
 DISCORD_AUR_PKG=""
 case "$DISCORD_CHOICE" in
@@ -1466,7 +1592,7 @@ fi
 step "Choosing a browser"
 
 prompt_choice BROWSER_CHOICE 6 "Which browser would you like to install?" \
-    "Brave" "Zen Browser" "Vivaldi" "Microsoft Edge" "LibreWolf" "Skip — don't install a browser"
+    "Brave" "Zen Browser" "Vivaldi" "Microsoft Edge" "LibreWolf" "Skip — don't install a browser" _HAS_SKIP_
 
 case "$BROWSER_CHOICE" in
     1) BROWSER_NAME="Brave";          BROWSER_PKG="brave-bin" ;;
