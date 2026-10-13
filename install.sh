@@ -154,12 +154,21 @@ run_spinner() {
 # key=value line in ANSWERS_FILE. On the next run the same questions are
 # skipped and their previous answer is replayed — see prompt_choice below.
 #
+# Two refinements on top of plain replay:
+#  * Installed software wins. Before each question the script checks whether
+#    what's already installed answers it (reuse_detected/detect_one below) —
+#    e.g. mangowm installed means MangoWM, zen-browser-bin means Zen. Ground
+#    truth beats a stale saved answer, including a remembered "skip" from
+#    before you installed the thing by hand.
+#  * Destructive choices never replay. The Firefox prompt's "Remove Firefox"
+#    is marked _HAS_SKIP_, so a remembered removal can't silently nuke a
+#    Firefox you installed later — that one always re-asks while present.
+#
 # The file lives under ~/.config/simpbar/ (already the installer's home for
 # reminders.txt / wallpaper / browser-choice). A prompt only auto-replays an
-# answer when the remembered choice is still a valid option AND (for prompts
-# where "skip/none" is an option) when it isn't a skip — so an old "Skip the
-# browser" never quietly suppresses a browser you now want, and a prompt whose
-# options ever change upstream falls back to asking rather than picking blindly.
+# answer when the remembered choice is still a valid option; a prompt whose
+# options ever change upstream falls back to asking rather than picking
+# blindly.
 ANSWERS_FILE="$HOME/.config/simpbar/install-answers"
 
 # force_ask=1 makes every prompt ask again instead of replaying a saved
@@ -195,6 +204,57 @@ has_saved_answers() {
     [ -r "$ANSWERS_FILE" ] && [ -s "$ANSWERS_FILE" ]
 }
 
+# True when pacman knows the package (official repos or a foreign/AUR build
+# already installed — `pacman -Q` covers both).
+pkg_installed() {
+    pacman -Qq "$1" >/dev/null 2>&1
+}
+
+# Map installed packages to a prompt choice. Each argument is
+# "<number>:<pkg> [<pkg> ...]" — the number to pick when one of its packages
+# is installed. Prints the number when the installed packages point at exactly
+# ONE choice, and nothing when nothing matches or two different choices both
+# have something installed (ambiguous — the caller falls through to the saved
+# answer or the question). Always succeeds, so it composes with `if`.
+detect_one() {
+    local hit="" spec c pkgs p
+    for spec in "$@"; do
+        c="${spec%%:*}"; pkgs="${spec#*:}"
+        for p in $pkgs; do
+            if pkg_installed "$p"; then
+                if [ -n "$hit" ] && [ "$hit" != "$c" ]; then
+                    return 0 # ambiguous: leave it to the saved answer/question
+                fi
+                hit="$c"
+                break
+            fi
+        done
+    done
+    [ -n "$hit" ] && printf '%s' "$hit"
+    return 0
+}
+
+# When installed packages point at exactly one choice, take it as the answer:
+# store it and return 0 so the caller skips its prompt_choice. Otherwise
+# return 1 and the caller asks (or replays a saved answer) as usual.
+# Installed software is ground truth — it beats a stale saved answer, e.g. a
+# remembered "skip the browser" from before you installed one by hand.
+reuse_detected() {
+    local var="$1"; shift
+    local hit
+    hit="$(detect_one "$@")" || return 1
+    [ -n "$hit" ] || return 1
+    printf -v "$var" '%s' "$hit"
+    save_answer "$var" "$hit"
+    return 0
+}
+
+# One-line "detected, skipping" note, mirroring prompt_choice's replay note.
+detected_note() {
+    printf '  %s·%s %s — detected installed %s%s%s, skipping question\n' \
+        "$C_GREEN" "$C_RESET" "$1" "$C_BOLD" "$2" "$C_RESET"
+}
+
 # Print a numbered menu, read one choice from /dev/tty, and fall back to
 # a default when input isn't available or left blank.
 #   prompt_choice RESULT_VAR DEFAULT "Question?" "Option 1" "Option 2" ...
@@ -204,14 +264,15 @@ has_saved_answers() {
 # itself) that answer is still a valid option, the question is skipped
 # entirely: the saved value is replayed and a one-line note shown. Press Enter
 # at the review prompt (or delete the answers file) to force every question to
-# be asked again.
+# be asked again. Callers check installed software FIRST (reuse_detected) so a
+# saved answer only replays when detection found nothing either way.
 #
-# Prompts whose LAST option means "skip / install nothing" (browser, Discord,
-# launcher, video editor) pass the literal token _HAS_SKIP_ as the final
-# argument. Those skip answers are never replayed, so a remembered "skip the
-# browser" can't quietly suppress a browser the user now wants — only real
-# selections are remembered. Every other prompt (repo, WM, file manager,
-# OBS, falcond, matugen, …) has no skip option, so all of its answers replay.
+# A prompt may pass the literal token _HAS_SKIP_ as the final argument to
+# mark its last option as never-replayable. Only the destructive Firefox
+# "Remove Firefox" option uses this: a remembered removal must never silently
+# nuke a Firefox installed later, so that prompt always re-asks while Firefox
+# is present. Ordinary "skip / install nothing" answers DO replay — the
+# re-run review prompt is the way to change your mind.
 prompt_choice() {
     local result_var="$1" default="$2" question="$3"; shift 3
     local n=1 opt choice saved opt_count=$#
@@ -388,27 +449,50 @@ printf '    for your CPU (x86-64-v3/v4 or AMD Zen).\n'
 printf '  %sChaotic-AUR:%s a binary mirror of AUR packages layered on plain\n' "$C_YELLOW" "$C_RESET"
 printf '    Arch — closest to what this installer used to do.\n'
 
-prompt_choice REPO_CHOICE 2 "Which repository setup would you like?" "CachyOS" "Chaotic-AUR"
+# When exactly one of the two repo setups is already configured, that's the
+# answer — no point asking which repos you want when pacman.conf shows it.
+REPO_DETECTED=0
+_have_cachyos=0; have_chaotic=0
+grep -qE '^\[cachyos' /etc/pacman.conf 2>/dev/null && _have_cachyos=1
+grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null && have_chaotic=1
+if [ "$_have_cachyos" = 1 ] && [ "$have_chaotic" = 0 ]; then
+    REPO_CHOICE=1; save_answer REPO_CHOICE 1; REPO_DETECTED=1
+elif [ "$_have_cachyos" = 0 ] && [ "$have_chaotic" = 1 ]; then
+    REPO_CHOICE=2; save_answer REPO_CHOICE 2; REPO_DETECTED=1
+else
+    prompt_choice REPO_CHOICE 2 "Which repository setup would you like?" "CachyOS" "Chaotic-AUR"
+fi
 case "$REPO_CHOICE" in
     1) REPO_NAME="CachyOS";    REPO_LABEL="CachyOS" ;;
     *) REPO_NAME="Chaotic-AUR"; REPO_LABEL="Chaotic-AUR" ;;
 esac
+[ "$REPO_DETECTED" = 1 ] && detected_note "Repositories" "$REPO_NAME"
 ok "Selected ${REPO_NAME} repositories"
 
 # ── Step 2: window manager ───────────────────────────────────────────
+step "Choosing your window manager"
 step "Choosing your window manager"
 
 printf '\n  %sHyprland%s is the default setup (Lua config, %s~/.config/hypr%s).\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$C_RESET"
 printf '  %sMangoWM%s uses your shipped %s~/.config/mango%s config (flat files\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$C_RESET"
 printf '  under %scfg/%s — where simpbar-config writes its Mango pages).\n' "$C_CYAN" "$C_RESET"
 
-prompt_choice WM_CHOICE 1 "Which window manager would you like to install?" "Hyprland" "MangoWM"
+# A WM package already installed is the answer — asking "which WM" when only
+# mangowm is present just burns a prompt. Both/neither installed falls
+# through to the saved answer or the question.
+if reuse_detected WM_CHOICE '1:hyprland' '2:mangowm'; then
+    WM_DETECTED=1
+else
+    WM_DETECTED=0
+    prompt_choice WM_CHOICE 1 "Which window manager would you like to install?" "Hyprland" "MangoWM"
+fi
 case "$WM_CHOICE" in
     2) WM_NAME="MangoWM"; WM_IS_HYPRLAND=0; WM_IS_MANGO=1
        CONFIG_DIRS=(mango swaync fastfetch matugen) ;;
     *) WM_NAME="Hyprland"; WM_IS_HYPRLAND=1; WM_IS_MANGO=0
        CONFIG_DIRS=(hypr swaync fastfetch matugen) ;;
 esac
+[ "$WM_DETECTED" = 1 ] && detected_note "Window manager" "$WM_NAME"
 ok "Selected ${WM_NAME}"
 
 # ── Step 3: prerequisites ────────────────────────────────────────────
@@ -714,13 +798,19 @@ else
     PACMAN_PKGS+=(alacritty easyeffects)
 fi
 
-prompt_choice FILE_MANAGER_CHOICE 1 "Which file manager would you like to use?" \
-    "Nautilus" "Nemo" "Dolphin"
+if reuse_detected FILE_MANAGER_CHOICE '1:nautilus' '2:nemo' '3:dolphin'; then
+    FILE_MANAGER_DETECTED=1
+else
+    FILE_MANAGER_DETECTED=0
+    prompt_choice FILE_MANAGER_CHOICE 1 "Which file manager would you like to use?" \
+        "Nautilus" "Nemo" "Dolphin"
+fi
 case "$FILE_MANAGER_CHOICE" in
     2) FILE_MANAGER_NAME="Nemo";    FILE_MANAGER_BIN="nemo";    PACMAN_PKGS+=(nemo) ;;
     3) FILE_MANAGER_NAME="Dolphin"; FILE_MANAGER_BIN="dolphin"; PACMAN_PKGS+=(dolphin) ;;
     *) FILE_MANAGER_NAME="Nautilus"; FILE_MANAGER_BIN="nautilus"; PACMAN_PKGS+=(nautilus) ;;
 esac
+[ "$FILE_MANAGER_DETECTED" = 1 ] && detected_note "File manager" "$FILE_MANAGER_NAME"
 
 # Point whichever config the chosen WM ships at the picked file manager.
 if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
@@ -737,36 +827,71 @@ else
     fi
 fi
 
-prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
+if reuse_detected OBS_CHOICE '1:obs-studio'; then
+    OBS_DETECTED=1
+else
+    OBS_DETECTED=0
+    prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
+fi
 [ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
+[ "$OBS_DETECTED" = 1 ] && detected_note "OBS Studio" "obs-studio"
 
-prompt_choice VIDEO_EDITOR_YN 2 "Would you like to install a video editor?" "Yes" "No"
-if [ "$VIDEO_EDITOR_YN" = 1 ]; then
+# An installed editor answers both questions at once (want one? which?).
+# Otherwise the outer Yes/No replays/asks, and only a Yes reaches the inner
+# choice — same shape as before, just pre-empted by ground truth.
+if reuse_detected VIDEO_EDITOR_CHOICE '1:kdenlive' '2:shotcut' '3:flowblade'; then
+    VIDEO_EDITOR_YN=1
+    save_answer VIDEO_EDITOR_YN 1
+    VIDEO_EDITOR_DETECTED=1
+else
+    VIDEO_EDITOR_DETECTED=0
+    prompt_choice VIDEO_EDITOR_YN 2 "Would you like to install a video editor?" "Yes" "No"
+fi
+if [ "$VIDEO_EDITOR_YN" = 1 ] && [ "$VIDEO_EDITOR_DETECTED" = 0 ]; then
     prompt_choice VIDEO_EDITOR_CHOICE 1 "Which video editor would you like to install?" \
         "Kdenlive" "Shotcut" "Flowblade"
-    case "$VIDEO_EDITOR_CHOICE" in
+fi
+if [ "$VIDEO_EDITOR_YN" = 1 ]; then
+    case "${VIDEO_EDITOR_CHOICE:-}" in
         1) VIDEO_EDITOR_NAME="Kdenlive";  PACMAN_PKGS+=(kdenlive) ;;
         2) VIDEO_EDITOR_NAME="Shotcut";   PACMAN_PKGS+=(shotcut) ;;
         3) VIDEO_EDITOR_NAME="Flowblade"; PACMAN_PKGS+=(flowblade) ;;
         *) VIDEO_EDITOR_NAME="" ;;
     esac
+    [ "$VIDEO_EDITOR_DETECTED" = 1 ] && [ -n "$VIDEO_EDITOR_NAME" ] && detected_note "Video editor" "$VIDEO_EDITOR_NAME"
 else
     VIDEO_EDITOR_NAME=""
 fi
 
-prompt_choice LAUNCHER_CHOICE 4 "Would you like to install any game launchers?" \
-    "Lutris" "Heroic" "Both" "Neither" _HAS_SKIP_
+# Lutris and Heroic are independent packages, so "both installed" is its own
+# answer (choice 3) that detect_one's exactly-one rule can't express — check
+# it first, then fall back to the single-hit rule.
+LAUNCHER_DETECTED=0
+if pkg_installed lutris && pkg_installed heroic-bin; then
+    LAUNCHER_CHOICE=3; save_answer LAUNCHER_CHOICE 3; LAUNCHER_DETECTED=1
+elif reuse_detected LAUNCHER_CHOICE '1:lutris' '2:heroic-bin'; then
+    LAUNCHER_DETECTED=1
+else
+    prompt_choice LAUNCHER_CHOICE 4 "Would you like to install any game launchers?" \
+        "Lutris" "Heroic" "Both" "Neither"
+fi
 
 INSTALL_HEROIC=0
 case "$LAUNCHER_CHOICE" in
-    1) PACMAN_PKGS+=(lutris) ;;
-    2) INSTALL_HEROIC=1 ;;
-    3) PACMAN_PKGS+=(lutris); INSTALL_HEROIC=1 ;;
-    *) ;;
+    1) LAUNCHER_NAME="Lutris"; PACMAN_PKGS+=(lutris) ;;
+    2) LAUNCHER_NAME="Heroic"; INSTALL_HEROIC=1 ;;
+    3) LAUNCHER_NAME="Lutris + Heroic"; PACMAN_PKGS+=(lutris); INSTALL_HEROIC=1 ;;
+    *) LAUNCHER_NAME="" ;;
 esac
+[ "$LAUNCHER_DETECTED" = 1 ] && [ -n "$LAUNCHER_NAME" ] && detected_note "Game launchers" "$LAUNCHER_NAME"
 
-prompt_choice DISCORD_CHOICE 4 "Which Discord client would you like to install?" \
-    "Discord" "Vesktop" "Equibop" "Skip — don't install a Discord client" _HAS_SKIP_
+if reuse_detected DISCORD_CHOICE '1:discord' '2:vesktop-bin' '3:equibop-bin'; then
+    DISCORD_DETECTED=1
+else
+    DISCORD_DETECTED=0
+    prompt_choice DISCORD_CHOICE 4 "Which Discord client would you like to install?" \
+        "Discord" "Vesktop" "Equibop" "Skip — don't install a Discord client"
+fi
 
 DISCORD_AUR_PKG=""
 case "$DISCORD_CHOICE" in
@@ -775,13 +900,19 @@ case "$DISCORD_CHOICE" in
     3) DISCORD_NAME="Equibop"; DISCORD_AUR_PKG="equibop-bin" ;;
     *) DISCORD_NAME="" ;;
 esac
+[ "$DISCORD_DETECTED" = 1 ] && [ -n "$DISCORD_NAME" ] && detected_note "Discord client" "$DISCORD_NAME"
 
 printf '\n  %sfalcond%s is a gaming performance daemon: it watches for running games\n' "$C_BOLD" "$C_RESET"
 printf '  (including Proton/Wine) and automatically applies performance profiles —\n'
 printf '  CPU scheduler switching, AMD 3D V-Cache mode, performance mode — without\n'
 printf '  you having to flip settings manually. %sfalcond-gui%s is a GTK app to\n' "$C_BOLD" "$C_RESET"
 printf '  configure and monitor it.\n'
-prompt_choice FALCOND_CHOICE 2 "Would you like to install falcond & falcond-gui?" "Yes" "No"
+if reuse_detected FALCOND_CHOICE '1:falcond'; then
+    FALCOND_DETECTED=1
+else
+    FALCOND_DETECTED=0
+    prompt_choice FALCOND_CHOICE 2 "Would you like to install falcond & falcond-gui?" "Yes" "No"
+fi
 INSTALL_FALCOND=0
 if [ "$FALCOND_CHOICE" = 1 ]; then
     INSTALL_FALCOND=1
@@ -792,14 +923,21 @@ if [ "$FALCOND_CHOICE" = 1 ]; then
     # nothing for falcond-gui to query, so the scheduler list shows empty.
     PACMAN_PKGS+=(scx-scheds scx-tools)
 fi
+[ "$FALCOND_DETECTED" = 1 ] && detected_note "falcond" "falcond + falcond-gui"
 
 printf '\n  %smatugen%s is the Material You colorscheme generator simpbar uses for\n' "$C_BOLD" "$C_RESET"
 printf '  auto-theming: pick a wallpaper and it recolors the bar to match it\n'
 printf '  (the bar has an %sAuto-theme with matugen%s toggle in simpbar-config). It\n' "$C_BOLD" "$C_RESET"
 printf '  is AUR-only and compiled from source, so it is the slowest install step.\n'
-prompt_choice MATUGEN_CHOICE 1 "Would you like to install matugen for wallpaper-based auto-theming?" "Yes" "No"
+if reuse_detected MATUGEN_CHOICE '1:matugen'; then
+    MATUGEN_DETECTED=1
+else
+    MATUGEN_DETECTED=0
+    prompt_choice MATUGEN_CHOICE 1 "Would you like to install matugen for wallpaper-based auto-theming?" "Yes" "No"
+fi
 INSTALL_MATUGEN=0
 [ "$MATUGEN_CHOICE" = 1 ] && INSTALL_MATUGEN=1
+[ "$MATUGEN_DETECTED" = 1 ] && detected_note "matugen" "matugen"
 
 printf '  Installing %d packages via pacman:\n    %s\n' "${#PACMAN_PKGS[@]}" "${PACMAN_PKGS[*]}"
 run_spinner "pacman: installing ${#PACMAN_PKGS[@]} packages" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
@@ -1591,8 +1729,13 @@ fi
 # ── Step 7: choose a browser ─────────────────────────────────────────
 step "Choosing a browser"
 
-prompt_choice BROWSER_CHOICE 6 "Which browser would you like to install?" \
-    "Brave" "Zen Browser" "Vivaldi" "Microsoft Edge" "LibreWolf" "Skip — don't install a browser" _HAS_SKIP_
+if reuse_detected BROWSER_CHOICE '1:brave-bin' '2:zen-browser-bin' '3:vivaldi' '4:microsoft-edge-stable-bin' '5:librewolf-bin'; then
+    BROWSER_DETECTED=1
+else
+    BROWSER_DETECTED=0
+    prompt_choice BROWSER_CHOICE 6 "Which browser would you like to install?" \
+        "Brave" "Zen Browser" "Vivaldi" "Microsoft Edge" "LibreWolf" "Skip — don't install a browser"
+fi
 
 case "$BROWSER_CHOICE" in
     1) BROWSER_NAME="Brave";          BROWSER_PKG="brave-bin" ;;
@@ -1602,6 +1745,7 @@ case "$BROWSER_CHOICE" in
     5) BROWSER_NAME="LibreWolf";      BROWSER_PKG="librewolf-bin" ;;
     *) BROWSER_NAME=""; BROWSER_PKG="" ;;
 esac
+[ "$BROWSER_DETECTED" = 1 ] && [ -n "$BROWSER_NAME" ] && detected_note "Browser" "$BROWSER_NAME"
 
 if [ -z "$BROWSER_NAME" ]; then
     warn "Skipping browser install, as requested"
@@ -1613,10 +1757,12 @@ if [ -n "$BROWSER_PKG" ] && pacman -Qq "$BROWSER_PKG" >/dev/null 2>&1; then
     ok "$BROWSER_NAME installed"
 fi
 
-# Firefox often ships preinstalled — ask before touching it.
+# Firefox often ships preinstalled — ask before touching it. The Remove
+# option is marked _HAS_SKIP_ so a remembered removal never replays: that
+# choice is destructive and must always be a live decision.
 if pacman -Qq firefox >/dev/null 2>&1; then
     prompt_choice FIREFOX_CHOICE 1 "Firefox is currently installed. Keep it or remove it?" \
-        "Keep Firefox" "Remove Firefox"
+        "Keep Firefox" "Remove Firefox" _HAS_SKIP_
     case "$FIREFOX_CHOICE" in
         2)
             run_spinner "Removing Firefox" sudo pacman -Rns --noconfirm firefox \
