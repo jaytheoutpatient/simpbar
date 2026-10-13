@@ -485,10 +485,17 @@ if [ "$REPO_CHOICE" = 1 ]; then
 
         # The official script detects your CPU's ISA level, adds the matching
         # [cachyos*] sections, installs the keyring/mirrorlists, swaps in its
-        # tuned pacman, and runs pacman -Syu. It is non-interactive; the sudo
-        # wrapper/askpass set up earlier feeds it the stored password.
+        # tuned pacman, and runs pacman -Syu. Its internal `pacman -U` and
+        # `pacman -Syu` carry no --noconfirm, so they prompt with "[Y/n]".
+        # When this installer runs as `curl ... | bash`, stdin is the still-open
+        # pipe feeding the rest of the script — an unanswered pacman would read
+        # the next lines of the script source as its answer and abort. Feed it
+        # a stream of "y" answers instead so the prompts are satisfied and the
+        # script source is never consumed. The sudo wrapper/askpass set up
+        # earlier handles the password (sudo -A reads it via askpass, not stdin,
+        # so the "y" lines pass straight through to the script).
         run_spinner "Installing the CachyOS repos (tuned pacman + core packages)" \
-            bash -c 'cd /tmp/cachyos-repo && sudo ./cachyos-repo.sh --install' \
+            bash -c 'cd /tmp/cachyos-repo && yes | sudo ./cachyos-repo.sh --install' \
             || die "CachyOS repo setup failed (see output above)."
         rm -rf /tmp/cachyos-repo
         ok "CachyOS repos enabled"
