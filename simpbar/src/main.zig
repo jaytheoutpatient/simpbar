@@ -335,6 +335,53 @@ fn workspaceLessThan(_: void, a: Workspace, b: Workspace) bool {
 /// the bar behaves identically on either desktop.
 const CompositorMode = enum { hyprland, mango };
 
+/// One Mango layout: the short symbol `mmsg get layouts` reports (also the
+/// `layout` field on each tag), the full name `dispatch setlayout,<name>`
+/// expects, and a Nerd Font glyph that reads as that layout's arrangement.
+///
+/// `icon` is a pre-encoded UTF-8 string rather than a codepoint so it can be
+/// drawn straight through the same `nextUtf8Codepoint`/`drawGlyphAt` path as
+/// every other label — including the supplementary-plane (5-hex-digit) Material
+/// Design icons, which the bar already renders (the power button is
+/// `md-power` U+F0425). The glyphs are picked for distinctness first, then
+/// meaning: column/row shapes for the tile families, arrows for the scrollers,
+/// a funnel for vertical_deck (matching noctalia's mango_layouts plugin).
+///
+/// Keep `symbol`/`name` in sync with `mmsg get layouts`; the order matches the
+/// compositor's own enumeration so the picker lists them the way Mango does.
+const MangoLayout = struct {
+    symbol: []const u8, // "DW", "CT", ...
+    name: []const u8, // "dwindle", "center_tile", ...
+    icon: []const u8, // UTF-8 glyph
+};
+
+const MANGO_LAYOUTS = [_]MangoLayout{
+    .{ .symbol = "T", .name = "tile", .icon = "\u{f0db}" }, // fa-table_columns — master + stack
+    .{ .symbol = "S", .name = "scroller", .icon = "\u{f04e1}" }, // md-swap_horizontal — horizontal strip
+    .{ .symbol = "G", .name = "grid", .icon = "\u{f0570}" }, // md-view_grid
+    .{ .symbol = "M", .name = "monocle", .icon = "\u{f2d0}" }, // fa-window_maximize — one fullscreen window
+    .{ .symbol = "K", .name = "deck", .icon = "\u{eea8}" }, // fa-layer_group — stacked deck
+    .{ .symbol = "CT", .name = "center_tile", .icon = "\u{ebf7}" }, // cod-layout_centered — master centred
+    .{ .symbol = "RT", .name = "right_tile", .icon = "\u{ebf4}" }, // cod-layout_sidebar_right — master right
+    .{ .symbol = "VS", .name = "vertical_scroller", .icon = "\u{f04e2}" }, // md-swap_vertical
+    .{ .symbol = "VT", .name = "vertical_tile", .icon = "\u{f056a}" }, // md-view_agenda — stacked rows
+    .{ .symbol = "VG", .name = "vertical_grid", .icon = "\u{f15fc}" }, // md-dots_grid
+    .{ .symbol = "VK", .name = "vertical_deck", .icon = "\u{f0b0}" }, // fa-filter — funnel
+    .{ .symbol = "DW", .name = "dwindle", .icon = "\u{f00fb}" }, // md-call_split — diagonal split
+    .{ .symbol = "F", .name = "fair", .icon = "\u{ebf0}" }, // cod-layout_panel_justify — equal panels
+    .{ .symbol = "VF", .name = "vertical_fair", .icon = "\u{f1963}" }, // md-align_vertical_distribute
+};
+
+/// The layout whose `symbol` matches, or null if the symbol is unknown (a
+/// newer Mango added a layout this build doesn't know). The module then
+/// falls back to hiding itself rather than showing a wrong icon.
+fn layoutBySymbol(symbol: []const u8) ?*const MangoLayout {
+    for (&MANGO_LAYOUTS) |*l| {
+        if (std.mem.eql(u8, l.symbol, symbol)) return l;
+    }
+    return null;
+}
+
 /// Tracks the compositor's workspace/tag list via IPC, matching waybar's
 /// "hyprland/workspaces" module ("all-outputs": true, "sort-by-number": true,
 /// "active-only": false from ~/.config/waybar/config). The Hyprland backend
@@ -346,6 +393,13 @@ const Workspaces = struct {
     list: std.ArrayList(Workspace),
     sock_path_buf: [108]u8 = undefined,
     sock_path_len: usize,
+    /// The active tag's Mango layout symbol ("DW", "CT", ...), captured from
+    /// the same `mmsg get all-tags` payload refreshMango already parses, so
+    /// the layout module costs no extra IPC. Empty under Hyprland (no per-tag
+    /// layout concept in its IPC) and empty until the first successful Mango
+    /// refresh — callers treat empty as "unknown" and hide the module.
+    layout_buf: [8]u8 = undefined,
+    layout_len: usize = 0,
 
     fn init(gpa: std.mem.Allocator, mode: CompositorMode, sock_path: []const u8) !Workspaces {
         var self = Workspaces{
@@ -399,16 +453,22 @@ const Workspaces = struct {
 
     /// Mango backend: `mmsg get all-tags` returns one JSON object with every
     /// monitor's tags; each tag is `{"index":N,"is_active":b,"is_urgent":b,...
-    /// }`, `index` immediately followed by `is_active`, so a plain substring
-    /// scan (matching refreshHyprland's style) suffices. A tag counts as
-    /// active when any monitor reports it active.
+    /// "layout":"DW",...}`, `index` immediately followed by `is_active`, so a
+    /// plain substring scan (matching refreshHyprland's style) suffices. A tag
+    /// counts as active when any monitor reports it active. The active tag's
+    /// `layout` symbol is stashed for the layout module; with a single
+    /// monitor (the common case) that is exactly the tag `setlayout` targets,
+    /// and with several it is the first active tag across monitors.
     fn refreshMango(self: *Workspaces) !void {
         const tags_json = try mangoRequest(self.gpa, self.sockPath(), "get all-tags");
         defer self.gpa.free(tags_json);
 
         self.list.clearRetainingCapacity();
+        self.layout_len = 0;
         const needle = "\"index\":";
         const active_needle = "\"is_active\":";
+        const layout_needle = "\"layout\":\"";
+        const close_needle = "}";
         var idx: usize = 0;
         while (std.mem.indexOfPos(u8, tags_json, idx, needle)) |pos| {
             const after = pos + needle.len;
@@ -418,11 +478,51 @@ const Workspaces = struct {
                     const v = p + active_needle.len;
                     if (v < tags_json.len and tags_json[v] == 't') active = true;
                 }
+                // Stash the FIRST active tag's layout. Mango reports each
+                // monitor's tags as one array of flat objects, and this scan
+                // isn't object-aware (same shape as the is_active lookup
+                // above), so bound the search to this tag's own object by
+                // stopping at the next `}` — that keeps the layout we read the
+                // one belonging to the tag we're on rather than the next tag's.
+                // With several monitors the first active tag wins, which on the
+                // single-monitor setups this bar targets is simply the active
+                // tag; `layout()` returning empty (unknown) is the safe
+                // fallback and hides the module rather than guessing.
+                if (active and self.layout_len == 0) {
+                    const obj_end = std.mem.indexOfPos(u8, tags_json, after, close_needle) orelse tags_json.len;
+                    const obj = tags_json[after..obj_end];
+                    if (std.mem.indexOf(u8, obj, layout_needle)) |lp| {
+                        const s = lp + layout_needle.len;
+                        var e = s;
+                        while (e < obj.len and obj[e] != '"') : (e += 1) {}
+                        const sym = obj[s..e];
+                        if (sym.len > 0 and sym.len <= self.layout_buf.len) {
+                            @memcpy(self.layout_buf[0..sym.len], sym);
+                            self.layout_len = sym.len;
+                        }
+                    }
+                }
                 try self.list.append(self.gpa, .{ .id = id, .active = active });
             }
             idx = after;
         }
         std.sort.insertion(Workspace, self.list.items, {}, workspaceLessThan);
+    }
+
+    /// The active tag's layout symbol, or empty if unknown (Hyprland, or
+    /// before the first Mango refresh succeeded).
+    fn layout(self: *const Workspaces) []const u8 {
+        return self.layout_buf[0..self.layout_len];
+    }
+
+    /// Applies layout `name` (a MANGO_LAYOUTS name, e.g. "dwindle") to the
+    /// active tag. `set_layout` is runtime-only — it never writes the config
+    /// file — and Mango announces the change on the very `watch all-tags`
+    /// channel this bar already streams, so the icon updates on its own.
+    fn setLayout(self: *const Workspaces, name: []const u8) !void {
+        var cmd_buf: [64]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&cmd_buf, "dispatch setlayout,{s}", .{name});
+        try self.dispatchCommand(cmd);
     }
 
     /// Fire-and-forget a plain (non-JSON) dispatch command in the compositor's
@@ -502,6 +602,10 @@ const Action = union(enum) {
     activate_tray: usize,
     context_menu_tray: usize,
     mpris_control: MprisControl,
+    /// Opens the Mango layout picker popup (the layout module's click).
+    open_layout_picker,
+    /// Applies the layout at `MANGO_LAYOUTS[index]` (a picker row click).
+    set_layout: usize,
 };
 
 /// What a vertical scroll wheel does over a ClickRegion. Separate from Action
@@ -725,6 +829,11 @@ const ModuleKind = enum {
     custom_script,
     cpu_temp,
     cava,
+    /// Mango layout switcher: shows the active tag's layout as a distinct
+    /// glyph and opens a picker popup on click. Mango-only in practice — the
+    /// icon is unknown (hidden) under Hyprland, which has no per-tag layout
+    /// in the IPC this bar reads.
+    layout,
 };
 
 /// One entry in a left/center/right module list. Flat + all-optional
@@ -1758,6 +1867,10 @@ const POPUP_PADDING_X: i32 = 10;
 const POPUP_MIN_WIDTH: i32 = 80;
 const POPUP_MAX_WIDTH: i32 = 320;
 const MAX_POPUP_ROWS = 40;
+/// Horizontal space between a layout-picker row's icon and its name.
+const LAYOUT_ICON_GAP: i32 = 8;
+/// Marks the active layout's row in the layout picker (fa-check).
+const LAYOUT_ACTIVE_CHECK = "\u{f00c}";
 
 const PopupRow = struct {
     y_start: i32,
@@ -1769,19 +1882,28 @@ const PopupRow = struct {
     item_id: ?i32,
 };
 
-/// One open right-click context menu, backed by a real xdg_popup surface
-/// (parented to our layer-shell bar via zwlr_layer_surface_v1::get_popup).
-/// Only the top-level items are shown — no submenu drill-down, which costs
-/// nothing for the apps actually tested against (Steam's menu is flat).
+/// One open popup, backed by a real xdg_popup surface (parented to our
+/// layer-shell bar via zwlr_layer_surface_v1::get_popup). Two kinds share
+/// the surface/hit-test machinery:
+///
+///   * `.dbusmenu` — a tray item's right-click menu. Only the top-level
+///     items are shown — no submenu drill-down, which costs nothing for the
+///     apps actually tested against (Steam's menu is flat).
+///   * `.layout_picker` — the Mango layout switcher. Rows come from
+///     MANGO_LAYOUTS instead of a DBusMenu, so `menu` is left undefined.
 const PopupMenu = struct {
     surface: *wl.Surface,
     xdg_surface: *xdg.Surface,
     popup: *xdg.Popup,
+    /// Which row source populates this popup (see the type doc above).
+    kind: PopupKind = .dbusmenu,
     dest_buf: [64]u8 = undefined,
     dest_len: usize = 0,
     path_buf: [128]u8 = undefined,
     path_len: usize = 0,
-    menu: dbusmenu.DbusMenu,
+    /// Valid only when kind == .dbusmenu — the layout picker has no backing
+    /// menu and leaves this undefined, so nothing may read it for that kind.
+    menu: dbusmenu.DbusMenu = undefined,
     width: u32 = 0,
     height: u32 = 0,
     configured: bool = false,
@@ -1804,6 +1926,53 @@ const PopupMenu = struct {
         return null;
     }
 };
+
+/// What a PopupMenu's rows are sourced from; selects the draw and click
+/// paths in drawPopup / the pointer-button handler.
+const PopupKind = enum { dbusmenu, layout_picker };
+
+/// Creates the xdg_popup surface a popup menu draws on, anchored to a thin
+/// rect at the clicked x position and spanning the bar's full height — the
+/// popup opens above it (bar is bottom-anchored), sliding to stay on-screen
+/// horizontally if it would run off either edge. Shared by the DBusMenu
+/// context menu and the layout picker, which differ only in their rows.
+/// Returns the three objects (still caller-owned: popup is wired to the bar,
+/// but the positioner is already destroyed) or null on any failure.
+const PopupSurface = struct {
+    surface: *wl.Surface,
+    xdg_surface: *xdg.Surface,
+    popup: *xdg.Popup,
+};
+
+fn createPopupSurface(bar: *Bar, width: i32, height: i32) ?PopupSurface {
+    const wm_base = bar.wm_base orelse return null;
+    const surface = bar.compositor.createSurface() catch return null;
+    const xdg_surface = wm_base.getXdgSurface(surface) catch {
+        surface.destroy();
+        return null;
+    };
+    const positioner = wm_base.createPositioner() catch {
+        xdg_surface.destroy();
+        surface.destroy();
+        return null;
+    };
+    defer positioner.destroy();
+
+    positioner.setSize(width, height);
+    const anchor_x: i32 = @max(0, bar.pointer_x - 4);
+    positioner.setAnchorRect(anchor_x, 0, 8, @intCast(bar.height));
+    positioner.setAnchor(.top);
+    positioner.setGravity(.top);
+    positioner.setConstraintAdjustment(.{ .slide_x = true, .slide_y = true, .flip_y = true });
+
+    const popup = xdg_surface.getPopup(null, positioner) catch {
+        xdg_surface.destroy();
+        surface.destroy();
+        return null;
+    };
+    bar.layer_surface.getPopup(popup);
+    return .{ .surface = surface, .xdg_surface = xdg_surface, .popup = popup };
+}
 
 /// Right-click on a tray item: fetches its Menu property; if present,
 /// builds and shows a real popup listing the top-level items. Falls back to
@@ -1843,19 +2012,6 @@ fn openTrayContextMenu(bar: *Bar, tray_index: usize) void {
         return;
     };
 
-    const wm_base = bar.wm_base orelse return;
-    const surface = bar.compositor.createSurface() catch return;
-    const xdg_surface = wm_base.getXdgSurface(surface) catch {
-        surface.destroy();
-        return;
-    };
-    const positioner = wm_base.createPositioner() catch {
-        xdg_surface.destroy();
-        surface.destroy();
-        return;
-    };
-    defer positioner.destroy();
-
     var top_idx: [MAX_POPUP_ROWS]usize = undefined;
     const top_children = menu.childrenOf(0, &top_idx);
 
@@ -1873,28 +2029,12 @@ fn openTrayContextMenu(bar: *Bar, tray_index: usize) void {
     }
     if (total_h < POPUP_ROW_HEIGHT) total_h = POPUP_ROW_HEIGHT;
 
-    positioner.setSize(max_w, total_h);
-    // Anchor a thin rect at the clicked x position, spanning the bar's full
-    // height — the popup opens above it (bar is bottom-anchored), sliding
-    // to stay on-screen horizontally if it would run off either edge.
-    const anchor_x: i32 = @max(0, bar.pointer_x - 4);
-    positioner.setAnchorRect(anchor_x, 0, 8, @intCast(bar.height));
-    positioner.setAnchor(.top);
-    positioner.setGravity(.top);
-    positioner.setConstraintAdjustment(.{ .slide_x = true, .slide_y = true, .flip_y = true });
-
-    const popup = xdg_surface.getPopup(null, positioner) catch {
-        xdg_surface.destroy();
-        surface.destroy();
-        return;
-    };
-    bar.layer_surface.getPopup(popup);
+    const ps = createPopupSurface(bar, max_w, total_h) orelse return;
 
     var pm = PopupMenu{
-        .surface = surface,
-        .xdg_surface = xdg_surface,
-        .popup = popup,
-        .menu = menu,
+        .surface = ps.surface,
+        .xdg_surface = ps.xdg_surface,
+        .popup = ps.popup,
     };
     pm.dest_len = @min(item.busName().len, pm.dest_buf.len);
     @memcpy(pm.dest_buf[0..pm.dest_len], item.busName()[0..pm.dest_len]);
@@ -1902,11 +2042,53 @@ fn openTrayContextMenu(bar: *Bar, tray_index: usize) void {
     @memcpy(pm.path_buf[0..pm.path_len], menu_path[0..pm.path_len]);
     bar.popup = pm;
 
-    xdg_surface.setListener(*Bar, popupXdgSurfaceListener, bar);
-    popup.setListener(*Bar, popupEventListener, bar);
-    if (bar.seat) |seat| popup.grab(seat, bar.last_pointer_serial);
+    wirePopup(bar, ps);
+}
 
-    surface.commit(); // initial null commit — triggers the first configure
+/// Left-click on the Mango layout module: shows a popup listing every layout
+/// MANGO_LAYOUTS knows, each with its own icon (the same glyph the bar shows)
+/// and name, so it's obvious which layout you're on and what the alternatives
+/// are — the shape noctalia's mango_layouts plugin uses. Rows are sourced from
+/// MANGO_LAYOUTS rather than a DBusMenu; clicking one fires `.set_layout`
+/// through the same hit-test path as a tray menu row.
+fn openLayoutPicker(bar: *Bar) void {
+    if (bar.popup != null) return; // one at a time
+    if (bar.workspaces.mode != .mango) return; // no per-tag layout concept elsewhere
+
+    // Width: widest (icon + gap + name, plus the check the ACTIVE row also
+    // draws) plus padding, so no label truncates and the active row's check
+    // doesn't clip off the right edge.
+    const check_w = LAYOUT_ICON_GAP + textPixelWidth(bar.font, LAYOUT_ACTIVE_CHECK);
+    var max_w: i32 = POPUP_MIN_WIDTH;
+    for (&MANGO_LAYOUTS) |*l| {
+        const w: i32 = @intCast(textPixelWidth(bar.font, l.icon) + LAYOUT_ICON_GAP + textPixelWidth(bar.font, l.name) + check_w + POPUP_PADDING_X * 2);
+        if (w > max_w) max_w = w;
+    }
+    if (max_w > POPUP_MAX_WIDTH) max_w = POPUP_MAX_WIDTH;
+    const total_h: i32 = @as(i32, @intCast(MANGO_LAYOUTS.len)) * POPUP_ROW_HEIGHT;
+
+    const ps = createPopupSurface(bar, max_w, total_h) orelse return;
+
+    const pm = PopupMenu{
+        .surface = ps.surface,
+        .xdg_surface = ps.xdg_surface,
+        .popup = ps.popup,
+        .kind = .layout_picker,
+    };
+    bar.popup = pm;
+
+    wirePopup(bar, ps);
+}
+
+/// Finishes bringing up a just-created popup: hooks up its configure listeners
+/// and (if we hold a seat) grabs it, then does the initial null commit that
+/// triggers the first configure. Shared by every popup kind.
+fn wirePopup(bar: *Bar, ps: PopupSurface) void {
+    ps.xdg_surface.setListener(*Bar, popupXdgSurfaceListener, bar);
+    ps.popup.setListener(*Bar, popupEventListener, bar);
+    if (bar.seat) |seat| ps.popup.grab(seat, bar.last_pointer_serial);
+
+    ps.surface.commit(); // initial null commit — triggers the first configure
 }
 
 fn closePopup(bar: *Bar) void {
@@ -1944,10 +2126,10 @@ fn popupEventListener(_: *xdg.Popup, event: xdg.Popup.Event, bar: *Bar) void {
     }
 }
 
-/// Renders the popup's menu rows into a fresh SHM buffer and commits it —
-/// the same pattern as drawAndCommit, just for the popup's own surface and
-/// a much simpler (single-column list) layout. Also (re)populates
-/// `rows` for hit-testing hover/click.
+/// Renders the popup's rows into a fresh SHM buffer and commits it — the same
+/// pattern as drawAndCommit, just for the popup's own surface and a much
+/// simpler (single-column list) layout. Also (re)populates `rows` for
+/// hit-testing hover/click. The row source depends on pm.kind.
 fn drawPopup(bar: *Bar) !void {
     var pm = &(bar.popup orelse return);
     if (!pm.configured or pm.width == 0 or pm.height == 0) return;
@@ -1966,6 +2148,24 @@ fn drawPopup(bar: *Bar) !void {
     const pixels: [*]u32 = @ptrCast(@alignCast(data.ptr));
     @memset(pixels[0 .. size / 4], current_config.appearance.popup_bg_color);
 
+    switch (pm.kind) {
+        .dbusmenu => drawDbusMenuRows(bar, pm, pixels),
+        .layout_picker => drawLayoutPickerRows(bar, pm, pixels),
+    }
+
+    const pool = try bar.shm.createPool(fd, @intCast(size));
+    defer pool.destroy();
+    const buffer = try pool.createBuffer(0, @intCast(pm.width), @intCast(pm.height), @intCast(stride), .argb8888);
+    defer buffer.destroy();
+    pm.surface.attach(buffer, 0, 0);
+    pm.surface.damageBuffer(0, 0, @intCast(pm.width), @intCast(pm.height));
+    pm.surface.commit();
+}
+
+/// Row-renderer for a `.dbusmenu` popup: the top-level items of the backing
+/// DBusMenu, separators drawn as thin lines, and `item_id` carrying the
+/// dbusmenu id so a click can send the "clicked" Event.
+fn drawDbusMenuRows(bar: *Bar, pm: *PopupMenu, pixels: [*]u32) void {
     var top_idx: [MAX_POPUP_ROWS]usize = undefined;
     const top_children = pm.menu.childrenOf(0, &top_idx);
 
@@ -1995,32 +2195,87 @@ fn drawPopup(bar: *Bar) !void {
         } else {
             const hovered = pm.pointer_y >= y_start and pm.pointer_y < y_end;
             if (hovered and it.enabled) {
-                var py: i32 = y_start;
-                while (py < y_end and py < pm.height) : (py += 1) {
-                    if (py < 0) continue;
-                    var x: u32 = 0;
-                    while (x < pm.width) : (x += 1) pixels[@as(u32, @intCast(py)) * pm.width + x] = current_config.appearance.popup_hover_color;
-                }
+                fillPopupRowBand(pixels, pm, y_start, y_end);
             }
             const color = if (it.enabled) current_config.appearance.text_color else current_config.appearance.popup_disabled_color;
-            const baseline = y_start + @divTrunc(row_h + bar.font.ascentPx() - bar.font.descentPx(), 2);
-            var x0: i64 = POPUP_PADDING_X;
-            var ci: usize = 0;
-            while (nextUtf8Codepoint(it.label(), &ci)) |cp| {
-                x0 += drawGlyphAt(pixels, pm.width, pm.height, bar.font, x0, baseline, cp, color, 0, pm.width);
+            drawPopupLabel(pixels, pm, bar, y_start, POPUP_PADDING_X, it.label(), color);
+        }
+
+        y = y_end;
+    }
+}
+
+/// Fills a row's band with the hover colour so a row reads as interactive.
+fn fillPopupRowBand(pixels: [*]u32, pm: *PopupMenu, y_start: i32, y_end: i32) void {
+    var py: i32 = y_start;
+    while (py < y_end and py < pm.height) : (py += 1) {
+        if (py < 0) continue;
+        var x: u32 = 0;
+        while (x < pm.width) : (x += 1) pixels[@as(u32, @intCast(py)) * pm.width + x] = current_config.appearance.popup_hover_color;
+    }
+}
+
+/// Draws one row's label at `x0`, baseline-centered in the row that starts at
+/// `y_start`, one codepoint at a time through the same glyph path the bar uses.
+fn drawPopupLabel(pixels: [*]u32, pm: *PopupMenu, bar: *Bar, y_start: i32, x0_start: i64, label: []const u8, color: u32) void {
+    const baseline = y_start + @divTrunc(POPUP_ROW_HEIGHT + bar.font.ascentPx() - bar.font.descentPx(), 2);
+    var x0 = x0_start;
+    var ci: usize = 0;
+    while (nextUtf8Codepoint(label, &ci)) |cp| {
+        x0 += drawGlyphAt(pixels, pm.width, pm.height, bar.font, x0, baseline, cp, color, 0, pm.width);
+    }
+}
+
+/// Row-renderer for a `.layout_picker` popup: one row per MANGO_LAYOUTS entry,
+/// drawn as the layout's icon + name, with the active layout marked by a
+/// persistent hover-coloured band plus a trailing check so it's unambiguous
+/// which layout you're currently on. `item_id` carries the MANGO_LAYOUTS index
+/// so a click can apply that layout.
+fn drawLayoutPickerRows(bar: *Bar, pm: *PopupMenu, pixels: [*]u32) void {
+    const active_symbol = bar.workspaces.layout();
+    const text_color = current_config.appearance.text_color;
+
+    pm.row_count = 0;
+    var y: i32 = 0;
+    for (MANGO_LAYOUTS, 0..) |layout, i| {
+        const y_start = y;
+        const y_end = y + POPUP_ROW_HEIGHT;
+
+        if (pm.row_count < pm.rows.len) {
+            pm.rows[pm.row_count] = .{
+                .y_start = y_start,
+                .y_end = y_end,
+                .item_id = @intCast(i),
+            };
+            pm.row_count += 1;
+        }
+
+        const is_active = active_symbol.len > 0 and std.mem.eql(u8, active_symbol, layout.symbol);
+        const hovered = pm.pointer_y >= y_start and pm.pointer_y < y_end;
+        if (hovered or is_active) fillPopupRowBand(pixels, pm, y_start, y_end);
+
+        // Icon, then the name, then — for the active row — a check.
+        const baseline = y_start + @divTrunc(POPUP_ROW_HEIGHT + bar.font.ascentPx() - bar.font.descentPx(), 2);
+        var x0: i64 = POPUP_PADDING_X;
+        var ci: usize = 0;
+        while (nextUtf8Codepoint(layout.icon, &ci)) |cp| {
+            x0 += drawGlyphAt(pixels, pm.width, pm.height, bar.font, x0, baseline, cp, text_color, 0, pm.width);
+        }
+        x0 += LAYOUT_ICON_GAP;
+        ci = 0;
+        while (nextUtf8Codepoint(layout.name, &ci)) |cp| {
+            x0 += drawGlyphAt(pixels, pm.width, pm.height, bar.font, x0, baseline, cp, text_color, 0, pm.width);
+        }
+        if (is_active) {
+            x0 += LAYOUT_ICON_GAP;
+            ci = 0;
+            while (nextUtf8Codepoint(LAYOUT_ACTIVE_CHECK, &ci)) |cp| {
+                _ = drawGlyphAt(pixels, pm.width, pm.height, bar.font, x0, baseline, cp, text_color, 0, pm.width);
             }
         }
 
         y = y_end;
     }
-
-    const pool = try bar.shm.createPool(fd, @intCast(size));
-    defer pool.destroy();
-    const buffer = try pool.createBuffer(0, @intCast(pm.width), @intCast(pm.height), @intCast(stride), .argb8888);
-    defer buffer.destroy();
-    pm.surface.attach(buffer, 0, 0);
-    pm.surface.damageBuffer(0, 0, @intCast(pm.width), @intCast(pm.height));
-    pm.surface.commit();
 }
 
 const MAX_OUTPUTS = 8;
@@ -4640,6 +4895,7 @@ fn drawRightGroup(
     volume_text: []const u8,
     drawer_anim: f32,
     tray: *const Tray,
+    workspaces: *const Workspaces,
     center_start_x: i64,
     pointer_x: i32,
     click_regions: *ClickRegions,
@@ -4800,6 +5056,20 @@ fn drawRightGroup(
                     const cell = reserveRightCell(x_end, textPixelWidth(font, net_label), center_start_x);
                     x_end = cell.next_pen;
                     _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, net_label, color, null, pointer_x, click_regions);
+                }
+            },
+            .layout => {
+                // Mango layout indicator: the active tag's layout as its own
+                // distinct glyph, so a glance tells you which layout you're in.
+                // Clicking opens the picker popup. Hidden entirely (no cell
+                // reserved) when the layout is unknown — Hyprland, or before
+                // the first Mango refresh — so it costs nothing there.
+                if (layoutBySymbol(workspaces.layout())) |l| {
+                    if (!first) x_end -= MODULE_GAP;
+                    first = false;
+                    const cell = reserveRightCell(x_end, textPixelWidth(font, l.icon), center_start_x);
+                    x_end = cell.next_pen;
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, l.icon, color, .open_layout_picker, pointer_x, click_regions);
                 }
             },
             .custom_script => {
@@ -5001,15 +5271,25 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                 if (e.button != BTN_LEFT) return;
                 const pm = &(bar.popup orelse return);
                 const row = pm.hitTestRow(pm.pointer_y) orelse return;
+                const kind = pm.kind; // copy: closePopup nulls bar.popup
                 if (row.item_id) |id| {
-                    var dest_buf: [64]u8 = undefined;
-                    var path_buf: [128]u8 = undefined;
-                    const dest_len = pm.dest().len;
-                    const path_len = pm.path().len;
-                    @memcpy(dest_buf[0..dest_len], pm.dest());
-                    @memcpy(path_buf[0..path_len], pm.path());
-                    if (bar.tray.conn) |*c| {
-                        dbusmenu.sendClickEvent(c, dest_buf[0..dest_len], path_buf[0..path_len], id);
+                    switch (kind) {
+                        .layout_picker => {
+                            if (id >= 0 and id < MANGO_LAYOUTS.len) {
+                                handleAction(bar, .{ .set_layout = @intCast(id) });
+                            }
+                        },
+                        .dbusmenu => {
+                            var dest_buf: [64]u8 = undefined;
+                            var path_buf: [128]u8 = undefined;
+                            const dest_len = pm.dest().len;
+                            const path_len = pm.path().len;
+                            @memcpy(dest_buf[0..dest_len], pm.dest());
+                            @memcpy(path_buf[0..path_len], pm.path());
+                            if (bar.tray.conn) |*c| {
+                                dbusmenu.sendClickEvent(c, dest_buf[0..dest_len], path_buf[0..path_len], id);
+                            }
+                        },
                     }
                 }
                 closePopup(bar);
@@ -5132,6 +5412,13 @@ fn handleAction(bar: *Bar, action: Action) void {
             };
             spawnPlayerctlCommand(bar.mpris_player_buf[0..bar.mpris_player_len], cmd);
         },
+        .open_layout_picker => openLayoutPicker(bar),
+        .set_layout => |index| {
+            if (index >= MANGO_LAYOUTS.len) return;
+            bar.workspaces.setLayout(MANGO_LAYOUTS[index].name) catch |err| {
+                logging.err("layout switch failed: {}", .{err});
+            };
+        },
     }
 }
 
@@ -5184,6 +5471,8 @@ fn actionName(a: Action) []const u8 {
         .activate_tray => "activate_tray",
         .context_menu_tray => "context_menu_tray",
         .mpris_control => "mpris_control",
+        .open_layout_picker => "open_layout_picker",
+        .set_layout => "set_layout",
     };
 }
 
@@ -5340,6 +5629,7 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
         volume_text,
         bar.drawer_anim,
         bar.tray,
+        bar.workspaces,
         center_start_x,
         bar.pointer_x,
         &bar.click_regions,

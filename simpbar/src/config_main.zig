@@ -89,6 +89,8 @@ const ModuleKind = enum {
     custom_script,
     cpu_temp,
     cava,
+    /// Mango layout switcher (right-side only; hidden under Hyprland).
+    layout,
 };
 
 // Every ModuleKind valid in the "right" group per main.zig's drawRightGroup
@@ -101,7 +103,7 @@ const RIGHT_MODULE_KINDS = [_]ModuleKind{
     .power,     .drawer_toggle, .volume,  .waypaper,      .pacman,
     .tray,      .weather,       .cpu,     .ram,           .network,
     .disk,      .battery,       .custom_script, .cpu_temp,
-    .cava,
+    .cava,      .layout,
 };
 
 // The kind set shared by the Left and Center groups. main.zig now draws
@@ -2316,6 +2318,7 @@ fn moduleKindDisplayName(kind: ModuleKind) [:0]const u8 {
         .custom_script => "Custom Script",
         .cpu_temp => "CPU Temperature",
         .cava => "Audio Visualizer",
+        .layout => "Mango Layout",
     };
 }
 
