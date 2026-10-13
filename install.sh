@@ -531,31 +531,70 @@ fi
 # ── Step 6: detect GPU and install packages ──────────────────────────
 step "Detecting GPU"
 
+# True when any of the named packages is already installed. Used to avoid
+# targeting a package that conflicts with an already-present alternative: the
+# -git Mesa builds (mesa-git / lib32-mesa-git, common on gaming setups) ship
+# the same drivers but *conflict* with the official mesa / lib32-mesa. Since
+# every package below goes into one `pacman -S` transaction, a single such
+# conflict aborts the whole install — so we skip a package when a variant is
+# already doing its job. `pacman -Qq` exits 0 only for an exact-name match,
+# hence checking the -git names too.
+pkg_or_variant_installed() {
+    local pkg
+    for pkg in "$@"; do
+        pacman -Qq "$pkg" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
 GPU_INFO=$(lspci 2>/dev/null | grep -Ei 'vga compatible controller|3d controller')
 GPU_PKGS=()
+GPU_DETECTED=0
 
+# Mesa family. The -git builds (mesa-git / lib32-mesa-git) both *provide* and
+# *conflict* with the official packages — mesa-git provides mesa AND the
+# vulkan-radeon/vulkan-intel drivers, and conflicts with each of them; likewise
+# lib32-mesa-git for the lib32-* set. So when a -git variant is already
+# installed we must skip the corresponding official packages entirely (they're
+# already covered), or the single pacman -S transaction aborts on the conflict.
 if echo "$GPU_INFO" | grep -qi nvidia; then
     ok "NVIDIA GPU detected — adding the proprietary driver + Vulkan + OpenCL packages"
+    GPU_DETECTED=1
     GPU_PKGS+=(nvidia nvidia-utils lib32-nvidia-utils nvidia-settings opencl-nvidia lib32-opencl-nvidia)
 fi
 if echo "$GPU_INFO" | grep -Eqi 'amd|advanced micro devices|radeon'; then
     ok "AMD GPU detected — adding Mesa + Vulkan (RADV) packages"
-    GPU_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon)
+    GPU_DETECTED=1
+    pkg_or_variant_installed mesa mesa-git          || GPU_PKGS+=(mesa)
+    pkg_or_variant_installed mesa-git               || GPU_PKGS+=(vulkan-radeon)
+    pkg_or_variant_installed lib32-mesa lib32-mesa-git || GPU_PKGS+=(lib32-mesa)
+    pkg_or_variant_installed lib32-mesa-git         || GPU_PKGS+=(lib32-vulkan-radeon)
 fi
 if echo "$GPU_INFO" | grep -qi intel; then
     ok "Intel GPU detected — adding Mesa + Vulkan packages"
-    GPU_PKGS+=(mesa lib32-mesa vulkan-intel lib32-vulkan-intel)
+    GPU_DETECTED=1
+    pkg_or_variant_installed mesa mesa-git          || GPU_PKGS+=(mesa)
+    pkg_or_variant_installed mesa-git               || GPU_PKGS+=(vulkan-intel)
+    pkg_or_variant_installed lib32-mesa lib32-mesa-git || GPU_PKGS+=(lib32-mesa)
+    pkg_or_variant_installed lib32-mesa-git         || GPU_PKGS+=(lib32-vulkan-intel)
 fi
 
-if [ "${#GPU_PKGS[@]}" -eq 0 ]; then
+# Keyed off GPU_DETECTED, not off GPU_PKGS being non-empty: with a -git Mesa
+# build already installed, detection succeeds but every driver package above is
+# skipped (already provided), leaving GPU_PKGS empty — yet the loader below is
+# still needed and the "unknown vendor" warning would be wrong.
+if [ "$GPU_DETECTED" -eq 0 ]; then
     warn "Could not detect a known GPU vendor (NVIDIA/AMD/Intel) via lspci — install graphics drivers manually if needed"
 else
     # The Vulkan loader is a separate package from the vendor driver itself —
     # without it, Vulkan apps (and therefore Proton/DXVK) can't find the
-    # driver even if it's installed. Needed regardless of vendor.
+    # driver even if it's installed. Needed regardless of vendor; mesa-git
+    # provides the drivers but not the loader, so this is required either way.
     GPU_PKGS+=(vulkan-icd-loader lib32-vulkan-icd-loader)
-    # De-dupe for hybrid graphics (e.g. Intel+NVIDIA laptops both pull in mesa/lib32-mesa)
-    mapfile -t GPU_PKGS < <(printf '%s\n' "${GPU_PKGS[@]}" | sort -u)
+    if [ "${#GPU_PKGS[@]}" -gt 0 ]; then
+        # De-dupe for hybrid graphics (e.g. Intel+NVIDIA laptops both pull in mesa/lib32-mesa)
+        mapfile -t GPU_PKGS < <(printf '%s\n' "${GPU_PKGS[@]}" | sort -u)
+    fi
 fi
 
 printf '\n%sInstalling packages%s\n' "$C_BLUE$C_BOLD" "$C_RESET"
