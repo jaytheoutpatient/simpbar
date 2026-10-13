@@ -529,11 +529,17 @@ else
 fi
 
 # ── Step 6: install packages ─────────────────────────────────────────
-# No GPU-driver handling here on purpose: `steam` is always installed below and
-# its hard depends (vulkan-driver, lib32-vulkan-driver, vulkan-icd-loader,
-# lib32-vulkan-icd-loader, lib32-libgl) already pull in the correct vendor
-# Vulkan driver and Mesa. Targeting mesa/lib32-mesa directly only risked
-# conflicts with pre-installed variants (e.g. mesa-git), so it's left out.
+# Graphics: the official Mesa Vulkan stack is pinned explicitly below (see the
+# `PACMAN_PKGS+=` for the Vulkan ICDs). There is deliberately no GPU detection,
+# but the drivers cannot be left to `steam` either: steam hard-depends on the
+# vulkan-driver / lib32-vulkan-driver virtuals, and on a fresh system those are
+# unsatisfied, so pacman picks a provider by repo order. The CachyOS repos are
+# listed first in pacman.conf, so it selects their mesa-git / lib32-mesa-git —
+# which conflict with the installed official mesa and abort the whole
+# transaction ("Remove mesa? [Y/n]" answered N by --noconfirm). Pinning the
+# official ICDs satisfies steam's depends directly so mesa-git is never pulled;
+# radeon/intel cover real hardware and swrast covers GPU-less machines (test
+# VMs), so the same fixed set works everywhere.
 step "Installing packages"
 
 # Steam lives in the multilib repo, which isn't enabled by default.
@@ -566,6 +572,11 @@ fi
 # what actually gets deployed.
 # brightnessctl backs both WMs' XF86MonBrightness* binds.
 PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji foot fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
+
+# Official Mesa Vulkan stack — see the Step 6 header: pinning these satisfies
+# steam's vulkan-driver / lib32-vulkan-driver depends directly, so pacman never
+# resolves them to the CachyOS repos' conflicting mesa-git / lib32-mesa-git.
+PACMAN_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon vulkan-intel lib32-vulkan-intel vulkan-swrast lib32-vulkan-swrast)
 
 # The compositor itself plus its desktop portal, chosen in Step 2. MangoWM
 # also needs the apps the shipped mango config starts/binds on login
