@@ -121,6 +121,10 @@ var reminders_path_buf: [512]u8 = undefined;
 var reminders_path: [:0]const u8 = "";
 var notes_dir_path_buf: [512]u8 = undefined;
 var notes_dir_path: [:0]const u8 = "";
+var widgets_disabled_path_buf: [512]u8 = undefined;
+var widgets_disabled_path: [:0]const u8 = "";
+var shell_pidfile_path_buf: [512]u8 = undefined;
+var shell_pidfile_path: [:0]const u8 = "";
 
 /// SIGUSR1 live-reload flag: matugen's post_hook sends the shell the very
 /// same signal it sends the bar (see [templates.simpbar] in
@@ -177,6 +181,16 @@ fn resolveConfigPaths() void {
     reminders_path = std.fmt.bufPrintZ(&reminders_path_buf, "{s}/reminders.txt", .{dir}) catch "";
     notes_dir_path = std.fmt.bufPrintZ(&notes_dir_path_buf, "{s}/notes", .{dir}) catch "";
     if (notes_dir_path.len > 0) _ = posix.system.mkdir(notes_dir_path.ptr, 0o755); // sticky-note slots
+    // Per-widget on/off list (written by simpbar-config, one widget id per
+    // line): widgets named here are skipped at startup. Missing file means
+    // all enabled, so fresh installs behave exactly as before. A separate
+    // file rather than flags inside shell.json so the GUI never has to
+    // rewrite shell.json (which would risk clobbering drag-persisted widget
+    // positions); the GUI owns this file outright.
+    widgets_disabled_path = std.fmt.bufPrintZ(&widgets_disabled_path_buf, "{s}/widgets-disabled", .{dir}) catch "";
+    // Pidfile so simpbar-config can restart the widgets when a toggle flips
+    // (same convention as the bar's simpbar.pid).
+    shell_pidfile_path = std.fmt.bufPrintZ(&shell_pidfile_path_buf, "{s}/simpbar-shell.pid", .{dir}) catch "";
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
@@ -196,6 +210,74 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
         if (list.items.len > 1024 * 1024) break; // sanity cap
     }
     return list.toOwnedSlice(allocator);
+}
+
+/// Bitmask of widgets the user switched off in simpbar-config: bit i is
+/// @intFromEnum(WidgetId) for each id named (one per line) in the
+/// widgets-disabled file. Missing/unreadable file = 0 (all enabled).
+/// Unknown ids warn and skip rather than failing startup.
+fn disabledMask(allocator: std.mem.Allocator) u8 {
+    // The u8 mask (and u3 shifts below) hold at most 8 widgets — today there
+    // are 7. Trip the compiler, not a runtime panic, if an 8th+ arrives.
+    comptime {
+        const n = @typeInfo(widgets_mod.WidgetId).@"enum".fields.len;
+        if (n > 8) @compileError("disabledMask: u8 mask holds at most 8 widgets");
+    }
+    if (widgets_disabled_path.len == 0) return 0;
+    const bytes = readFileAlloc(allocator, widgets_disabled_path) catch return 0;
+    defer allocator.free(bytes);
+    var mask: u8 = 0;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| {
+        const id = std.mem.trim(u8, line, " \t\r");
+        if (id.len == 0) continue;
+        const e = std.meta.stringToEnum(widgets_mod.WidgetId, id) orelse {
+            logging.warn("widgets: unknown id \"{s}\" in widgets-disabled — skipping", .{id});
+            continue;
+        };
+        mask |= @as(u8, 1) << @as(u3, @intCast(@intFromEnum(e)));
+    }
+    return mask;
+}
+
+/// Compacts cfg.widget_cfgs in place, dropping widgets the user switched off
+/// (see disabledMask). Runs on a startup copy in main(), not on g_shell_cfg —
+/// positions of dropped widgets stay in shell.json untouched, so re-enabling
+/// restores them where they were.
+fn applyDisabledWidgets(allocator: std.mem.Allocator, cfg: *ShellConfig) void {
+    const mask = disabledMask(allocator);
+    if (mask == 0) return;
+    var n: usize = 0;
+    for (cfg.widget_cfgs[0..cfg.widget_count]) |wc| {
+        const bit: u8 = @as(u8, 1) << @as(u3, @intCast(@intFromEnum(wc.id)));
+        if (mask & bit != 0) {
+            logging.step("widgets: {s} switched off — skipping", .{@tagName(wc.id)});
+            continue;
+        }
+        cfg.widget_cfgs[n] = wc;
+        n += 1;
+    }
+    cfg.widget_count = n;
+}
+
+/// Writes this process's PID to ~/.config/simpbar/simpbar-shell.pid so
+/// simpbar-config knows what to signal when the widgets switch flips.
+/// Best effort, mirroring the bar's writePidfile — a missing pidfile just
+/// means the GUI falls back to spawning, never a reason to fail startup.
+fn writeShellPidfile() void {
+    if (shell_pidfile_path.len == 0) return;
+    const raw_fd = posix.system.open(shell_pidfile_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(posix.mode_t, 0o644));
+    if (raw_fd < 0) return;
+    const fd: posix.fd_t = @intCast(raw_fd);
+    defer _ = posix.system.close(fd);
+    var buf: [16]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d}\n", .{std.c.getpid()}) catch return;
+    var off: usize = 0;
+    while (off < text.len) {
+        const n = posix.system.write(fd, text[off..].ptr, text.len - off);
+        if (n <= 0) return;
+        off += @intCast(n);
+    }
 }
 
 fn parseHexColor(s: []const u8) !u32 {
@@ -1493,7 +1575,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = gpa_state.allocator();
 
     resolveConfigPaths();
-    const cfg = loadConfig(gpa);
+    var cfg = loadConfig(gpa);
+    // Per-widget kill switches (simpbar-config writes the disabled list):
+    // filter the startup copy, leaving g_shell_cfg (and shell.json positions)
+    // complete so re-enabling restores widgets where they were. Zero left
+    // means exit before touching Wayland — the autostart entries relaunch
+    // this binary every login, so this is what keeps "everything off" off
+    // across sessions without editing autostart files. `overview ...` client
+    // commands return before this point and are unaffected.
+    applyDisabledWidgets(gpa, &cfg);
+    if (cfg.widget_count == 0) {
+        logging.step("widgets: all widgets switched off — exiting", .{});
+        return;
+    }
     var theme = widgets_mod.Theme{
         .card_alpha = cfg.card_bg_opacity,
         .radius_px = cfg.corner_radius,
@@ -1642,6 +1736,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         logging.warn("ipc: no control socket (overview toggle dead): {}", .{err});
         break :blk -1;
     };
+
+    // Pidfile only once this instance actually owns the daemon slot (past the
+    // AlreadyRunning exit above, and never in selftest mode): the GUI's
+    // toggle-restart waits for this pidfile to change, which must mean "new
+    // instance fully up", and a zero-widget exit leaves no pidfile pointing
+    // at a dead process.
+    if (!g_selftest) writeShellPidfile();
 
     // Slot 0: display fd, slot 1: control socket (fixed), slots 2+:
     // widget fetch pipes (refreshed every loop).

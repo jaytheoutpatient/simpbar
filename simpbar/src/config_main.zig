@@ -259,6 +259,8 @@ const JsonConfig = struct {
 var config_json_path_buf: [512]u8 = undefined;
 var pidfile_path_buf: [512]u8 = undefined;
 var matugen_type_path_buf: [512]u8 = undefined;
+var widgets_disabled_path_buf: [512]u8 = undefined;
+var shell_pidfile_path_buf: [512]u8 = undefined;
 var config_json_path: [:0]const u8 = "";
 var pidfile_path: [:0]const u8 = "";
 // simpbar owns this small state file (NOT matugen's config.toml — matugen
@@ -266,6 +268,15 @@ var pidfile_path: [:0]const u8 = "";
 // /usr/bin/simpbar-matugen and passed to matugen as `--type`. See
 // MATUGEN_TYPE_CHOICES below.
 var matugen_type_path: [:0]const u8 = "";
+// Per-widget on/off list (one widget id per line), written by the Appearance
+// page's Desktop Widgets switches and read by simpbar-shell at startup.
+// Missing file means all enabled. The GUI owns this file outright (unlike
+// shell.json, which carries drag-persisted positions the GUI must never
+// rewrite), so a full rewrite on every toggle is safe.
+var widgets_disabled_path: [:0]const u8 = "";
+// simpbar-shell's pidfile (written by the shell itself, same convention as
+// the bar's simpbar.pid) so a widget toggle can restart it.
+var shell_pidfile_path: [:0]const u8 = "";
 
 fn resolvePaths() void {
     const home = std.mem.span(getenv("HOME") orelse "/root");
@@ -275,6 +286,8 @@ fn resolvePaths() void {
     config_json_path = std.fmt.bufPrintZ(&config_json_path_buf, "{s}/config.json", .{dir}) catch "";
     pidfile_path = std.fmt.bufPrintZ(&pidfile_path_buf, "{s}/simpbar.pid", .{dir}) catch "";
     matugen_type_path = std.fmt.bufPrintZ(&matugen_type_path_buf, "{s}/matugen-type", .{dir}) catch "";
+    widgets_disabled_path = std.fmt.bufPrintZ(&widgets_disabled_path_buf, "{s}/widgets-disabled", .{dir}) catch "";
+    shell_pidfile_path = std.fmt.bufPrintZ(&shell_pidfile_path_buf, "{s}/simpbar-shell.pid", .{dir}) catch "";
 }
 
 // ---------------------------------------------------------------------
@@ -494,6 +507,10 @@ var live_empty_click_command: []const u8 = "";
 // like live_auto_theme above. Loaded from ~/.config/simpbar/matugen-type;
 // defaults to matugen's own default when that file is absent.
 var live_matugen_type: []const u8 = "scheme-tonal-spot";
+// Desktop widgets on/off, one bit per WIDGET_TABLE row below (bit i =
+// row i). Lives outside config.json in the widgets-disabled file; default
+// zero (missing file means all enabled).
+var live_disabled_mask: u8 = 0;
 
 // Module lists (Step 6) — each group is a small fixed-capacity mutable
 // array, not a read-only slice into config_arena, since Modules-tab rows
@@ -862,6 +879,9 @@ fn loadConfigFromDisk() void {
             }
         }
     }
+    // Per-widget on/off list is separate from config.json (see
+    // widgets_disabled_path).
+    live_disabled_mask = loadDisabledMask();
 
     live_left.load(parsed.modules.left);
     live_center.load(parsed.modules.center);
@@ -1300,6 +1320,130 @@ fn buildMatugenTypeRow(group: *gtk.AdwPreferencesGroup) void {
     gtk.adw_preferences_group_add(group, @ptrCast(row));
 }
 
+/// Reads the per-widget on/off list (one widget id per line) into a mask
+/// over WIDGET_TABLE below (bit i = row i). Missing/unreadable file means
+/// zero (all enabled), matching the shell's own default — a fresh install
+/// has no file.
+fn loadDisabledMask() u8 {
+    const raw = readFileAll(widgets_disabled_path) orelse return 0;
+    defer gpa.free(raw);
+    var mask: u8 = 0;
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line| {
+        const id = std.mem.trim(u8, line, " \t\r");
+        if (id.len == 0) continue;
+        for (WIDGET_TABLE, 0..) |w, i| {
+            if (std.mem.eql(u8, w.id, id)) {
+                mask |= @as(u8, 1) << @as(u3, @intCast(i));
+                break;
+            }
+        }
+    }
+    return mask;
+}
+
+/// Rewrites the on/off list from the live mask, one id per line in table
+/// order. The GUI owns this file outright (unlike shell.json), so a full
+/// rewrite is safe — widget positions live in shell.json and are untouched.
+fn saveDisabledMask() void {
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    for (WIDGET_TABLE, 0..) |w, i| {
+        const bit: u8 = @as(u8, 1) << @as(u3, @intCast(i));
+        if (live_disabled_mask & bit == 0) continue;
+        const line = std.fmt.bufPrint(buf[len..], "{s}\n", .{w.id}) catch break;
+        len += line.len;
+    }
+    if (!writeFileAll(widgets_disabled_path, buf[0..len])) {
+        logging.err("config: could not write {s}", .{widgets_disabled_path});
+    }
+}
+
+/// The shell's PID from its pidfile, or null when it isn't running (or the
+/// pidfile is missing/stale). Mirrors readPidfilePid for the bar.
+fn readShellPid() ?c_int {
+    const text = readFileAll(shell_pidfile_path) orelse return null;
+    defer gpa.free(text);
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    return std.fmt.parseInt(c_int, trimmed, 10) catch null;
+}
+
+/// Restarts the widgets so a per-widget toggle takes effect: the shell only
+/// reads the on/off list at startup, so kill + spawn is the apply step.
+/// Unlike restartBar there is deliberately no pidfile-change wait — the
+/// shell's control-socket probe makes two daemons impossible (a redundant
+/// spawn just exits 0), so rapid toggles can't stack orphans, and the kill
+/// needs no grace period (the shell installs no SIGTERM handler, so default
+/// disposition terminates it long before the new instance reaches its own
+/// socket probe after config/font/Wayland init).
+fn restartShell() void {
+    if (readShellPid()) |pid| {
+        _ = std.c.kill(pid, .TERM);
+    } else {
+        // No pidfile (shell predating pidfiles, or none running): exact-name
+        // pkill covers the live-but-untracked case; a miss is a silent no-op.
+        launchDetached(&.{ "pkill", "-x", "simpbar-shell" });
+    }
+    launchDetached(&.{"simpbar-shell"});
+}
+
+/// One desktop widget's row in the Desktop Widgets group. `id` is the exact
+/// shell.json/control id the shell itself uses (see WidgetId) — it is what
+/// lands in the widgets-disabled file, so it must stay byte-for-byte in sync
+/// with the shell. The mask bit is the row index (GUI-internal only; the
+/// file stores names, never bits).
+const WidgetToggle = struct {
+    id: []const u8,
+    title: [:0]const u8,
+    subtitle: [:0]const u8,
+};
+
+const WIDGET_TABLE = [_]WidgetToggle{
+    .{ .id = "clock", .title = "Clock", .subtitle = "Digital clock card" },
+    .{ .id = "weather", .title = "Weather", .subtitle = "Weather card" },
+    .{ .id = "media", .title = "Media", .subtitle = "Now-playing card with cover art and controls" },
+    .{ .id = "system", .title = "System", .subtitle = "System stats card" },
+    .{ .id = "calendar", .title = "Calendar", .subtitle = "Calendar card with reminders" },
+    .{ .id = "watch", .title = "Watch", .subtitle = "Analog watch" },
+    .{ .id = "note1", .title = "Sticky note", .subtitle = "Sticky note card" },
+};
+
+/// Flips one desktop widget off/on: updates the live mask, persists the
+/// on/off list, and restarts the shell so the change shows up right away.
+/// The widget index arrives as the signal's user_data (see buildWidgetRows).
+/// Independent of config.json — intentionally not routed through
+/// saveAndSignal.
+fn onWidgetEnabledChanged(sw: *gtk.GtkSwitch, _: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
+    const idx: usize = @intFromPtr(user_data.?);
+    if (idx >= WIDGET_TABLE.len) return;
+    const bit: u8 = @as(u8, 1) << @as(u3, @intCast(idx));
+    if (gtk.gtk_switch_get_active(sw) != 0) {
+        live_disabled_mask &= ~bit;
+    } else {
+        live_disabled_mask |= bit;
+    }
+    saveDisabledMask();
+    restartShell();
+}
+
+fn buildWidgetRows(group: *gtk.AdwPreferencesGroup) void {
+    for (WIDGET_TABLE, 0..) |w, i| {
+        const bit: u8 = @as(u8, 1) << @as(u3, @intCast(i));
+        const row = gtk.adw_action_row_new();
+        gtk.adw_preferences_row_set_title(@ptrCast(row), w.title);
+        gtk.adw_action_row_set_subtitle(row, w.subtitle);
+        gtk.adw_action_row_set_icon_name(row, "applications-graphics-symbolic");
+
+        const sw = gtk.gtk_switch_new();
+        gtk.gtk_switch_set_active(sw, if (live_disabled_mask & bit == 0) 1 else 0);
+        gtk.gtk_widget_set_valign(@ptrCast(sw), gtk.ALIGN_CENTER);
+        _ = gtk.g_signal_connect_data(@ptrCast(sw), "notify::active", @ptrCast(&onWidgetEnabledChanged), @ptrFromInt(i), null, 0);
+
+        gtk.adw_action_row_add_suffix(row, @ptrCast(sw));
+        gtk.adw_preferences_group_add(group, @ptrCast(row));
+    }
+}
+
 fn buildClockFormatRow(group: *gtk.AdwPreferencesGroup) void {
     const row = gtk.adw_combo_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(row), "Clock Format");
@@ -1730,6 +1874,11 @@ fn buildAppearancePage() *gtk.GtkBox {
     buildAutoThemeRow(theming_group);
     buildMatugenTypeRow(theming_group);
     gtk.gtk_box_append(outer, @ptrCast(theming_group));
+
+    const widgets_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(widgets_group, "Desktop Widgets");
+    buildWidgetRows(widgets_group);
+    gtk.gtk_box_append(outer, @ptrCast(widgets_group));
 
     const bar_group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(bar_group, "Bar Colors");
