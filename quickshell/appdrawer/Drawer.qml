@@ -428,10 +428,165 @@ PanelWindow {
                 }
         }
 
+        // ---- wallhaven filter bar ----------------------------------------
+        // Sort / range / resolution / category cycles plus color dots, online
+        // mode only. Collapses to zero height otherwise, so the local grid
+        // keeps its exact spacing. Every change re-runs the active query.
+        Item {
+            id: filterBar
+            anchors.top: tabStrip.bottom
+            anchors.topMargin: visible ? 10 : 0
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: win.padX
+            anchors.rightMargin: win.padX
+            height: visible ? 62 : 0
+            visible: win.showingWallpapers && win.whOnline
+
+            Row {
+                id: filterRowA
+                anchors.top: parent.top
+                anchors.left: parent.left
+                spacing: 6
+                height: 28
+
+                Item {
+                    width: 128
+                    height: 28
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: 9
+                        color: sortHover.hovered ? Theme.hover : "transparent"
+                        border.width: 1
+                        border.color: Theme.separator
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Sort: " + WallhavenSearch.sortLabel()
+                        color: Theme.text
+                        font.pixelSize: 12
+                    }
+                    HoverHandler { id: sortHover }
+                    TapHandler { onTapped: WallhavenSearch.cycleSort() }
+                }
+                Item {
+                    width: 118
+                    height: 28
+                    visible: WallhavenSearch.whSort === "toplist"
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: 9
+                        color: rangeHover.hovered ? Theme.hover : "transparent"
+                        border.width: 1
+                        border.color: Theme.separator
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Range: " + WallhavenSearch.rangeLabel()
+                        color: Theme.text
+                        font.pixelSize: 12
+                    }
+                    HoverHandler { id: rangeHover }
+                    TapHandler { onTapped: WallhavenSearch.cycleRange() }
+                }
+                Item {
+                    width: 118
+                    height: 28
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: 9
+                        color: resHover.hovered ? Theme.hover : "transparent"
+                        border.width: 1
+                        border.color: Theme.separator
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Res: " + WallhavenSearch.resLabel()
+                        color: Theme.text
+                        font.pixelSize: 12
+                    }
+                    HoverHandler { id: resHover }
+                    TapHandler { onTapped: WallhavenSearch.cycleRes() }
+                }
+                Item {
+                    width: 128
+                    height: 28
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: 9
+                        color: catHover.hovered ? Theme.hover : "transparent"
+                        border.width: 1
+                        border.color: Theme.separator
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Cat: " + WallhavenSearch.catLabel()
+                        color: Theme.text
+                        font.pixelSize: 12
+                    }
+                    HoverHandler { id: catHover }
+                    TapHandler { onTapped: WallhavenSearch.cycleCat() }
+                }
+            }
+
+            Row {
+                anchors.top: filterRowA.bottom
+                anchors.topMargin: 6
+                anchors.left: parent.left
+                spacing: 6
+                height: 28
+
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Color:"
+                    color: Theme.dim
+                    font.pixelSize: 12
+                }
+                Item {
+                    width: 52
+                    height: 28
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: 9
+                        color: anyColorHover.hovered ? Theme.hover : "transparent"
+                        border.width: 1
+                        border.color: WallhavenSearch.whColor === "" ? Theme.accent : Theme.separator
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Any"
+                        color: WallhavenSearch.whColor === "" ? Theme.accent : Theme.text
+                        font.pixelSize: 12
+                    }
+                    HoverHandler { id: anyColorHover }
+                    TapHandler { onTapped: WallhavenSearch.setColor(WallhavenSearch.whColor) }
+                }
+                Repeater {
+                    model: WallhavenSearch.colorChoices
+                    delegate: Item {
+                        required property string modelData
+                        width: 28
+                        height: 28
+                        Rectangle {
+                            anchors.centerIn: parent
+                            width: 18
+                            height: 18
+                            radius: 9
+                            color: "#" + modelData
+                            border.width: 2
+                            border.color: WallhavenSearch.whColor === modelData ? Theme.accent : "transparent"
+                        }
+                        HoverHandler { id: dotHover }
+                        TapHandler { onTapped: WallhavenSearch.setColor(modelData) }
+                    }
+                }
+            }
+        }
+
         // ---- body: categories + grid --------------------------------------
         Item {
             id: body
-            anchors.top: tabStrip.bottom
+            anchors.top: filterBar.bottom
             anchors.topMargin: 10
             anchors.left: parent.left
             anchors.right: parent.right
@@ -748,7 +903,9 @@ PanelWindow {
                             ? WallpaperModel.status
                             : (win.whOnline
                                ? (WallhavenSearch.results.length > 0
-                                  ? WallhavenSearch.results.length + " results  ·  click a tile to download & apply"
+                                  ? (WallhavenSearch.total > 0
+                                     ? WallhavenSearch.results.length + " of " + WallhavenSearch.total + " results  ·  click a tile to download & apply"
+                                     : WallhavenSearch.results.length + " results  ·  click a tile to download & apply")
                                   : "press Enter to search wallhaven.cc")
                                : WallpaperModel.visibleItems.length + " wallpapers  ·  Enter apply  ·  Esc close")))
                       : (AppModel.visibleApps.length + " apps  ·  Enter launch  ·  Esc close  ·  right-click a tile to pin")
@@ -761,11 +918,44 @@ PanelWindow {
             // HoverHandler + TapHandler, so they all read as one group.
             // Overlays close each other: tapping Power closes Options and vice
             // versa.
-            //
-            // [Bing] [Online] [Random]        [Options] [Power]
+            // [More] [Bing] [Lucky] [Random]        [Options] [Power]
+
+            // Next wallhaven result page, appended to the grid. Only in
+            // online mode while the API reports further pages.
+            Item {
+                id: moreBtn
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.right: bingBtn.left
+                anchors.rightMargin: 8
+                width: 76
+                height: 26
+                visible: win.showingWallpapers && win.whOnline && WallhavenSearch.hasMore && !win.optionsOpen
+
+                Rectangle {
+                    anchors.fill: parent
+                    radius: 8
+                    color: moreHover.hovered ? Theme.hover : "transparent"
+                    border.width: 1
+                    border.color: Theme.separator
+                    opacity: (win.wpBusy || WallhavenSearch.searching) ? 0.5 : 1.0
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: WallhavenSearch.searching ? "Loading…" : "More"
+                        color: Theme.text
+                        font.pixelSize: 12
+                    }
+                }
+                HoverHandler { id: moreHover }
+                TapHandler {
+                    enabled: !win.wpBusy && !WallhavenSearch.searching && !WallhavenSearch.applying && !win.optionsOpen
+                    onTapped: WallhavenSearch.searchMore()
+                }
+            }
 
             // Today's Bing wallpaper, downloaded and applied.
             Item {
+                id: bingBtn
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.right: onlineBtn.left
                 anchors.rightMargin: 8
@@ -795,7 +985,8 @@ PanelWindow {
                 }
             }
 
-            // A random wallpaper from wallhaven.cc, fetched and applied.
+            // A random wallpaper from wallhaven.cc, fetched and applied
+            // (the Lucky button — this is NOT the Wallhaven search tab).
             Item {
                 id: onlineBtn
                 anchors.verticalCenter: parent.verticalCenter
@@ -815,7 +1006,7 @@ PanelWindow {
 
                     Text {
                         anchors.centerIn: parent
-                        text: win.wpBusy ? "Working…" : "Online"
+                        text: win.wpBusy ? "Working…" : "Lucky"
                         color: Theme.text
                         font.pixelSize: 12
                     }

@@ -18,9 +18,16 @@
 #   simpbar-wallpaper random --online           fetch a random wallhaven.cc wallpaper
 #
 # search/fetch/random options:
-#   --page N        results page (default 1)
+#   --page N        first results page (default 1)
+#   --pages N       fetch N consecutive pages per search, rows concatenated
+#                   (default 1, max 3 — a preview grid's More button walks the
+#                   full selection ~48 rows at a time this way)
 #   --atleast WxH   minimum resolution; "any" to disable (default 1920x1080)
 #   --sorting S     favorites | toplist | date_added (default favorites)
+#   --toprange R    toplist window: 1d 3d 1w 1M 3M 6M 1y (default: the API's
+#                   own, ~1M). Ignored unless --sorting toplist.
+#   --colors HEX    one 6-digit hex color, no '#' (try: 0066cc). Only
+#                   wallpapers built around it come back.
 #   --order O       asc | desc (default desc)
 #   --category C    general | anime | nature | people, comma-separated, or
 #                   "any". Enforced locally -- see below. Defaults: search ->
@@ -38,6 +45,11 @@
 #   --apply         apply it once downloaded
 #   --thumbs        search only: also print each result's small-thumbnail URL as
 #                   an extra column after the image URL (preview grids use it)
+#   --meta          search only: append a `#meta<TAB>total<TAB>page<TAB>last`
+#                   trailer line after the result rows, so a preview grid can
+#                   page through the full selection instead of stopping at the
+#                   first 24. Ignored with --save (whose stdout is paths-only),
+#                   and skipped by the stock 7-column row parser.
 #   --minres WxH    random --online only: minimum resolution (default 1920x1080)
 #
 # Two things about wallhaven.cc's search that the defaults here work around:
@@ -753,84 +765,12 @@ for im in (d.get("images") or []):
 # wallhaven.cc
 # ---------------------------------------------------------------------------
 
-# id, resolution, category/purity, favourites, views, dominant colours, URL.
-# TAB-separated so `cut -f1` is the id and the rest is still there to read.
-cmd_search() {
-    local query="" page=1 atleast="1920x1080" sorting="favorites" order="desc"
-    local category="general" purity="" seed="" save=0 force=0 apply=0 arg
-    local maxsize=0 thumbs=0
-
-    while [ $# -gt 0 ]; do
-        arg="$1"
-        case "$arg" in
-            --page)      page="${2:-}"; shift 2 || die "--page needs a number" ;;
-            --page=*)    page="${arg#*=}"; shift ;;
-            --atleast)   atleast="${2:-}"; shift 2 || die "--atleast needs WxH" ;;
-            --atleast=*) atleast="${arg#*=}"; shift ;;
-            --sorting)   sorting="${2:-}"; shift 2 || die "--sorting needs a value" ;;
-            --sorting=*) sorting="${arg#*=}"; shift ;;
-            --order)     order="${2:-}"; shift 2 || die "--order needs asc or desc" ;;
-            --order=*)   order="${arg#*=}"; shift ;;
-            --category)  category="${2:-}"; shift 2 || die "--category needs a value" ;;
-            --category=*) category="${arg#*=}"; shift ;;
-            --purity)    purity="${2:-}"; shift 2 || die "--purity needs a value" ;;
-            --purity=*)  purity="${arg#*=}"; shift ;;
-            --seed)      seed="${2:-}"; shift 2 || die "--seed needs a value" ;;
-            --seed=*)    seed="${arg#*=}"; shift ;;
-            --save)      save="${2:-}"; shift 2 || die "--save needs a count" ;;
-            --maxsize)   maxsize="${2:-}"; shift 2 || die "--maxsize needs a number of MB" ;;
-            --maxsize=*) maxsize="${arg#*=}"; shift ;;
-            --save=*)    save="${arg#*=}"; shift ;;
-            --force)     force=1; shift ;;
-            --apply)     apply=1; shift ;;
-            --thumbs)    thumbs=1; shift ;;
-            -h|--help)   fetch_help; return 0 ;;
-            -*)          die "unknown option for search: $arg" ;;
-            *)           query="${query:+$query }$arg"; shift ;;
-        esac
-    done
-
-    need_curl; need_json
-
-    [ -n "$query" ] || die "search needs a query (try: simpbar-wallpaper search 'northern lights')"
-    case "$page" in ''|*[!0-9]*) die "--page must be a number" ;; esac
-    [ "$page" -ge 1 ] || die "--page starts at 1"
-    case "$save" in ''|*[!0-9]*) die "--save needs a count" ;; esac
-    [ "$save" -le 24 ] || die "--save is at most 24 (one page of results)"
-    case "$maxsize" in ''|*[!0-9]*) die "--maxsize must be a number of MB" ;; esac
-    case "$sorting" in favorites|toplist|date_added) ;; *) die "--sorting must be favorites, toplist or date_added" ;; esac
-    case "$order" in asc|desc) ;; *) die "--order must be asc or desc" ;; esac
-    # Comma-separated, because the API's own categories parameter takes a list
-    # even though it then ignores it.
-    local c
-    for c in ${category//,/ }; do
-        case "$c" in
-            general|anime|nature|people) ;;
-            *) die "--category must be general, anime, nature or people (comma-separated), or 'any'" ;;
-        esac
-    done
-    [ "$category" = "any" ] && category=""
-    if [ "$atleast" != "any" ] && ! printf '%s' "$atleast" | grep -Eq '^[0-9]+x[0-9]+$'; then
-        die "--atleast must be WxH (1920x1080) or 'any'"
-    fi
-
-    purity="$(wallhaven_purity "$purity")" || exit 1
-
-    # categories is sent because it costs nothing and may start working, but the
-    # result is filtered locally as well -- see the header.
-    local url="https://wallhaven.cc/api/v1/search"
-    url="$url?q=$(urlenc "$query")&purity=$purity"
-    [ -n "$category" ] && url="$url&categories=$(urlenc "$category")"
-    url="$url&sorting=$sorting&order=$order&page=$page"
-    [ "$atleast" != "any" ] && url="$url&atleast=$atleast"
-    [ -n "$seed" ] && url="$url&seed=$(urlenc "$seed")"
-    url="$url$(wallhaven_authopts)"
-
-    local json
-    json="$(api_get "$url")" || return 1
-
-    local n
-    n="$(printf '%s' "$json" | python3 -c '
+# Turn one /search response (on stdin) into TAB-separated result rows.
+# Args: category-list, maxsize-MB, thumbs-flag. Exits non-zero when the body
+# is not parseable JSON at all (an empty-but-valid page is NOT an error --
+# the caller decides whether to try the next page).
+wallhaven_rows() {
+    python3 -c '
 import json, sys
 want = set(filter(None, sys.argv[1].split(",")))
 maxsize = int(sys.argv[2]) * 1024 * 1024
@@ -859,11 +799,148 @@ for w in (d.get("data") or []):
         row.append((w.get("thumbs") or {}).get("small") or "")
     rows.append("\t".join(row))
 print("\n".join(rows))
-' "$category" "$maxsize" "$thumbs")" || { log "could not read the API's response"; return 1; }
+' "$1" "$2" "$3"
+}
 
-    if ! printf '%s' "$n" | grep -q '[^[:space:]]'; then
+# Last result page a /search response (on stdin) reports, or empty when the
+# body has no usable meta block.
+wallhaven_last_page() {
+    python3 -c '
+import json, math, sys
+try:
+    m = json.load(sys.stdin).get("meta", {}) or {}
+    total = m.get("total", "")
+    last = m.get("last_page", "")
+    per = m.get("per_page", "") or 24
+    if not last and str(total).isdigit():
+        last = math.ceil(int(total) / int(per))
+    print(last if last else "")
+except Exception:
+    print("")
+'
+}
+
+# id, resolution, category/purity, favourites, views, dominant colours, URL.
+# TAB-separated so `cut -f1` is the id and the rest is still there to read.
+cmd_search() {
+    local query="" page=1 pages=1 atleast="1920x1080" sorting="favorites" order="desc"
+    local category="general" purity="" seed="" save=0 force=0 apply=0 arg
+    local maxsize=0 thumbs=0 meta=0 colors="" toprange=""
+
+    while [ $# -gt 0 ]; do
+        arg="$1"
+        case "$arg" in
+            --page)      page="${2:-}"; shift 2 || die "--page needs a number" ;;
+            --page=*)    page="${arg#*=}"; shift ;;
+            --pages)     pages="${2:-}"; shift 2 || die "--pages needs a number" ;;
+            --pages=*)   pages="${arg#*=}"; shift ;;
+            --atleast)   atleast="${2:-}"; shift 2 || die "--atleast needs WxH" ;;
+            --atleast=*) atleast="${arg#*=}"; shift ;;
+            --sorting)   sorting="${2:-}"; shift 2 || die "--sorting needs a value" ;;
+            --sorting=*) sorting="${arg#*=}"; shift ;;
+            --order)     order="${2:-}"; shift 2 || die "--order needs asc or desc" ;;
+            --order=*)   order="${arg#*=}"; shift ;;
+            --category)  category="${2:-}"; shift 2 || die "--category needs a value" ;;
+            --category=*) category="${arg#*=}"; shift ;;
+            --purity)    purity="${2:-}"; shift 2 || die "--purity needs a value" ;;
+            --purity=*)  purity="${arg#*=}"; shift ;;
+            --seed)      seed="${2:-}"; shift 2 || die "--seed needs a value" ;;
+            --seed=*)    seed="${arg#*=}"; shift ;;
+            --save)      save="${2:-}"; shift 2 || die "--save needs a count" ;;
+            --maxsize)   maxsize="${2:-}"; shift 2 || die "--maxsize needs a number of MB" ;;
+            --maxsize=*) maxsize="${arg#*=}"; shift ;;
+            --save=*)    save="${arg#*=}"; shift ;;
+            --force)     force=1; shift ;;
+            --apply)     apply=1; shift ;;
+            --thumbs)    thumbs=1; shift ;;
+            --meta)      meta=1; shift ;;
+            --colors)    colors="${2:-}"; shift 2 || die "--colors needs a hex color" ;;
+            --colors=*)  colors="${arg#*=}"; shift ;;
+            --toprange)  toprange="${2:-}"; shift 2 || die "--toprange needs a range" ;;
+            --toprange=*) toprange="${arg#*=}"; shift ;;
+            -h|--help)   fetch_help; return 0 ;;
+            -*)          die "unknown option for search: $arg" ;;
+            *)           query="${query:+$query }$arg"; shift ;;
+        esac
+    done
+
+    need_curl; need_json
+
+    [ -n "$query" ] || die "search needs a query (try: simpbar-wallpaper search 'northern lights')"
+    case "$page" in ''|*[!0-9]*) die "--page must be a number" ;; esac
+    [ "$page" -ge 1 ] || die "--page starts at 1"
+    case "$pages" in ''|*[!0-9]*) die "--pages must be a number" ;; esac
+    [ "$pages" -ge 1 ] && [ "$pages" -le 3 ] || die "--pages must be 1-3 (be kind to the API)"
+    case "$save" in ''|*[!0-9]*) die "--save needs a count" ;; esac
+    [ "$save" -le 24 ] || die "--save is at most 24 (one page of results)"
+    case "$maxsize" in ''|*[!0-9]*) die "--maxsize must be a number of MB" ;; esac
+    case "$sorting" in favorites|toplist|date_added) ;; *) die "--sorting must be favorites, toplist or date_added" ;; esac
+    case "$order" in asc|desc) ;; *) die "--order must be asc or desc" ;; esac
+    case "$toprange" in ""|1d|3d|1w|1M|3M|6M|1y) ;; *) die "--toprange must be 1d, 3d, 1w, 1M, 3M, 6M or 1y" ;; esac
+    if [ -n "$colors" ] && ! printf '%s' "$colors" | grep -Eq '^[0-9a-fA-F]{6}$'; then
+        die "--colors must be one 6-digit hex color, no '#' (try: --colors 0066cc)"
+    fi
+    # Comma-separated, because the API's own categories parameter takes a list
+    # even though it then ignores it. "any" skips the local filter entirely.
+    local c
+    if [ "$category" != "any" ]; then
+        for c in ${category//,/ }; do
+            case "$c" in
+                general|anime|nature|people) ;;
+                *) die "--category must be general, anime, nature or people (comma-separated), or 'any'" ;;
+            esac
+        done
+    fi
+    [ "$category" = "any" ] && category=""
+    if [ "$atleast" != "any" ] && ! printf '%s' "$atleast" | grep -Eq '^[0-9]+x[0-9]+$'; then
+        die "--atleast must be WxH (1920x1080) or 'any'"
+    fi
+
+    purity="$(wallhaven_purity "$purity")" || exit 1
+
+    # categories is sent because it costs nothing and may start working, but the
+    # result is filtered locally as well -- see the header. Pages are fetched
+    # oldest-first from --page through --page+--pages-1 (a preview grid's More
+    # button walks the full selection this way); an empty page is skipped, not
+    # fatal, and fetching stops early at the API's own last page.
+    local n="" got=0 p="$page" last_json="" last_ok_page="$page" json rows
+    while [ "$p" -lt $((page + pages)) ]; do
+        local url="https://wallhaven.cc/api/v1/search"
+        url="$url?q=$(urlenc "$query")&purity=$purity"
+        [ -n "$category" ] && url="$url&categories=$(urlenc "$category")"
+        url="$url&sorting=$sorting&order=$order&page=$p"
+        # topRange only means anything to toplist sorting; sending it with
+        # anything else is silently ignored server-side, so keep it off.
+        [ "$sorting" = "toplist" ] && [ -n "$toprange" ] && url="$url&topRange=$toprange"
+        [ -n "$colors" ] && url="$url&colors=$colors"
+        [ "$atleast" != "any" ] && url="$url&atleast=$atleast"
+        [ -n "$seed" ] && url="$url&seed=$(urlenc "$seed")"
+        url="$url$(wallhaven_authopts)"
+
+        if ! json="$(api_get "$url")"; then
+            # A failed page after good ones hands over what it has; a failed
+            # first page is the original silent failure (api_get logged why).
+            [ "$got" -eq 1 ] && break || return 1
+        fi
+        last_json="$json"
+        rows="$(printf '%s' "$json" | wallhaven_rows "$category" "$maxsize" "$thumbs")" || { log "could not read the API's response"; return 1; }
+        if printf '%s' "$rows" | grep -q '[^[:space:]]'; then
+            n="${n:+$n
+}$rows"
+            got=1
+            last_ok_page="$p"
+        fi
+        local last_here
+        last_here="$(printf '%s' "$json" | wallhaven_last_page)"
+        case "$last_here" in ''|*[!0-9]*) ;;
+            *) [ "$p" -ge "$last_here" ] && break ;;
+        esac
+        p=$((p + 1))
+    done
+
+    if [ "$got" -eq 0 ]; then
         local total
-        total="$(printf '%s' "$json" | python3 -c '
+        total="$(printf '%s' "$last_json" | python3 -c '
 import json, sys
 try: print(json.load(sys.stdin).get("meta", {}).get("total", ""))
 except Exception: print("")
@@ -871,7 +948,7 @@ except Exception: print("")
         if [ -n "$category" ]; then
             log "no '${category}' results for \"$query\" on page $page"
             log "  the API does not filter by category itself, so this is filtered here --"
-            log "  the page may simply have had other categories on it. Try --page $((page + 1)) or --category any"
+            log "  the page may simply have had other categories on it. Try --page $((page + pages)) or --category any"
         else
             log "no results for \"$query\" (purity=$purity, min ${atleast})"
         fi
@@ -904,6 +981,29 @@ except Exception: print("")
     fi
 
     printf '%s\n' "$n"
+    # Paged browsing for preview grids: a `#meta` trailer (total, highest
+    # page behind these rows, last page) after the result rows. Four tab
+    # fields, so the stock row parser (7+ fields) skips it, and `cut -f1`
+    # pipelines never see it as an id. Skipped under --save, whose stdout
+    # contract is paths-only.
+    if [ "$meta" -eq 1 ] && [ "$save" -eq 0 ]; then
+        local metaline mtotal="" mlast=""
+        metaline="$(printf '%s' "$last_json" | python3 -c '
+import json, math, sys
+try:
+    m = json.load(sys.stdin).get("meta", {}) or {}
+    total = m.get("total", "")
+    last = m.get("last_page", "")
+    per = m.get("per_page", "") or 24
+    if not last and str(total).isdigit():
+        last = math.ceil(int(total) / int(per))
+    print("%s\t%s" % (total, last))
+except Exception:
+    print("\t")
+')" || metaline=""
+        IFS=$'\t' read -r mtotal mlast <<< "$metaline"
+        printf '#meta\t%s\t%s\t%s\n' "$mtotal" "$last_ok_page" "${mlast:-1}"
+    fi
     return 0
 }
 
