@@ -206,6 +206,15 @@ const JsonAppearance = struct {
     popup_hover_color: []const u8 = "#3A3A3A",
     popup_separator_color: []const u8 = "#444444",
     popup_disabled_color: []const u8 = "#707070",
+    bezel_color: []const u8 = "#DCDCDC",
+    matrix_color: []const u8 = "#00FF41",
+    // "none" (default), "cava" or "matrix" — the bar background mode.
+    // Matches main.zig's JsonAppearance.bg_mode exactly.
+    bg_mode: []const u8 = "none",
+    // Cava background wash strength 0-100. Matches main.zig exactly.
+    cava_bg_strength: u8 = 35,
+    // Matrix fall speed. Matches main.zig exactly.
+    matrix_speed: u32 = 2,
     bar_height: u32 = 28,
     border_top_px: u32 = 2,
     border_bottom_px: u32 = 0,
@@ -247,9 +256,14 @@ const JsonAppearance = struct {
     // Hover/active-pill animation master switch. Matches main.zig's
     // JsonAppearance.animations_enabled exactly.
     animations_enabled: bool = true,
-    // "matugen" (default) or "rainbow-puke" — the hover/active bezel style.
-    // Matches main.zig's JsonAppearance.bezel_style exactly.
+    // "matugen" (default), "rainbow-puke" or "solid" — the hover/active
+    // bezel style. Matches main.zig's JsonAppearance.bezel_style exactly.
     bezel_style: []const u8 = "matugen",
+    // "rotating" (default), "breathing" or "solid" — the hover/active bezel
+    // effect. Matches main.zig's JsonAppearance.bezel_effect exactly.
+    bezel_effect: []const u8 = "rotating",
+    module_pill_opacity: u8 = 100,
+    module_border_width: u32 = 1,
     // Resting module pills on/off. Matches main.zig's
     // JsonAppearance.module_pills exactly.
     module_pills: bool = true,
@@ -458,7 +472,7 @@ fn rgbaToHex(c: gtk.GdkRGBA, buf: []u8) []const u8 {
 // Live in-memory config state
 // ---------------------------------------------------------------------
 
-const ColorField = enum { bg, text, border, hover, module_bg, cava, ws_active, ws_inactive, popup_bg, popup_hover, popup_separator, popup_disabled };
+const ColorField = enum { bg, text, border, hover, module_bg, cava, ws_active, ws_inactive, popup_bg, popup_hover, popup_separator, popup_disabled, bezel, matrix };
 
 const ColorSpec = struct {
     field: ColorField,
@@ -482,6 +496,8 @@ const COLOR_SPECS = [_]ColorSpec{
     .{ .field = .popup_hover, .default_hex = "#3A3A3A", .title = "Popup Hover", .group = .popup },
     .{ .field = .popup_separator, .default_hex = "#444444", .title = "Popup Separator", .group = .popup },
     .{ .field = .popup_disabled, .default_hex = "#707070", .title = "Popup Disabled Text", .group = .popup },
+    .{ .field = .bezel, .default_hex = "#DCDCDC", .title = "Bezel Color", .group = .bar },
+    .{ .field = .matrix, .default_hex = "#00FF41", .title = "Matrix Rain", .group = .bar },
 };
 
 var live_color_values: [COLOR_SPECS.len]gtk.GdkRGBA = undefined;
@@ -527,6 +543,18 @@ var live_auto_theme: []const u8 = "matugen";
 var live_animations_enabled: bool = true;
 // Bezel style, one of BEZEL_STYLE_CHOICES below (static literals).
 var live_bezel_style: []const u8 = "matugen";
+// Bezel effect, one of BEZEL_EFFECT_CHOICES below (static literals).
+var live_bezel_effect: []const u8 = "rotating";
+// Bar background mode, one of BG_MODE_CHOICES below (static literals).
+var live_bg_mode: []const u8 = "none";
+// Cava background wash strength 0-100.
+var live_cava_bg_strength: u8 = 35;
+// Matrix fall speed, pixels per tick.
+var live_matrix_speed: u32 = 2;
+// Resting pill opacity 0-100.
+var live_module_pill_opacity: u8 = 100;
+// Bezel outline thickness in px.
+var live_module_border_width: u32 = 1;
 // Resting module pills on/off.
 var live_module_pills: bool = true;
 // Bezel rings on/off wherever they appear.
@@ -882,6 +910,7 @@ fn loadConfigFromDisk() void {
         j.workspace_inactive_color,
         j.popup_bg_color,              j.popup_hover_color,
         j.popup_separator_color,       j.popup_disabled_color,
+        j.bezel_color,                 j.matrix_color,
     };
     for (hexes, 0..) |hex, i| {
         live_color_values[i] = hexToRgba(hex) orelse hexToRgba(COLOR_SPECS[i].default_hex).?;
@@ -903,7 +932,13 @@ fn loadConfigFromDisk() void {
     live_auto_theme = if (std.mem.eql(u8, j.auto_theme, "manual")) "manual" else "matugen";
     live_empty_click_command = j.empty_click_command;
     live_animations_enabled = j.animations_enabled;
-    live_bezel_style = if (std.mem.eql(u8, j.bezel_style, "rainbow-puke")) "rainbow-puke" else "matugen";
+    live_bezel_style = if (std.mem.eql(u8, j.bezel_style, "rainbow-puke")) "rainbow-puke" else if (std.mem.eql(u8, j.bezel_style, "solid")) "solid" else "matugen";
+    live_bezel_effect = if (std.mem.eql(u8, j.bezel_effect, "breathing")) "breathing" else if (std.mem.eql(u8, j.bezel_effect, "solid")) "solid" else "rotating";
+    live_bg_mode = if (std.mem.eql(u8, j.bg_mode, "cava")) "cava" else if (std.mem.eql(u8, j.bg_mode, "matrix")) "matrix" else "none";
+    live_cava_bg_strength = @min(j.cava_bg_strength, 100);
+    live_matrix_speed = std.math.clamp(j.matrix_speed, 1, 6);
+    live_module_pill_opacity = @min(j.module_pill_opacity, 100);
+    live_module_border_width = @min(j.module_border_width, 8);
     live_module_pills = j.module_pills;
     live_pill_borders = j.pill_borders;
     // Scheme type lives in its own simpbar-owned file (not config.json, not
@@ -1048,6 +1083,8 @@ fn buildConfigJson() ![]u8 {
             .popup_hover => "popup_hover_color",
             .popup_separator => "popup_separator_color",
             .popup_disabled => "popup_disabled_color",
+            .bezel => "bezel_color",
+            .matrix => "matrix_color",
         };
         try appendJsonString(&list, key);
         try list.append(gpa, ':');
@@ -1090,6 +1127,18 @@ fn buildConfigJson() ![]u8 {
     try list.appendSlice(gpa, if (live_animations_enabled) "true" else "false");
     try list.appendSlice(gpa, ",\"bezel_style\":");
     try appendJsonString(&list, live_bezel_style);
+    try list.appendSlice(gpa, ",\"bezel_effect\":");
+    try appendJsonString(&list, live_bezel_effect);
+    try list.appendSlice(gpa, ",\"bg_mode\":");
+    try appendJsonString(&list, live_bg_mode);
+    try list.appendSlice(gpa, ",\"cava_bg_strength\":");
+    try appendJsonInt(&list, u8, live_cava_bg_strength);
+    try list.appendSlice(gpa, ",\"matrix_speed\":");
+    try appendJsonInt(&list, u32, live_matrix_speed);
+    try list.appendSlice(gpa, ",\"module_pill_opacity\":");
+    try appendJsonInt(&list, u8, live_module_pill_opacity);
+    try list.appendSlice(gpa, ",\"module_border_width\":");
+    try appendJsonInt(&list, u32, live_module_border_width);
     try list.appendSlice(gpa, ",\"module_pills\":");
     try list.appendSlice(gpa, if (live_module_pills) "true" else "false");
     try list.appendSlice(gpa, ",\"pill_borders\":");
@@ -1264,6 +1313,16 @@ fn onCornerRadiusChanged(button: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c
     saveAndSignal();
 }
 
+fn onModulePillOpacityChanged(button: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c) void {
+    live_module_pill_opacity = @intCast(@min(gtk.gtk_spin_button_get_value_as_int(button), 100));
+    saveAndSignal();
+}
+
+fn onModuleBorderWidthChanged(button: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c) void {
+    live_module_border_width = @intCast(@min(@max(gtk.gtk_spin_button_get_value_as_int(button), 0), 8));
+    saveAndSignal();
+}
+
 fn onPositionChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
     live_position = if (gtk.adw_combo_row_get_selected(row) == 0) "top" else "bottom";
     saveAndSignal();
@@ -1426,7 +1485,7 @@ fn onAnimationsEnabledChanged(sw: *gtk.GtkSwitch, _: *gtk.GParamSpec, _: ?*anyop
 fn buildAnimationsRow(group: *gtk.AdwPreferencesGroup) void {
     const row = gtk.adw_action_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(row), "Animations");
-    gtk.adw_action_row_set_subtitle(row, "Fade and rotate the hover highlight and active-workspace pill. Turning this off snaps highlights instantly and freezes the bezel.");
+    gtk.adw_action_row_set_subtitle(row, "Fade the hover highlight and active-workspace pill, and move the bezel. Turning this off snaps highlights instantly and freezes the bezel.");
     gtk.adw_action_row_set_icon_name(row, "applications-graphics-symbolic");
 
     const sw = gtk.gtk_switch_new();
@@ -1440,8 +1499,88 @@ fn buildAnimationsRow(group: *gtk.AdwPreferencesGroup) void {
 
 // Bezel style choices (values must stay byte-for-byte in sync with main.zig's
 // BEZEL_STYLE_* — they are written straight into config.json).
-const BEZEL_STYLE_CHOICES = [_][]const u8{ "matugen", "rainbow-puke" };
-const BEZEL_STYLE_LABELS = [_][*:0]const u8{ "Matugen", "Rainbow puke" };
+const BEZEL_STYLE_CHOICES = [_][]const u8{ "matugen", "rainbow-puke", "solid" };
+const BEZEL_STYLE_LABELS = [_][*:0]const u8{ "Matugen", "Rainbow puke", "Solid" };
+
+// Bezel effect choices (values must stay byte-for-byte in sync with
+// main.zig's BEZEL_EFFECT_* — they are written straight into config.json).
+const BEZEL_EFFECT_CHOICES = [_][]const u8{ "rotating", "breathing", "solid" };
+
+// Background mode choices (values must stay byte-for-byte in sync with
+// main.zig's BG_MODE_* — they are written straight into config.json).
+const BG_MODE_CHOICES = [_][]const u8{ "none", "cava", "matrix" };
+const BG_MODE_LABELS = [_][*:0]const u8{ "None", "Cava", "Matrix" };
+
+/// Picks the bar background mode (appearance.bg_mode). Applies on the next
+/// SIGUSR1 reload like every other config.json change.
+fn onBgModeChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx >= BG_MODE_CHOICES.len) return;
+    live_bg_mode = BG_MODE_CHOICES[idx];
+    saveAndSignal();
+}
+
+fn buildBgModeRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Background effect");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "Animated backdrop behind the modules. Cava follows the music; Matrix rains on its own.");
+
+    var buf: [BG_MODE_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (BG_MODE_LABELS, 0..) |label, i| buf[i] = label;
+    buf[BG_MODE_LABELS.len] = null;
+    gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+
+    var selected_idx: c_uint = 0;
+    for (BG_MODE_CHOICES, 0..) |choice, i| {
+        if (std.mem.eql(u8, choice, live_bg_mode)) selected_idx = @intCast(i);
+    }
+    gtk.adw_combo_row_set_selected(row, selected_idx);
+    _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onBgModeChanged), null, null, 0);
+
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+/// Sets the cava background wash strength (appearance.cava_bg_strength).
+fn onCavaBgStrengthChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c) void {
+    live_cava_bg_strength = @intCast(@min(gtk.gtk_spin_button_get_value_as_int(spin), 100));
+    saveAndSignal();
+}
+
+/// Sets the matrix fall speed (appearance.matrix_speed).
+fn onMatrixSpeedChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c) void {
+    live_matrix_speed = @as(u32, @intCast(gtk.gtk_spin_button_get_value_as_int(spin)));
+    saveAndSignal();
+}
+const BEZEL_EFFECT_LABELS = [_][*:0]const u8{ "Rotating", "Breathing", "Solid" };
+
+/// Picks the hover/active bezel effect (appearance.bezel_effect). Applies on
+/// the next SIGUSR1 reload like every other config.json change.
+fn onBezelEffectChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx >= BEZEL_EFFECT_CHOICES.len) return;
+    live_bezel_effect = BEZEL_EFFECT_CHOICES[idx];
+    saveAndSignal();
+}
+
+fn buildBezelEffectRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Bezel effect");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "How the bezel moves: travel around the pill, gently swell in place, or sit still.");
+
+    var buf: [BEZEL_EFFECT_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (BEZEL_EFFECT_LABELS, 0..) |label, i| buf[i] = label;
+    buf[BEZEL_EFFECT_LABELS.len] = null;
+    gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+
+    var selected_idx: c_uint = 0;
+    for (BEZEL_EFFECT_CHOICES, 0..) |choice, i| {
+        if (std.mem.eql(u8, choice, live_bezel_effect)) selected_idx = @intCast(i);
+    }
+    gtk.adw_combo_row_set_selected(row, selected_idx);
+    _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onBezelEffectChanged), null, null, 0);
+
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
 
 /// Picks the hover/active bezel style (appearance.bezel_style). Applies on
 /// the next SIGUSR1 reload like every other config.json change.
@@ -1455,7 +1594,7 @@ fn onBezelStyleChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque
 fn buildBezelStyleRow(group: *gtk.AdwPreferencesGroup) void {
     const row = gtk.adw_combo_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(row), "Bezel style");
-    gtk.adw_action_row_set_subtitle(@ptrCast(row), "What travels around the hover highlight and active-workspace pill: the wallpaper palette, or the full hue wheel.");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "What the bezel ring wears: the wallpaper palette traveling around, the full hue wheel, or one solid Bezel Color (under Bar Colors).");
 
     var buf: [BEZEL_STYLE_LABELS.len + 1]?[*:0]const u8 = undefined;
     for (BEZEL_STYLE_LABELS, 0..) |label, i| buf[i] = label;
@@ -2077,8 +2216,11 @@ fn buildAppearancePage() *gtk.GtkBox {
     gtk.adw_preferences_group_set_title(animation_group, "Animation");
     buildAnimationsRow(animation_group);
     buildBezelStyleRow(animation_group);
+    buildBezelEffectRow(animation_group);
     buildModulePillsRow(animation_group);
     buildPillBordersRow(animation_group);
+    addSpinRow(animation_group, "Module pill opacity (%)", 0, 100, @floatFromInt(live_module_pill_opacity), @ptrCast(&onModulePillOpacityChanged));
+    addSpinRow(animation_group, "Pill border width (px)", 0, 8, @floatFromInt(live_module_border_width), @ptrCast(&onModuleBorderWidthChanged));
     gtk.gtk_box_append(outer, @ptrCast(animation_group));
 
     const widgets_group = gtk.adw_preferences_group_new();
@@ -2129,9 +2271,17 @@ fn buildAppearancePage() *gtk.GtkBox {
 
     const transparency_group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(transparency_group, "Transparency");
-    gtk.adw_preferences_group_set_description(transparency_group, "Lowering this fades the bar's background through to what's behind it. For an actual blur (not just a plain see-through cutout), simpbar's Hyprland layer rule needs blur enabled too — already set up if you added it from here.");
+    gtk.adw_preferences_group_set_description(transparency_group, "Lowering this fades the bar's background and borders through to what's behind it, down to invisible at 0 — modules, pills and text stay fully visible, floating over the wallpaper. For an actual blur (not just a plain see-through cutout), turn on Bar Blur in your compositor's settings page.");
     addSpinRow(transparency_group, "Background Opacity (%)", 0, 100, @floatFromInt(live_bg_opacity_percent), @ptrCast(&onBgOpacityChanged));
     gtk.gtk_box_append(outer, @ptrCast(transparency_group));
+
+    const background_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(background_group, "Background Effect");
+    gtk.adw_preferences_group_set_description(background_group, "What paints behind the modules: nothing, the audio visualizer wash (uses the Audio Visualizer color under Bar Colors), or cmatrix-style glyph rain (uses the Matrix Rain color). Effects need a visible background — at 0% opacity above there is nothing to paint on.");
+    buildBgModeRow(background_group);
+    addSpinRow(background_group, "Cava Strength (%)", 0, 100, @floatFromInt(live_cava_bg_strength), @ptrCast(&onCavaBgStrengthChanged));
+    addSpinRow(background_group, "Matrix Speed", 1, 6, @floatFromInt(live_matrix_speed), @ptrCast(&onMatrixSpeedChanged));
+    gtk.gtk_box_append(outer, @ptrCast(background_group));
 
     const font_group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(font_group, "Font");

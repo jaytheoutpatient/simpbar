@@ -219,6 +219,146 @@ fn addComboField(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, labels: [
 }
 
 // ---------------------------------------------------------------------
+// Per-surface blur switches — the Blur group's Bar / Desktop Widgets
+// rows. These are NOT single appearance.conf keys: each toggles the
+// `no_blur` param on that surface's layer_rule line in rules.conf
+// (Mango only blurs a layer when blur_layer is on AND no rule opts it
+// out, so the switch reads/writes that opt-out).
+// ---------------------------------------------------------------------
+
+const BlurCtx = struct { surface: []const u8 };
+var g_blur_ctx: [8]BlurCtx = undefined;
+var g_blur_n: usize = 0;
+
+/// Splits one `layer_rule` value into its comma-separated params. For each
+/// non-empty fragment calls `f` with (key, value) — value is "" when the
+/// fragment carries no colon (kept verbatim by the writer below, mirroring
+/// openRuleDialog's extras handling).
+fn eachRuleParam(value: []const u8, ctx: anytype, f: fn (@TypeOf(ctx), []const u8, []const u8, []const u8) void) void {
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |raw| {
+        const p = std.mem.trim(u8, raw, " \t");
+        if (p.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, p, ':')) |c| {
+            f(ctx, p, std.mem.trim(u8, p[0..c], " \t"), std.mem.trim(u8, p[c + 1 ..], " \t"));
+        } else {
+            f(ctx, p, "", "");
+        }
+    }
+}
+
+/// Index of the LAST layer_rule line matching `surface` (later rules win),
+/// or null. Mango matches layer_name as a regex; the GUI works on exact
+/// names, same as the Layer Rules editor's display.
+fn layerRuleIndexFor(surface: []const u8) ?usize {
+    var found: ?usize = null;
+    for (doc_rules.lines.items, 0..) |l, i| {
+        const kv = mango.parseKV(l) orelse continue;
+        if (!std.mem.eql(u8, kv.key, "layer_rule")) continue;
+        var name_match = false;
+        var it = std.mem.splitScalar(u8, kv.value, ',');
+        while (it.next()) |raw| {
+            const p = std.mem.trim(u8, raw, " \t");
+            const c = std.mem.indexOfScalar(u8, p, ':') orelse continue;
+            if (std.mem.eql(u8, std.mem.trim(u8, p[0..c], " \t"), "layer_name") and
+                std.mem.eql(u8, std.mem.trim(u8, p[c + 1 ..], " \t"), surface))
+            {
+                name_match = true;
+                break;
+            }
+        }
+        if (name_match) found = i;
+    }
+    return found;
+}
+
+/// Effective blur state for a layer-shell surface: blurred unless its
+/// (last matching) layer_rule line opts out with no_blur:1. Missing line or
+/// missing param both mean blurred — the default once blur_layer is on.
+fn layerBlurEnabled(surface: []const u8) bool {
+    const i = layerRuleIndexFor(surface) orelse return true;
+    const kv = mango.parseKV(doc_rules.line(i)) orelse return true;
+    var it = std.mem.splitScalar(u8, kv.value, ',');
+    while (it.next()) |raw| {
+        const p = std.mem.trim(u8, raw, " \t");
+        const c = std.mem.indexOfScalar(u8, p, ':') orelse continue;
+        if (std.mem.eql(u8, std.mem.trim(u8, p[0..c], " \t"), "no_blur")) {
+            const v = std.mem.trim(u8, p[c + 1 ..], " \t");
+            return !(std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true"));
+        }
+    }
+    return true;
+}
+
+const BlurEmit = struct { out: []u8, n: *usize, first: *bool, want: []const u8, saw: *bool };
+
+fn blurEmitSet(ctx: *BlurEmit, frag: []const u8, pk: []const u8, pv: []const u8) void {
+    if (!ctx.first.*) appendStr(ctx.out, ctx.n, ", ");
+    ctx.first.* = false;
+    if (pk.len == 0) {
+        appendStr(ctx.out, ctx.n, frag);
+    } else if (std.mem.eql(u8, pk, "no_blur")) {
+        appendStr(ctx.out, ctx.n, "no_blur:");
+        appendStr(ctx.out, ctx.n, ctx.want);
+        ctx.saw.* = true;
+    } else {
+        appendStr(ctx.out, ctx.n, pk);
+        appendStr(ctx.out, ctx.n, ":");
+        appendStr(ctx.out, ctx.n, pv);
+    }
+}
+
+/// Sets the surface's blur state, preserving every other param (and any
+/// colon-less extras) on its layer_rule line in place. Appends a minimal
+/// opt-out line when turning off with no line to edit; turning on with no
+/// line needs no write — blurring is the default for layers.
+fn setLayerBlur(surface: []const u8, on: bool) void {
+    const want: []const u8 = if (on) "0" else "1";
+    if (layerRuleIndexFor(surface)) |mi| {
+        const kv = mango.parseKV(doc_rules.line(mi)) orelse return;
+        var buf: [mango.MAX_LINE]u8 = undefined;
+        var n: usize = 0;
+        var first = true;
+        var saw = false;
+        var ctx: BlurEmit = .{ .out = &buf, .n = &n, .first = &first, .want = want, .saw = &saw };
+        appendStr(&buf, &n, "layer_rule = ");
+        eachRuleParam(kv.value, &ctx, blurEmitSet);
+        if (!saw) {
+            appendStr(&buf, &n, ", no_blur:");
+            appendStr(&buf, &n, want);
+        }
+        doc_rules.setLine(mi, buf[0..n]);
+    } else if (!on) {
+        var buf: [mango.MAX_LINE]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "layer_rule = no_blur:1, layer_name:{s}", .{surface}) catch return;
+        doc_rules.appendLine(s);
+    }
+}
+
+fn onSurfaceBlurSwitch(sw: *gtk.GtkSwitch, _: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
+    const ctx: *BlurCtx = @ptrCast(@alignCast(user_data.?));
+    const on = gtk.gtk_switch_get_active(sw) != 0;
+    if (on and !doc_appearance.getBool("blur_layer", true)) {
+        // A surface switch is meaningless with layer blur off — enable it
+        // (the group description says this happens).
+        doc_appearance.setValue("blur_layer", "1");
+        _ = doc_appearance.save();
+    }
+    setLayerBlur(ctx.surface, on);
+    _ = doc_rules.save();
+    reload();
+    rebuildRuleList(&g_rp_lrules);
+}
+
+fn addSurfaceBlurSwitch(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, surface: []const u8) void {
+    if (g_blur_n >= g_blur_ctx.len) g_blur_n = 0;
+    const ctx = &g_blur_ctx[g_blur_n];
+    g_blur_n += 1;
+    ctx.* = .{ .surface = surface };
+    hp.addSwitchRow(group, title, "", layerBlurEnabled(surface), @ptrCast(&onSurfaceBlurSwitch), @ptrCast(ctx));
+}
+
+// ---------------------------------------------------------------------
 // Small utilities
 // ---------------------------------------------------------------------
 
@@ -873,6 +1013,17 @@ fn buildGeneralPage() *gtk.GtkBox {
     addSpinField(decor, "Unfocused Opacity", 0.1, 1.0, 0.05, &doc_appearance, "unfocused_opacity", 1.0, true);
     gtk.gtk_box_append(outer, @ptrCast(decor));
 
+    const blur = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(blur, "Blur");
+    gtk.adw_preferences_group_set_description(blur, "Blur needs something translucent to show through: for the bar use Background Opacity under the Appearance tab, for the widgets card_bg_opacity in ~/.config/simpbar/shell.json. Turning a surface on also enables Blur on Layer Surfaces, which it needs.");
+    addSwitchField(blur, "Enable Blur", &doc_appearance, "blur", true);
+    addSwitchField(blur, "Blur on Layer Surfaces", &doc_appearance, "blur_layer", true);
+    addSurfaceBlurSwitch(blur, "Bar Blur", "simpbar");
+    addSurfaceBlurSwitch(blur, "Desktop Widgets Blur", "simpbar-shell");
+    addSpinField(blur, "Blur Radius", 1, 32, 1, &doc_appearance, "blur_params_radius", 4, false);
+    addSpinField(blur, "Blur Passes", 1, 8, 1, &doc_appearance, "blur_params_num_passes", 2, false);
+    gtk.gtk_box_append(outer, @ptrCast(blur));
+
     const colors = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(colors, "Colors");
     gtk.adw_preferences_group_set_description(colors, "Base colours in appearance.conf. If ~/.config/mango/cfg/matugen-colors.conf exists, matugen's generated colours override these on reload.");
@@ -1073,3 +1224,56 @@ pub const pages = struct {
         };
     }
 };
+
+// ---------------------------------------------------------------------
+// Tests — layer-blur switch logic (pure Doc operations, no display).
+// Run: zig test src/mango_pages.zig
+// ---------------------------------------------------------------------
+
+test "layer blur round-trip" {
+    const t = std.testing;
+    doc_rules.reset();
+    defer doc_rules.reset();
+    // In-memory fixture mirroring a real rules.conf (selection opt-out,
+    // bar line with extra params, widgets line, comment).
+    doc_rules.appendLine("# Layer rules fixture");
+    doc_rules.appendLine("layer_rule = no_animation:1, no_blur:1, layer_name:selection");
+    doc_rules.appendLine("layer_rule = no_animation:0, no_blur:0, layer_name:simpbar");
+    doc_rules.appendLine("layer_rule = no_blur:0, layer_name:simpbar-shell");
+
+    // Fixture state: bar + widgets blurred, selection opted out.
+    try t.expect(layerBlurEnabled("simpbar"));
+    try t.expect(layerBlurEnabled("simpbar-shell"));
+    try t.expect(!layerBlurEnabled("selection"));
+    try t.expect(layerBlurEnabled("never-seen")); // no line = default blur
+
+    // Turning the bar off preserves its other params in place.
+    setLayerBlur("simpbar", false);
+    try t.expect(!layerBlurEnabled("simpbar"));
+    try t.expectEqualStrings("layer_rule = no_animation:0, no_blur:1, layer_name:simpbar", doc_rules.line(2));
+
+    // ...and back on.
+    setLayerBlur("simpbar", true);
+    try t.expect(layerBlurEnabled("simpbar"));
+    try t.expectEqualStrings("layer_rule = no_animation:0, no_blur:0, layer_name:simpbar", doc_rules.line(2));
+
+    // Turning off a surface with no line appends a minimal opt-out.
+    doc_rules.removeLine(3); // drop the simpbarshell line
+    try t.expect(layerBlurEnabled("simpbar-shell"));
+    setLayerBlur("simpbar-shell", false);
+    try t.expect(!layerBlurEnabled("simpbar-shell"));
+    try t.expectEqualStrings("layer_rule = no_blur:1, layer_name:simpbar-shell", doc_rules.line(doc_rules.lineCount() - 1));
+
+    // Turning on a lineless surface writes nothing (default already blurs).
+    const n_before = doc_rules.lineCount();
+    setLayerBlur("never-seen", true);
+    try t.expectEqual(n_before, doc_rules.lineCount());
+
+    // Last matching line wins, for both read and write.
+    doc_rules.appendLine("layer_rule = no_blur:1, layer_name:simpbar");
+    try t.expect(!layerBlurEnabled("simpbar"));
+    setLayerBlur("simpbar", true);
+    try t.expect(layerBlurEnabled("simpbar"));
+    try t.expectEqualStrings("layer_rule = no_blur:0, layer_name:simpbar", doc_rules.line(doc_rules.lineCount() - 1));
+    try t.expectEqualStrings("layer_rule = no_animation:0, no_blur:0, layer_name:simpbar", doc_rules.line(2));
+}

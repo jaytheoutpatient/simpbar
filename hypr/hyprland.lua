@@ -345,6 +345,15 @@ hl.window_rule({
 	float = true,
 })
 
+-- Frost the bar itself like the widgets below: same blur-behind-translucency
+-- deal (the bar's bg_opacity_percent tint controls the frosted strength).
+hl.layer_rule({
+	name = "simpbar-blur",
+	match = { namespace = "^simpbar$" },
+	blur = true,
+	ignore_alpha = 0.5,
+})
+
 -- Frost the desktop widgets (simpbar-shell) like the bar: a layer rule can
 -- add blur that a client can't request for itself on Wayland. ignore_alpha
 -- keeps the fully transparent parts of the surface (where the wallpaper shows

@@ -11,5 +11,7 @@
   "popup_bg_color": "#{{ colors.surface_container.default.hex_stripped }}",
   "popup_hover_color": "#{{ colors.primary_container.default.hex_stripped }}",
   "popup_separator_color": "#{{ colors.outline_variant.default.hex_stripped }}",
-  "popup_disabled_color": "#{{ colors.on_surface_variant.default.hex_stripped }}"
+  "popup_disabled_color": "#{{ colors.on_surface_variant.default.hex_stripped }}",
+  "bezel_color": "#{{ colors.primary.default.hex_stripped }}",
+  "matrix_color": "#{{ colors.tertiary.default.hex_stripped }}"
 }

@@ -58,6 +58,18 @@ pub fn build(b: *Build) !void {
         .name = "simpbar",
         .root_module = exe_mod,
     });
+    // Zig 0.16 defaults Debug builds to the self-hosted x86 backend +
+    // self-hosted ELF linker, and both fall over on this project:
+    //   - the backend segfaults compiling the Debug binaries
+    //     ("process terminated with signal SEGV"), and
+    //   - zig ld cannot handle the R_X86_64_PC64 relocations in the
+    //     .sframe section that GCC 16's crt1.o ships
+    //     ("fatal linker error: unhandled relocation type ...
+    //      in crt1.o:.sframe").
+    // ReleaseFast already picks LLVM+LLD by mode default; pin both
+    // explicitly so every optimize mode builds the same way.
+    exe.use_llvm = true;
+    exe.use_lld = true;
 
     _ = wayland_dep;
 
@@ -88,6 +100,8 @@ pub fn build(b: *Build) !void {
         .name = "simpbar-welcome",
         .root_module = welcome_mod,
     });
+    welcome_exe.use_llvm = true; // see simpbar exe above: Debug defaults SEGV/ld-lld
+    welcome_exe.use_lld = true;
     b.installArtifact(welcome_exe);
 
     const run_welcome_cmd = b.addRunArtifact(welcome_exe);
@@ -115,6 +129,8 @@ pub fn build(b: *Build) !void {
         .name = "simpbar-config",
         .root_module = config_mod,
     });
+    config_exe.use_llvm = true; // see simpbar exe above: Debug defaults SEGV/ld-lld
+    config_exe.use_lld = true;
     b.installArtifact(config_exe);
 
     const run_config_cmd = b.addRunArtifact(config_exe);

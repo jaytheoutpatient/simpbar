@@ -41,8 +41,8 @@ const WORKSPACE_LEFT_MARGIN: i64 = 8;
 /// can join any two module kinds there (workspaces beside clock, mpris
 /// beside launchers, etc.), and without a guaranteed module→module gap the
 /// last segment of one runs straight into the first of the next. Segments
-/// also carry their own intra-module gaps (workspace_gap between pills,
-/// LAUNCHER_GAP between launcher buttons).
+/// also carry their own intra-module gaps (workspace_gap between digits
+/// inside their shared pill, LAUNCHER_GAP between launcher buttons).
 const MODULE_GAP: i64 = 12;
 
 // Spacing for the custom/* launcher buttons and custom/power.
@@ -471,7 +471,7 @@ fn parseIdAt(text: []const u8, start_pos: usize) ?i32 {
     return std.fmt.parseInt(i32, text[start..i], 10) catch null;
 }
 
-const Workspace = struct { id: i32, active: bool };
+const Workspace = struct { id: i32, active: bool, urgent: bool = false };
 
 fn workspaceLessThan(_: void, a: Workspace, b: Workspace) bool {
     return a.id < b.id;
@@ -625,6 +625,16 @@ const Workspaces = struct {
                     const v = p + active_needle.len;
                     if (v < tags_json.len and tags_json[v] == 't') active = true;
                 }
+                // Urgent tags (demanding attention) get a dot under their
+                // digit — bounded to this tag's object like the layout
+                // lookup below, for the same cross-tag reason.
+                var urgent = false;
+                const obj_end_u = std.mem.indexOfPos(u8, tags_json, after, close_needle) orelse tags_json.len;
+                const urgent_needle = "\"is_urgent\":";
+                if (std.mem.indexOf(u8, tags_json[after..obj_end_u], urgent_needle)) |p| {
+                    const v = after + p + urgent_needle.len;
+                    if (v < tags_json.len and tags_json[v] == 't') urgent = true;
+                }
                 // Stash the FIRST active tag's layout. Mango reports each
                 // monitor's tags as one array of flat objects, and this scan
                 // isn't object-aware (same shape as the is_active lookup
@@ -649,7 +659,7 @@ const Workspaces = struct {
                         }
                     }
                 }
-                try self.list.append(self.gpa, .{ .id = id, .active = active });
+                try self.list.append(self.gpa, .{ .id = id, .active = active, .urgent = urgent });
             }
             idx = after;
         }
@@ -974,6 +984,9 @@ const WAYPAPER_BUTTON = LauncherButton{ .label = "\u{f030}", .command = "simpbar
 // expanded like the real one's rotating chevron does, but it's the actual
 // character now instead of a stand-in letter.
 const DRAWER_TOGGLE_LABEL = "\u{25be}";
+/// Drawer toggle glyph while the drawer is open. Measured separately (not
+/// assumed equal advance to the down chevron) so the cell stays exact.
+const DRAWER_TOGGLE_LABEL_UP = "\u{25b4}";
 
 // --- runtime config (module layout, appearance, launcher pins) -----------
 //
@@ -1043,6 +1056,23 @@ const Appearance = struct {
     /// always plain (no rim, no underline, no fade), so the lit states read
     /// by contrast rather than competing with a ring on every module.
     module_bg_color: u32,
+    /// Flat ring color for the "solid" bezel style. Ignored by the traveling
+    /// styles (which build the ring from the palette / hue wheel instead).
+    bezel_color: u32,
+    /// Resting pill opacity, 0-100 (Noctalia's capsule_opacity): blends the
+    /// pill fill toward the opaque bar background, so translucent pills are
+    /// faked the same way everywhere in this file (lerp, since the pipeline
+    /// is opaque). Exact while the bar background itself is opaque; over a
+    /// transparent bar background it reads as translucent-tinted rather than
+    /// true see-through — an accepted approximation, documented here so it
+    /// doesn't surprise anyone later.
+    module_pill_opacity: u8,
+    /// Resting/hover/active bezel outline thickness in px (Noctalia's
+    /// capsule_border_width, 0 disables). Clamped at draw time so at least a
+    /// sliver of fill survives — tiny pills degrade to flat instead of
+    /// inverting. The bezel style itself (matugen ring vs rainbow-puke)
+    /// stays on bezel_style; this is only the width.
+    module_border_width: u32,
     /// Resting module pills on/off. Off = modules sit directly on the bar
     /// background (pre-pill look); hover/active treatments still draw their
     /// own pill when lit, so nothing interactive goes blind.
@@ -1050,16 +1080,36 @@ const Appearance = struct {
     /// Bezel rings on/off wherever they appear (resting pills, hover, active
     /// workspace, popup rows). Off = flat fills + dash only, no rings.
     pill_borders: bool,
-    /// Master switch for hover/active-pill animation (fade + bezel rotation).
+    /// Master switch for hover/active-pill animation (fade + bezel motion).
     /// Off = highlights snap instantly and the bezel sits still — same look,
-    /// none of the motion. Drawer/ticker animation is untouched; this covers
+    /// none of the motion. Drawer animation is untouched; this covers
     /// only the hover treatment.
     animations_enabled: bool,
     /// Hover/active bezel style: "matugen" (default) wears the wallpaper
-    /// palette ring; "rainbow-puke" wears the full hue wheel. Anything
-    /// unrecognized falls back to "matugen", same permissive spirit as
-    /// `position`.
+    /// palette ring; "rainbow-puke" wears the full hue wheel; "solid" wears
+    /// one flat bezel_color ring. Anything unrecognized falls back to
+    /// "matugen", same permissive spirit as `position`.
     bezel_style: []const u8,
+    /// Hover/active bezel effect — what the ring DOES, independent of the
+    /// style above (which picks what travels): "rotating" (default) sends
+    /// the ring around the pill; "breathing" holds it still and swells its
+    /// brightness; "solid" holds it still at full brightness. Only moves
+    /// while animations are on — off freezes every effect at its resting
+    /// phase. Unrecognized values fall back to "rotating".
+    bezel_effect: []const u8,
+    /// Bar background mode: "none" (default) is the plain bg_color fill;
+    /// "cava" washes the equalizer across the whole background (uses the
+    /// Audio Visualizer color); "matrix" rains glyph streams (matrix_color).
+    /// Unrecognized values fall back to "none".
+    bg_mode: []const u8,
+    /// How strongly the cava background wash tints (0-100): 0 = invisible,
+    /// 100 = full cava_color on lit pixels. Module pills/text stay opaque
+    /// above it regardless.
+    cava_bg_strength: u8,
+    /// Glyph-stream color for the "matrix" background mode.
+    matrix_color: u32,
+    /// Matrix fall speed, pixels per 60ms tick (1-6).
+    matrix_speed: u32,
     bar_height: u32,
     /// Four independent edges (px), replacing the old single top-only
     /// border_px — which edge "faces the desktop" flips with `position`, but
@@ -1186,6 +1236,13 @@ fn defaultConfig() Config {
             .popup_disabled_color = 0xFF707070,
             .cava_color = 0xFFDCDCDC,
             .module_bg_color = 0xFF1E1E1E,
+            .bezel_color = 0xFFDCDCDC, // solid-bezel default: accent-white, same as the active workspace color
+            .bg_mode = BG_MODE_NONE,
+            .cava_bg_strength = 35,
+            .matrix_color = 0xFF00FF41, // classic phosphor green
+            .matrix_speed = 2,
+            .module_pill_opacity = 100,
+            .module_border_width = 1,
             .module_pills = true,
             .pill_borders = true,
             .bar_height = 28,
@@ -1205,6 +1262,7 @@ fn defaultConfig() Config {
             .empty_click_command = "",
             .animations_enabled = true,
             .bezel_style = BEZEL_STYLE_MATUGEN,
+            .bezel_effect = BEZEL_EFFECT_ROTATING,
         },
         .modules = .{
             .left = &DEFAULT_LEFT,
@@ -1337,10 +1395,18 @@ const JsonAppearance = struct {
     popup_disabled_color: []const u8 = "#707070",
     cava_color: []const u8 = "#DCDCDC",
     module_bg_color: []const u8 = "#1E1E1E",
+    bezel_color: []const u8 = "#DCDCDC",
+    bg_mode: []const u8 = "none",
+    cava_bg_strength: u8 = 35,
+    matrix_color: []const u8 = "#00FF41",
+    matrix_speed: u32 = 2,
+    module_pill_opacity: u8 = 100,
+    module_border_width: u32 = 1,
     module_pills: bool = true,
     pill_borders: bool = true,
     animations_enabled: bool = true,
     bezel_style: []const u8 = "matugen",
+    bezel_effect: []const u8 = "rotating",
     bar_height: u32 = 28,
     border_top_px: u32 = 2,
     border_bottom_px: u32 = 0,
@@ -1418,6 +1484,8 @@ const JsonMatugenColors = struct {
     popup_disabled_color: ?[]const u8 = null,
     cava_color: ?[]const u8 = null,
     module_bg_color: ?[]const u8 = null,
+    bezel_color: ?[]const u8 = null,
+    matrix_color: ?[]const u8 = null,
 };
 
 /// Applies the colors matugen wrote to ~/.config/simpbar/matugen.json into
@@ -1463,6 +1531,8 @@ fn tryApplyMatugenColors(allocator: std.mem.Allocator, appearance: *Appearance) 
     _ = mergeMatugenColor(appearance, "popup_disabled_color", colors.popup_disabled_color) orelse return false;
     _ = mergeMatugenColor(appearance, "cava_color", colors.cava_color) orelse return false;
     _ = mergeMatugenColor(appearance, "module_bg_color", colors.module_bg_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "bezel_color", colors.bezel_color) orelse return false;
+    _ = mergeMatugenColor(appearance, "matrix_color", colors.matrix_color) orelse return false;
 
     return true;
 }
@@ -1523,6 +1593,13 @@ fn parseAppearance(j: JsonAppearance) ?Appearance {
         .popup_disabled_color = parseHexColor(j.popup_disabled_color) catch return null,
         .cava_color = parseHexColor(j.cava_color) catch return null,
         .module_bg_color = parseHexColor(j.module_bg_color) catch return null,
+        .bezel_color = parseHexColor(j.bezel_color) catch return null,
+        .bg_mode = if (std.mem.eql(u8, j.bg_mode, BG_MODE_CAVA)) BG_MODE_CAVA else if (std.mem.eql(u8, j.bg_mode, BG_MODE_MATRIX)) BG_MODE_MATRIX else BG_MODE_NONE,
+        .cava_bg_strength = @min(j.cava_bg_strength, 100),
+        .matrix_color = parseHexColor(j.matrix_color) catch return null,
+        .matrix_speed = std.math.clamp(j.matrix_speed, 1, 6),
+        .module_pill_opacity = @min(j.module_pill_opacity, 100),
+        .module_border_width = @min(j.module_border_width, 8),
         .module_pills = j.module_pills,
         .pill_borders = j.pill_borders,
         .bar_height = j.bar_height,
@@ -1546,7 +1623,8 @@ fn parseAppearance(j: JsonAppearance) ?Appearance {
         .monitor = j.monitor,
         .empty_click_command = j.empty_click_command,
         .animations_enabled = j.animations_enabled,
-        .bezel_style = if (std.mem.eql(u8, j.bezel_style, BEZEL_STYLE_RAINBOW_PUKE)) BEZEL_STYLE_RAINBOW_PUKE else BEZEL_STYLE_MATUGEN,
+        .bezel_style = if (std.mem.eql(u8, j.bezel_style, BEZEL_STYLE_RAINBOW_PUKE)) BEZEL_STYLE_RAINBOW_PUKE else if (std.mem.eql(u8, j.bezel_style, BEZEL_STYLE_SOLID)) BEZEL_STYLE_SOLID else BEZEL_STYLE_MATUGEN,
+        .bezel_effect = if (std.mem.eql(u8, j.bezel_effect, BEZEL_EFFECT_BREATHING)) BEZEL_EFFECT_BREATHING else if (std.mem.eql(u8, j.bezel_effect, BEZEL_EFFECT_SOLID)) BEZEL_EFFECT_SOLID else BEZEL_EFFECT_ROTATING,
     };
 }
 
@@ -2466,12 +2544,18 @@ fn fillPopupRowBand(pixels: [*]u32, pm: *PopupMenu, y_start: i32, y_end: i32, an
     if (anim <= 0.0) return;
     const a = anim * HOVER_MAX_ALPHA;
     const pill = lerpColor(current_config.appearance.popup_bg_color, current_config.appearance.popup_hover_color, a);
-    if (current_config.appearance.pill_borders) {
-        strokeBezel(pixels, pm.width, pm.height, POPUP_ROW_PAD_X, y_start + POPUP_ROW_PAD_Y, pm.width - POPUP_ROW_PAD_X, y_end - POPUP_ROW_PAD_Y, POPUP_ROW_RADIUS, current_config.appearance.popup_bg_color, anim);
-        fillRoundedRect(pixels, pm.width, pm.height, POPUP_ROW_PAD_X + 1, y_start + POPUP_ROW_PAD_Y + 1, pm.width - POPUP_ROW_PAD_X - 1, y_end - POPUP_ROW_PAD_Y - 1, POPUP_ROW_RADIUS - 1, pill);
-    } else {
-        fillRoundedRect(pixels, pm.width, pm.height, POPUP_ROW_PAD_X, y_start + POPUP_ROW_PAD_Y, pm.width - POPUP_ROW_PAD_X, y_end - POPUP_ROW_PAD_Y, POPUP_ROW_RADIUS, pill);
-    }
+    const w: i64 = @as(i64, pm.width) - 2 * @as(i64, POPUP_ROW_PAD_X);
+    const h: i64 = @as(i64, y_end - y_start) - 2 * @as(i64, POPUP_ROW_PAD_Y);
+    const t: i64 = bezelThick(w, h);
+    const tr: i32 = @intCast(@max(@as(i64, 0), @as(i64, POPUP_ROW_RADIUS) - t));
+    const x0: i64 = @as(i64, POPUP_ROW_PAD_X) + t;
+    const y0: i64 = @as(i64, y_start) + @as(i64, POPUP_ROW_PAD_Y) + t;
+    const x1: i64 = @as(i64, pm.width) - @as(i64, POPUP_ROW_PAD_X) - t;
+    const y1: i64 = @as(i64, y_end) - @as(i64, POPUP_ROW_PAD_Y) - t;
+    // strokeBezel self-skips at thickness 0 (borders off or too small),
+    // leaving just the flat fill — one path for both cases.
+    strokeBezel(pixels, pm.width, pm.height, POPUP_ROW_PAD_X, y_start + POPUP_ROW_PAD_Y, pm.width - POPUP_ROW_PAD_X, y_end - POPUP_ROW_PAD_Y, POPUP_ROW_RADIUS, current_config.appearance.popup_bg_color, anim);
+    fillRoundedRect(pixels, pm.width, pm.height, x0, y0, x1, y1, tr, pill);
 }
 
 /// Draws one row's label at `x0`, baseline-centered in the row that starts at
@@ -2619,6 +2703,15 @@ const Bar = struct {
     dock_input_set: bool = false,
     dock_input_x: i64 = 0,
     dock_input_w: i64 = 0,
+    /// Taskbar↔dock morph: eased blend, 0 = taskbar geometry .. 1 = dock
+    /// pack. On a mode switch it travels from the current value to the new
+    /// target with an elastic overshoot (rubber band); while traveling,
+    /// paintFrame draws the interpolated layout below. from/t hold the
+    /// animation; active gates the per-tick redraws.
+    mode_blend: f32 = 0.0,
+    mode_morph_from: f32 = 0.0,
+    mode_morph_t: f32 = 1.0,
+    mode_morph_active: bool = false,
     /// Auto-hide state (appearance.auto_hide): hidden = collapsed to the
     /// edge strip, exclusive zone released. hide_grace counts scroll ticks
     /// down to hiding after the pointer leaves (a short delay so brushing
@@ -2632,11 +2725,25 @@ const Bar = struct {
     /// pointer moves off a scrollable region (see the .axis handler), so
     /// partial scroll can't carry across modules.
     scroll_accum: f64 = 0.0,
-    mpris_scroll_step: i64 = 0,
-    mpris_prev_buf: [64]u8 = undefined,
-    mpris_prev_len: usize = 0,
     mpris_player_buf: [128]u8 = undefined,
     mpris_player_len: usize = 0,
+    /// Matrix-rain background state (bg_mode == "matrix"): per-column
+    /// stream head heights in px, scattered on first paint/resize and
+    /// advanced on the 60ms tick. ncols == 0 means uninitialized for the
+    /// current width.
+    matrix_heads: [512]i16 = [_]i16{0} ** 512,
+    matrix_ncols: usize = 0,
+    /// One-time-resolved rain charset for this bar's font (katakana where
+    /// the font has it, else full blocks — an unresolved miss every frame
+    /// would flicker and burn a FreeType load each time).
+    matrix_chars: [16]u32 = [_]u32{0} ** 16,
+    matrix_chars_len: usize = 0,
+    matrix_charset_done: bool = false,
+    /// Media progress fraction (position/length) for the progress underline,
+    /// or null when the player doesn't report both. Refreshed with the
+    /// mpris poll (2s cadence — smooth enough for a thin bar that moves a
+    /// few px per update on a normal track).
+    mpris_frac: ?f32 = null,
     popup: ?PopupMenu = null,
 };
 
@@ -2951,6 +3058,9 @@ fn realMain() !void {
             .wm_base = globals.wm_base,
             .seat = globals.seat,
             .height = current_config.appearance.bar_height,
+            // Start settled in the configured mode (no morph sweep at login;
+            // transitions only run on live switches below).
+            .mode_blend = if (std.mem.eql(u8, current_config.appearance.bar_mode, BAR_MODE_DOCK)) 1.0 else 0.0,
         };
         layer_surface.setListener(*Bar, layerSurfaceListener, &bars[bar_count]);
         bar_count += 1;
@@ -3115,7 +3225,7 @@ fn realMain() !void {
     defer {
         if (cava_state.pending_fd >= 0) _ = posix.system.close(cava_state.pending_fd);
     }
-    if (findRightEntry(.cava) != null) startCavaFetch();
+    if (cavaWanted()) startCavaFetch();
 
     // Main event loop: multiplex the Wayland display fd (compositor events),
     // a 1s timerfd (clock ticks), and the compositor's workspace-event socket
@@ -3195,7 +3305,11 @@ fn realMain() !void {
             // A dead/vacant cava visualizer is retried on a slow timer rather
             // than wedged: cava can exit on its own (audio sink dropped) and
             // the initial spawn above can race the pulseaudio socket appearing.
-            if (cava_state.pending_fd < 0 and findRightEntry(.cava) != null and
+            // A running daemon the config no longer wants (module removed and
+            // background mode changed away) is stopped here instead.
+            if (!cavaWanted()) {
+                if (cava_state.pending_fd >= 0) closeCava();
+            } else if (cava_state.pending_fd < 0 and
                 (second_count - cava_state.dead_since_tick) >= CAVA_RESPAWN_SECONDS)
             {
                 cava_state.dead_since_tick = second_count;
@@ -3274,25 +3388,40 @@ fn realMain() !void {
         if (poll_fds[11].revents & posix.POLL.IN != 0) {
             var expirations: u64 = undefined;
             _ = posix.read(scroll_timer_fd, std.mem.asBytes(&expirations)) catch {};
-            // The hover bezel's rotation clock — advances whether or not
+            // The hover bezel's animation clock — advances whether or not
             // anything is hovered (wrapping is fine; phase math is modulo).
+            // Matrix streams ride the same clock.
             hover_frame +%= 1;
+            if (current_config.appearance.animations_enabled and std.mem.eql(u8, current_config.appearance.bg_mode, BG_MODE_MATRIX)) {
+                for (bars[0..bar_count]) |*b| updateMatrixHeads(b);
+            }
             // Only bother animating (and redrawing) when there's actually
             // something to show — no point burning a redraw every 60ms
             // while nothing's playing and the drawer's fade isn't mid-flight.
-            // mpris_scroll_step/drawer_anim are per-bar state (each bar's
-            // own scroll position/fade progresses independently), so this
-            // loops over every bar rather than updating one shared value.
+            // drawer_anim is per-bar state (each bar's own fade progresses
+            // independently), so this loops over every bar rather than
+            // updating one shared value.
             for (bars[0..bar_count]) |*b| {
                 var needs_redraw = false;
-                if (b.mpris.text().len > 0) {
-                    b.mpris_scroll_step += SCROLL_STEP_PX;
-                    needs_redraw = true;
-                }
                 // Auto-hide grace countdown (see the leave handler).
                 if (b.autohide_grace > 0) {
                     b.autohide_grace -= 1;
                     if (b.autohide_grace == 0) autohideHide(b);
+                }
+                // Taskbar↔dock rubber-band morph: ease the blend toward the
+                // current mode's endpoint, redrawing every tick while
+                // traveling (settled endpoints paint no differently than
+                // before, so idle costs nothing extra).
+                if (b.mode_morph_active) {
+                    const morph_target: f32 = if (std.mem.eql(u8, current_config.appearance.bar_mode, BAR_MODE_DOCK)) 1.0 else 0.0;
+                    b.mode_morph_t += MODE_MORPH_STEP;
+                    if (b.mode_morph_t >= 1.0) {
+                        b.mode_blend = morph_target;
+                        b.mode_morph_active = false;
+                    } else {
+                        b.mode_blend = b.mode_morph_from + (morph_target - b.mode_morph_from) * easeOutElastic(b.mode_morph_t);
+                    }
+                    needs_redraw = true;
                 }
                 const drawer_target: f32 = if (b.drawer_expanded) 1.0 else 0.0;
                 if (b.drawer_anim != drawer_target) {
@@ -3320,7 +3449,7 @@ fn realMain() !void {
                         needs_redraw = true;
                     }
                 }
-                // A settled-but-lit hover still rotates its bezel, so it
+                // A settled-but-lit hover still animates its bezel, so it
                 // needs a redraw every tick until it goes fully dark — but
                 // only while animations are on (off = frozen bezel = static).
                 // Same for the active-workspace pill below: its bezel never
@@ -3343,6 +3472,9 @@ fn realMain() !void {
                             }
                         }
                     }
+                    // Animated backgrounds repaint every tick while visible
+                    // (same cost class as the always-on bezel above).
+                    if (!needs_redraw and bgEffectVisible()) needs_redraw = true;
                 }
                 if (needs_redraw) {
                     drawAndCommit(b) catch |err| {
@@ -3351,7 +3483,7 @@ fn realMain() !void {
                 }
                 // An open popup's row pills ride the same tick — easing plus,
                 // like the bar, a redraw every tick while any row stays lit
-                // (the bezel keeps rotating under a parked pointer). Both
+                // (the bezel keeps animating under a parked pointer). Both
                 // collapse to snap + no forced redraws with animations off.
                 if (b.popup) |*pm| {
                     var popup_redraw = false;
@@ -3445,6 +3577,12 @@ fn realMain() !void {
                 // configure event here.
                 if (geometry_changed) {
                     for (bars[0..bar_count]) |*b| applyLayerGeometry(b);
+                }
+                // A mode flip starts the rubber-band morph (or snaps when
+                // animations are off). From the current eased value, so a
+                // rapid re-flip retargets smoothly instead of jumping.
+                if (!std.mem.eql(u8, old_bar_mode, cfg.appearance.bar_mode)) {
+                    for (bars[0..bar_count]) |*b| startModeMorph(b);
                 }
 
                 // Try loading the NEW font before touching the old one — if
@@ -3768,6 +3906,14 @@ fn closeCava() void {
     if (cava_state.pending_fd >= 0) _ = posix.system.close(cava_state.pending_fd);
     cava_state.pending_fd = -1;
     cava_state.read_len = 0;
+}
+
+/// Whether the cava daemon should be running: the right-group module wants
+/// it, or the background mode paints with it. Checked at startup, on the
+/// 1Hz respawn tick, and to stop a daemon the config no longer needs.
+fn cavaWanted() bool {
+    if (findRightEntry(.cava) != null) return true;
+    return std.mem.eql(u8, current_config.appearance.bg_mode, BG_MODE_CAVA);
 }
 
 /// Forks/execs `cava -p ~/.config/simpbar/cava.conf` with the child's stdout
@@ -4390,8 +4536,7 @@ const WEATHER_REFRESH_SECONDS: i64 = 1200; // matches "interval": 1200 in ~/.con
 const PACMAN_REFRESH_SECONDS: i64 = 3600; // matches custom/pacman's "interval": 3600
 const VOLUME_REFRESH_SECONDS: i64 = 5; // wireplumber has no interval (event-driven); polled here instead
 const MPRIS_REFRESH_SECONDS: i64 = 2; // mpris has no interval either (also event-driven); polled here instead
-const SCROLL_INTERVAL_MS: i64 = 60; // mpris ticker animation tick, shared with the drawer fade below
-const SCROLL_STEP_PX: i64 = 1; // ...and how far it advances per tick (~17px/s)
+const SCROLL_INTERVAL_MS: i64 = 60; // drawer fade + hover/morph animation tick
 const DRAWER_ANIM_STEP: f32 = 0.25; // fraction of the fade per SCROLL_INTERVAL_MS tick (~240ms full fade)
 
 fn startWeatherFetch(cmd: *PolledCommand) void {
@@ -4439,22 +4584,32 @@ fn startVolumeFetch(cmd: *PolledCommand) void {
 }
 
 // Finds the first playerctl-visible player that's actually Playing or
-// Paused and prints "PLAYER|STATUS|ARTIST - TITLE" (the player name is
-// used to target play/pause/prev/next clicks at this exact player via
-// spawnPlayerctlCommand, not just for display). Deliberately not filtered
-// by player name (~/.config/waybar/config's old "mpris" module ignored
-// "firefox" entirely, which also hides every Firefox-family browser tab —
-// Zen Browser registers as "firefox.instance_<pid>" too, same as vanilla
-// Firefox) — instead skips Stopped entries, which is what that filter was
-// really working around: Firefox-family browsers leave a stale "Stopped"
-// MPRIS entry with the last tab's title lingering after the tab closes.
+// Paused and prints two lines: "PLAYER|STATUS|ARTIST - TITLE" then
+// "POSITION|LENGTH" (the player name is used to target play/pause/prev/next
+// clicks at this exact player via spawnPlayerctlCommand, not just for
+// display). Position/length are MPRIS microseconds for the progress
+// underline; players that don't report them leave the fields empty and the
+// bar simply shows no progress. Two lines (not extra |-fields) because track
+// titles may contain '|' themselves — the second line carries only integers,
+// so it parses unambiguously. (Same convention as simpbar-shell's
+// MPRIS_SCRIPT, which uses \x1f separators for the same reason; a second
+// line is simpler here since this script already prints exactly one.)
+// Deliberately not filtered by player name (~/.config/waybar/config's old
+// "mpris" module ignored "firefox" entirely, which also hides every
+// Firefox-family browser tab — Zen Browser registers as
+// "firefox.instance_<pid>" too, same as vanilla Firefox) — instead skips
+// Stopped entries, which is what that filter was really working around:
+// Firefox-family browsers leave a stale "Stopped" MPRIS entry with the last
+// tab's title lingering after the tab closes.
 // No output at all if every visible player is Stopped/none exist — same
 // as the real module in that case.
 const MPRIS_SCRIPT =
     \\for p in $(playerctl -l 2>/dev/null); do
     \\  out=$(playerctl -p "$p" metadata --format "{{status}}|{{artist}} - {{title}}" 2>/dev/null) || continue
     \\  case "$out" in Stopped\|*) continue;; esac
-    \\  printf '%s|%s' "$p" "$out"
+    \\  pos=$(playerctl -p "$p" position 2>/dev/null) || pos=""
+    \\  len=$(playerctl -p "$p" metadata mpris:length 2>/dev/null) || len=""
+    \\  printf '%s|%s\n%s|%s' "$p" "$out" "$pos" "$len"
     \\  break
     \\done
 ;
@@ -4462,6 +4617,32 @@ const MPRIS_SCRIPT =
 fn startMprisFetch(cmd: *PolledCommand) void {
     var argv = [_:null]?[*:0]const u8{ "sh", "-c", MPRIS_SCRIPT, null };
     cmd.startFetch("/bin/sh", &argv);
+}
+
+/// Parses playerctl's decimal-seconds position ("211.716851", or a bare
+/// integer) into integer microseconds, or -1 when malformed. Integer math
+/// only — no float parsing.
+fn parseMprisPos(s: []const u8) i64 {
+    if (s.len == 0) return -1;
+    if (std.mem.indexOfScalar(u8, s, '.')) |dot| {
+        const whole = std.fmt.parseInt(i64, s[0..dot], 10) catch return -1;
+        if (whole < 0) return -1;
+        var frac = s[dot + 1 ..];
+        if (frac.len == 0) return whole * 1000000;
+        if (frac.len > 6) frac = frac[0..6];
+        var mult: i64 = 100000;
+        var frac_us: i64 = 0;
+        // "716851" -> 7*100000 + 1*10000 + ... (positional, truncated).
+        for (frac) |c| {
+            if (c < '0' or c > '9') return -1;
+            frac_us += @as(i64, c - '0') * mult;
+            mult = @divTrunc(mult, 10);
+        }
+        return whole * 1000000 + frac_us;
+    }
+    const whole = std.fmt.parseInt(i64, s, 10) catch return -1;
+    if (whole < 0) return -1;
+    return whole * 1000000;
 }
 
 /// Parses wpctl's "Volume: 1.00" into a "100" percentage string written
@@ -4724,8 +4905,11 @@ fn baselineY(buf_height: u32, font: *const font_mod.Font) i64 {
 /// `click_regions` with each workspace's clickable x-range, since layout
 /// shifts as workspaces come and go. Assumes the caller has already cleared
 /// `click_regions` for this frame.
-/// Returns the x position just past the last workspace drawn, so
-/// `drawMpris` (next in "modules-left") can continue from there.
+/// All digits share ONE resting pill (no inner seams — the same treatment as
+/// the center launcher runs and the mpris single bar); per-digit hover wash
+/// and click regions are unchanged, so only the resting layer changes and
+/// the pen advances exactly as before.
+/// Returns the x position just past the last workspace drawn.
 /// Draws the numbered workspace pills starting at `x0_start` (not a fixed
 /// margin — the left group is now order-driven, so workspaces can live at
 /// any position in the chain), returning the x after the last number. The
@@ -4743,8 +4927,27 @@ fn drawWorkspaces(
     const y0: i64 = baselineY(buf_height, font);
     const workspace_gap = current_config.appearance.workspace_gap;
 
-    var x0: i64 = x0_start;
+    // Measure pass: run bounds for the single shared resting pill. Replicates
+    // the draw loop's pen walk exactly (content + trailing gap per number),
+    // so the pill lands pixel-true on the per-digit hover bounds below.
     var id_buf: [8]u8 = undefined;
+    var mx0: i64 = x0_start;
+    var run_start: i64 = 0;
+    var run_end: i64 = 0;
+    var any = false;
+    for (workspaces) |ws| {
+        const text = std.fmt.bufPrint(&id_buf, "{d}", .{ws.id}) catch continue;
+        const w = textPixelWidth(font, text);
+        if (!any) {
+            run_start = mx0 - @divTrunc(workspace_gap, 2);
+            any = true;
+        }
+        run_end = mx0 + w + @divTrunc(workspace_gap, 2);
+        mx0 += w + workspace_gap;
+    }
+    if (any) drawRestingPill(pixels, buf_width, buf_height, run_start, run_end);
+
+    var x0: i64 = x0_start;
     for (workspaces) |ws| {
         const color = if (ws.active) current_config.appearance.workspace_active_color else current_config.appearance.workspace_inactive_color;
         const text = std.fmt.bufPrint(&id_buf, "{d}", .{ws.id}) catch continue;
@@ -4754,11 +4957,15 @@ fn drawWorkspaces(
         const hover_start = region_start - @divTrunc(workspace_gap, 2);
         const hover_end = region_start + textPixelWidth(font, text) + @divTrunc(workspace_gap, 2);
         if (ws.active) drawActivePill(pixels, buf_width, buf_height, hover_start, hover_end);
-        drawModulePill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
+        // Hover wash only — the shared resting pill above owns the ring (no
+        // inner seams). Same geometry the per-digit resting pill used, so a
+        // parked pointer paints identically.
+        drawPill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
         var i: usize = 0;
         while (nextUtf8Codepoint(text, &i)) |cp| {
             x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, color, 0, buf_width);
         }
+        drawUrgentDot(pixels, buf_width, buf_height, @divTrunc(region_start + x0, 2), ws.urgent);
         click_regions.addScrollable(@intCast(hover_start), @intCast(hover_end), .{ .switch_workspace = ws.id }, .step_workspace);
         x0 += workspace_gap;
     }
@@ -4775,85 +4982,67 @@ const MPRIS_CONTROL_GAP: i64 = 6; // spacing between the three control glyphs, a
 /// the status icon already shown in the track text (pause glyph while
 /// Playing, play glyph otherwise) so it always shows the action a click
 /// performs, not the current state.
-fn drawMprisControls(
-    pixels: [*]u32,
-    buf_width: u32,
-    buf_height: u32,
-    font: *font_mod.Font,
-    x0_start: i64,
-    playing: bool,
-    click_regions: *ClickRegions,
-) i64 {
-    const y0: i64 = baselineY(buf_height, font);
+/// Round play/pause toggle box side shared by the left and center mpris
+/// modules (reference look): squarish circular button. Measured identically
+/// at compose time (centering) and draw time (pen advance).
+fn mprisToggleSide(font: *font_mod.Font, playing: bool) i64 {
+    const icon: u32 = if (playing) 0xf04c else 0xf04b;
+    const adv = if (font.glyph(icon)) |g| g.advance_x else |_| 0;
+    const dia: i64 = @as(i64, @intCast(current_config.appearance.bar_height)) - 2 * @as(i64, HOVER_PILL_PAD_Y);
+    return @max(adv + 4, dia);
+}
+
+/// Media progress underline: accent bar under the mpris text spanning `frac`
+/// of the run width, at the dash slot with capsule ends (min 8px so a sliver
+/// always reads). No-op when frac is null (unknown length) or zero — the
+/// hover dash still works wherever pills are interactive.
+fn drawMprisProgress(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, run_w: i64, frac: ?f32) void {
+    const f = frac orelse return;
+    if (f <= 0.0 or run_w <= 0) return;
+    const w = @max(@as(i64, 8), @as(i64, @intFromFloat(@as(f32, @floatFromInt(run_w)) * f)));
+    const h: i64 = @intCast(buf_height);
+    const uy1 = h - HOVER_UNDERLINE_BOTTOM_GAP;
+    fillRoundedRect(pixels, buf_width, buf_height, x0, uy1 - HOVER_UNDERLINE_H, x0 + w, uy1, @divTrunc(HOVER_UNDERLINE_H + 1, 2), current_config.appearance.workspace_active_color);
+}
+
+/// One mpris pill shared by the left and center modules: resting pill
+/// spanning track text + round toggle as a single bar (no inner-ring seam),
+/// static text, progress underline, toggle hover wash. Returns the pen past
+/// the button (no trailing gap; callers add spacing like every other module
+/// kind). Empty text draws nothing and advances nothing.
+fn drawMprisPill(pixels: [*]u32, buf_width: u32, buf_height: u32, font: *font_mod.Font, y0: i64, x0_start: i64, text: []const u8, playing: bool, frac: ?f32, click_regions: *ClickRegions) i64 {
+    if (text.len == 0) return x0_start;
+    const side = mprisToggleSide(font, playing);
+    const text_w = textPixelWidth(font, text);
     var x0 = x0_start;
-    const buttons = [_]struct { icon: u32, action: MprisControl }{
-        .{ .icon = 0xf048, .action = .previous }, // nf-fa-step_backward
-        .{ .icon = if (playing) 0xf04c else 0xf04b, .action = .play_pause }, // pause : play
-        .{ .icon = 0xf051, .action = .next }, // nf-fa-step_forward
-    };
-    for (buttons) |btn| {
-        const region_start = x0;
-        // Measuring via font.glyph directly (rather than drawing first)
-        // lets the highlight go down before the glyph — same cached
-        // lookup drawGlyphAt makes right after, so no extra rasterizing.
-        const advance = if (font.glyph(btn.icon)) |g| g.advance_x else |_| 0;
-        _ = drawModulePill(pixels, buf_width, buf_height, region_start - 2, region_start + advance + 2, click_regions.nextHover());
-        x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, btn.icon, current_config.appearance.text_color, 0, buf_width);
-        click_regions.add(@intCast(region_start - 2), @intCast(x0 + 2), .{ .mpris_control = btn.action });
-        x0 += MPRIS_CONTROL_GAP;
+    // Resting pill over text + toggle as one bar (pad matches the static
+    // segments' ±4px rhythm).
+    drawRestingPill(pixels, buf_width, buf_height, x0 - 4, x0 + text_w + MPRIS_CONTROL_GAP + side + 4);
+    var i: usize = 0;
+    while (nextUtf8Codepoint(text, &i)) |cp| {
+        x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
     }
-    return x0;
+    drawMprisProgress(pixels, buf_width, buf_height, x0_start, text_w, frac);
+    x0 += MPRIS_CONTROL_GAP;
+    // Toggle hover wash only (the resting pill above owns ring + fill).
+    drawPill(pixels, buf_width, buf_height, x0 - 2, x0 + side + 2, click_regions.nextHover());
+    const icon: u32 = if (playing) 0xf04c else 0xf04b;
+    const adv = if (font.glyph(icon)) |g| g.advance_x else |_| 0;
+    const gx = x0 + @divTrunc(side - adv, 2);
+    _ = drawGlyphAt(pixels, buf_width, buf_height, font, gx, y0, icon, current_config.appearance.text_color, 0, buf_width);
+    click_regions.add(@intCast(x0 - 2), @intCast(x0 + side + 2), .{ .mpris_control = .play_pause });
+    return x0 + side;
 }
 
-// Blank stretch between one loop of the ticker and the next repetition of
-// the same text, so they don't run into each other.
-const MPRIS_TICKER_GAP = "     ";
-
-/// Draws mpris text between `x0_start` and `x_limit`, matching "mpris" in
-/// "modules-left" (after "hyprland/workspaces") — as a continuous ticker,
-/// always scrolling regardless of whether the text would fit statically
-/// (a deliberate style choice, not just overflow handling). `scroll_step`
-/// (advanced on a fast timer elsewhere) is the position within one
-/// text+gap cycle; enough repetitions of "text+gap" are drawn back to back
-/// to fill the visible window, so as one copy scrolls fully off the left
-/// the next is already sliding in from the right — no dead pause waiting
-/// for a single copy to loop back around. Pixel-accurate clipping (via
-/// drawGlyphAt's clip params, not a whole-glyph skip) keeps the sliding
-/// text from ever spilling past `x_limit` even mid-glyph.
-fn drawMpris(pixels: [*]u32, buf_width: u32, buf_height: u32, font: *font_mod.Font, x0_start: i64, x_limit: i64, mpris_text: []const u8, scroll_step: i64) void {
-    if (mpris_text.len == 0) return;
-    const y0: i64 = baselineY(buf_height, font);
-    const window_start = x0_start + LAUNCHER_GAP;
-    if (x_limit <= window_start) return;
-
-    const text_width = textPixelWidth(font, mpris_text);
-    const gap_width = textPixelWidth(font, MPRIS_TICKER_GAP);
-    const cycle_len = text_width + gap_width;
-    if (cycle_len <= 0) return;
-    const pos_in_cycle = @mod(scroll_step, cycle_len);
-
-    var copy_start = window_start - pos_in_cycle;
-    while (copy_start < x_limit) : (copy_start += cycle_len) {
-        var x0 = copy_start;
-        var i: usize = 0;
-        while (nextUtf8Codepoint(mpris_text, &i)) |cp| {
-            x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, window_start, x_limit);
-        }
-    }
-}
 
 /// Draws the left group as an ordered chain in config order — the waybar
 /// "modules-left" model where every left/center-capable module contributes
-/// its own fixed width left-to-right (mpris is the exception: a filling
-/// ticker with no intrinsic width, drawn last among left entries exactly as
-/// the original hardcoded workspaces→mpris handoff did, since a scroll
-/// window can't occupy a determinate slot). Workspaces/clock/launchers are
-/// each drawn at the running pen x and advance it; anything after mpris in
-/// the left config order is honored but drawn beyond the ticker window's
-/// right edge (a degenerate placement the GUI still allows, rendered
-/// defensively rather than dropped). RIGHT-only module kinds are ignored —
-/// the config GUI won't place them in left, and the renderer has no
-/// left-anchored drawing for them.
+/// its own fixed width left-to-right, mpris included (static track text +
+/// round toggle via drawMprisPill, same as the center module).
+/// Workspaces/clock/launchers/mpris are each drawn at the running pen x and
+/// advance it. RIGHT-only module kinds are ignored — the config GUI won't
+/// place them in left, and the renderer has no left-anchored drawing for
+/// them.
 fn drawLeftGroup(
     pixels: [*]u32,
     buf_width: u32,
@@ -4863,7 +5052,7 @@ fn drawLeftGroup(
     time_text: []const u8,
     mpris_text: []const u8,
     mpris_playing: bool,
-    mpris_scroll_step: i64,
+    mpris_frac: ?f32,
     center_start_x: i64,
     x0_start: i64,
     click_regions: *ClickRegions,
@@ -4896,8 +5085,13 @@ fn drawLeftGroup(
                 // pen, so the glyph run starts at the centered position
                 // while the pen jumps straight to the cell's right edge.
                 const cell = reserveLeftCell(x0, textPixelWidth(font, time_text), center_start_x);
-                // Resting pill over the cell — static text, so no hover.
-                drawRestingPill(pixels, buf_width, buf_height, cell.content_start, cell.content_end);
+                // Resting pill over the cell, ±4px like drawRightAligned's
+                // modules: the cell sits in the 12px module-gap rhythm where
+                // neighbors intrude up to 8px, so anything wider overlaps the
+                // next pill. (Cell bounds hug the text exactly — MODULE_CELL_MIN
+                // only pads tiny content — so the ±0 they replaced put glyphs
+                // right on the border.)
+                drawRestingPill(pixels, buf_width, buf_height, cell.content_start - 4, cell.content_end + 4);
                 var cx = cell.content_start;
                 var i: usize = 0;
                 while (nextUtf8Codepoint(time_text, &i)) |cp| {
@@ -4913,6 +5107,32 @@ fn drawLeftGroup(
                 // icon decodes, so the button stays clickable/visible, and
                 // name-only skips the icon entirely. Either way: icon (if
                 // drawn), label (if drawn), hover highlight, spawn click.
+                // Measure pass: span ONE resting pill across the whole button
+                // run instead of separated per-button pills. Width logic
+                // mirrors the draw loop below — keep in sync.
+                var run_x = x0;
+                var run_first = true;
+                var run_start: i64 = 0;
+                var run_end: i64 = 0;
+                for (current_config.launchers, 0..) |mbtn, mli| {
+                    const mmode = launcherDisplayMode(mbtn.display);
+                    const mhas = mli < launcher_icons.len and launcher_icons[mli].has_icon;
+                    const mdistro: u32 = if (mli < launcher_icons.len) launcher_icons[mli].distro_glyph else 0;
+                    const mdraw_icon = (mhas or mdistro != 0) and mmode != .label;
+                    const mdraw_label = mmode != .icon or (!mhas and mdistro == 0);
+                    var mdg: [4]u8 = undefined;
+                    const munit: i64 = if (mhas and mdistro == 0) LAUNCHER_ICON_SIZE else if (mdistro != 0) textPixelWidth(font, encodeBmpCodepoint(mdistro, &mdg)) else 0;
+                    const mw = (if (mdraw_label) textPixelWidth(font, mbtn.label) else 0) + (if (mdraw_icon) munit + (if (mdraw_label) LAUNCHER_ICON_TEXT_GAP else 0) else 0);
+                    if (run_first) {
+                        run_start = run_x - @divTrunc(LAUNCHER_GAP, 2);
+                        run_first = false;
+                    } else {
+                        run_x += LAUNCHER_GAP;
+                    }
+                    run_x += mw;
+                    run_end = run_x + @divTrunc(LAUNCHER_GAP, 2);
+                }
+                if (!run_first) drawRestingPill(pixels, buf_width, buf_height, run_start, run_end);
                 for (current_config.launchers, 0..) |btn, li| {
                     const mode = launcherDisplayMode(btn.display);
                     const has_icon = li < launcher_icons.len and launcher_icons[li].has_icon;
@@ -4933,7 +5153,7 @@ fn drawLeftGroup(
                     const region_start = x0;
                     const hover_start = region_start - @divTrunc(LAUNCHER_GAP, 2);
                     const hover_end = region_start + label_w + @divTrunc(LAUNCHER_GAP, 2);
-                    _ = drawModulePill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
+                    drawPill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
                     if (draw_icon and li < launcher_icons.len) {
                         if (draw_glyph) {
                             var gi: usize = 0;
@@ -4957,32 +5177,16 @@ fn drawLeftGroup(
                 }
             },
             .mpris => {
-                // Controls then a ticker filling the space up to the center
-                // group's left edge (original behavior; see fn doc comment).
-                // In dock mode there is no dead stretch to fill — the pack
-                // is tight — so the track renders as static text (like the
-                // center's mpris segment) and the pen advances past exactly
-                // what drew, keeping the pack free of empty space.
-                if (mpris_text.len > 0) {
-                    x0 = drawMprisControls(pixels, buf_width, buf_height, font, x0, mpris_playing, click_regions);
-                }
-                if (std.mem.eql(u8, current_config.appearance.bar_mode, BAR_MODE_DOCK)) {
-                    var i: usize = 0;
-                    while (nextUtf8Codepoint(mpris_text, &i)) |cp| {
-                        x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
-                    }
-                } else {
-                    drawMpris(pixels, buf_width, buf_height, font, x0, center_start_x - LAUNCHER_GAP, mpris_text, mpris_scroll_step);
-                }
+                // Same pill as the center module (static text + round toggle
+                // + progress) — one shared code path with the center module.
+                // Empty text draws nothing and advances nothing.
+                x0 = drawMprisPill(pixels, buf_width, buf_height, font, y0, x0, mpris_text, mpris_playing, mpris_frac, click_regions);
             },
             else => {}, // RIGHT-only kind in left: no left-anchored render for it
         }
         any_drawn = true;
     }
-    // Pen end = content end, with one taskbar-only exception: a playing
-    // ticker paints past the pen into the gap without advancing it (in dock
-    // mode the track is static text, so the pen advances past exactly what
-    // drew and the pack stays tight).
+    // Pen end = content end (every module advances past exactly what drew).
     return x0;
 }
 
@@ -5028,6 +5232,14 @@ const CenterSegment = struct {
     /// or plain-text segment.
     ws_id: ?i32 = null,
     ws_active: bool = false,
+    ws_urgent: bool = false,
+    /// True when this static segment is the mpris track label (gets the
+    /// progress underline when the player reports position/length).
+    mpris: bool = false,
+    /// Play/pause toggle width (glyph advance + leading gap) appended after
+    /// an mpris label, 0 when the seg isn't mpris. Measured at compose time
+    /// so centering accounts for it exactly like any other width.
+    mpris_toggle_w: i64 = 0,
 };
 
 const CenterSegments = struct {
@@ -5043,7 +5255,7 @@ const CenterSegments = struct {
 /// Cross-group drag lets any left/center-capable module kind live here now,
 /// so beyond the original clock + launchers this also emits workspace
 /// pills (colored, clickable) and a static mpris track label.
-fn composeCenterSegments(out: *CenterSegments, font: *font_mod.Font, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8) void {
+fn composeCenterSegments(out: *CenterSegments, font: *font_mod.Font, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8, mpris_playing: bool) void {
     out.* = .{};
     var emitted_any = false;
     for (current_config.modules.center) |entry| {
@@ -5104,16 +5316,16 @@ fn composeCenterSegments(out: *CenterSegments, font: *font_mod.Font, time_text: 
                     seg.* = .{ .label = "", .gap_after = current_config.appearance.workspace_gap };
                     seg.ws_id = ws.id;
                     seg.ws_active = ws.active;
+                    seg.ws_urgent = ws.urgent;
                     seg.label = std.fmt.bufPrint(&seg.label_buf, "{d}", .{ws.id}) catch "";
                     out.len += 1;
                 }
             },
             .mpris => {
                 if (mpris_text.len > 0 and out.len < out.items.len) {
-                    // mpris in center is a static label (no ticker/controls)
-                    // — a centered block can't afford the left chain's
-                    // unbounded rightward scrolling.
-                    out.items[out.len] = .{ .label = mpris_text, .command = null, .gap_after = MODULE_GAP };
+                    // mpris in center is a static label plus a play/pause
+                    // toggle, sharing drawMprisPill with the left module.
+                    out.items[out.len] = .{ .label = mpris_text, .command = null, .gap_after = MODULE_GAP, .mpris = true, .mpris_toggle_w = mprisToggleSide(font, mpris_playing) + MPRIS_CONTROL_GAP };
                     out.len += 1;
                 }
             },
@@ -5123,19 +5335,19 @@ fn composeCenterSegments(out: *CenterSegments, font: *font_mod.Font, time_text: 
     }
 }
 
-fn centerGroupWidth(font: *font_mod.Font, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8) i64 {
+fn centerGroupWidth(font: *font_mod.Font, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8, mpris_playing: bool) i64 {
     var segs: CenterSegments = .{};
-    composeCenterSegments(&segs, font, time_text, workspaces, mpris_text);
+    composeCenterSegments(&segs, font, time_text, workspaces, mpris_text, mpris_playing);
     var total: i64 = 0;
-    for (segs.items[0..segs.len]) |seg| total += seg.icon_w + textPixelWidth(font, seg.label) + seg.gap_after;
+    for (segs.items[0..segs.len]) |seg| total += seg.icon_w + textPixelWidth(font, seg.label) + seg.mpris_toggle_w + seg.gap_after;
     return total;
 }
 
 /// x position of the center group's left edge — the boundary drawMpris
 /// must stay clear of (it grows rightward from the workspaces and would
 /// otherwise run into this pixel-for-pixel identical calculation).
-fn centerGroupStartX(buf_width: u32, font: *font_mod.Font, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8) i64 {
-    return @divTrunc(@as(i64, @intCast(buf_width)) - centerGroupWidth(font, time_text, workspaces, mpris_text), 2);
+fn centerGroupStartX(buf_width: u32, font: *font_mod.Font, time_text: []const u8, workspaces: []const Workspace, mpris_text: []const u8, mpris_playing: bool) i64 {
+    return @divTrunc(@as(i64, @intCast(buf_width)) - centerGroupWidth(font, time_text, workspaces, mpris_text, mpris_playing), 2);
 }
 
 fn drawCenterGroup(
@@ -5146,34 +5358,79 @@ fn drawCenterGroup(
     time_text: []const u8,
     workspaces: []const Workspace,
     mpris_text: []const u8,
+    mpris_frac: ?f32,
+    mpris_playing: bool,
     x0_start: i64,
     click_regions: *ClickRegions,
 ) i64 {
     const y0: i64 = baselineY(buf_height, font);
     var x0: i64 = x0_start;
     var segs: CenterSegments = .{};
-    composeCenterSegments(&segs, font, time_text, workspaces, mpris_text);
+    composeCenterSegments(&segs, font, time_text, workspaces, mpris_text, mpris_playing);
+
+    // Measure pass: ONE resting pill per consecutive launcher-button run
+    // and ONE per consecutive workspace-digit run (joined digits, no inner
+    // seams) instead of separated per-button/per-digit pills. The x-walk
+    // replicates the draw loop below exactly (content + trailing gap_after
+    // per segment); run bounds match the per-button/per-digit hover bounds
+    // the draw loop recomputes, so the pills land pixel-true.
+    const workspace_gap = current_config.appearance.workspace_gap;
+    var scan_x = x0;
+    var scan_run = false;
+    var scan_start: i64 = 0;
+    var scan_last_end: i64 = 0;
+    var wscan_run = false;
+    var wscan_start: i64 = 0;
+    var wscan_last_end: i64 = 0;
+    for (segs.items[0..segs.len]) |seg| {
+        const seg_w = seg.icon_w + textPixelWidth(font, seg.label);
+        const is_launcher = seg.command != null and seg.ws_id == null;
+        if (is_launcher and !scan_run) {
+            scan_run = true;
+            scan_start = scan_x - @divTrunc(LAUNCHER_GAP, 2);
+        }
+        if (is_launcher) scan_last_end = scan_x + seg_w;
+        if (!is_launcher and scan_run) {
+            scan_run = false;
+            drawRestingPill(pixels, buf_width, buf_height, scan_start, scan_last_end + @divTrunc(LAUNCHER_GAP, 2));
+        }
+        const is_ws = seg.ws_id != null;
+        if (is_ws and !wscan_run) {
+            wscan_run = true;
+            wscan_start = scan_x - @divTrunc(workspace_gap, 2);
+        }
+        if (is_ws) wscan_last_end = scan_x + seg_w + @divTrunc(workspace_gap, 2);
+        if (!is_ws and wscan_run) {
+            wscan_run = false;
+            drawRestingPill(pixels, buf_width, buf_height, wscan_start, wscan_last_end);
+        }
+        scan_x += seg_w + seg.gap_after;
+    }
+    if (scan_run) drawRestingPill(pixels, buf_width, buf_height, scan_start, scan_last_end + @divTrunc(LAUNCHER_GAP, 2));
+    if (wscan_run) drawRestingPill(pixels, buf_width, buf_height, wscan_start, wscan_last_end);
 
     for (segs.items[0..segs.len]) |seg| {
         if (seg.ws_id) |ws_id| {
-            const workspace_gap = current_config.appearance.workspace_gap;
             const color = if (seg.ws_active) current_config.appearance.workspace_active_color else current_config.appearance.workspace_inactive_color;
             const region_start = x0;
             const hover_start = region_start - @divTrunc(workspace_gap, 2);
             const hover_end = region_start + textPixelWidth(font, seg.label) + @divTrunc(workspace_gap, 2);
             if (seg.ws_active) drawActivePill(pixels, buf_width, buf_height, hover_start, hover_end);
-            drawModulePill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
+            // Hover wash only — the shared run pill from the measure pass
+            // owns the ring (no inner seams).
+            drawPill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
             var i: usize = 0;
             while (nextUtf8Codepoint(seg.label, &i)) |cp| {
                 x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, color, 0, buf_width);
             }
+            drawUrgentDot(pixels, buf_width, buf_height, @divTrunc(region_start + x0, 2), seg.ws_urgent);
             click_regions.addScrollable(@intCast(hover_start), @intCast(hover_end), .{ .switch_workspace = ws_id }, .step_workspace);
         } else if (seg.command) |cmd| {
             const region_start = x0;
             const label_w = seg.icon_w + textPixelWidth(font, seg.label);
             const hover_start = region_start - @divTrunc(LAUNCHER_GAP, 2);
             const hover_end = region_start + label_w + @divTrunc(LAUNCHER_GAP, 2);
-            _ = drawModulePill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
+            drawPill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
             if (seg.icon_w > 0 and seg.launcher_idx < launcher_icons.len) {
                 const distro = launcher_icons[seg.launcher_idx].distro_glyph;
                 if (distro != 0) {
@@ -5196,11 +5453,17 @@ fn drawCenterGroup(
                 x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
             }
             click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .spawn = cmd });
+        } else if (seg.mpris) {
+            // mpris shares the left module's pill wholesale (one bar, one
+            // code path) — text, progress, round toggle and all.
+            x0 = drawMprisPill(pixels, buf_width, buf_height, font, y0, x0, seg.label, mpris_playing, mpris_frac, click_regions);
         } else {
             // Static segment (clock, plain label): resting pill over the
-            // content bounds, matching the interactive modules' rhythm.
+            // content bounds at ±4px (drawRightAligned rhythm — the segment
+            // sits in trailing-gap spacing where neighbors intrude, so the
+            // ±8 used for joined launcher runs would overlap).
             const st_w = seg.icon_w + textPixelWidth(font, seg.label);
-            drawRestingPill(pixels, buf_width, buf_height, x0 - @divTrunc(LAUNCHER_GAP, 2), x0 + st_w + @divTrunc(LAUNCHER_GAP, 2));
+            drawRestingPill(pixels, buf_width, buf_height, x0 - 4, x0 + st_w + 4);
             if (seg.icon_w > 0 and seg.launcher_idx < launcher_icons.len) {
                 drawLauncherIcon(pixels, buf_width, buf_height, x0, &launcher_icons[seg.launcher_idx]);
                 x0 += seg.icon_w;
@@ -5287,6 +5550,20 @@ const AUTOHIDE_STRIP_PX: i32 = 2;
 /// Hide delay after the pointer leaves, in scroll-timer ticks
 /// (5 × 60ms ≈ 300ms — calm, not flickery).
 const AUTOHIDE_GRACE_TICKS: u32 = 5;
+/// Taskbar↔dock morph pacing: fraction of the transition per 60ms tick
+/// (~11 ticks ≈ 660ms of squash-and-stretch; the elastic curve itself carries
+/// the overshoot, so this only sets the tempo, not the shape).
+const MODE_MORPH_STEP: f32 = 0.09;
+
+/// Classic ease-out elastic: shoots past 1 early, then wobbles down to it —
+/// the rubber band. ref: easings.net easeOutElastic (c4 amplitude term).
+fn easeOutElastic(t: f32) f32 {
+    if (t <= 0.0) return 0.0;
+    if (t >= 1.0) return 1.0;
+    const c4 = (2.0 * std.math.pi) / 3.0;
+    return std.math.pow(f32, 2.0, -10.0 * t) * std.math.sin((t * 10.0 - 0.75) * c4) + 1.0;
+}
+
 /// Hover fade pacing: fraction per 60ms scroll-timer tick (~150ms full fade —
 /// deliberately snappier than the drawer's ~240ms, since hover tracks the
 /// pointer and must never feel laggy).
@@ -5305,6 +5582,25 @@ const HOVER_UNDERLINE_H: i32 = 3;
 /// Gap between the underline's bottom edge and the bar's bottom edge.
 const HOVER_UNDERLINE_BOTTOM_GAP: i32 = 2;
 
+/// Urgent-workspace dot color: warm amber, fixed (urgency reads
+/// conventionally, not thematically — matching the reference look rather
+/// than the palette).
+const URGENT_DOT_COLOR: u32 = 0xFFF5A524;
+/// Radius of the urgent dot / its lift above the underline slot (which stays
+/// free for the hover dash, so the two never collide).
+const URGENT_DOT_R: i64 = 2;
+const URGENT_DOT_LIFT: i64 = 4;
+
+/// Marks an urgent workspace with a dot centered under its digit, floating
+/// just above the underline slot so a hovered urgent pill shows both.
+/// No-op for non-urgent digits.
+fn drawUrgentDot(pixels: [*]u32, buf_width: u32, buf_height: u32, digit_cx: i64, urgent: bool) void {
+    if (!urgent) return;
+    const h: i64 = @intCast(buf_height);
+    const cy = h - HOVER_UNDERLINE_BOTTOM_GAP - HOVER_UNDERLINE_H - URGENT_DOT_LIFT;
+    fillRoundedRect(pixels, buf_width, buf_height, digit_cx - URGENT_DOT_R, cy - URGENT_DOT_R, digit_cx + URGENT_DOT_R, cy + URGENT_DOT_R, @intCast(URGENT_DOT_R), URGENT_DOT_COLOR);
+}
+
 /// Frames elapsed on the scroll-timer tick — the clock for the hover bezel
 /// rotation below. Wraps rather than resetting; phase math is modulo-based.
 var hover_frame: u32 = 0;
@@ -5312,6 +5608,34 @@ var hover_frame: u32 = 0;
 /// Hover/active bezel styles (appearance.bezel_style values).
 const BEZEL_STYLE_MATUGEN = "matugen";
 const BEZEL_STYLE_RAINBOW_PUKE = "rainbow-puke";
+const BEZEL_STYLE_SOLID = "solid";
+
+/// Hover/active bezel effects (appearance.bezel_effect values) — what the
+/// ring does, independent of the style above.
+const BEZEL_EFFECT_ROTATING = "rotating";
+const BEZEL_EFFECT_BREATHING = "breathing";
+const BEZEL_EFFECT_SOLID = "solid";
+
+/// Bar background modes (appearance.bg_mode values): what paints behind
+/// the modules — "none" (default) is today's plain bg_color fill, "cava"
+/// washes the cava equalizer across the whole background, "matrix" rains
+/// cmatrix-style glyph streams. Unrecognized values fall back to "none".
+const BG_MODE_NONE = "none";
+const BG_MODE_CAVA = "cava";
+const BG_MODE_MATRIX = "matrix";
+
+/// Breath period in ticks (60 × 60ms ≈ 3.6s per in-out cycle).
+const BEZEL_BREATH_PERIOD: u32 = 60;
+
+/// Breathing multiplier at `frame`: a 0.55..1.0 sine swell whose trough
+/// never fully vanishes, so the ring stays a ring. Wraps with the period.
+/// Pure (no config access) so tests can pin it.
+fn bezelBreathAt(frame: u32) f32 {
+    const period: f32 = @floatFromInt(BEZEL_BREATH_PERIOD);
+    const bf: f32 = @floatFromInt(frame % BEZEL_BREATH_PERIOD);
+    const tau: f32 = @floatCast(std.math.pi * 2.0);
+    return 0.55 + 0.45 * std.math.sin(bf / period * tau);
+}
 
 /// Rotation period of the hover bezel, in ticks (40 × 60ms ≈ 2.4s per turn).
 const HOVER_BEZEL_PERIOD: u32 = 40;
@@ -5421,14 +5745,31 @@ fn fillRoundedRect(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, y0:
 
 /// 1px animated bezel around the rounded rect [x0,x1)×[y0,y1): the ring wears
 /// the matugen palette itself — accent, text, hover-fill, inactive in
-/// quarter turns, blending smoothly between neighbors — traveling around the
-/// border (one turn per HOVER_BEZEL_PERIOD ticks). Every hue on the ring
-/// comes straight out of appearance, so it reads as the wallpaper's colors,
-/// never rainbow; on manual (non-matugen) themes it reads as that theme's
-/// four roles instead. Faded by `a` toward `bg`.
+/// quarter turns, blending smoothly between neighbors — unless the style is
+/// "rainbow-puke" (full hue wheel) or "solid" (one flat bezel_color ring).
+/// The gradient styles travel around the border when the effect is
+/// "rotating" (one turn per HOVER_BEZEL_PERIOD ticks), swell in place when
+/// "breathing", and sit still when "solid" (as does a solid ring — it has no
+/// gradient to travel).
+/// Every hue on the ring comes straight out of appearance, so it reads as
+/// the wallpaper's colors, never rainbow; on manual (non-matugen) themes it
+/// reads as that theme's four roles instead. Faded by `a` toward `bg`.
 /// NOTE: callers pass the UNcapped fade level here (not × HOVER_MAX_ALPHA):
 /// the bezel needs full brightness to read at 1px wide — capping it along
 /// with the pill wash renders the hue swing nearly invisible on a dark bar.
+/// Effective bezel thickness for a shape: 0 when borders are off, the
+/// configured module_border_width otherwise, clamped so at least a sliver of
+/// fill survives (tiny pills degrade to flat instead of inverting). Single
+/// source for both the stroke below and the fill insets at its call sites,
+/// so the two can never disagree about where the rim ends.
+fn bezelThick(w: i64, h: i64) i32 {
+    if (!current_config.appearance.pill_borders) return 0;
+    const cfg: i64 = current_config.appearance.module_border_width;
+    const fit: i64 = @divTrunc(@min(w, h), 2) - 1;
+    if (fit < 1) return 0;
+    return @intCast(@min(cfg, fit));
+}
+
 fn strokeBezel(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, y0: i64, x1: i64, y1: i64, radius: i32, bg: u32, a: f32) void {
     if (x1 <= x0 or y1 <= y0) return;
     const stops = [_]u32{
@@ -5441,8 +5782,14 @@ fn strokeBezel(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, y0: i64
     const h = y1 - y0;
     const r = @min(radius, @as(i32, @intCast(@divTrunc(@min(w, h), 2))));
     if (r < 0) return;
+    // Rim thickness comes from the shared helper (0 = borders off or too
+    // small to fit: plain fill, no ring). Doubled below since the shape
+    // math runs in doubled coordinates.
+    const t: i64 = bezelThick(w, h);
+    if (t == 0) return;
+    const T = 2 * t;
     // Doubled coordinates (see fillRoundedRect); the inner shape is the
-    // outer shrunk 1px per side with radius 1px smaller.
+    // outer shrunk t px per side with radius t px smaller.
     const X0 = 2 * x0;
     const X1 = 2 * x1;
     const Y0 = 2 * y0;
@@ -5450,12 +5797,19 @@ fn strokeBezel(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, y0: i64
     const R: i64 = 2 * @as(i64, r);
     const ccx = x0 + x1; // rect center, already in doubled units
     const ccy = y0 + y1;
-    // Frozen at 0 while animations are off (static bezel); advancing phase
-    // is what the per-tick redraws below are actually animating.
-    const phase = if (current_config.appearance.animations_enabled)
+    // Effect motion: rotating travels the ring with the frame clock;
+    // breathing holds it still and swells its brightness instead (the
+    // breath multiplier below); solid holds it still at full brightness.
+    // Everything freezes at its resting phase while animations are off —
+    // the same still look, with hover fades still easing (that easing
+    // lives in the fade level `a`, untouched here).
+    const anim_on = current_config.appearance.animations_enabled;
+    const effect = current_config.appearance.bezel_effect;
+    const phase = if (anim_on and std.mem.eql(u8, effect, BEZEL_EFFECT_ROTATING))
         @as(f32, @floatFromInt(hover_frame % HOVER_BEZEL_PERIOD)) / @as(f32, HOVER_BEZEL_PERIOD)
     else
         0.0;
+    const breath: f32 = if (anim_on and std.mem.eql(u8, effect, BEZEL_EFFECT_BREATHING)) bezelBreathAt(hover_frame) else 1.0;
     const xs: i64 = @max(0, x0);
     const xe: i64 = @min(@as(i64, @intCast(buf_width)), x1);
     const ys: i64 = @max(0, y0);
@@ -5467,18 +5821,21 @@ fn strokeBezel(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, y0: i64
             const cx = 2 * px + 1;
             const cy = 2 * py + 1;
             if (!inRoundedRect2(cx, cy, X0, Y0, X1, Y1, R)) continue;
-            if (inRoundedRect2(cx, cy, X0 + 2, Y0 + 2, X1 - 2, Y1 - 2, R - 2)) continue;
+            if (inRoundedRect2(cx, cy, X0 + T, Y0 + T, X1 - T, Y1 - T, R - T)) continue;
             const ang = std.math.atan2(@as(f32, @floatFromInt(cy - ccy)), @as(f32, @floatFromInt(cx - ccx)));
             // Ring position in turns (floored modulo keeps negatives in
             // range); the palette quarters travel with the frame phase.
             const frac = @mod(ang / (std.math.pi * 2.0) + phase, 1.0);
             // "rainbow-puke" runs the full hue wheel at fixed vividness;
-            // the default matugen ring wears the wallpaper palette instead.
-            const ring = if (std.mem.eql(u8, current_config.appearance.bezel_style, BEZEL_STYLE_RAINBOW_PUKE))
+            // "solid" wears one flat bezel_color ring; the default matugen
+            // ring wears the wallpaper palette instead.
+            const ring = if (std.mem.eql(u8, current_config.appearance.bezel_style, BEZEL_STYLE_SOLID))
+                current_config.appearance.bezel_color
+            else if (std.mem.eql(u8, current_config.appearance.bezel_style, BEZEL_STYLE_RAINBOW_PUKE))
                 hsvToRgb(frac, 0.85, 1.0)
             else
                 bezelColorAt(stops, frac);
-            const col = lerpColor(bg, ring, a);
+            const col = lerpColor(bg, ring, a * breath);
             pixels[@as(usize, @intCast(py)) * buf_width + @as(usize, @intCast(px))] = col;
         }
     }
@@ -5526,12 +5883,14 @@ fn drawActivePill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64,
 fn drawRestingPill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64, x_end: i64) void {
     if (!current_config.appearance.module_pills) return;
     const h: i64 = @intCast(buf_height);
-    if (!current_config.appearance.pill_borders) {
-        fillRoundedRect(pixels, buf_width, buf_height, x_start, HOVER_PILL_PAD_Y, x_end, h - HOVER_PILL_PAD_Y, HOVER_PILL_RADIUS, current_config.appearance.module_bg_color);
-        return;
-    }
+    // Resting fill honors module_pill_opacity (blended toward the opaque bar
+    // background — see the field doc for the approximation this implies).
+    const pct: f32 = @as(f32, @floatFromInt(current_config.appearance.module_pill_opacity)) / 100.0;
+    const pill_col = lerpColor(current_config.appearance.bg_color, current_config.appearance.module_bg_color, pct);
+    const t: i64 = bezelThick(x_end - x_start, h - 2 * HOVER_PILL_PAD_Y);
+    const tr: i32 = @intCast(@max(@as(i64, 0), @as(i64, HOVER_PILL_RADIUS) - t));
     strokeBezel(pixels, buf_width, buf_height, x_start, HOVER_PILL_PAD_Y, x_end, h - HOVER_PILL_PAD_Y, HOVER_PILL_RADIUS, current_config.appearance.bg_color, 1.0);
-    fillRoundedRect(pixels, buf_width, buf_height, x_start + 1, HOVER_PILL_PAD_Y + 1, x_end - 1, h - HOVER_PILL_PAD_Y - 1, HOVER_PILL_RADIUS - 1, current_config.appearance.module_bg_color);
+    fillRoundedRect(pixels, buf_width, buf_height, x_start + t, HOVER_PILL_PAD_Y + t, x_end - t, h - HOVER_PILL_PAD_Y - t, tr, pill_col);
 }
 
 fn drawPill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64, x_end: i64, anim: f32) void {
@@ -5549,8 +5908,11 @@ fn drawPill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64, x_end
     if (current_config.appearance.pill_borders and !current_config.appearance.module_pills) {
         strokeBezel(pixels, buf_width, buf_height, x_start, HOVER_PILL_PAD_Y, x_end, h - HOVER_PILL_PAD_Y, HOVER_PILL_RADIUS, bg, anim);
     }
-    // Wash inset inside the resting ring, then the underline on top.
-    fillRoundedRect(pixels, buf_width, buf_height, x_start + 1, HOVER_PILL_PAD_Y + 1, x_end - 1, h - HOVER_PILL_PAD_Y - 1, HOVER_PILL_RADIUS - 1, pill);
+    // Wash inset inside the resting ring (same shared thickness, so it nests
+    // exactly), then the underline on top.
+    const wt: i64 = bezelThick(x_end - x_start, h - 2 * HOVER_PILL_PAD_Y);
+    const wr: i32 = @intCast(@max(@as(i64, 0), @as(i64, HOVER_PILL_RADIUS) - wt));
+    fillRoundedRect(pixels, buf_width, buf_height, x_start + wt, HOVER_PILL_PAD_Y + wt, x_end - wt, h - HOVER_PILL_PAD_Y - wt, wr, pill);
     // Centered dash, ~a third of the region wide (min 8px so narrow pills
     // like workspace digits still read), sitting just above the bottom edge.
     const w = x_end - x_start;
@@ -5648,6 +6010,230 @@ fn drawCavaEqualizer(pixels: [*]u32, buf_width: u32, buf_height: u32, x_end: i64
     return x_end - @as(i64, @intCast(cava_state.bar_count)) * (CAVA_BAR_WIDTH + CAVA_BAR_GAP);
 }
 
+/// Whether any background effect needs per-tick repaints right now: a mode
+/// is set, animations are on, and the background is actually visible
+/// (bg_opacity 0 = gone body, gone effect). Cava additionally needs data
+/// and a nonzero strength — a silent daemon paints plain tint.
+fn bgEffectVisible() bool {
+    if (!current_config.appearance.animations_enabled) return false;
+    if (current_config.appearance.bg_opacity_percent == 0) return false;
+    const mode = current_config.appearance.bg_mode;
+    if (std.mem.eql(u8, mode, BG_MODE_CAVA)) {
+        return cava_state.has_data and current_config.appearance.cava_bg_strength > 0;
+    }
+    if (std.mem.eql(u8, mode, BG_MODE_MATRIX)) return true;
+    return false;
+}
+
+const MATRIX_MAX_COLS: usize = 512; // widest surface this covers at 8px cells (4K)
+const MATRIX_CELL_W: i64 = 8;
+const MATRIX_CELL_H: i64 = 8;
+const MATRIX_TAIL_PX: i64 = 72; // visible stream length behind each head
+
+/// Rain brightness 0..1 for a pixel `dist` px behind its stream head: full
+/// at the head, linear falloff over MATRIX_TAIL_PX, dark past it. Pure so
+/// tests can pin it.
+fn matrixFalloff(dist: i64) f32 {
+    if (dist < 0) return 0.0;
+    if (dist >= MATRIX_TAIL_PX) return 0.0;
+    return 1.0 - @as(f32, @floatFromInt(dist)) / @as(f32, @floatFromInt(MATRIX_TAIL_PX));
+}
+
+/// Advances every stream head for `bar`'s current width, (re)scattering
+/// deterministically on first paint or resize so columns never march in
+/// sync. No-op on degenerate sizes.
+fn updateMatrixHeads(bar: *Bar) void {
+    const w: i64 = @intCast(bar.width);
+    const h: i64 = @intCast(bar.height);
+    if (w <= 0 or h <= 0) return;
+    const uw: usize = @intCast(w);
+    const ncols: usize = @min(uw / @as(usize, MATRIX_CELL_W), bar.matrix_heads.len);
+    if (bar.matrix_ncols != ncols) {
+        var i: usize = 0;
+        while (i < ncols) : (i += 1) {
+            const spread: i64 = h + 2 * MATRIX_TAIL_PX;
+            const ii: i64 = @intCast(i);
+            bar.matrix_heads[i] = @intCast(@mod(ii * 7919, spread) - MATRIX_TAIL_PX);
+        }
+        bar.matrix_ncols = ncols;
+    }
+    const speed: i16 = @intCast(current_config.appearance.matrix_speed);
+    var i: usize = 0;
+    while (i < bar.matrix_ncols) : (i += 1) {
+        const extra: i16 = if (i % 3 == 0) 1 else 0;
+        bar.matrix_heads[i] += speed + extra;
+        if (@as(i64, bar.matrix_heads[i]) - MATRIX_TAIL_PX > h) {
+            const stagger: i64 = @intCast((i * 37) % @as(usize, MATRIX_TAIL_PX));
+            bar.matrix_heads[i] = @intCast(-MATRIX_TAIL_PX - stagger);
+        }
+    }
+}
+
+/// Resolves the rain charset against this bar's font exactly once: katakana
+/// where the face has it, digits, always ending in FULL BLOCK so the list
+/// can never come back empty (blocks ship in practically every monospace).
+fn resolveMatrixCharset(bar: *Bar) void {
+    if (bar.matrix_charset_done) return;
+    bar.matrix_charset_done = true;
+    const candidates = [_]u32{
+        0x30A2, 0x30A4, 0x30A6, 0x30A8, 0x30AA, 0x30AB, 0x30AD, 0x30AF, 0x30B2,
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+        0x2588,
+    };
+    for (candidates) |cp| {
+        if (bar.matrix_chars_len >= bar.matrix_chars.len) break;
+        _ = bar.font.glyph(cp) catch continue;
+        bar.matrix_chars[bar.matrix_chars_len] = cp;
+        bar.matrix_chars_len += 1;
+    }
+    if (bar.matrix_chars_len == 0) {
+        bar.matrix_chars[0] = 0x2588;
+        bar.matrix_chars_len = 1;
+    }
+}
+
+/// Blits one rain cell, preserving the destination alpha (blendPixel forces
+/// opaque — over a translucent bar background that would punch solid holes).
+/// `bright` folds the tail falloff into the glyph coverage.
+fn blitMatrixGlyph(pixels: [*]u32, buf_width: u32, buf_height: u32, font: *font_mod.Font, pen_x: i64, baseline_y: i64, cp: u32, fg_rgb: u32, bright: f32, clip_x0: i64, clip_x1: i64) void {
+    const g = font.glyph(cp) catch return;
+    const fr: f32 = @floatFromInt((fg_rgb >> 16) & 0xFF);
+    const fg: f32 = @floatFromInt((fg_rgb >> 8) & 0xFF);
+    const fb: f32 = @floatFromInt(fg_rgb & 0xFF);
+    const x0 = pen_x + g.bitmap_left;
+    const y0 = baseline_y - g.bitmap_top;
+    for (0..g.height) |row| {
+        for (0..g.width) |col| {
+            const coverage = g.pixels[row * g.width + col];
+            if (coverage == 0) continue;
+            const px = x0 + @as(i64, @intCast(col));
+            const py = y0 + @as(i64, @intCast(row));
+            if (px < clip_x0 or px >= clip_x1 or py < 0) continue;
+            const pxu: usize = @intCast(px);
+            const pyu: usize = @intCast(py);
+            if (pxu >= buf_width or pyu >= buf_height) continue;
+            const k = @as(f32, @floatFromInt(coverage)) / 255.0 * bright;
+            const dst = pixels[pyu * buf_width + pxu];
+            const dr: f32 = @floatFromInt((dst >> 16) & 0xFF);
+            const dg: f32 = @floatFromInt((dst >> 8) & 0xFF);
+            const db: f32 = @floatFromInt(dst & 0xFF);
+            const r: u32 = @intFromFloat(dr + (fr - dr) * k);
+            const gg: u32 = @intFromFloat(dg + (fg - dg) * k);
+            const b: u32 = @intFromFloat(db + (fb - db) * k);
+            pixels[pyu * buf_width + pxu] = (dst & 0xFF000000) | (r << 16) | (gg << 8) | b;
+        }
+    }
+}
+
+/// Rains the matrix streams over the background rect [x0,x1)×[y0,y1) with
+/// corner `radius`: one stable glyph per 8px cell (charset position-hash, so
+/// cells don't flicker), brightness falling off behind each head, head cell
+/// near-white. Cells straddling the rounded shape are skipped whole (all
+/// four corners must test inside), so nothing pokes past dock capsules.
+fn drawMatrixBackground(bar: *Bar, pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, x1: i64, y0: i64, y1: i64, radius: i64) void {
+    if (bar.matrix_ncols == 0) return;
+    resolveMatrixCharset(bar);
+    const mat_rgb = current_config.appearance.matrix_color & 0x00FFFFFF;
+    const X0 = 2 * x0;
+    const X1 = 2 * x1;
+    const Y0 = 2 * y0;
+    const Y1 = 2 * y1;
+    const R = 2 * radius;
+    const nchars: i64 = @intCast(bar.matrix_chars_len);
+    var col: usize = 0;
+    while (col < bar.matrix_ncols) : (col += 1) {
+        const cx0 = x0 + @as(i64, @intCast(col)) * MATRIX_CELL_W;
+        if (cx0 + MATRIX_CELL_W <= x0 or cx0 >= x1) continue;
+        const head: i64 = bar.matrix_heads[col];
+        var y = head;
+        while (true) {
+            const dist = head - y;
+            const b = matrixFalloff(dist);
+            if (b <= 0.0) break;
+            const cy0 = y - MATRIX_CELL_H;
+            if (cy0 + MATRIX_CELL_H <= y0 or cy0 >= y1) {
+                y -= MATRIX_CELL_H;
+                if (y < y0 - MATRIX_TAIL_PX - MATRIX_CELL_H) break;
+                continue;
+            }
+            // Whole-cell shape test (four corners, doubled coords).
+            if (inRoundedRect2(2 * cx0 + 1, 2 * cy0 + 1, X0, Y0, X1, Y1, R) and
+                inRoundedRect2(2 * (cx0 + MATRIX_CELL_W) - 1, 2 * cy0 + 1, X0, Y0, X1, Y1, R) and
+                inRoundedRect2(2 * cx0 + 1, 2 * y - 1, X0, Y0, X1, Y1, R) and
+                inRoundedRect2(2 * (cx0 + MATRIX_CELL_W) - 1, 2 * y - 1, X0, Y0, X1, Y1, R))
+            {
+                const cellrow = @divFloor(y, MATRIX_CELL_H);
+                const ici: i64 = @intCast(col);
+                const cp = bar.matrix_chars[@as(usize, @intCast(@mod(ici * 31 + cellrow * 17, nchars)))];
+                // Head cell flashes near-white; the tail wears matrix green.
+                const fr: f32 = @floatFromInt((mat_rgb >> 16) & 0xFF);
+                const fg: f32 = @floatFromInt((mat_rgb >> 8) & 0xFF);
+                const fb: f32 = @floatFromInt(mat_rgb & 0xFF);
+                const hw: f32 = if (dist < MATRIX_CELL_H) 0.6 else 0.0;
+                const cr: u32 = @intFromFloat(fr + (255.0 - fr) * hw);
+                const cg: u32 = @intFromFloat(fg + (255.0 - fg) * hw);
+                const cb: u32 = @intFromFloat(fb + (255.0 - fb) * hw);
+                blitMatrixGlyph(pixels, buf_width, buf_height, bar.font, cx0, y - 1, cp, (cr << 16) | (cg << 8) | cb, b, x0, x1);
+            }
+            y -= MATRIX_CELL_H;
+            if (y < -MATRIX_TAIL_PX - MATRIX_CELL_H) break;
+        }
+    }
+}
+
+/// Washes the cava equalizer across the background rect [x0,x1)×[y0,y1)
+/// with corner `radius`: the 24 daemon values stretch over the width, each
+/// column rising from the region's bottom edge, tinted toward cava_color by
+/// cava_bg_strength. Same bg_alpha as the flat fill, so bg_opacity fades
+/// wash and body alike.
+fn drawCavaBackground(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, x1: i64, y0: i64, y1: i64, radius: i64) void {
+    _ = buf_height;
+    if (!cava_state.has_data or cava_state.bar_count == 0) return;
+    const s = @as(f32, @floatFromInt(current_config.appearance.cava_bg_strength)) / 100.0;
+    if (s <= 0.0) return;
+    const w = x1 - x0;
+    if (w <= 0) return;
+    const rh = y1 - y0;
+    if (rh <= 0) return;
+    const bg_rgb = current_config.appearance.bg_color & 0x00FFFFFF;
+    const cav_rgb = current_config.appearance.cava_color & 0x00FFFFFF;
+    const bg_a: u32 = (@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100) << 24;
+    const uw: usize = @intCast(w);
+    const X0 = 2 * x0;
+    const X1 = 2 * x1;
+    const Y0 = 2 * y0;
+    const Y1 = 2 * y1;
+    const R = 2 * radius;
+    var x = x0;
+    while (x < x1) : (x += 1) {
+        const ux: usize = @intCast(x - x0);
+        const sample = cava_state.bars[ux * cava_state.bar_count / uw];
+        const frac = @as(f32, @floatFromInt(sample)) / @as(f32, @floatFromInt(CAVA_REFERENCE_MAX));
+        const bh: i64 = @intFromFloat(frac * @as(f32, @floatFromInt(rh)));
+        if (bh <= 0) continue;
+        var y = y1 - bh;
+        while (y < y1) : (y += 1) {
+            if (radius > 0 and !inRoundedRect2(2 * x + 1, 2 * y + 1, X0, Y0, X1, Y1, R)) continue;
+            const col = lerpColor(bg_rgb, cav_rgb, s);
+            pixels[@as(usize, @intCast(y)) * buf_width + @as(usize, @intCast(x))] = bg_a | (col & 0x00FFFFFF);
+        }
+    }
+}
+
+/// Paints the background effect (bg_mode) over the already-filled
+/// background shape [x0,x1)×[y0,y1) with corner `radius` — under all
+/// modules, above the flat fill. No-op unless a mode is set, animations
+/// are on, and the background is actually visible.
+fn paintBackgroundEffect(bar: *Bar, pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, x1: i64, y0: i64, y1: i64, radius: i64) void {
+    if (!bgEffectVisible()) return;
+    const mode = current_config.appearance.bg_mode;
+    if (std.mem.eql(u8, mode, BG_MODE_CAVA)) {
+        drawCavaBackground(pixels, buf_width, buf_height, x0, x1, y0, y1, radius);
+    } else if (std.mem.eql(u8, mode, BG_MODE_MATRIX)) {
+        drawMatrixBackground(bar, pixels, buf_width, buf_height, x0, x1, y0, y1, radius);
+    }
+}
+
 /// Draws `current_config.modules.right` in config order, right-to-left from
 /// the bar's edge — today's default order reproduces the original
 /// hardcoded sequence exactly: custom/power, then the group/tray-expander
@@ -5714,9 +6300,16 @@ fn drawRightGroup(
             .drawer_toggle => {
                 if (!first) x_end -= MODULE_GAP;
                 first = false;
-                const cell = reserveRightCell(x_end, textPixelWidth(font, DRAWER_TOGGLE_LABEL), center_start_x);
+                // Open state wears the active pill + flipped chevron (like an
+                // active workspace reads live): tracked off the drawer fade
+                // level rather than threading another param — anim > 0.5 is
+                // what is visibly on screen.
+                const drawer_open = drawer_anim > 0.5;
+                const toggle_label = if (drawer_open) DRAWER_TOGGLE_LABEL_UP else DRAWER_TOGGLE_LABEL;
+                const cell = reserveRightCell(x_end, textPixelWidth(font, toggle_label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, DRAWER_TOGGLE_LABEL, text_color, .toggle_drawer, click_regions);
+                if (drawer_open) drawActivePill(pixels, buf_width, buf_height, cell.content_start, cell.content_end);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, toggle_label, if (drawer_open) current_config.appearance.workspace_active_color else text_color, .toggle_drawer, click_regions);
             },
             .volume => {
                 if (!first) x_end -= MODULE_GAP;
@@ -6324,6 +6917,55 @@ fn logClickRegionLayout(bar: *Bar) void {
 var g_last_region_log: [1024]u8 = undefined;
 var g_last_region_log_len: usize = 0;
 
+/// Last-frame dock pack geometry shared by the dock frame and the morph
+/// transition below (single source of truth for the gap rules).
+const DockPack = struct {
+    total: i64,
+    start: i64,
+    center: i64,
+    right_end: i64,
+};
+
+fn dockPack(bar: *const Bar) DockPack {
+    const buf_w: i64 = @intCast(bar.width);
+    const lw = bar.dock_left_w;
+    const cw = bar.dock_center_w;
+    const rw = bar.dock_right_w;
+    var total: i64 = lw + cw + rw;
+    if (lw > 0 and cw > 0) total += DOCK_GAP;
+    if (cw > 0 and rw > 0) total += DOCK_GAP;
+    if (lw > 0 and cw == 0 and rw > 0) total += DOCK_GAP;
+    const pack_start = @divTrunc(buf_w - total, 2);
+    return .{
+        .total = total,
+        .start = pack_start,
+        .center = pack_start + lw + (if (lw > 0 and (cw > 0 or rw > 0)) DOCK_GAP else 0),
+        .right_end = pack_start + total,
+    };
+}
+
+/// Begins the taskbar↔dock rubber-band morph on a mode switch: travels from
+/// the current eased blend to the new mode's endpoint with an elastic
+/// overshoot (see easeOutElastic). Honors the animations kill-switch with an
+/// instant snap instead.
+fn startModeMorph(bar: *Bar) void {
+    const target: f32 = if (std.mem.eql(u8, current_config.appearance.bar_mode, BAR_MODE_DOCK)) 1.0 else 0.0;
+    if (!current_config.appearance.animations_enabled) {
+        bar.mode_blend = target;
+        bar.mode_morph_active = false;
+        return;
+    }
+    bar.mode_morph_from = bar.mode_blend;
+    bar.mode_morph_t = 0.0;
+    bar.mode_morph_active = true;
+}
+
+/// Integer lerp for morphing geometry (all pack math stays i64; the blend
+/// itself is float).
+fn lerpI64(a: i64, b: i64, t: f32) i64 {
+    return @intFromFloat(@as(f32, @floatFromInt(a)) + (@as(f32, @floatFromInt(b)) - @as(f32, @floatFromInt(a))) * t);
+}
+
 /// Dock-mode frame (appearance.bar_mode == "dock"): packs left/center/right
 /// into one centered pill with no dead space, instead of taskbar's
 /// edge-anchored full-width layout. Pack geometry comes from LAST frame's
@@ -6333,35 +6975,30 @@ var g_last_region_log_len: usize = 0;
 /// center → right so each block starts from stable last-frame origins; the
 /// background pill and the input region both cover the stable pack span, so
 /// a change-frame's content may peek past the pill for a single frame at
-/// most. The mpris ticker renders static here (a scrolling ticker needs the
-/// dead stretch dock mode exists to remove); see drawLeftGroup.
+/// most.
 fn paintDock(bar: *Bar, pixels: [*]u32, time_text: []const u8, mpris_text: []const u8, mpris_playing: bool, volume_text: []const u8, weather_text: []const u8) void {
-    const buf_w: i64 = @intCast(bar.width);
     const buf_h: i64 = @intCast(bar.height);
-    const bg_fill: u32 = (@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100 << 24) | (current_config.appearance.bg_color & 0x00FFFFFF);
+    const bg_alpha: u32 = (@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100) << 24;
+    const bg_fill: u32 = bg_alpha | (current_config.appearance.bg_color & 0x00FFFFFF);
 
     // Last-frame pack span, with gaps only between non-empty groups.
-    const lw = bar.dock_left_w;
-    const cw = bar.dock_center_w;
-    const rw = bar.dock_right_w;
-    var total: i64 = lw + cw + rw;
-    if (lw > 0 and cw > 0) total += DOCK_GAP;
-    if (cw > 0 and rw > 0) total += DOCK_GAP;
-    if (lw > 0 and cw == 0 and rw > 0) total += DOCK_GAP;
-    const pack_start = @divTrunc(buf_w - total, 2);
-    const center_start_last = pack_start + lw + (if (lw > 0 and (cw > 0 or rw > 0)) DOCK_GAP else 0);
-    const right_end_last = pack_start + total;
+    const pack = dockPack(bar);
+    const total = pack.total;
+    const pack_start = pack.start;
+    const center_start_last = pack.center;
+    const right_end_last = pack.right_end;
 
     // Background capsule over the pack span (skipped while degenerate —
     // groups still draw below so widths get measured for the next frame).
     if (total > 0) {
         fillRoundedRect(pixels, bar.width, bar.height, pack_start - DOCK_PILL_PAD, 0, pack_start + total + DOCK_PILL_PAD, buf_h, @intCast(@divTrunc(buf_h, 2)), bg_fill);
+        paintBackgroundEffect(bar, pixels, bar.width, bar.height, pack_start - DOCK_PILL_PAD, pack_start + total + DOCK_PILL_PAD, 0, buf_h, @divTrunc(buf_h, 2));
     }
 
     // Groups left to right; pens recorded back for the next frame.
-    const left_end = drawLeftGroup(pixels, bar.width, bar.height, bar.font, bar.workspaces.list.items, time_text, mpris_text, mpris_playing, bar.mpris_scroll_step, center_start_last, pack_start, &bar.click_regions);
+    const left_end = drawLeftGroup(pixels, bar.width, bar.height, bar.font, bar.workspaces.list.items, time_text, mpris_text, mpris_playing, bar.mpris_frac, center_start_last, pack_start, &bar.click_regions);
     bar.dock_left_w = @max(0, left_end - pack_start);
-    const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, center_start_last, &bar.click_regions);
+    const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, bar.mpris_frac, mpris_playing, center_start_last, &bar.click_regions);
     bar.dock_center_w = @max(0, center_end - center_start_last);
     const right_start = drawRightGroup(pixels, bar.width, bar.height, bar.font, weather_text, bar.pacman.text(), volume_text, bar.drawer_anim, bar.tray, bar.workspaces, center_end, right_end_last, &bar.click_regions);
     bar.dock_right_w = @max(0, right_end_last - right_start);
@@ -6389,20 +7026,73 @@ fn paintDock(bar: *Bar, pixels: [*]u32, time_text: []const u8, mpris_text: []con
     }
 }
 
-fn paintFrame(bar: *Bar, pixels: [*]u32) void {
-    const pixel_count: usize = @as(usize, bar.width) * bar.height;
-    // Only the fill's alpha varies with bg_opacity_percent — text/icons/
-    // border keep their own configured (always-opaque) colors, so lowering
-    // this fades the background through to whatever's behind the bar
-    // (blurred, if the "simpbar" Hyprland layer rule is set up) rather than
-    // fading the whole bar's contents uniformly.
+/// Mid-morph frame (0 < bar.mode_blend < 1): taskbar and dock geometry
+/// interpolated by the eased blend, so the bar visibly stretches/recoils
+/// between full-bleed and packed instead of snapping. The background is one
+/// pill morphing full-surface square into pack capsule (bounds and radius
+/// both lerped); straight borders and the surface corner pass stay off for
+/// the half-second this lasts, exactly as in dock mode. Group pens are
+/// recorded anchor-subtracted as usual, so the width cache stays warm
+/// through the transition.
+fn paintMorph(bar: *Bar, pixels: [*]u32, e: f32, time_text: []const u8, mpris_text: []const u8, mpris_playing: bool, volume_text: []const u8, weather_text: []const u8) void {
+    const buf_w: i64 = @intCast(bar.width);
+    const buf_h: i64 = @intCast(bar.height);
     const bg_alpha: u32 = (@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100) << 24;
     const bg_fill: u32 = bg_alpha | (current_config.appearance.bg_color & 0x00FFFFFF);
-    const is_dock = std.mem.eql(u8, current_config.appearance.bar_mode, BAR_MODE_DOCK);
+    const pack = dockPack(bar);
+
+    // Taskbar endpoints (today's exact anchors) and dock endpoints.
+    const t_left: i64 = WORKSPACE_LEFT_MARGIN;
+    const t_center = centerGroupStartX(bar.width, bar.font, time_text, bar.workspaces.list.items, mpris_text, mpris_playing);
+    const t_right: i64 = buf_w - RIGHT_MARGIN;
+    const L = lerpI64(t_left, pack.start, e);
+    const C = lerpI64(t_center, pack.center, e);
+    const Rend = lerpI64(t_right, pack.right_end, e);
+
+    // Background pill: full surface at e=0, pack capsule at e=1. Radius
+    // clamped at 0 — elastic overshoot past either endpoint extrapolates the
+    // rect (clipped, correct) and must not invert the rounding.
+    const user_r: i64 = @intCast(@min(current_config.appearance.corner_radius_px, @min(bar.width, bar.height) / 2));
+    const pr = @max(0, lerpI64(user_r, @divTrunc(buf_h, 2), e));
+    fillRoundedRect(pixels, bar.width, bar.height, lerpI64(0, pack.start - DOCK_PILL_PAD, e), 0, lerpI64(buf_w, pack.start + pack.total + DOCK_PILL_PAD, e), buf_h, @intCast(pr), bg_fill);
+    paintBackgroundEffect(bar, pixels, bar.width, bar.height, lerpI64(0, pack.start - DOCK_PILL_PAD, e), lerpI64(buf_w, pack.start + pack.total + DOCK_PILL_PAD, e), 0, buf_h, pr);
+
+    const left_end = drawLeftGroup(pixels, bar.width, bar.height, bar.font, bar.workspaces.list.items, time_text, mpris_text, mpris_playing, bar.mpris_frac, C, L, &bar.click_regions);
+    bar.dock_left_w = @max(0, left_end - L);
+    const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, bar.mpris_frac, mpris_playing, C, &bar.click_regions);
+    bar.dock_center_w = @max(0, center_end - C);
+    const right_start = drawRightGroup(pixels, bar.width, bar.height, bar.font, weather_text, bar.pacman.text(), volume_text, bar.drawer_anim, bar.tray, bar.workspaces, center_end, Rend, &bar.click_regions);
+    bar.dock_right_w = @max(0, Rend - right_start);
+
+    // Input follows the morphing pill (same change-detect fields as dock).
+    const rx = @max(0, lerpI64(0, pack.start - DOCK_PILL_PAD, e));
+    const rw: i64 = lerpI64(buf_w, pack.total + DOCK_PILL_PAD * 2, e);
+    if (!bar.dock_input_set or bar.dock_input_x != rx or bar.dock_input_w != rw) {
+        if (bar.compositor.createRegion()) |region| {
+            region.add(@intCast(rx), 0, @intCast(rw), @intCast(bar.height));
+            bar.surface.setInputRegion(region);
+            region.destroy();
+        } else |_| {}
+        bar.dock_input_set = true;
+        bar.dock_input_x = rx;
+        bar.dock_input_w = rw;
+    }
+}
+
+fn paintFrame(bar: *Bar, pixels: [*]u32) void {
+    const pixel_count: usize = @as(usize, bar.width) * bar.height;
+    // Only the background fill and borders follow bg_opacity_percent — every
+    // module (pills, text, icons, hover, bezels) stays fully opaque, so at 0
+    // the bar body is gone but the modules float over the wallpaper.
+    const bg_alpha: u32 = (@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100) << 24;
+    const bg_fill: u32 = bg_alpha | (current_config.appearance.bg_color & 0x00FFFFFF);
+    // Eased taskbar↔dock blend (see mode_blend): endpoints render through
+    // the exact legacy paths so both modes stay pixel-identical at rest.
+    const e = bar.mode_blend;
     var i: usize = 0;
-    // Dock mode leaves the surface transparent outside the packed pill
-    // (paintDock, below); taskbar fills edge to edge as before.
-    while (i < pixel_count) : (i += 1) pixels[i] = if (is_dock) 0 else bg_fill;
+    // Transparent base unless fully taskbar (the dock pill and morph pill
+    // paint their own background; taskbar fills edge to edge as before).
+    while (i < pixel_count) : (i += 1) pixels[i] = if (e <= 0.0) bg_fill else 0;
 
     // Auto-hide collapsed state: transparent surface with just the 2px hint
     // strip at the screen edge. No modules, no regions (autohideHide already
@@ -6414,11 +7104,14 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
         const strip = autohideStripRect(bar);
         const strip_u: u32 = @intCast(AUTOHIDE_STRIP_PX);
         const sy: u32 = if (std.mem.eql(u8, current_config.appearance.position, "top")) 0 else bar.height - strip_u;
+        // Same alpha as the background: at opacity 0 a hidden bar leaves no
+        // trace at all.
+        const strip_col: u32 = ((@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100) << 24) | (current_config.appearance.border_color & 0x00FFFFFF);
         var yy: u32 = sy;
         while (yy < sy + strip_u and yy < bar.height) : (yy += 1) {
             var xx: i64 = @max(0, strip.x);
             const xe: i64 = @min(@as(i64, @intCast(bar.width)), strip.x + strip.w);
-            while (xx < xe) : (xx += 1) pixels[yy * bar.width + @as(usize, @intCast(xx))] = current_config.appearance.border_color;
+            while (xx < xe) : (xx += 1) pixels[yy * bar.width + @as(usize, @intCast(xx))] = strip_col;
         }
         return;
     }
@@ -6435,13 +7128,15 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     // left+right can't exceed bar.width (top/left take priority on an
     // impossible combination, same "first configured wins" spirit as
     // everything else that clamps rather than errors).
-    const bc = current_config.appearance.border_color;
-    // No full-width borders in dock mode — the packed pill carries its own
-    // bezel, and border rects would stripe across the transparent gaps.
-    const top_px = if (is_dock) 0 else @min(current_config.appearance.border_top_px, bar.height);
-    const bottom_px = if (is_dock) 0 else @min(current_config.appearance.border_bottom_px, bar.height - top_px);
-    const left_px = if (is_dock) 0 else @min(current_config.appearance.border_left_px, bar.width);
-    const right_px = if (is_dock) 0 else @min(current_config.appearance.border_right_px, bar.width - left_px);
+    // Borders fade with the background (same alpha): at 0 only modules,
+    // pills, text and icons remain — the bar body is gone.
+    const bc = ((@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100) << 24) | (current_config.appearance.border_color & 0x00FFFFFF);
+    // Full-width borders only at the taskbar endpoint — dock and morph carry
+    // their own bezel, and border rects would stripe the transparent gaps.
+    const top_px = if (e <= 0.0) @min(current_config.appearance.border_top_px, bar.height) else 0;
+    const bottom_px = if (e <= 0.0) @min(current_config.appearance.border_bottom_px, bar.height - top_px) else 0;
+    const left_px = if (e <= 0.0) @min(current_config.appearance.border_left_px, bar.width) else 0;
+    const right_px = if (e <= 0.0) @min(current_config.appearance.border_right_px, bar.width - left_px) else 0;
 
     var row: u32 = 0;
     while (row < top_px) : (row += 1) {
@@ -6459,6 +7154,14 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
         while (col < left_px) : (col += 1) pixels[row * bar.width + col] = bc;
         col = bar.width - right_px;
         while (col < bar.width) : (col += 1) pixels[row * bar.width + col] = bc;
+    }
+
+    // Background effect inside the border bands (taskbar endpoint only —
+    // dock/morph paint their own shape above). Under all modules.
+    if (e <= 0.0) {
+        const er: i64 = @intCast(@min(current_config.appearance.corner_radius_px, @min(bar.width, bar.height) / 2));
+        const bh: i64 = @intCast(bar.height);
+        paintBackgroundEffect(bar, pixels, bar.width, bar.height, @as(i64, @intCast(left_px)), @as(i64, @intCast(bar.width)) - @as(i64, @intCast(right_px)), @as(i64, @intCast(top_px)), bh - @as(i64, @intCast(bottom_px)), er);
     }
 
     bar.click_regions.clear();
@@ -6489,34 +7192,46 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
             @memcpy(bar.mpris_player_buf[0..bar.mpris_player_len], player[0..bar.mpris_player_len]);
             break :blk mpris_raw[sep + 1 ..];
         };
-        mpris_playing = std.mem.startsWith(u8, status_and_track, "Playing|");
-        var mpris_buf: [64]u8 = undefined;
-        mpris_text = formatMprisText(status_and_track, &mpris_buf);
-        // Restart the scroll from the beginning whenever the track (or
-        // play/pause status, since that's part of the same string) actually
-        // changes — but not on every redraw, which would happen constantly
-        // during the animation itself and never let it progress.
-        if (!std.mem.eql(u8, bar.mpris_prev_buf[0..bar.mpris_prev_len], mpris_text)) {
-            bar.mpris_scroll_step = 0;
-            @memcpy(bar.mpris_prev_buf[0..mpris_text.len], mpris_text);
-            bar.mpris_prev_len = mpris_text.len;
+        // Second output line ("POSITION|LENGTH") feeds the progress
+        // underline; absent/unparseable means unknown, never guessed. Split
+        // off before display shaping so the numbers can never leak into the
+        // visible text. Position prints as decimal seconds ("211.716851")
+        // while length is integer microseconds — split the fraction by hand
+        // (integer math only) rather than pulling in float parsing.
+        var track_part = status_and_track;
+        bar.mpris_frac = null;
+        if (std.mem.indexOfScalar(u8, status_and_track, '\n')) |nl| {
+            track_part = status_and_track[0..nl];
+            const numline = std.mem.trim(u8, status_and_track[nl + 1 ..], " \t\r\n");
+            if (std.mem.indexOfScalar(u8, numline, '|')) |pp| {
+                const pos_us = parseMprisPos(numline[0..pp]);
+                const len = std.fmt.parseInt(i64, numline[pp + 1 ..], 10) catch -1;
+                // Lengths are microseconds; anything under a second is noise
+                // (or a malformed line) rather than a track.
+                if (pos_us >= 0 and len > 1000000) {
+                    bar.mpris_frac = @min(1.0, @as(f32, @floatFromInt(pos_us)) / @as(f32, @floatFromInt(len)));
+                }
+            }
         }
+        mpris_playing = std.mem.startsWith(u8, track_part, "Playing|");
+        var mpris_buf: [64]u8 = undefined;
+        mpris_text = formatMprisText(track_part, &mpris_buf);
     }
-    const center_start_x = centerGroupStartX(bar.width, bar.font, time_text, bar.workspaces.list.items, mpris_text);
+    const center_start_x = centerGroupStartX(bar.width, bar.font, time_text, bar.workspaces.list.items, mpris_text, mpris_playing);
     var volume_buf: [16]u8 = undefined;
     const volume_text = parseVolumePercent(bar.volume.text(), &volume_buf);
     var weather_buf: [32]u8 = undefined;
     const weather_text = formatWeatherText(bar.weather.text(), &weather_buf);
-    if (is_dock) {
+    if (e >= 1.0) {
         paintDock(bar, pixels, time_text, mpris_text, mpris_playing, volume_text, weather_text);
-    } else {
+    } else if (e <= 0.0) {
         // Leaving dock mode must release the input region, or the bar keeps
         // only its last pill clickable.
         if (bar.dock_input_set) {
             bar.surface.setInputRegion(null);
             bar.dock_input_set = false;
         }
-        const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, center_start_x, &bar.click_regions);
+        const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, bar.mpris_frac, mpris_playing, center_start_x, &bar.click_regions);
         // Record content widths even in taskbar mode, so flipping to dock
         // packs correctly on the very first frame instead of piling up at
         // center for a frame. Anchor-subtracted, so identical values would
@@ -6531,7 +7246,7 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
             time_text,
             mpris_text,
             mpris_playing,
-            bar.mpris_scroll_step,
+            bar.mpris_frac,
             center_start_x,
             WORKSPACE_LEFT_MARGIN,
             &bar.click_regions,
@@ -6554,6 +7269,9 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
             &bar.click_regions,
         );
         bar.dock_right_w = @max(0, right_anchor - right_start);
+    } else {
+        // Mid-morph: interpolated layout (see paintMorph).
+        paintMorph(bar, pixels, e, time_text, mpris_text, mpris_playing, volume_text, weather_text);
     }
 
     // Region layout changes only when module widths change (a workspace
@@ -6581,7 +7299,9 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     const radius = @min(current_config.appearance.corner_radius_px, @min(bar.width, bar.height) / 2);
     // Skipped in dock mode: the surface corners are already transparent
     // there, and the packed pill carries its own capsule rounding.
-    if (radius > 0 and !is_dock) {
+    // Surface corners only at the taskbar endpoint (the dock pill and morph
+    // pill carry their own rounding; the surface is transparent there).
+    if (radius > 0 and e <= 0.0) {
         const r_i: i32 = @intCast(radius);
         const r_sq: i32 = r_i * r_i;
         // Inner edge of each corner's border band: the circle shrunk by that
@@ -6665,4 +7385,39 @@ fn drawAndCommit(bar: *Bar) !void {
     bar.surface.attach(buffer, 0, 0);
     bar.surface.damageBuffer(0, 0, @intCast(bar.width), @intCast(bar.height));
     bar.surface.commit();
+}
+
+// ---------------------------------------------------------------------
+// Tests — bezel breathing math (pure, no display).
+// Run: zig test src/main.zig -lc -fllvm -flld <bar link flags below>
+// ---------------------------------------------------------------------
+
+test "bezel breath phases" {
+    const t = std.testing;
+    const eps = 1e-5;
+    // Frame 0: swell starts at rest; quarter period: full; half: rest;
+    // three-quarter: trough (never below 0.10 — the ring stays a ring).
+    try t.expect(@abs(bezelBreathAt(0) - 0.55) < eps);
+    try t.expect(@abs(bezelBreathAt(BEZEL_BREATH_PERIOD / 4) - 1.0) < eps);
+    try t.expect(@abs(bezelBreathAt(BEZEL_BREATH_PERIOD / 2) - 0.55) < eps);
+    try t.expect(@abs(bezelBreathAt(3 * BEZEL_BREATH_PERIOD / 4) - 0.10) < eps);
+    // Full period stays in range and wraps exactly.
+    var f: u32 = 0;
+    while (f <= BEZEL_BREATH_PERIOD) : (f += 1) {
+        const v = bezelBreathAt(f);
+        try t.expect(v >= 0.09 and v <= 1.01);
+    }
+    try t.expect(bezelBreathAt(BEZEL_BREATH_PERIOD) == bezelBreathAt(0));
+    try t.expect(bezelBreathAt(BEZEL_BREATH_PERIOD + 1) == bezelBreathAt(1));
+}
+
+test "matrix falloff" {
+    const t = std.testing;
+    const eps = 1e-5;
+    // Full at the head, linear down the tail, dark at/past its end.
+    try t.expect(@abs(matrixFalloff(0) - 1.0) < eps);
+    try t.expect(@abs(matrixFalloff(@divTrunc(MATRIX_TAIL_PX, 2)) - 0.5) < eps);
+    try t.expect(matrixFalloff(MATRIX_TAIL_PX) == 0.0);
+    try t.expect(matrixFalloff(MATRIX_TAIL_PX + 40) == 0.0);
+    try t.expect(matrixFalloff(-5) == 0.0);
 }
