@@ -1346,12 +1346,15 @@ FOOTEOF
     ok "foot config placed in ~/.config/foot/foot.ini"
 fi
 
-# waypaper, protonplus etc. used to mean an AUR helper — with Chaotic-AUR
+# protonplus etc. used to mean an AUR helper — with Chaotic-AUR
 # (or CachyOS) enabled most of these are now binary packages, so they install
 # through pacman from the chosen repo, and yay/paru are only reached for the
 # stragglers the repo doesn't carry. wlogout is deliberately gone: the app
 # drawer's Power menu (bar power button / SUPER+SHIFT+Q) replaces it.
-AUR_PKGS=(waypaper protonplus dracula-gtk-theme bibata-cursor-theme game-devices-udev zafiro-icon-theme)
+# waypaper is deliberately gone too: the app drawer's wallpaper tab owns
+# picking now (see the Wallpaper Button tombstone in the bar source). Users
+# who already have waypaper keep it working — nothing here uninstalls it.
+AUR_PKGS=(protonplus dracula-gtk-theme bibata-cursor-theme game-devices-udev zafiro-icon-theme)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 [ "$INSTALL_FALCOND" -eq 1 ] && AUR_PKGS+=(falcond falcond-gui)
@@ -1428,56 +1431,6 @@ else
     BING_FILE=""
     warn "Could not download today's Bing wallpaper — nothing is wrong, the wallpaper engine simply starts empty"
     printf '       %sFetch one any time with:%s simpbar-wallpaper bing\n' "$C_BOLD" "$C_RESET"
-fi
-
-if pacman -Qq waypaper >/dev/null 2>&1; then
-    mkdir -p ~/.config/waypaper
-    if [ -e ~/.config/waypaper/config.ini ]; then
-        warn "~/.config/waypaper/config.ini already exists — leaving your existing waypaper config alone"
-        if [ "$INSTALL_MATUGEN" -eq 1 ]; then
-            printf '  %sNote:%s add %s to waypaper to auto-recolor the bar on each wallpaper change.\n' "$C_BOLD" "$C_RESET" 'post_command = simpbar-matugen "$wallpaper"'
-        fi
-    else
-        # waypaper substitutes $wallpaper with the chosen image at runtime; the
-        # literal $wallpaper is preserved by stashing the exact text (the shell
-        # won't re-expand it once the heredoc expands this variable).
-        if [ "$INSTALL_MATUGEN" -eq 1 ]; then
-            MATUGEN_POST_COMMAND='simpbar-matugen "$wallpaper"'
-        else
-            MATUGEN_POST_COMMAND=""
-        fi
-        cat > ~/.config/waypaper/config.ini <<EOF
-[Settings]
-language = en
-folder = $WALLPAPER_DIR
-wallpaper = $BING_FILE
-backend = swaybg
-monitors = All
-fill = Fill
-sort = name
-color = #ffffff
-subfolders = False
-all_subfolders = False
-show_hidden = False
-show_gifs_only = False
-show_path_in_tooltip = True
-number_of_columns = 3
-use_xdg_state = False
-zen_mode = False
-swww_transition_type = any
-swww_transition_step = 63
-swww_transition_angle = 0
-swww_transition_duration = 2
-swww_transition_fps = 60
-mpvpaper_sound = False
-mpvpaper_options =
-post_command = $MATUGEN_POST_COMMAND
-keybindings = ~/.config/waypaper/keybindings.ini
-EOF
-        ok "waypaper set to use ~/Pictures/Wallpaper as its default folder"
-    fi
-else
-    warn "waypaper isn't installed — skipping wallpaper folder setup"
 fi
 
 # One owner for the wallpaper. This used to hand login to a swaybg.service
@@ -2104,7 +2057,7 @@ fi
 if [ -e ~/.config/rofi/config.rasi ]; then
     ok "rofi configured with the Material theme"
 fi
-ok "waypaper, protonplus and the theme packages installed (from ${REPO_NAME} or AUR helper)"
+ok "protonplus and the theme packages installed (from ${REPO_NAME} or AUR helper)"
 if [ -n "$BROWSER_NAME" ]; then
     ok "$BROWSER_NAME installed (from ${REPO_NAME} or AUR helper)"
 else
@@ -2114,9 +2067,6 @@ if [ "$REPO_CHOICE" = 1 ]; then
     ok "CachyOS repos enabled"
 else
     ok "Chaotic-AUR repo enabled"
-fi
-if [ -e ~/.config/waypaper/config.ini ]; then
-    ok "waypaper default folder set to ~/Pictures/Wallpaper"
 fi
 if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
     ok "Today's Bing wallpaper downloaded to ~/Pictures/Wallpaper"

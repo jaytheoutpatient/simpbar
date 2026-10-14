@@ -973,13 +973,6 @@ const CENTER_LAUNCHERS = [_]LauncherButton{
 // off); wlogout is no longer installed, so this opens that menu instead.
 const POWER_BUTTON = LauncherButton{ .label = "\u{f0425}", .command = "appdrawer power" };
 
-// custom/waypaper, one of the "group/tray-expander" drawer's children.
-// Icon only in the real config, no text. The module kind is still called
-// "waypaper" for config.json backwards compat; the actual picker it spawns is
-// simpbar-wallpaper, which launches azote on Debian (where waypaper isn't
-// packaged) and waypaper on Arch.
-const WAYPAPER_BUTTON = LauncherButton{ .label = "\u{f030}", .command = "simpbar-wallpaper" };
-
 // Real config's drawer toggle glyph (▾) — doesn't flip direction when
 // expanded like the real one's rotating chevron does, but it's the actual
 // character now instead of a stand-in letter.
@@ -1005,6 +998,11 @@ const ModuleKind = enum {
     power,
     drawer_toggle,
     volume,
+    /// Tombstone: the old Wallpaper Button module, superseded by the app
+    /// drawer's wallpaper tab. Kept (unrendered, see drawRightGroup) so a
+    /// config.json that still names it keeps parsing instead of falling back
+    /// to defaults; simpbar-config strips it on load so the next save cleans
+    /// the file. Do NOT add it back to RIGHT_MODULE_KINDS or defaults.
     waypaper,
     pacman,
     tray,
@@ -1213,7 +1211,6 @@ const DEFAULT_RIGHT = [_]ModuleEntry{
     .{ .kind = .power, .enabled = true },
     .{ .kind = .drawer_toggle, .enabled = true },
     .{ .kind = .volume, .enabled = true, .in_drawer = true },
-    .{ .kind = .waypaper, .enabled = true, .in_drawer = true },
     .{ .kind = .pacman, .enabled = true, .in_drawer = true },
     .{ .kind = .tray, .enabled = true, .in_drawer = true },
     .{ .kind = .weather, .enabled = true },
@@ -6237,9 +6234,8 @@ fn paintBackgroundEffect(bar: *Bar, pixels: [*]u32, buf_width: u32, buf_height: 
 /// Draws `current_config.modules.right` in config order, right-to-left from
 /// the bar's edge — today's default order reproduces the original
 /// hardcoded sequence exactly: custom/power, then the group/tray-expander
-/// drawer (a "▾" toggle; expanded reveals custom/pacman, custom/waypaper, a
-/// polled wireplumber volume reading, and any tray icons), then
-/// custom/weather. An entry with `in_drawer == true` is only drawn while
+/// drawer (a "▾" toggle; expanded reveals custom/pacman, a polled
+/// wireplumber volume reading, and any tray icons), then custom/weather. An entry with `in_drawer == true` is only drawn while
 /// `drawer_anim > 0` (0 = fully collapsed, 1 = fully expanded, animated
 /// over a few frames by the caller), fading toward the bar's background
 /// color as it goes, so expanding/collapsing is a quick fade rather than an
@@ -6325,11 +6321,8 @@ fn drawRightGroup(
                 _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, vol_label, drawer_color, null, click_regions);
             },
             .waypaper => {
-                if (!first) x_end -= MODULE_GAP;
-                first = false;
-                const cell = reserveRightCell(x_end, textPixelWidth(font, WAYPAPER_BUTTON.label), center_start_x);
-                x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, WAYPAPER_BUTTON.label, drawer_color, .{ .spawn = WAYPAPER_BUTTON.command }, click_regions);
+                // Tombstone (see ModuleKind): old configs still parse, but
+                // nothing draws — no space taken, `first` untouched.
             },
             .pacman => {
                 if (!first) x_end -= MODULE_GAP;
@@ -7420,4 +7413,32 @@ test "matrix falloff" {
     try t.expect(matrixFalloff(MATRIX_TAIL_PX) == 0.0);
     try t.expect(matrixFalloff(MATRIX_TAIL_PX + 40) == 0.0);
     try t.expect(matrixFalloff(-5) == 0.0);
+}
+
+test "waypaper tombstone still parses" {
+    const t = std.testing;
+    // An old config.json naming the retired module must keep parsing (into
+    // the tombstone variant) instead of falling back to defaults and wiping
+    // the user's layout. The renderer skips it; the GUI strips it on load.
+    // An unknown kind still fails the whole parse — which is exactly why the
+    // tombstone variant above has to exist: without it, every config.json
+    // written while waypaper was a module would fall back to defaults.
+    const bad_doc =
+        \\{"appearance": {}, "modules": {"left": [], "center": [], "right": [{"kind": "waypower", "enabled": false}]}, "launchers": []}
+    ;
+    var arena2 = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena2.deinit();
+    try t.expectError(error.InvalidEnumTag, std.json.parseFromSliceLeaky(JsonConfig, arena2.allocator(), bad_doc, .{}));
+    const doc2 =
+        \\{"appearance": {}, "modules": {"left": [], "center": [], "right": [{"kind": "waypaper", "enabled": false, "in_drawer": true}, {"kind": "weather", "enabled": true}]}, "launchers": []}
+    ;
+    // Leaky parse needs an arena (production passes its config arena); a
+    // throwaway one keeps the leak checker quiet.
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(JsonConfig, arena.allocator(), doc2, .{});
+    try t.expectEqual(@as(usize, 2), parsed.modules.right.len);
+    try t.expectEqual(ModuleKind.waypaper, parsed.modules.right[0].kind);
+    try t.expect(parsed.modules.right[0].in_drawer);
+    try t.expectEqual(ModuleKind.weather, parsed.modules.right[1].kind);
 }

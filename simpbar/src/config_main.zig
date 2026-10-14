@@ -77,6 +77,9 @@ const ModuleKind = enum {
     power,
     drawer_toggle,
     volume,
+    /// Tombstone: the old Wallpaper Button module (see main.zig's
+    /// ModuleKind). Parses so old configs keep loading; never rendered,
+    /// never listed, stripped from live_right on load.
     waypaper,
     pacman,
     tray,
@@ -100,10 +103,9 @@ const ModuleKind = enum {
 // ones happen to already be in config.json. Keep this in sync with
 // drawRightGroup's switch if a new right-side kind is ever added.
 const RIGHT_MODULE_KINDS = [_]ModuleKind{
-    .power,     .drawer_toggle, .volume,  .waypaper,      .pacman,
-    .tray,      .weather,       .cpu,     .ram,           .network,
-    .disk,      .battery,       .custom_script, .cpu_temp,
-    .cava,      .layout,
+    .power, .drawer_toggle, .volume, .pacman, .tray,
+    .weather, .cpu, .ram, .network, .disk,
+    .battery, .custom_script, .cpu_temp, .cava, .layout,
 };
 
 // The kind set shared by the Left and Center groups. main.zig now draws
@@ -155,7 +157,6 @@ const DEFAULT_RIGHT = [_]ModuleEntry{
     .{ .kind = .power, .enabled = true },
     .{ .kind = .drawer_toggle, .enabled = true },
     .{ .kind = .volume, .enabled = true, .in_drawer = true },
-    .{ .kind = .waypaper, .enabled = true, .in_drawer = true },
     .{ .kind = .pacman, .enabled = true, .in_drawer = true },
     .{ .kind = .tray, .enabled = true, .in_drawer = true },
     .{ .kind = .weather, .enabled = true },
@@ -964,7 +965,27 @@ fn loadConfigFromDisk() void {
     live_left.ensureKindsPresent(&LEFT_CENTER_MODULE_KINDS);
     live_center.ensureKindsPresent(&LEFT_CENTER_MODULE_KINDS);
     live_right.ensureKindsPresent(&RIGHT_MODULE_KINDS);
+    // Drop tombstoned entries (see ModuleKind.waypaper): the bar skips them
+    // when rendering, and leaving them in live_right would rewrite them back
+    // into config.json on every save. Filtering here (rather than in load())
+    // keeps load() a faithful copy and puts the migration where the other
+    // kind-list repair already lives.
+    stripRemovedKinds(&live_right);
     live_launchers.load(parsed.launchers);
+}
+
+/// Removes entries whose kind was retired (see ModuleKind.waypaper) from a
+/// loaded group, in place, preserving order. Pure group surgery (no GUI
+/// calls) so tests can pin it.
+fn stripRemovedKinds(group: *ModuleGroup) void {
+    var w: usize = 0;
+    while (w < group.len) {
+        if (group.rows[w].entry.kind == .waypaper) {
+            _ = group.removeAt(w);
+        } else {
+            w += 1;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -2792,8 +2813,8 @@ fn buildShortcutsPage() *gtk.GtkBox {
 
 // ---------------------------------------------------------------------
 // Modules tab widgets (Step 6: switches + custom-script fields; Step 7:
-// real drag-and-drop reordering). Each group ("Left"/"Center"/"Right") is
-// an application-owned GtkListBox (styled with libadwaita's "boxed-list"
+// real drag-and-drop reordering). Each group ("Left"/"Center"/"Right" plus
+// a "Drawer" filtered view over the right group) is an application-owned GtkListBox (styled with libadwaita's "boxed-list"
 // CSS class to keep the same rounded-card look AdwPreferencesGroup gives
 // the Appearance tab) rather than an AdwPreferencesGroup — AdwPreferences-
 // Group manages its rows via an internal GtkListBox that isn't exposed to
@@ -2813,7 +2834,7 @@ fn moduleKindDisplayName(kind: ModuleKind) [:0]const u8 {
         .power => "Power Button",
         .drawer_toggle => "Drawer Toggle",
         .volume => "Volume",
-        .waypaper => "Wallpaper Button",
+        .waypaper => "Wallpaper Button", // tombstone: never listed, kept for the switch's exhaustiveness
         .pacman => "Package Updates",
         .tray => "System Tray",
         .weather => "Weather",
@@ -2889,10 +2910,33 @@ const GroupCtx = struct {
     /// Center both allow LEFT_CENTER_MODULE_KINDS; Right allows
     /// RIGHT_MODULE_KINDS.
     allowed: []const ModuleKind,
+    /// Which slice of the backing array this section displays. Left/Center
+    /// show everything; Right shows only the bar's own modules while the
+    /// Drawer section shows the toggle plus in_drawer entries (see
+    /// buildModulesPage) — both views share live_right, so a drag between
+    /// them just flips the entry's in_drawer flag (handled in onModuleDrop).
+    view: ModuleView = .all,
 };
+
+/// One Modules-tab section's slice of its backing ModuleGroup.
+const ModuleView = enum {
+    all, // every entry (Left, Center)
+    right_bar, // right entries with in_drawer == false, minus the toggle
+    drawer, // the toggle plus right entries with in_drawer == true
+};
+
+/// Whether `entry` belongs in a section showing `view`.
+fn viewShows(view: ModuleView, entry: *const ModuleEntry) bool {
+    return switch (view) {
+        .all => true,
+        .right_bar => !entry.in_drawer and entry.kind != .drawer_toggle,
+        .drawer => entry.in_drawer or entry.kind == .drawer_toggle,
+    };
+}
 var left_ctx: GroupCtx = undefined;
 var center_ctx: GroupCtx = undefined;
 var right_ctx: GroupCtx = undefined;
+var drawer_ctx: GroupCtx = undefined;
 
 const MODULE_ROW_DATA_KEY = "simpbar-module-row";
 
@@ -2911,13 +2955,15 @@ fn onModuleDragPrepare(_: *gtk.GtkDragSource, user_data: ?*anyopaque) callconv(.
     return gtk.gdk_content_provider_new_for_value(&value);
 }
 
-/// Returns the GroupCtx whose group owns `row`, scanning the three live
-/// groups — the drop handler needs the SOURCE group's ctx (to removeAt from
-/// its array and rebuild its listbox) even though the signal only carries
-/// the destination's. Null when the pointer is stale (from before a rebuild)
-/// or belongs to some other widget's data.
+/// Returns the GroupCtx whose group owns `row`, scanning the live groups —
+/// the drop handler needs the SOURCE group's ctx (to removeAt from its
+/// array and rebuild its listbox) even though the signal only carries the
+/// destination's. Right and Drawer share one backing array but are separate
+/// views, so a Right↔Drawer drag reports two different ctxs over the same
+/// group (onModuleDrop adjusts for that). Null when the pointer is stale
+/// (from before a rebuild) or belongs to some other widget's data.
 fn groupCtxOwning(row: *const ModuleRow) ?*GroupCtx {
-    const candidates = [_]*GroupCtx{ &left_ctx, &center_ctx, &right_ctx };
+    const candidates = [_]*GroupCtx{ &left_ctx, &center_ctx, &right_ctx, &drawer_ctx };
     for (candidates) |c| {
         if (c.group.indexOf(row) != null) return c;
     }
@@ -2942,11 +2988,14 @@ fn onModuleDrop(_: *gtk.GtkDropTarget, value: *const gtk.GValue, _: f64, y: f64,
     const src_ctx = groupCtxOwning(source_row) orelse return 0;
 
     // Destination insertion index: dropping below the last row appends.
-    var to: usize = ctx.group.len;
+    // Resolved pre-removal against the destination's rows (row pointers go
+    // stale across removeAt/insertAt's memmoves, so nothing below may
+    // re-derive an index from a widget tag).
+    var to_pre: usize = ctx.group.len;
     if (gtk.gtk_list_box_get_row_at_y(ctx.listbox, @intFromFloat(y))) |target_widget| {
         if (gtk.g_object_get_data(@ptrCast(target_widget), MODULE_ROW_DATA_KEY)) |tp| {
             const target_row: *ModuleRow = @ptrCast(@alignCast(tp));
-            if (ctx.group.indexOf(target_row)) |idx| to = idx;
+            if (ctx.group.indexOf(target_row)) |idx| to_pre = idx;
         }
     }
 
@@ -2954,6 +3003,7 @@ fn onModuleDrop(_: *gtk.GtkDropTarget, value: *const gtk.GValue, _: f64, y: f64,
         // Same-group reorder — existing behavior. Drop on a row = land at
         // that row's index; below the last row = move to the end.
         const from = src_ctx.group.indexOf(source_row) orelse return 0;
+        var to = to_pre;
         if (to >= src_ctx.group.len) to = src_ctx.group.len - 1;
         if (from != to) {
             src_ctx.group.moveRow(from, to);
@@ -2983,7 +3033,18 @@ fn onModuleDrop(_: *gtk.GtkDropTarget, value: *const gtk.GValue, _: f64, y: f64,
     }
 
     const from = src_ctx.group.indexOf(source_row) orelse return 0;
-    const removed = src_ctx.group.removeAt(from) orelse return 0;
+    var removed = src_ctx.group.removeAt(from) orelse return 0;
+    // Drawer assignment: crossing into the Drawer view flags the entry so it
+    // only renders while the drawer is open; crossing into the Right view
+    // unflags it back onto the bar. The toggle itself keeps its flag (it is
+    // always shown in the Drawer section but renders on the bar).
+    if (ctx == &drawer_ctx and removed.entry.kind != .drawer_toggle) removed.entry.in_drawer = true;
+    if (ctx == &right_ctx) removed.entry.in_drawer = false;
+    // `to` was resolved pre-removal against the destination's rows; when
+    // source and destination share one backing array (a Right↔Drawer move),
+    // the removal shifted everything past `from` down by one.
+    var to = to_pre;
+    if (src_ctx.group == ctx.group and from < to) to -= 1;
     if (!ctx.group.insertAt(to, removed)) {
         // Destination full — put the row back where it came from and abort.
         _ = src_ctx.group.insertAt(from, removed);
@@ -3055,25 +3116,36 @@ fn addModuleRow(listbox: *gtk.GtkListBox, row: *ModuleRow, reorderable: bool) vo
 /// surgically removing/reinserting just the one moved row while trying to
 /// keep every other row's widgets, drag sources, and signal connections
 /// alive, at the cost of recreating widgets on every drop (reorders are a
-/// low-frequency user action, not a hot path).
+/// low-frequency user action, not a hot path). Renders only the ctx's view
+/// slice (the Right and Drawer sections each show part of live_right).
 fn rebuildGroupListBox(ctx: *GroupCtx) void {
     gtk.gtk_list_box_remove_all(ctx.listbox);
     for (0..ctx.group.len) |i| {
+        if (!viewShows(ctx.view, &ctx.group.rows[i].entry)) continue;
         addModuleRow(ctx.listbox, &ctx.group.rows[i], ctx.reorderable);
     }
 }
 
-/// Builds one group's section in the Modules tab: a heading, a boxed-list,
-/// a drop target (every group is one now — Left/Right/Center all accept
-/// cross-group drops), and one draggable row per module. `allowed` is the
-/// set of module kinds this group can legally hold (see GroupCtx.allowed);
-/// drops of any other kind are rejected by onModuleDrop, so a drop can
-/// never land in a group where main.zig has no renderer for it.
-fn addModuleGroupSection(outer: *gtk.GtkBox, title: [:0]const u8, mgroup: *ModuleGroup, ctx: *GroupCtx, allowed: []const ModuleKind) void {
+/// Builds one group's section in the Modules tab: a heading, an optional
+/// one-line subtitle, a boxed-list, a drop target (every group is one now —
+/// Left/Right/Center all accept cross-group drops), and one draggable row
+/// per module in this view's slice. `allowed` is the set of module kinds
+/// this group can legally hold (see GroupCtx.allowed); drops of any other
+/// kind are rejected by onModuleDrop, so a drop can never land in a group
+/// where main.zig has no renderer for it.
+fn addModuleGroupSection(outer: *gtk.GtkBox, title: [:0]const u8, mgroup: *ModuleGroup, ctx: *GroupCtx, allowed: []const ModuleKind, view: ModuleView, subtitle: ?[:0]const u8) void {
     const heading = gtk.gtk_label_new(title);
     gtk.gtk_widget_add_css_class(@ptrCast(heading), "heading");
     gtk.gtk_label_set_xalign(heading, 0);
     gtk.gtk_box_append(outer, @ptrCast(heading));
+
+    if (subtitle) |st| {
+        const sub = gtk.gtk_label_new(st);
+        gtk.gtk_widget_add_css_class(@ptrCast(sub), "dim-label");
+        gtk.gtk_label_set_xalign(sub, 0);
+        gtk.gtk_label_set_wrap(sub, 1);
+        gtk.gtk_box_append(outer, @ptrCast(sub));
+    }
 
     const listbox = gtk.gtk_list_box_new();
     gtk.gtk_widget_add_css_class(@ptrCast(listbox), "boxed-list");
@@ -3085,13 +3157,14 @@ fn addModuleGroupSection(outer: *gtk.GtkBox, title: [:0]const u8, mgroup: *Modul
     // drop zone without needing to move the drop target onto a different
     // (larger) widget and translate coordinates between them.
     gtk.gtk_widget_set_size_request(@ptrCast(listbox), -1, 160);
-    ctx.* = .{ .group = mgroup, .listbox = listbox, .reorderable = true, .allowed = allowed };
+    ctx.* = .{ .group = mgroup, .listbox = listbox, .reorderable = true, .allowed = allowed, .view = view };
 
     const drop_target = gtk.gtk_drop_target_new(gtk.G_TYPE_POINTER, gtk.GDK_ACTION_MOVE);
     _ = gtk.g_signal_connect_data(@ptrCast(drop_target), "drop", @ptrCast(&onModuleDrop), @ptrCast(ctx), null, 0);
     gtk.gtk_widget_add_controller(@ptrCast(listbox), @ptrCast(drop_target));
 
     for (0..mgroup.len) |i| {
+        if (!viewShows(view, &mgroup.rows[i].entry)) continue;
         addModuleRow(listbox, &mgroup.rows[i], true);
     }
     gtk.gtk_box_append(outer, @ptrCast(listbox));
@@ -3106,9 +3179,10 @@ fn buildModulesPage() *gtk.GtkBox {
     gtk.gtk_widget_set_margin_start(@ptrCast(outer), 24);
     gtk.gtk_widget_set_margin_end(@ptrCast(outer), 24);
 
-    addModuleGroupSection(outer, "Left", &live_left, &left_ctx, &LEFT_CENTER_MODULE_KINDS);
-    addModuleGroupSection(outer, "Center", &live_center, &center_ctx, &LEFT_CENTER_MODULE_KINDS);
-    addModuleGroupSection(outer, "Right", &live_right, &right_ctx, &RIGHT_MODULE_KINDS);
+    addModuleGroupSection(outer, "Left", &live_left, &left_ctx, &LEFT_CENTER_MODULE_KINDS, .all, null);
+    addModuleGroupSection(outer, "Center", &live_center, &center_ctx, &LEFT_CENTER_MODULE_KINDS, .all, null);
+    addModuleGroupSection(outer, "Right", &live_right, &right_ctx, &RIGHT_MODULE_KINDS, .right_bar, "Modules pinned to the bar's right edge, always visible.");
+    addModuleGroupSection(outer, "Drawer", &live_right, &drawer_ctx, &RIGHT_MODULE_KINDS, .drawer, "The toggle button plus modules that appear when it opens. Drag modules between Right and Drawer to assign them.");
 
     return outer;
 }
@@ -3305,5 +3379,85 @@ fn realMain() !void {
     const code = gtk.g_application_run(@ptrCast(app), 0, null);
     logging.step("gtk main loop exited with code {d}", .{code});
     exit(code);
+}
+
+// ---------------------------------------------------------------------
+// Tests — drawer/right view separation (pure data logic, no display).
+// Run: zig test src/config_main.zig -lc -fllvm -flld <gtk libs, see below>
+// ---------------------------------------------------------------------
+
+test "drawer view separation" {
+    const t = std.testing;
+    // Backing right group: toggle, weather (bar), volume + pacman (drawer).
+    var g: ModuleGroup = .{};
+    const kinds = [_]ModuleKind{ .drawer_toggle, .weather, .volume, .pacman };
+    const drawer = [_]bool{ false, false, true, true };
+    for (kinds, 0..) |k, i| {
+        g.rows[i] = .{ .entry = .{ .kind = k, .enabled = true, .in_drawer = drawer[i] } };
+    }
+    g.len = kinds.len;
+
+    // Right view: bar modules only, no toggle.
+    var right_shown: usize = 0;
+    var right_kind: ModuleKind = .weather;
+    for (g.rows[0..g.len]) |*row| {
+        if (!viewShows(.right_bar, &row.entry)) continue;
+        right_shown += 1;
+        right_kind = row.entry.kind;
+    }
+    try t.expectEqual(@as(usize, 1), right_shown);
+    try t.expectEqual(ModuleKind.weather, right_kind);
+
+    // Drawer view: toggle + flagged entries.
+    var drawer_kinds: [4]ModuleKind = undefined;
+    var drawer_n: usize = 0;
+    for (g.rows[0..g.len]) |*row| {
+        if (!viewShows(.drawer, &row.entry)) continue;
+        drawer_kinds[drawer_n] = row.entry.kind;
+        drawer_n += 1;
+    }
+    try t.expectEqual(@as(usize, 3), drawer_n);
+    try t.expectEqual(ModuleKind.drawer_toggle, drawer_kinds[0]);
+    try t.expectEqual(ModuleKind.volume, drawer_kinds[1]);
+    try t.expectEqual(ModuleKind.pacman, drawer_kinds[2]);
+
+    // Simulate a Right→Drawer drop of weather below pacman: remove at 1,
+    // flag it, insert at the drawer's end (backing index 3 post-removal).
+    var moved = g.removeAt(1) orelse return error.TestUnexpectedResult;
+    moved.entry.in_drawer = true;
+    try t.expect(g.insertAt(3, moved));
+    try t.expectEqual(@as(usize, 4), g.len);
+    try t.expectEqual(ModuleKind.drawer_toggle, g.rows[0].entry.kind);
+    try t.expectEqual(ModuleKind.volume, g.rows[1].entry.kind);
+    try t.expectEqual(ModuleKind.pacman, g.rows[2].entry.kind);
+    try t.expectEqual(ModuleKind.weather, g.rows[3].entry.kind);
+    try t.expect(g.rows[3].entry.in_drawer);
+    // Weather left the Right view and joined the Drawer view.
+    try t.expect(!viewShows(.right_bar, &g.rows[3].entry));
+    try t.expect(viewShows(.drawer, &g.rows[3].entry));
+
+    // Same-backing index adjustment: dropping onto backing index 3 after
+    // removing index 1 lands at 2.
+    var to: usize = 3;
+    if (1 < to) to -= 1;
+    try t.expectEqual(@as(usize, 2), to);
+}
+
+test "tombstoned kinds strip cleanly" {
+    const t = std.testing;
+    var g: ModuleGroup = .{};
+    const kinds = [_]ModuleKind{ .weather, .waypaper, .volume, .waypaper, .pacman };
+    for (kinds, 0..) |k, i| {
+        g.rows[i] = .{ .entry = .{ .kind = k, .enabled = true } };
+    }
+    g.len = kinds.len;
+    stripRemovedKinds(&g);
+    try t.expectEqual(@as(usize, 3), g.len);
+    try t.expectEqual(ModuleKind.weather, g.rows[0].entry.kind);
+    try t.expectEqual(ModuleKind.volume, g.rows[1].entry.kind);
+    try t.expectEqual(ModuleKind.pacman, g.rows[2].entry.kind);
+    // Idempotent: nothing left to strip.
+    stripRemovedKinds(&g);
+    try t.expectEqual(@as(usize, 3), g.len);
 }
 
