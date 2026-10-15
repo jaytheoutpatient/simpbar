@@ -2050,7 +2050,11 @@ install_extra_software() {
 install_simpbar_desktop() {
     local tu="${CONFIG[username]}"
     local th="$MOUNTPOINT/home/$tu"
-    [[ -d "$th" ]] || { show_warning "Home $th missing — skipping desktop install"; return 0; }
+    # Outcome flag for the completion banner (this runs in the current
+    # shell, so the global persists): the banner must never claim a
+    # desktop that was never deployed.
+    DESKTOP_RESULT="ok"
+    [[ -d "$th" ]] || { show_warning "Home $th missing — skipping desktop install"; DESKTOP_RESULT="failed: no home dir"; return 0; }
 
     local wm_label="Hyprland"
     [[ "${CONFIG[desktop]}" == "mango" ]] && wm_label="MangoWM"
@@ -2108,16 +2112,27 @@ install_simpbar_desktop() {
 
     # ── 2. simpbar source (same main.zip install.sh fetches) ─────────
     local src_tmp=""
-    src_tmp=$(mktemp -d) || { show_warning "mktemp failed — skipping desktop deploy"; return 0; }
-    if ! curl -fL -o "$src_tmp/simpbar.zip" \
-        https://github.com/jaytheoutpatient/simpbar/archive/refs/heads/main.zip >/dev/null 2>&1; then
-        show_warning "Could not download simpbar source — desktop deploy skipped"
+    src_tmp=$(mktemp -d) || { show_warning "mktemp failed — skipping desktop deploy"; DESKTOP_RESULT="failed: no temp dir"; return 0; }
+    # Retry: one transient network blip must not void the whole desktop.
+    local dl_try dl_ok=0
+    for dl_try in 1 2 3; do
+        if curl -fL -o "$src_tmp/simpbar.zip" \
+            https://github.com/jaytheoutpatient/simpbar/archive/refs/heads/main.zip >/dev/null 2>&1; then
+            dl_ok=1
+            break
+        fi
+        [[ "$dl_try" -lt 3 ]] && sleep 5
+    done
+    if [[ "$dl_ok" != "1" ]]; then
+        show_warning "Could not download simpbar source after 3 tries — desktop deploy skipped"
         rm -rf "$src_tmp"
+        DESKTOP_RESULT="failed: source download"
         return 0
     fi
     if ! unzip -o "$src_tmp/simpbar.zip" -d "$src_tmp" >/dev/null 2>&1; then
         show_warning "Could not extract simpbar source — desktop deploy skipped"
         rm -rf "$src_tmp"
+        DESKTOP_RESULT="failed: source extract"
         return 0
     fi
     local src="$src_tmp/simpbar-main"
@@ -2133,6 +2148,7 @@ install_simpbar_desktop() {
         if [[ ! -d "$src/$d" ]]; then
             show_warning "Archive lacks $d/ — desktop deploy skipped (layout changed upstream?)"
             rm -rf "$src_tmp"
+            DESKTOP_RESULT="failed: archive layout"
             return 0
         fi
     done
@@ -2231,6 +2247,14 @@ install_simpbar_desktop() {
     [[ -f "$zb/simpbar/zig-out/bin/simpbar-welcome" ]] \
         && install -Dm755 "$zb/simpbar/zig-out/bin/simpbar-welcome" "$MOUNTPOINT/usr/bin/simpbar-welcome" \
         || show_warning "simpbar-welcome binary missing"
+    # Binaries are the one thing a post-reboot run can't trivially redo
+    # without rebuilding, so a miss here downgrades the whole step: the
+    # banner reports partial instead of claiming success.
+    local miss_bin=""
+    for miss_bin in simpbar simpbar-shell simpbar-config simpbar-welcome; do
+        [[ -x "$MOUNTPOINT/usr/bin/$miss_bin" ]] \
+            || DESKTOP_RESULT="partial: $miss_bin missing"
+    done
 
     # ── 4. helpers + launchers (same contents as install.sh) ────────
     install -Dm755 "$th/.local/share/simpbar/simpbar-matugen" "$MOUNTPOINT/usr/bin/simpbar-matugen" 2>/dev/null \
@@ -2615,17 +2639,34 @@ perform_installation() {
     if [[ "${CONFIG[desktop]}" != "none" ]]; then
         local _wm_done="Hyprland"
         [[ "${CONFIG[desktop]}" == "mango" ]] && _wm_done="MangoWM"
-        gum style --foreground 82 --bold --border double --border-foreground 82 \
-            --align center --width 60 --margin "1 2" --padding "1 2" \
-            "✨ Installation Complete! ✨" \
-            "" \
-            "Your simpbar desktop ($_wm_done) is installed." \
-            "" \
-            "Remove the installation media and reboot, then" \
-            "pick $_wm_done in ly and log in." \
-            "" \
-            "For browsers, Discord and extras, run post-reboot:" \
-            "  curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash"
+        if [[ "${DESKTOP_RESULT:-ok}" == "ok" ]]; then
+            gum style --foreground 82 --bold --border double --border-foreground 82 \
+                --align center --width 60 --margin "1 2" --padding "1 2" \
+                "✨ Installation Complete! ✨" \
+                "" \
+                "Your simpbar desktop ($_wm_done) is installed." \
+                "" \
+                "Remove the installation media and reboot, then" \
+                "pick $_wm_done in ly and log in." \
+                "" \
+                "For browsers, Discord and extras, run post-reboot:" \
+                "  curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash"
+        else
+            # The desktop step never aborts the run, so a failure here
+            # still reaches this banner — report it honestly instead of
+            # claiming an install that never happened. The base system
+            # is fine; only the desktop needs salvaging.
+            gum style --foreground 214 --bold --border double --border-foreground 214 \
+                --align center --width 60 --margin "1 2" --padding "1 2" \
+                "⚠ Desktop Incomplete (${DESKTOP_RESULT:-unknown}) ⚠" \
+                "" \
+                "The base system installed fine, but the" \
+                "$_wm_done desktop step did not finish." \
+                "" \
+                "Reboot, log in, then run the desktop" \
+                "setup to fill the gaps:" \
+                "  curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash"
+        fi
     else
         gum style --foreground 82 --bold --border double --border-foreground 82 \
             --align center --width 60 --margin "1 2" --padding "1 2" \
