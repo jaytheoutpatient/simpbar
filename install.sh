@@ -968,7 +968,7 @@ fi
 # make a layer-shell surface at all. See the "App drawer" section below for
 # what actually gets deployed.
 # brightnessctl backs both WMs' XF86MonBrightness* binds.
-PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility fish polkit-gnome grim slurp cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
+PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility polkit-gnome grim slurp cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
 
 # Official Mesa Vulkan stack — see the Step 6 header: pinning these satisfies
 # steam's vulkan-driver / lib32-vulkan-driver depends directly, so pacman never
@@ -1252,7 +1252,7 @@ fi
 # waypaper is deliberately gone too: the app drawer's wallpaper tab owns
 # picking now (see the Wallpaper Button tombstone in the bar source). Users
 # who already have waypaper keep it working — nothing here uninstalls it.
-AUR_PKGS=(protonplus dracula-gtk-theme bibata-cursor-theme game-devices-udev zafiro-icon-theme)
+AUR_PKGS=(protonplus bibata-cursor-theme game-devices-udev)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 [ "$INSTALL_MATUGEN" -eq 1 ] && AUR_PKGS+=(matugen)
@@ -1406,36 +1406,9 @@ if [ "$INSTALL_MATUGEN" -eq 1 ]; then
     fi
 fi
 
-# Apply the Dracula GTK theme and the Bibata cursor theme, now that
-# they're actually installed. This uses the same gsettings mechanism
-# nwg-look reads/writes, so it shows up as already selected there too.
-if pacman -Qq dracula-gtk-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
-    run_spinner "Applying Dracula GTK theme" \
-        gsettings set org.gnome.desktop.interface gtk-theme 'Dracula' \
-        || warn "Could not apply the Dracula GTK theme — select it manually in nwg-look"
-elif ! pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
-    warn "dracula-gtk-theme isn't installed — skipping GTK theme apply"
-else
-    warn "gsettings not found — select the Dracula theme manually in nwg-look"
-fi
-
-# Zafiro's AUR package has had reported issues with how it lays out its
-# newer color-variant folders, so check the exact folder actually exists
-# before pointing gsettings at it rather than assuming the name.
-if pacman -Qq zafiro-icon-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
-    ZAFIRO_DRACULA_DIR=$(find /usr/share/icons -maxdepth 1 -iname 'zafiro-dracula*' -print -quit 2>/dev/null)
-    if [ -n "$ZAFIRO_DRACULA_DIR" ]; then
-        run_spinner "Applying Zafiro-Dracula icon theme" \
-            gsettings set org.gnome.desktop.interface icon-theme "$(basename "$ZAFIRO_DRACULA_DIR")" \
-            || warn "Could not apply the Zafiro-Dracula icon theme — select it manually in nwg-look"
-    else
-        warn "zafiro-icon-theme installed but no Zafiro-Dracula folder found under /usr/share/icons — check available variants with: ls /usr/share/icons | grep -i zafiro"
-    fi
-elif ! pacman -Qq zafiro-icon-theme >/dev/null 2>&1; then
-    warn "zafiro-icon-theme isn't installed — skipping icon theme apply"
-else
-    warn "gsettings not found — select the Zafiro-Dracula icon theme manually in nwg-look"
-fi
+# Apply the Bibata cursor theme, now that it's actually installed. This
+# uses the same gsettings mechanism nwg-look reads/writes, so it shows up
+# as already selected there too.
 
 if pacman -Qq bibata-cursor-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
     run_spinner "Applying Bibata Modern Classic cursor" \
@@ -1757,30 +1730,11 @@ else
     ok "fastfetch added to ~/.bashrc"
 fi
 
-# Keep fish's default greeting message empty.
-mkdir -p ~/.config/fish
-touch ~/.config/fish/config.fish
-if grep -qx 'set -g fish_greeting' ~/.config/fish/config.fish 2>/dev/null; then
-    ok "fish greeting already set to empty"
-else
-    printf '\nset -g fish_greeting\n' >> ~/.config/fish/config.fish
-    ok "fish greeting set to empty"
-fi
-
-# Run fastfetch on new fish sessions too.
-if grep -qx 'fastfetch' ~/.config/fish/config.fish 2>/dev/null; then
-    ok "fastfetch already set to run in fish"
-else
-    printf '\nfastfetch\n' >> ~/.config/fish/config.fish
-    ok "fastfetch added to fish config"
-fi
-
 # Simpbar's logs live in ~/Documents/simpbar-logs — create the folder now and
 # export SIMPBAR_LOG_DIR from the login + interactive shells so the bar,
 # simpbar-welcome, and simpbar-config launched under Hyprland all write there
 # (the app falls back to ~/.config/simpbar-config/logs when it isn't set).
 SIMPBAR_ENV_LINE='export SIMPBAR_LOG_DIR="$HOME/Documents/simpbar-logs"'
-SIMPBAR_ENV_FISH='set -gx SIMPBAR_LOG_DIR "$HOME/Documents/simpbar-logs"'
 mkdir -p ~/Documents/simpbar-logs
 for profile in ~/.profile ~/.bashrc; do
     touch "$profile"
@@ -1791,17 +1745,7 @@ for profile in ~/.profile ~/.bashrc; do
         ok "SIMPBAR_LOG_DIR exported in $profile"
     fi
 done
-mkdir -p ~/.config/fish
-touch ~/.config/fish/config.fish
-if grep -q 'set -gx SIMPBAR_LOG_DIR' ~/.config/fish/config.fish 2>/dev/null; then
-    ok "SIMPBAR_LOG_DIR already exported in fish config"
-else
-    printf '\n%s\n' "$SIMPBAR_ENV_FISH" >> ~/.config/fish/config.fish
-    ok "SIMPBAR_LOG_DIR exported in fish config"
-fi
 ok "simpbar logs will be written to ~/Documents/simpbar-logs"
-
-FISH_PATH=$(command -v fish) || true
 
 # logo.png for the Simpbar Welcome app (GTK4 + libadwaita) — the app itself
 # was already built as a native Zig binary and installed to /usr/bin back
@@ -2038,12 +1982,6 @@ else
 fi
 ok "Flathub remote added for flatpak/bazaar"
 ok "nwg-look set to prefer dark theme"
-if pacman -Qq dracula-gtk-theme >/dev/null 2>&1; then
-    ok "Dracula GTK theme installed and applied"
-fi
-if pacman -Qq zafiro-icon-theme >/dev/null 2>&1; then
-    ok "Zafiro-Dracula icon theme installed"
-fi
 if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
     ok "Bibata Modern Classic cursor installed and applied"
 fi
@@ -2108,9 +2046,6 @@ fi
 ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
 ok "fastfetch runs automatically in new terminal sessions (~/.bashrc)"
-if pacman -Qq fish >/dev/null 2>&1; then
-    ok "fish shell installed with an empty greeting message and fastfetch on launch"
-fi
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"
@@ -2158,20 +2093,3 @@ else
 fi
 printf '\n%sEnjoy your new home & workflow! :)%s\n' "$C_GREEN$C_BOLD" "$C_RESET"
 printf '\n%sDon'"'"'t forget to reboot! Please use: systemctl reboot%s\n' "$C_YELLOW" "$C_RESET"
-
-# Switch the default login shell to fish. This runs last, on its own; since
-# the script already holds sudo (askpass, no re-prompt), it runs as root and
-# needs no password from the user at all.
-if [ -z "$FISH_PATH" ]; then
-    warn "Could not find the fish binary — skipping default shell switch"
-elif [ "$SHELL" = "$FISH_PATH" ]; then
-    ok "fish is already the default shell"
-else
-    grep -qx "$FISH_PATH" /etc/shells 2>/dev/null \
-        || printf '%s\n' "$FISH_PATH" | sudo tee -a /etc/shells >/dev/null
-    if sudo usermod -s "$FISH_PATH" "$USER" 2>/dev/null; then
-        ok "Default login shell switched to fish (takes effect next login)"
-    else
-        warn "Could not switch the default shell — run 'sudo usermod -s $FISH_PATH $USER' manually"
-    fi
-fi

@@ -2063,7 +2063,7 @@ install_simpbar_desktop() {
     local pkgs=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl
         mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji
         fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol
-        cava pipewire pipewire-pulse wireplumber gnome-disk-utility fish
+        cava pipewire pipewire-pulse wireplumber gnome-disk-utility
         polkit-gnome grim slurp cliphist wl-clipboard python-gobject gtk4
         libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk
         kdeconnect quickshell brightnessctl mesa lib32-mesa vulkan-radeon
@@ -2093,11 +2093,13 @@ install_simpbar_desktop() {
         done
     fi
 
-    # Theme/cursor/icon packs: best-effort repo installs (chaotic-aur
-    # usually carries them as binaries). Whatever misses stays a warning —
-    # the desktop works without themes, and nothing here may use an AUR
-    # helper (none is installed in the target yet).
-    local theme_pkgs=(protonplus dracula-gtk-theme bibata-cursor-theme game-devices-udev zafiro-icon-theme)
+    # Theme/cursor packs: best-effort repo installs (chaotic-aur usually
+    # carries them as binaries). Whatever misses stays a warning — the
+    # desktop works without themes, and nothing here may use an AUR
+    # helper (none is installed in the target yet). Dracula, Zafiro and
+    # fish were deliberately dropped from this list (install failures /
+    # unused), so they are not attempted at all.
+    local theme_pkgs=(protonplus bibata-cursor-theme game-devices-udev)
     local tp
     for tp in "${theme_pkgs[@]}"; do
         arch-chroot "$MOUNTPOINT" pacman -S --noconfirm --needed "$tp" >/dev/null 2>&1 \
@@ -2507,6 +2509,47 @@ WELCOMESVCEOF
             show_warning "No MangoWG session file in wayland-sessions — check 'ls /usr/share/wayland-sessions' after reboot; ly needs an entry to offer Mango"
         fi
     fi
+
+    # ── 12. fastfetch on shell start ────────────────────────────────
+    # useradd -m seeds .bashrc from /etc/skel; append once (grep-guarded
+    # so re-runs never duplicate it). Guarded on the binary too — a
+    # failed fastfetch install must not leave every shell printing errors.
+    if [[ -f "$MOUNTPOINT/usr/bin/fastfetch" ]]; then
+        touch "$th/.bashrc" 2>/dev/null || true
+        if ! grep -q "command -v fastfetch" "$th/.bashrc" 2>/dev/null; then
+            cat >> "$th/.bashrc" << 'BASHEOF' 2>/dev/null \
+                || show_warning ".bashrc fastfetch hook not added"
+
+# Featherlite: show system info on interactive shells.
+command -v fastfetch >/dev/null 2>&1 && fastfetch
+BASHEOF
+        fi
+    else
+        show_warning "fastfetch missing — no shell-start hook added"
+    fi
+
+    # ── 13. drawer chain verification ───────────────────────────────
+    # The drawer failing silently post-boot is always one of these four;
+    # check them all here (read-only) and report exactly which link broke
+    # instead of leaving it to guesswork after reboot.
+    local drawer_ok=1
+    if ! arch-chroot "$MOUNTPOINT" pacman -Qq quickshell >/dev/null 2>&1; then
+        show_warning "DRAWER: quickshell not installed — install post-reboot: sudo pacman -S quickshell"
+        drawer_ok=0
+    fi
+    if [[ ! -x "$MOUNTPOINT/usr/bin/appdrawer" ]]; then
+        show_warning "DRAWER: /usr/bin/appdrawer missing — empty-clicks and SUPER+Space/SUPER+Tab do nothing"
+        drawer_ok=0
+    fi
+    if [[ ! -f "$th/.config/quickshell/appdrawer/shell.qml" ]]; then
+        show_warning "DRAWER: appdrawer QML not deployed to ~/.config/quickshell/appdrawer"
+        drawer_ok=0
+    fi
+    if ! grep -q '"empty_click_command"' "$th/.config/simpbar/config.json" 2>/dev/null; then
+        show_warning "DRAWER: empty_click_command not set — empty bar clicks do nothing"
+        drawer_ok=0
+    fi
+    [[ "$drawer_ok" == "1" ]] || show_warning "App drawer chain incomplete — fix the DRAWER lines above post-reboot"
 
     rm -rf "$src_tmp"
     arch-chroot "$MOUNTPOINT" chown -R "$tu:$tu" "/home/$tu" 2>/dev/null \
