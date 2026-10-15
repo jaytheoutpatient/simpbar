@@ -1203,8 +1203,8 @@ PanelWindow {
 
             // Whether the key arrives from the environment instead of this
             // file. The engine prefers WALLHAVEN_APIKEY over the file, so an
-            // input here would be silently ignored -- disable it and say so,
-            // like noctalia does. Purity still comes from the file.
+            // input here would be silently ignored -- disable it and say so.
+            // Purity still comes from the file.
             readonly property bool envManaged: {
                 var v = Quickshell.env("WALLHAVEN_APIKEY");
                 return v !== undefined && v !== null && String(v).length > 0;
@@ -1241,11 +1241,11 @@ PanelWindow {
                 }
                 whOpts.fileKey = key;
                 whOpts.purity = purity;
-                // Prefill the (masked) field with the current key, like
-                // noctalia does: hitting Save without touching it writes the
-                // same key back, so an empty-by-default field can never wipe a
-                // configured key by accident. The environment-owned key is the
-                // one case where the field stays deliberately blank.
+                // Prefill the (masked) field with the current key: hitting
+                // Save without touching it writes the same key back, so an
+                // empty-by-default field can never wipe a configured key by
+                // accident. The environment-owned key is the one case where
+                // the field stays deliberately blank.
                 if (!whOpts.envManaged)
                     keyField.text = key;
                 if (whOpts.envManaged)

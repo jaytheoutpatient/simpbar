@@ -756,7 +756,7 @@ const CompositorMode = enum { hyprland, mango };
 /// Design icons, which the bar already renders (the power button is
 /// `md-power` U+F0425). The glyphs are picked for distinctness first, then
 /// meaning: column/row shapes for the tile families, arrows for the scrollers,
-/// a funnel for vertical_deck (matching noctalia's mango_layouts plugin).
+/// a funnel for vertical_deck.
 ///
 /// Keep `symbol`/`name` in sync with `mmsg get layouts`; the order matches the
 /// compositor's own enumeration so the picker lists them the way Mango does.
@@ -2048,7 +2048,7 @@ const Appearance = struct {
     /// Flat ring color for the "solid" bezel style. Ignored by the traveling
     /// styles (which build the ring from the palette / hue wheel instead).
     bezel_color: u32,
-    /// Resting pill opacity, 0-100 (Noctalia's capsule_opacity): blends the
+    /// Resting pill opacity, 0-100: blends the
     /// pill fill toward the opaque bar background, so translucent pills are
     /// faked the same way everywhere in this file (lerp, since the pipeline
     /// is opaque). Exact while the bar background itself is opaque; over a
@@ -2056,8 +2056,8 @@ const Appearance = struct {
     /// true see-through — an accepted approximation, documented here so it
     /// doesn't surprise anyone later.
     module_pill_opacity: u8,
-    /// Resting/hover/active bezel outline thickness in px (Noctalia's
-    /// capsule_border_width, 0 disables). Clamped at draw time so at least a
+    /// Resting/hover/active bezel outline thickness in px (0 disables).
+    /// Clamped at draw time so at least a
     /// sliver of fill survives — tiny pills degrade to flat instead of
     /// inverting. The bezel style itself (matugen ring vs rainbow-puke)
     /// stays on bezel_style; this is only the width.
@@ -3424,7 +3424,7 @@ fn openTrayContextMenu(bar: *Bar, tray_index: usize) void {
 /// Left-click on the Mango layout module: shows a popup listing every layout
 /// MANGO_LAYOUTS knows, each with its own icon (the same glyph the bar shows)
 /// and name, so it's obvious which layout you're on and what the alternatives
-/// are — the shape noctalia's mango_layouts plugin uses. Rows are sourced from
+/// are — the shape tiling-plugin layout pickers use. Rows are sourced from
 /// MANGO_LAYOUTS rather than a DBusMenu; clicking one fires `.set_layout`
 /// through the same hit-test path as a tray menu row.
 fn openLayoutPicker(bar: *Bar) void {
@@ -3548,15 +3548,14 @@ var vol_open_bar: ?*Bar = null;
 /// Long-lived `pactl subscribe` pipe: PipeWire change events land here in
 /// real time (a knob turn, media keys, other mixers), and each batch kicks
 /// a prompt volume re-poll — this is what makes the OSD fire in ~100ms
-/// instead of on the 5s timer's schedule. Event-driven like Noctalia's
-/// PipeWire service; the timer poll stays as fallback. -1 when down (the 1s
+/// instead of on the 5s timer's schedule. Event-driven; the timer poll
+/// stays as fallback. -1 when down (the 1s
 /// tick respawns past CAVA-style delay via vol_sub_dead_since).
 var vol_sub_fd: posix.fd_t = -1;
 var vol_sub_dead_since: i64 = 0;
 /// Poll-change OSD suppressions remaining (60ms ticks): a mixer-driven
 /// master set would otherwise echo as an OSD ~100ms later when the wpctl
-/// poll notices it — Noctalia suppresses panel-driven changes the same way.
-/// Only master-output sets arm it (app/mic sets never move the sink poll).
+/// poll notices it. Only master-output sets arm it (app/mic sets never move the sink poll).
 /// Direct wheel adjustments bypass it via showVolumeOSD (explicit action).
 var vol_osd_suppress_left: i32 = 0;
 
@@ -4130,7 +4129,7 @@ fn drawVolumeOSD(bar: *Bar, pm: *PopupMenu, pixels: [*]u32) void {
     var pbuf: [16]u8 = undefined;
     const vol = parseVolumePoll(bar.volume.text(), &pbuf);
     if (!vol.ok) return;
-    // Muted reads dimmed throughout (Noctalia's inactive state); the bar
+    // Muted reads dimmed throughout; the bar
     // underneath still shows where it will land on unmute.
     const col = if (vol.muted) current_config.appearance.popup_disabled_color else text_color;
     const pct = vol.pct;
@@ -6605,7 +6604,7 @@ fn utf8Encode(cp: u32, out: []u8) usize {
 }
 
 /// Condition effects for the weather hover animation (bar module + desktop
-/// card): what plays while the pointer sits on the widget, Noctalia-style.
+/// card): what plays while the pointer sits on the widget.
 /// Mapped from the shaped weather icon, like the tint.
 const WeatherFx = enum { none, rain, snow, storm, clear, cloud, fog, wind };
 
