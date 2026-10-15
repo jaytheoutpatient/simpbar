@@ -418,7 +418,13 @@ install_repo_or_aur() {
 
     printf '  %d package(s) are not in %s: %s\n' "${#aur[@]}" "$REPO_NAME" "${aur[*]}"
     if ! command -v yay >/dev/null && ! command -v paru >/dev/null; then
-        prompt_choice AUR_CHOICE 1 "No AUR helper found — ${#aur[@]} package(s) need the AUR. Install which one?" "yay" "paru" "skip"
+        # Xero defaults to paru — take it without asking. Anything else
+        # genuinely lacks a helper, so the question stands.
+        if [ "$XERO_SYSTEM" = 1 ]; then
+            AUR_CHOICE=2
+        else
+            prompt_choice AUR_CHOICE 1 "No AUR helper found — ${#aur[@]} package(s) need the AUR. Install which one?" "yay" "paru" "skip"
+        fi
         case "$AUR_CHOICE" in
             2) install_paru || warn "Could not install paru automatically — install manually: ${aur[*]}" ;;
             3) warn "Skipping AUR helper install — install manually: ${aur[*]}" ;;
@@ -530,8 +536,27 @@ if has_saved_answers; then
     esac
 fi
 
+# ── XeroLinux-provisioned systems ────────────────────────────────────
+# Xero's own installer sets up [xerolinux] + [chaotic-aur], a paru default,
+# and Phase-2 browsers/social apps — so on its systems this script skips
+# the overlapping choices below (repos, browser, Discord, AUR helper)
+# instead of re-asking or fighting them. Everything else (WM, terminals,
+# theming, simpbar itself) still runs. Non-Xero systems never see this.
+XERO_SYSTEM=0
+if grep -qE '^\[xerolinux\]' /etc/pacman.conf 2>/dev/null; then
+    XERO_SYSTEM=1
+    ok "XeroLinux-provisioned system detected — repo, browser, Discord, and AUR-helper choices are covered by the Xero install"
+fi
+
 # ── Step 1: package repositories ─────────────────────────────────────
 step "Choosing package repositories"
+
+if [ "$XERO_SYSTEM" = 1 ]; then
+    # Chaotic-AUR is already there via Xero (and CachyOS repos would fight
+    # the Xero stack), so take the Chaotic branch silently.
+    REPO_CHOICE=2; save_answer REPO_CHOICE 2; REPO_DETECTED=0
+    REPO_NAME="Chaotic-AUR"; REPO_LABEL="Chaotic-AUR"
+else
 
 printf '\n  %sBoth options add a binary repo to pacman so most packages —\n' "$C_BOLD"
 printf '  including things that are AUR-only on plain Arch — install through\n'
@@ -562,6 +587,7 @@ case "$REPO_CHOICE" in
 esac
 [ "$REPO_DETECTED" = 1 ] && detected_note "Repositories" "$REPO_NAME"
 ok "Selected ${REPO_NAME} repositories"
+fi
 
 # ── Step 2: window manager ───────────────────────────────────────────
 step "Choosing your window manager"
@@ -1064,6 +1090,13 @@ case "$LAUNCHER_CHOICE" in
 esac
 [ "$LAUNCHER_DETECTED" = 1 ] && [ -n "$LAUNCHER_NAME" ] && detected_note "Game launchers" "$LAUNCHER_NAME"
 
+if [ "$XERO_SYSTEM" = 1 ]; then
+    # Xero's Phase 2 covers Discord clients — skip the question and the
+    # install entirely (pin seeding below sees the empty name and skips).
+    DISCORD_DETECTED=0
+    DISCORD_NAME=""
+    DISCORD_AUR_PKG=""
+else
 if reuse_detected DISCORD_CHOICE '1:discord' '2:vesktop-bin' '3:equibop-bin equibop'; then
     DISCORD_DETECTED=1
 else
@@ -1088,6 +1121,7 @@ case "$DISCORD_CHOICE" in
     *) DISCORD_NAME="" ;;
 esac
 [ "$DISCORD_DETECTED" = 1 ] && [ -n "$DISCORD_NAME" ] && detected_note "Discord client" "$DISCORD_NAME"
+fi
 
 printf '\n  %smatugen%s is the Material You colorscheme generator simpbar uses for\n' "$C_BOLD" "$C_RESET"
 printf '  auto-theming: pick a wallpaper and it recolors the bar to match it\n'
@@ -1526,6 +1560,14 @@ fi
 # ── Step 7: choose a browser ─────────────────────────────────────────
 step "Choosing a browser"
 
+if [ "$XERO_SYSTEM" = 1 ]; then
+    # Xero's Phase 2 covers browsers (and the Firefox keep/remove choice
+    # below) — skip the question and the install entirely (pin seeding
+    # below sees the empty name and skips).
+    BROWSER_DETECTED=0
+    BROWSER_NAME=""
+    BROWSER_PKG=""
+else
 if reuse_detected BROWSER_CHOICE '1:brave-bin' '2:zen-browser-bin' '3:vivaldi' '4:microsoft-edge-stable-bin' '5:librewolf-bin'; then
     BROWSER_DETECTED=1
 else
@@ -1545,7 +1587,7 @@ esac
 [ "$BROWSER_DETECTED" = 1 ] && [ -n "$BROWSER_NAME" ] && detected_note "Browser" "$BROWSER_NAME"
 
 if [ -z "$BROWSER_NAME" ]; then
-    warn "Skipping browser install, as requested"
+    if [ "$XERO_SYSTEM" = 1 ]; then ok "Browser install skipped (covered by the Xero install)"; else warn "Skipping browser install, as requested"; fi
 else
     install_aur_pkg "$BROWSER_NAME" "$BROWSER_PKG" || true
 fi
@@ -1568,6 +1610,7 @@ if pacman -Qq firefox >/dev/null 2>&1; then
         1) ok "Keeping Firefox" ;;
         *) warn "Unrecognized choice — keeping Firefox" ;;
     esac
+fi
 fi
 
 # ── Default bar pins ───────────────────────────────────────────────
@@ -1990,6 +2033,8 @@ if pacman -Qq heroic-games-launcher-bin >/dev/null 2>&1; then
 fi
 if [ -n "$DISCORD_NAME" ]; then
     ok "$DISCORD_NAME installed"
+elif [ "$XERO_SYSTEM" = 1 ]; then
+    ok "Discord client install skipped (covered by the Xero install)"
 else
     ok "Discord client install skipped, as requested"
 fi
@@ -2022,6 +2067,8 @@ fi
 ok "protonplus and the theme packages installed (from ${REPO_NAME} or AUR helper)"
 if [ -n "$BROWSER_NAME" ]; then
     ok "$BROWSER_NAME installed (from ${REPO_NAME} or AUR helper)"
+elif [ "$XERO_SYSTEM" = 1 ]; then
+    ok "Browser install skipped (covered by the Xero install)"
 else
     ok "Browser install skipped, as requested"
 fi
