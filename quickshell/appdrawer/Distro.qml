@@ -44,6 +44,9 @@ Singleton {
         "artix": 0xf31f, "endeavouros": 0xf322, "garuda": 0xf337,
         "manjaro": 0xf312, "arcolinux": 0xf346, "archcraft": 0xf345,
         "crystal": 0xf348, "xerolinux": 0xf34a, "biglinux": 0xf347,
+        // Featherlite is Arch-based with no Nerd Font glyph of its own, so
+        // it wears the Arch logo (mirrored in simpbar/src/main.zig).
+        "featherlite": 0xf303,
         "debian": 0xf306, "ubuntu": 0xf31b, "pop": 0xf32a, "pop_os": 0xf32a,
         "linuxmint": 0xf30e, "zorin": 0xf32f, "elementary": 0xf309,
         "kubuntu": 0xf333, "kde_neon": 0xf331, "neon": 0xf331,

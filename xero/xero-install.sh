@@ -11,9 +11,10 @@
 # Author: XeroLinux Team
 # License: GPL-3.0
 #
-# Simpbar fork: no desktop environment (run the simpbar installer
-# after reboot), Limine bootloader instead of GRUB. Base-system flow
-# otherwise unchanged from upstream v2.0.0.
+# Simpbar fork: optional simpbar desktop (Hyprland or MangoWM — bar,
+# widgets, configs and helpers built and deployed into the new system),
+# Limine bootloader instead of GRUB. Base-system flow otherwise unchanged
+# from upstream v2.0.0.
 
 set -Eeuo pipefail
 
@@ -103,6 +104,15 @@ CONFIG[gfx_driver]="mesa"
 CONFIG[parallel_downloads]="5"
 CONFIG[aur_helper]="paru"
 CONFIG[extra_kernel]=""
+# Simpbar desktop (Hyprland/MangoWM + bar, widgets, configs). "none" keeps
+# the old base-only behavior; the file-manager/terminal picks only matter
+# when a desktop is chosen (keybinds + default pins), and default to the
+# same values install.sh uses.
+CONFIG[desktop]="none"
+CONFIG[file_manager]="nautilus"
+CONFIG[terminal_bin]="alacritty"
+CONFIG[terminal_class]="Alacritty"
+CONFIG[terminal_e]="-e"
 CONFIG[uefi]="no"
 CONFIG[boot_part]=""
 CONFIG[root_part]=""
@@ -221,6 +231,8 @@ ensure_dependencies() {
     command -v mkfs.xfs &>/dev/null || deps_needed+=("xfsprogs")
     command -v cryptsetup &>/dev/null || deps_needed+=("cryptsetup")
     command -v curl &>/dev/null || deps_needed+=("curl")
+    # Needed by the desktop step (simpbar source arrives as a zip).
+    command -v unzip &>/dev/null || deps_needed+=("unzip")
 
     if [[ ${#deps_needed[@]} -gt 0 ]]; then
         echo -e "${CYAN}Installing required dependencies...${NC}"
@@ -294,7 +306,7 @@ show_header() {
         --align center --width "$box_width" --margin "0 2" --padding "1 2" \
         "✨ $SCRIPT_NAME v$VERSION ✨" \
         "" \
-        "Installs a base Arch system (no desktop — simpbar setup after reboot)," \
+        "Installs a base Arch system (optional simpbar desktop: Hyprland/MangoWM)," \
         "with more configuration options than the ISO installer." \
         "For experienced Arch/Linux users. NOT beginner-friendly."
 }
@@ -1332,6 +1344,102 @@ select_extra_kernel() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────────
+# DESKTOP (simpbar: Hyprland or MangoWM + bar, widgets, configs, helpers)
+# ────────────────────────────────────────────────────────────────────────────────
+# install.sh's Steps 2/4/6 ported to phase 1: the window-manager question,
+# the file-manager/terminal picks that feed keybinds + default pins, and
+# the actual build/deploy later in install_simpbar_desktop (which runs in
+# the install order after the user exists). Browser/Discord/games/LazyVim
+# stay post-reboot choices — install.sh's own defaults skip them too, and
+# the Welcome app covers them on first login.
+
+select_desktop() {
+    show_header
+    show_submenu_header "🖥️ Desktop Environment"
+    echo ""
+
+    local options=(
+        "none      │ Base system only (no desktop — run install.sh after reboot)"
+        "hyprland  │ Hyprland + simpbar bar, widgets, configs and helpers"
+        "mango     │ MangoWM + simpbar bar, widgets, configs and helpers"
+    )
+
+    local selection=""
+    selection=$(printf '%s\n' "${options[@]}" | gum choose --height 5 --header "Desktop:") || true
+
+    case "$selection" in
+        "hyprland"*)
+            CONFIG[desktop]="hyprland"
+            show_success "Desktop: Hyprland + simpbar"
+            ;;
+        "mango"*)
+            CONFIG[desktop]="mango"
+            show_success "Desktop: MangoWM + simpbar"
+            ;;
+        *)
+            CONFIG[desktop]="none"
+            show_success "Desktop: none (base system only)"
+            sleep 0.5
+            return
+            ;;
+    esac
+    echo ""
+
+    # File manager: feeds the SUPER+E bind and the Files pin. Same default
+    # (Nautilus) as install.sh.
+    local fm_options=(
+        "nautilus  │ Nautilus (GNOME Files)"
+        "nemo      │ Nemo"
+        "dolphin   │ Dolphin"
+    )
+    local fm_sel=""
+    fm_sel=$(printf '%s\n' "${fm_options[@]}" | gum choose --height 5 --header "File manager:") || true
+    case "$fm_sel" in
+        "nemo"*)    CONFIG[file_manager]="nemo" ;;
+        "dolphin"*) CONFIG[file_manager]="dolphin" ;;
+        *)          CONFIG[file_manager]="nautilus" ;;
+    esac
+    show_success "File manager: ${CONFIG[file_manager]}"
+    echo ""
+
+    # Terminal: feeds SUPER+Return, the keybind viewer, and the Term pin.
+    # Same default (Alacritty) as install.sh.
+    local term_options=(
+        "kitty     │ Kitty"
+        "foot      │ Foot"
+        "ghostty   │ Ghostty"
+        "alacritty │ Alacritty"
+        "wezterm   │ WezTerm"
+        "konsole   │ Konsole"
+        "ptyxis    │ Ptyxis"
+    )
+    local term_sel=""
+    term_sel=$(printf '%s\n' "${term_options[@]}" | gum choose --height 9 --header "Terminal:") || true
+    # CLASS is the Wayland app-id the Hyprland float rule matches; misses
+    # only skip the float rule, the terminal itself always launches.
+    case "$term_sel" in
+        "kitty"*)     CONFIG[terminal_bin]="kitty";     CONFIG[terminal_class]="kitty";               CONFIG[terminal_e]="" ;;
+        "foot"*)      CONFIG[terminal_bin]="foot";      CONFIG[terminal_class]="foot";                CONFIG[terminal_e]="-e" ;;
+        "ghostty"*)   CONFIG[terminal_bin]="ghostty";   CONFIG[terminal_class]="ghostty";             CONFIG[terminal_e]="-e" ;;
+        "wezterm"*)   CONFIG[terminal_bin]="wezterm";   CONFIG[terminal_class]="wezterm";             CONFIG[terminal_e]="-e" ;;
+        "konsole"*)   CONFIG[terminal_bin]="konsole";   CONFIG[terminal_class]="org.kde.konsole";     CONFIG[terminal_e]="-e" ;;
+        "ptyxis"*)    CONFIG[terminal_bin]="ptyxis";    CONFIG[terminal_class]="app.ptyxis.Terminal"; CONFIG[terminal_e]="-e" ;;
+        *)            CONFIG[terminal_bin]="alacritty"; CONFIG[terminal_class]="Alacritty";           CONFIG[terminal_e]="-e" ;;
+    esac
+    show_success "Terminal: ${CONFIG[terminal_bin]}"
+    sleep 0.5
+}
+
+# One-line summary label for menus and the install summary.
+desktop_label() {
+    case "${CONFIG[desktop]}" in
+        hyprland) echo "Hyprland + simpbar" ;;
+        mango)    echo "MangoWM + simpbar" ;;
+        *)        echo "none (base only)" ;;
+    esac
+}
+
+# ────────────────────────────────────────────────────────────────────────────────
 # EXTRA PACKAGES (desktop-phase optional apps, picked up front like every
 # other setting instead of deferring to a desktop phase — the actual `pacman -S` calls
 # for these happen later, in install_user_packages, once the desktop phase
@@ -1581,7 +1689,7 @@ show_main_menu() {
             --align center --width "$box_width" --margin "0 2" --padding "1 2" \
             "✨ $SCRIPT_NAME v$VERSION ✨" \
             "" \
-            "Installs a base Arch system (no desktop — simpbar setup after reboot)," \
+            "Installs a base Arch system (optional simpbar desktop: Hyprland/MangoWM)," \
             "with more configuration options than the ISO installer." \
             "For experienced Arch/Linux users. NOT beginner-friendly."
 
@@ -1632,6 +1740,9 @@ show_main_menu() {
         local extra_pkg_label="None"
         [[ $extra_pkg_count -gt 0 ]] && extra_pkg_label="$extra_pkg_count selected"
 
+        local desktop_item_label
+        desktop_item_label=$(desktop_label)
+
         local menu_items=(
             ""
             "1.  Installer Language    │ ${CONFIG[installer_lang]}"
@@ -1646,8 +1757,9 @@ show_main_menu() {
             "10. AUR Helper            │ ${CONFIG[aur_helper]}"
             "11. Additional Kernel     │ $kernel_label"
             "12. Extra Packages        │ $extra_pkg_label"
+            "13. Desktop               │ $desktop_item_label"
             "──────────────────────────────────────────────"
-            "13. Start Installation"
+            "14. Start Installation"
             "0.  Exit"
         )
 
@@ -1683,7 +1795,8 @@ show_main_menu() {
             "10."*) select_aur_helper ;;
             "11."*) select_extra_kernel ;;
             "12."*) configure_extra_packages ;;
-            "13."*)
+            "13."*) select_desktop ;;
+            "14."*)
                 if validate_config; then
                     show_summary
                     local confirm_msg=""
@@ -1770,6 +1883,12 @@ show_summary() {
     [[ "${CONFIG[wants_libreoffice]}" == "yes" ]] && (( _epc++ ))
     [[ $_epc -gt 0 ]] && extra_pkg_summary="$_epc selected"
 
+    local desktop_summary
+    desktop_summary=$(desktop_label)
+    if [[ "${CONFIG[desktop]}" != "none" ]]; then
+        desktop_summary+=" (${CONFIG[file_manager]} / ${CONFIG[terminal_bin]})"
+    fi
+
     if [[ "${CONFIG[partition_mode]}" == "manual" ]]; then
         local efi_note=""
         [[ "${CONFIG[reuse_efi]}" == "yes" ]] && efi_note=" (reused, not formatted)"
@@ -1791,7 +1910,7 @@ show_summary() {
             "Encryption:       $encrypt_status" \
             "Swap:             ${CONFIG[swap]}" \
             "" \
-            "Desktop:          none (simpbar setup after reboot)" \
+            "Desktop:          $desktop_summary" \
             "AUR Helper:       ${CONFIG[aur_helper]}" \
             "Graphics:         ${CONFIG[gfx_driver]}" \
             "Boot Mode:        $boot_mode" \
@@ -1820,7 +1939,7 @@ show_summary() {
             "Encryption:       $encrypt_status" \
             "Swap:             ${CONFIG[swap]}" \
             "" \
-            "Desktop:          none (simpbar setup after reboot)" \
+            "Desktop:          $desktop_summary" \
             "AUR Helper:       ${CONFIG[aur_helper]}" \
             "Graphics:         ${CONFIG[gfx_driver]}" \
             "Boot Mode:        $boot_mode" \
@@ -1899,6 +2018,488 @@ install_extra_software() {
     fi
 }
 
+# ────────────────────────────────────────────────────────────────────────────────
+# SIMPBAR DESKTOP (phase-1 port of install.sh Steps 2/4/6 + build/deploy)
+# ────────────────────────────────────────────────────────────────────────────────
+# Installs the chosen WM + desktop stack, builds the bar/shell/config/
+# welcome from the simpbar repo, and deploys configs + helpers + pins into
+# the new user's home — so first login via ly lands on a working desktop.
+# Everything here targets $MOUNTPOINT (host-side file ops as ISO root,
+# package/build calls via arch-chroot); NOTHING touches the live ISO.
+#
+# Failure policy: NEVER abort the provisioning run. This runs under
+# `set -Eeuo pipefail` with a global ERR trap, so every fallible command
+# carries `|| show_warning ...` — a missing theme package must not kill a
+# 30-minute install. The function itself always returns 0; gaps are
+# reported as warnings and remain fillable post-reboot via install.sh
+# (whose reuse-detection degrades gracefully over what's already here).
+# Browser/Discord/games/LazyVim are deliberately NOT installed here —
+# install.sh's own defaults skip them too; they come post-reboot.
+install_simpbar_desktop() {
+    local tu="${CONFIG[username]}"
+    local th="$MOUNTPOINT/home/$tu"
+    [[ -d "$th" ]] || { show_warning "Home $th missing — skipping desktop install"; return 0; }
+
+    local wm_label="Hyprland"
+    [[ "${CONFIG[desktop]}" == "mango" ]] && wm_label="MangoWM"
+
+    # ── 1. packages ──────────────────────────────────────────────────
+    # install.sh's Step-6 set verbatim (bar build/runtime deps, portals
+    # handled per-WM below, fonts, tools) + the pinned Mesa ICDs (same
+    # steam-provider reasoning as install.sh) + matugen (official extra,
+    # no AUR needed) + the WM/FM/terminal picks.
+    local pkgs=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl
+        mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji
+        fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol
+        cava pipewire pipewire-pulse wireplumber gnome-disk-utility fish
+        polkit-gnome grim slurp cliphist wl-clipboard python-gobject gtk4
+        libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk
+        kdeconnect quickshell brightnessctl mesa lib32-mesa vulkan-radeon
+        lib32-vulkan-radeon vulkan-intel lib32-vulkan-intel vulkan-swrast
+        lib32-vulkan-swrast matugen)
+    if [[ "${CONFIG[desktop]}" == "mango" ]]; then
+        pkgs+=(mangowm xdg-desktop-portal-wlr xdg-desktop-portal-gtk easyeffects)
+    else
+        pkgs+=(hyprland xdg-desktop-portal-hyprland)
+    fi
+    pkgs+=("${CONFIG[file_manager]}" "${CONFIG[terminal_bin]}")
+
+    arch-chroot "$MOUNTPOINT" pacman -Sy >/dev/null 2>&1 \
+        || show_warning "Database sync failed — package installs may fail below"
+    # One bad package aborts a --noconfirm batch, so a batch failure
+    # retries per package and only true failures are reported (same shape
+    # as install.sh's install_repo_or_aur).
+    if ! arch-chroot "$MOUNTPOINT" pacman -S --noconfirm --needed "${pkgs[@]}" >/dev/null 2>&1; then
+        show_warning "Desktop batch install failed — retrying per package"
+        local p
+        for p in "${pkgs[@]}"; do
+            arch-chroot "$MOUNTPOINT" pacman -S --noconfirm --needed "$p" >/dev/null 2>&1 \
+                || show_warning "Could not install $p — install post-reboot: sudo pacman -S $p"
+        done
+    fi
+
+    # Theme/cursor/icon packs: best-effort repo installs (chaotic-aur
+    # usually carries them as binaries). Whatever misses stays a warning —
+    # the desktop works without themes, and nothing here may use an AUR
+    # helper (none is installed in the target yet).
+    local theme_pkgs=(protonplus dracula-gtk-theme bibata-cursor-theme game-devices-udev zafiro-icon-theme)
+    local tp
+    for tp in "${theme_pkgs[@]}"; do
+        arch-chroot "$MOUNTPOINT" pacman -S --noconfirm --needed "$tp" >/dev/null 2>&1 \
+            || show_warning "Could not install $tp — theming falls back to defaults"
+    done
+
+    # ── 2. simpbar source (same main.zip install.sh fetches) ─────────
+    local src_tmp=""
+    src_tmp=$(mktemp -d) || { show_warning "mktemp failed — skipping desktop deploy"; return 0; }
+    if ! curl -fL -o "$src_tmp/simpbar.zip" \
+        https://github.com/jaytheoutpatient/simpbar/archive/refs/heads/main.zip >/dev/null 2>&1; then
+        show_warning "Could not download simpbar source — desktop deploy skipped"
+        rm -rf "$src_tmp"
+        return 0
+    fi
+    if ! unzip -o "$src_tmp/simpbar.zip" -d "$src_tmp" >/dev/null 2>&1; then
+        show_warning "Could not extract simpbar source — desktop deploy skipped"
+        rm -rf "$src_tmp"
+        return 0
+    fi
+    local src="$src_tmp/simpbar-main"
+
+    local cfg_dirs=()
+    if [[ "${CONFIG[desktop]}" == "mango" ]]; then
+        cfg_dirs=(mango swaync fastfetch matugen)
+    else
+        cfg_dirs=(hypr swaync fastfetch matugen)
+    fi
+    local d
+    for d in "${cfg_dirs[@]}" simpbar simpbar-shell; do
+        if [[ ! -d "$src/$d" ]]; then
+            show_warning "Archive lacks $d/ — desktop deploy skipped (layout changed upstream?)"
+            rm -rf "$src_tmp"
+            return 0
+        fi
+    done
+
+    mkdir -p "$th/.config" "$th/.local/share/simpbar" "$th/Pictures/Wallpaper" \
+        "$th/Videos" "$th/Documents" "$th/Music" "$th/Projects" || true
+    for d in "${cfg_dirs[@]}"; do
+        rm -rf "$th/.config/$d"
+        cp -r "$src/$d" "$th/.config/" || show_warning "Could not deploy $d config"
+    done
+    # matugen layout: templates live in templates/.
+    if [[ -d "$th/.config/matugen" ]]; then
+        mkdir -p "$th/.config/matugen/templates"
+        for f in "$th/.config/matugen/"*.json "$th/.config/matugen/"*.css \
+                 "$th/.config/matugen/"*.lua "$th/.config/matugen/"*.ini \
+                 "$th/.config/matugen/"*.conf; do
+            [[ -f "$f" ]] && mv -f "$f" "$th/.config/matugen/templates/" 2>/dev/null || true
+        done
+    fi
+    # The shipped mango config keeps __HOME__ placeholders for the target
+    # user's home; hyprland.lua hardcodes nautilus/foot — point both at the
+    # picks from the desktop menu.
+    if [[ "${CONFIG[desktop]}" == "mango" ]]; then
+        sed -i "s|__HOME__|/home/$tu|g" "$th/.config/mango/config.conf" "$th/.config/mango/cfg/"*.conf 2>/dev/null \
+            || show_warning "Mango home substitution failed"
+        sed -i "s/bind = SUPER, e, spawn, dolphin/bind = SUPER, e, spawn, ${CONFIG[file_manager]}/" \
+            "$th/.config/mango/cfg/keybinds.conf" 2>/dev/null || true
+        sed -i "s/^bind = SUPER, Return, spawn, .*/bind = SUPER, Return, spawn, ${CONFIG[terminal_bin]}/" \
+            "$th/.config/mango/cfg/keybinds.conf" 2>/dev/null || true
+        if [[ -n "${CONFIG[terminal_e]}" ]]; then
+            sed -i "s|spawn, .* less __HOME__/.config/mango/cfg/keybinds.conf|spawn, ${CONFIG[terminal_bin]} ${CONFIG[terminal_e]} less /home/$tu/.config/mango/cfg/keybinds.conf|" \
+                "$th/.config/mango/cfg/keybinds.conf" 2>/dev/null || true
+        else
+            sed -i "s|spawn, .* less __HOME__/.config/mango/cfg/keybinds.conf|spawn, ${CONFIG[terminal_bin]} less /home/$tu/.config/mango/cfg/keybinds.conf|" \
+                "$th/.config/mango/cfg/keybinds.conf" 2>/dev/null || true
+        fi
+    else
+        if [[ -f "$th/.config/hypr/hyprland.lua" ]]; then
+            sed -i "s/^local fileManager = \".*\"/local fileManager = \"${CONFIG[file_manager]}\"/" \
+                "$th/.config/hypr/hyprland.lua" 2>/dev/null || true
+            sed -i "s/^local terminal = \".*\"/local terminal = \"${CONFIG[terminal_bin]}\"/" \
+                "$th/.config/hypr/hyprland.lua" 2>/dev/null || true
+            sed -i "s/^\tname = \"foot\",/\tname = \"${CONFIG[terminal_class]}\",/" \
+                "$th/.config/hypr/hyprland.lua" 2>/dev/null || true
+            sed -i "s/match = { class = \"foot\" }/match = { class = \"${CONFIG[terminal_class]}\" }/" \
+                "$th/.config/hypr/hyprland.lua" 2>/dev/null || true
+        fi
+    fi
+
+    # Sources + single-file helpers staged beside them (the /tmp archive is
+    # removed at the end of this step, so everything needed later is
+    # copied out now — same staging install.sh does under ~/.local/share).
+    rm -rf "$th/.local/share/simpbar/simpbar" "$th/.local/share/simpbar/simpbar-shell"
+    cp -r "$src/simpbar" "$th/.local/share/simpbar/simpbar" \
+        || show_warning "Could not stage simpbar source"
+    cp -r "$src/simpbar-shell" "$th/.local/share/simpbar/simpbar-shell" \
+        || show_warning "Could not stage simpbar-shell source"
+    mkdir -p "$th/.local/share/simpbar/assets/icons"
+    cp "$src/assets/icons/simpbar-config.svg" "$th/.local/share/simpbar/assets/icons/" 2>/dev/null \
+        || show_warning "simpbar-config.svg missing (bar pin falls back to text)"
+    # NOTE: the repo tracks the toggle script as `appdrawer` (no suffix);
+    # install.sh stages it as appdrawer-bin. Mirror that mapping here.
+    for f in simpbar-matugen simpbar-wallpaper simpbar-restore-wallpaper appdrawer appdrawer.desktop; do
+        if [[ -f "$src/$f" ]]; then
+            local dest="$f"
+            [[ "$f" == "appdrawer" ]] && dest="appdrawer-bin"
+            cp "$src/$f" "$th/.local/share/simpbar/$dest" 2>/dev/null \
+                || show_warning "Could not stage $f"
+        else
+            show_warning "$f missing from archive (layout changed upstream?)"
+        fi
+    done
+    unset dest
+
+    # ── 3. build (in-chroot, ReleaseFast like install.sh) ────────────
+    if [[ -f "$MOUNTPOINT/home/$tu/.local/share/simpbar/simpbar/build.zig" ]]; then
+        arch-chroot "$MOUNTPOINT" bash -c "cd '/home/$tu/.local/share/simpbar/simpbar' && zig build -Doptimize=ReleaseFast" \
+            >/dev/null 2>&1 \
+            || show_warning "simpbar build failed — bar/config/welcome missing; rebuild post-reboot in ~/.local/share/simpbar/simpbar"
+        arch-chroot "$MOUNTPOINT" bash -c "cd '/home/$tu/.local/share/simpbar/simpbar-shell' && zig build -Doptimize=ReleaseFast" \
+            >/dev/null 2>&1 \
+            || show_warning "simpbar-shell build failed — widgets missing; rebuild post-reboot in ~/.local/share/simpbar/simpbar-shell"
+    else
+        show_warning "Staged source has no build.zig — binaries skipped"
+    fi
+    local zb="$MOUNTPOINT/home/$tu/.local/share/simpbar"
+    [[ -f "$zb/simpbar/zig-out/bin/simpbar" ]] \
+        && install -Dm755 "$zb/simpbar/zig-out/bin/simpbar" "$MOUNTPOINT/usr/bin/simpbar" \
+        || show_warning "simpbar binary missing — /usr/bin/simpbar not installed"
+    [[ -f "$zb/simpbar-shell/zig-out/bin/simpbar-shell" ]] \
+        && install -Dm755 "$zb/simpbar-shell/zig-out/bin/simpbar-shell" "$MOUNTPOINT/usr/bin/simpbar-shell" \
+        || show_warning "simpbar-shell binary missing — widgets not installed"
+    [[ -f "$zb/simpbar/zig-out/bin/simpbar-config" ]] \
+        && install -Dm755 "$zb/simpbar/zig-out/bin/simpbar-config" "$MOUNTPOINT/usr/bin/simpbar-config" \
+        || show_warning "simpbar-config binary missing"
+    [[ -f "$zb/simpbar/zig-out/bin/simpbar-welcome" ]] \
+        && install -Dm755 "$zb/simpbar/zig-out/bin/simpbar-welcome" "$MOUNTPOINT/usr/bin/simpbar-welcome" \
+        || show_warning "simpbar-welcome binary missing"
+
+    # ── 4. helpers + launchers (same contents as install.sh) ────────
+    install -Dm755 "$th/.local/share/simpbar/simpbar-matugen" "$MOUNTPOINT/usr/bin/simpbar-matugen" 2>/dev/null \
+        || show_warning "simpbar-matugen helper not installed"
+    install -Dm755 "$th/.local/share/simpbar/simpbar-wallpaper" "$MOUNTPOINT/usr/bin/simpbar-wallpaper" 2>/dev/null \
+        || show_warning "simpbar-wallpaper engine not installed"
+    install -Dm755 "$th/.local/share/simpbar/simpbar-restore-wallpaper" "$MOUNTPOINT/usr/bin/simpbar-restore-wallpaper" 2>/dev/null \
+        || show_warning "wallpaper restore helper not installed"
+    install -Dm755 "$th/.local/share/simpbar/appdrawer-bin" "$MOUNTPOINT/usr/bin/appdrawer" 2>/dev/null \
+        || show_warning "/usr/bin/appdrawer not installed"
+    install -Dm644 "$th/.local/share/simpbar/appdrawer.desktop" "$MOUNTPOINT/usr/share/applications/appdrawer.desktop" 2>/dev/null \
+        || show_warning "appdrawer.desktop not installed"
+    install -Dm644 "$th/.local/share/simpbar/assets/icons/simpbar-config.svg" \
+        "$MOUNTPOINT/usr/share/icons/hicolor/scalable/apps/simpbar-config.svg" 2>/dev/null \
+        || show_warning "cog icon not installed (bar pin falls back to text)"
+
+    cat > "$MOUNTPOINT/usr/bin/simpbar-launch-browser" << 'BROWSERWRAPEOF'
+#!/bin/bash
+# simpbar-launch-browser — checks ~/.config/simpbar/browser-choice first (set
+# via the Welcome app's Setup tab); falls back to trying known binaries in
+# order if no preference is set or the preferred one isn't actually installed.
+PREF_FILE="$HOME/.config/simpbar/browser-choice"
+if [ -r "$PREF_FILE" ]; then
+    preferred=$(cat "$PREF_FILE")
+    [ -n "$preferred" ] && command -v "$preferred" >/dev/null 2>&1 && exec "$preferred"
+fi
+for bin in brave zen-browser zen vivaldi-stable vivaldi microsoft-edge-stable librewolf firefox; do
+    if command -v "$bin" >/dev/null 2>&1; then
+        exec "$bin"
+    fi
+done
+command -v notify-send >/dev/null 2>&1 && \
+    notify-send -a "Simpbar" "No browser found" \
+        "Install one from the Simpbar Welcome app or install script."
+BROWSERWRAPEOF
+    chmod 755 "$MOUNTPOINT/usr/bin/simpbar-launch-browser" 2>/dev/null || true
+
+    cat > "$MOUNTPOINT/usr/bin/simpbar-launch-discord" << 'DISCORDWRAPEOF'
+#!/bin/bash
+# simpbar-launch-discord — checks ~/.config/simpbar/discord-choice first (set
+# via the Welcome app's Setup tab); falls back to trying known binaries in
+# order if no preference is set or the preferred one isn't actually installed.
+PREF_FILE="$HOME/.config/simpbar/discord-choice"
+if [ -r "$PREF_FILE" ]; then
+    preferred=$(cat "$PREF_FILE")
+    [ -n "$preferred" ] && command -v "$preferred" >/dev/null 2>&1 && exec "$preferred"
+fi
+for bin in vesktop equibop discord; do
+    if command -v "$bin" >/dev/null 2>&1; then
+        exec "$bin"
+    fi
+done
+command -v notify-send >/dev/null 2>&1 && \
+    notify-send -a "Simpbar" "No Discord client found" \
+        "Install one from the Simpbar Welcome app or install script."
+DISCORDWRAPEOF
+    chmod 755 "$MOUNTPOINT/usr/bin/simpbar-launch-discord" 2>/dev/null || true
+
+    mkdir -p "$th/.local/share/applications"
+    cat > "$th/.local/share/applications/simpbar-welcome.desktop" << 'WELCOMEDESKTOPEOF'
+[Desktop Entry]
+Type=Application
+Name=Simpbar Welcome
+Comment=Setup actions, keybindings, and links for the simpbar Hyprland setup
+Exec=simpbar-welcome
+Icon=help-about
+Terminal=false
+Categories=Settings;
+StartupNotify=true
+WELCOMEDESKTOPEOF
+    cat > "$th/.local/share/applications/simpbar-config.desktop" << 'CONFIGDESKTOPEOF'
+[Desktop Entry]
+Type=Application
+Name=Simpbar Config
+Comment=Configure simpbar's appearance, module layout, and desktop shortcuts
+Exec=simpbar-config
+Icon=simpbar-config
+Terminal=false
+Categories=Settings;
+StartupNotify=true
+CONFIGDESKTOPEOF
+
+    # ── 5. app drawer QML ────────────────────────────────────────────
+    if [[ -d "$th/.local/share/simpbar/appdrawer" ]]; then
+        local qs_dir="$th/.config/quickshell/appdrawer"
+        mkdir -p "$qs_dir"
+        local qml
+        for qml in AppModel.qml AppTile.qml Distro.qml Drawer.qml Icons.qml shell.qml Theme.qml WallpaperModel.qml WallpaperTile.qml WallhavenSearch.qml; do
+            if [[ -f "$th/.local/share/simpbar/appdrawer/$qml" ]]; then
+                cp "$th/.local/share/simpbar/appdrawer/$qml" "$qs_dir/$qml" 2>/dev/null || true
+            else
+                show_warning "appdrawer $qml missing — the drawer may not load"
+            fi
+        done
+        [[ -f "$qs_dir/favourites.json" ]] || printf '{ "ids": [] }\n' > "$qs_dir/favourites.json"
+    fi
+
+    # ── 6. matugen config (always — auto-theming is core, not optional) ─
+    if [[ -f "$src/matugen/config.toml" ]]; then
+        mkdir -p "$th/.config/matugen/templates"
+        [[ -e "$th/.config/matugen/config.toml" ]] \
+            || cp "$src/matugen/config.toml" "$th/.config/matugen/config.toml" 2>/dev/null \
+            || show_warning "matugen config.toml not deployed"
+        if [[ -f "$src/matugen/simpbar.json" ]]; then
+            [[ -e "$th/.config/matugen/templates/simpbar.json" ]] \
+                || cp "$src/matugen/simpbar.json" "$th/.config/matugen/templates/simpbar.json" 2>/dev/null \
+                || show_warning "matugen simpbar template not deployed"
+        fi
+    else
+        show_warning "matugen/ missing from archive — theming config skipped"
+    fi
+
+    # ── 7. bar config + default pins ────────────────────────────────
+    # Empty icons: the bar derives them at runtime via the desktop index,
+    # so the picked file manager/terminal wear their own theme icons.
+    # Steam only when it actually landed; browser/Discord pins come
+    # post-reboot (neither is installed in phase 1).
+    local pins='[{"label":"Files","command":"'"${CONFIG[file_manager]}"'","icon":""},'
+    pins+='{"label":"Term","command":"'"${CONFIG[terminal_bin]}"'","icon":""},'
+    if [[ -x "$MOUNTPOINT/usr/bin/steam" ]]; then
+        pins+='{"label":"Steam","command":"steam","icon":""},'
+    fi
+    pins+='{"label":"Config","command":"simpbar-config","icon":"simpbar-config"},'
+    pins+='{"label":"Welcome","command":"simpbar-welcome","icon":"help-about"}]'
+    mkdir -p "$th/.config/simpbar"
+    if [[ ! -f "$th/.config/simpbar/config.json" ]]; then
+        printf '{"appearance":{"empty_click_command":"appdrawer"},"launchers":%s}\n' "$pins" \
+            > "$th/.config/simpbar/config.json" \
+            || show_warning "config.json not seeded"
+    elif ! grep -q '"launchers"' "$th/.config/simpbar/config.json" 2>/dev/null; then
+        if command -v python3 >/dev/null 2>&1; then
+            python3 - "$th/.config/simpbar/config.json" "$pins" << 'PYEOF' 2>/dev/null \
+                || show_warning "pin seeding failed (bar falls back to built-in pins)"
+import json, sys
+path, frag = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    cfg = json.load(f)
+if "launchers" not in cfg:
+    cfg["launchers"] = json.loads(frag)
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+PYEOF
+        else
+            show_warning "python3 unavailable — pin seeding skipped"
+        fi
+    fi
+    if [[ ! -f "$th/.config/simpbar/reminders.txt" ]]; then
+        cat > "$th/.config/simpbar/reminders.txt" << 'REMIN'
+# Reminders — one per line: YYYY-MM-DD HH:MM lead text
+#   lead = days before the date to notify (0 = on the day)
+# Click a day on the calendar card to add/remove via rofi.
+REMIN
+    fi
+
+    # ── 8. small user configs (rofi, qt6ct) ─────────────────────────
+    mkdir -p "$th/.config/rofi"
+    if [[ ! -e "$th/.config/rofi/config.rasi" ]]; then
+        cat > "$th/.config/rofi/config.rasi" << 'EOF'
+configuration {
+    display-drun: "Apps";
+    display-run: "Run";
+    display-window: "Window";
+    show-icons: true;
+}
+
+@theme "material"
+EOF
+    fi
+    if [[ -f "$MOUNTPOINT/usr/share/color-schemes/BreezeDark.colors" ]]; then
+        mkdir -p "$th/.config/qt6ct"
+        if [[ ! -e "$th/.config/qt6ct/qt6ct.conf" ]]; then
+            cat > "$th/.config/qt6ct/qt6ct.conf" << EOF
+[Appearance]
+style=Breeze
+color_scheme_path=/usr/share/color-schemes/BreezeDark.colors
+custom_palette=true
+EOF
+        fi
+    fi
+
+    # ── 9. user services WITHOUT a user manager ─────────────────────
+    # systemctl --user needs a DBus session (absent in chroot), so enable by
+    # symlink — exactly what `systemctl --user enable` would create. Each
+    # link is guarded on its unit existing in the target.
+    local u_dir="$th/.config/systemd/user"
+    mkdir -p "$u_dir/sockets.target.wants" "$u_dir/pipewire.service.wants" \
+        "$u_dir/timers.target.wants" "$u_dir/graphical-session.target.wants"
+    [[ -f "$MOUNTPOINT/usr/lib/systemd/user/pipewire.socket" ]] \
+        && ln -sf /usr/lib/systemd/user/pipewire.socket "$u_dir/sockets.target.wants/pipewire.socket"
+    [[ -f "$MOUNTPOINT/usr/lib/systemd/user/pipewire-pulse.socket" ]] \
+        && ln -sf /usr/lib/systemd/user/pipewire-pulse.socket "$u_dir/sockets.target.wants/pipewire-pulse.socket"
+    if [[ -f "$MOUNTPOINT/usr/lib/systemd/user/wireplumber.service" ]]; then
+        ln -sf /usr/lib/systemd/user/wireplumber.service "$u_dir/pipewire.service.wants/wireplumber.service"
+        ln -sf /usr/lib/systemd/user/wireplumber.service "$u_dir/pipewire-session-manager.service"
+    else
+        show_warning "wireplumber.service missing — audio session mgmt needs manual enable"
+    fi
+
+    cat > "$u_dir/simpbar-update-checker.service" << 'CHECKERSVCEOF'
+[Unit]
+Description=Check for simpbar/Arch updates
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/simpbar-check-updates
+CHECKERSVCEOF
+    cat > "$u_dir/simpbar-update-checker.timer" << 'CHECKERTIMEREOF'
+[Unit]
+Description=Periodically check for simpbar/Arch updates
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+CHECKERTIMEREOF
+    if arch-chroot "$MOUNTPOINT" pacman -Qq pacman-contrib libnotify >/dev/null 2>&1; then
+        ln -sf "/home/$tu/.config/systemd/user/simpbar-update-checker.timer" \
+            "$u_dir/timers.target.wants/simpbar-update-checker.timer"
+    else
+        show_warning "pacman-contrib/libnotify missing — update-checker timer left disabled"
+    fi
+
+    cat > "$u_dir/simpbar-welcome.service" << 'WELCOMESVCEOF'
+[Unit]
+Description=Simpbar Welcome (first-login popup)
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/simpbar-welcome --autostart
+
+[Install]
+WantedBy=graphical-session.target
+WELCOMESVCEOF
+    if arch-chroot "$MOUNTPOINT" pacman -Qq gtk4 libadwaita python-gobject >/dev/null 2>&1; then
+        ln -sf "/home/$tu/.config/systemd/user/simpbar-welcome.service" \
+            "$u_dir/graphical-session.target.wants/simpbar-welcome.service"
+    else
+        show_warning "GTK4/libadwaita/python-gobject missing — Welcome autostart left disabled"
+    fi
+
+    # ── 10. flathub + wallpaper (best-effort, never fatal) ──────────
+    arch-chroot "$MOUNTPOINT" su -l "$tu" -c \
+        'flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo' \
+        >/dev/null 2>&1 \
+        || show_warning "Flathub remote not added — add post-reboot from the Welcome app"
+    local bing_tmp=""
+    bing_tmp=$(mktemp) || true
+    if [[ -n "$bing_tmp" && -x "$src/simpbar-wallpaper" ]] \
+        && bash "$src/simpbar-wallpaper" bing > "$bing_tmp" 2>/dev/null; then
+        local bing_file=""
+        bing_file=$(head -n1 "$bing_tmp")
+        if [[ -n "$bing_file" && -f "$bing_file" ]]; then
+            cp "$bing_file" "$th/Pictures/Wallpaper/" 2>/dev/null || true
+            if [[ ! -r "$th/.config/simpbar/wallpaper" ]]; then
+                printf 'path=%s\nfill=fill\ncolor=#ffffff\n' \
+                    "$th/Pictures/Wallpaper/$(basename "$bing_file")" \
+                    > "$th/.config/simpbar/wallpaper" 2>/dev/null || true
+            fi
+        fi
+    else
+        show_warning "No wallpaper fetched — pick one from the app drawer after login"
+    fi
+    [[ -n "$bing_tmp" ]] && rm -f "$bing_tmp"
+
+    # ── 11. mango session sanity ────────────────────────────────────
+    # ly lists /usr/share/wayland-sessions: hyprland's package ships its
+    # entry, but if mangowm's doesn't (or the glob finds nothing mango),
+    # ly would boot to a chooser with no Mango in it.
+    if [[ "${CONFIG[desktop]}" == "mango" ]]; then
+        if ! ls "$MOUNTPOINT/usr/share/wayland-sessions/" 2>/dev/null | grep -qi mango; then
+            show_warning "No MangoWG session file in wayland-sessions — check 'ls /usr/share/wayland-sessions' after reboot; ly needs an entry to offer Mango"
+        fi
+    fi
+
+    rm -rf "$src_tmp"
+    arch-chroot "$MOUNTPOINT" chown -R "$tu:$tu" "/home/$tu" 2>/dev/null \
+        || show_warning "Could not chown home dir — check ownership after reboot"
+    show_success "Simpbar desktop ($wm_label) installed — pick it in ly after reboot"
+    return 0
+}
+
 perform_installation() {
     # Build the ordered step list dynamically based on config, so the
     # percent bar's total always matches what will actually run.
@@ -1931,6 +2532,13 @@ perform_installation() {
     step_labels+=("Installing Limine bootloader");    step_funcs+=("install_bootloader")
     step_labels+=("Configuring Btrfs snapshots");   step_funcs+=("setup_snapper")
     step_labels+=("Creating user account");         step_funcs+=("create_user")
+    # Desktop needs the user + home to exist (configs, builds, pins all
+    # land in the new user's home), so it runs right after create_user.
+    if [[ "${CONFIG[desktop]}" != "none" ]]; then
+        local _wm_step="Hyprland"
+        [[ "${CONFIG[desktop]}" == "mango" ]] && _wm_step="MangoWM"
+        step_labels+=("Installing simpbar desktop ($_wm_step)"); step_funcs+=("install_simpbar_desktop")
+    fi
     step_labels+=("Installing graphics drivers");   step_funcs+=("install_graphics")
     step_labels+=("Configuring swap");              step_funcs+=("setup_swap_system")
 
@@ -1941,19 +2549,36 @@ perform_installation() {
     done
 
     # No desktop phase here by design (there is no Part 2 in this fork):
-    # the base system above is the whole job. After rebooting, fetch the
-    # simpbar desktop installer and run it for the Hyprland/MangoWM
-    # desktop, bar, widgets and theming.
+    # the base system above is the whole job unless a desktop was chosen.
+    # After rebooting, install.sh finishes whatever is left (browsers,
+    # Discord, games — its reuse-detection skips everything phase 1
+    # already did).
     show_header
-    gum style --foreground 82 --bold --border double --border-foreground 82 \
-        --align center --width 60 --margin "1 2" --padding "1 2" \
-        "✨ Base System Installed! ✨" \
-        "" \
-        "No desktop environment was installed — that is intentional." \
-        "" \
-        "Remove the installation media and reboot, then set up" \
-        "the simpbar desktop:" \
-        "  curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash"
+    if [[ "${CONFIG[desktop]}" != "none" ]]; then
+        local _wm_done="Hyprland"
+        [[ "${CONFIG[desktop]}" == "mango" ]] && _wm_done="MangoWM"
+        gum style --foreground 82 --bold --border double --border-foreground 82 \
+            --align center --width 60 --margin "1 2" --padding "1 2" \
+            "✨ Installation Complete! ✨" \
+            "" \
+            "Your simpbar desktop ($_wm_done) is installed." \
+            "" \
+            "Remove the installation media and reboot, then" \
+            "pick $_wm_done in ly and log in." \
+            "" \
+            "For browsers, Discord and extras, run post-reboot:" \
+            "  curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash"
+    else
+        gum style --foreground 82 --bold --border double --border-foreground 82 \
+            --align center --width 60 --margin "1 2" --padding "1 2" \
+            "✨ Base System Installed! ✨" \
+            "" \
+            "No desktop environment was installed — that is intentional." \
+            "" \
+            "Remove the installation media and reboot, then set up" \
+            "the simpbar desktop:" \
+            "  curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash"
+    fi
     echo ""
 }
 
@@ -2348,6 +2973,26 @@ EOF
 ::1         localhost
 127.0.1.1   ${CONFIG[hostname]}.localdomain ${CONFIG[hostname]}
 EOF
+
+    # Distro branding: this is Featherlite, not Arch — but it IS Arch
+    # under the hood, so ID_LIKE=arch stays. That one line keeps every
+    # Arch-aware tool working: the bar/drawer distro badges (direct ID
+    # miss → ID_LIKE → Arch glyph), AUR helpers, installer scripts.
+    # Overwritten here (not shipped as a file) because the `filesystem`
+    # package owns /etc/os-release and a packaged file would fight it.
+    cat > "$MOUNTPOINT/etc/os-release" << 'FEATHEROS'
+NAME="Featherlite Linux"
+PRETTY_NAME="Featherlite Linux"
+ID=featherlite
+ID_LIKE=arch
+BUILD_ID=rolling
+ANSI_COLOR="0;36"
+HOME_URL="https://github.com/jaytheoutpatient/simpbar"
+DOCUMENTATION_URL="https://wiki.archlinux.org/"
+SUPPORT_URL="https://github.com/jaytheoutpatient/simpbar"
+BUG_REPORT_URL="https://github.com/jaytheoutpatient/simpbar/issues"
+LOGO=archlinux
+FEATHEROS
 
     arch-chroot "$MOUNTPOINT" systemctl enable NetworkManager
 

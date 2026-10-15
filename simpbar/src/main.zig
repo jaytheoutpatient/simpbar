@@ -160,6 +160,9 @@ const DISTRO_GLYPHS = std.StaticStringMap(u32).initComptime(.{
     .{ "artix", 0xF31F }, .{ "endeavouros", 0xF322 }, .{ "garuda", 0xF337 },
     .{ "manjaro", 0xF312 }, .{ "arcolinux", 0xF346 }, .{ "archcraft", 0xF345 },
     .{ "crystal", 0xF348 }, .{ "xerolinux", 0xF34A }, .{ "biglinux", 0xF347 },
+    // Featherlite is Arch-based with no Nerd Font glyph of its own, so it
+    // wears the Arch logo (mirrored in quickshell/appdrawer/Distro.qml).
+    .{ "featherlite", 0xF303 },
     .{ "debian", 0xF306 }, .{ "ubuntu", 0xF31B }, .{ "pop", 0xF32A },
     .{ "pop_os", 0xF32A }, .{ "linuxmint", 0xF30E }, .{ "zorin", 0xF32F },
     .{ "elementary", 0xF309 }, .{ "kubuntu", 0xF333 }, .{ "kde_neon", 0xF331 },

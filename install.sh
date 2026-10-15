@@ -513,9 +513,11 @@ if [ -d /run/archiso ]; then
                 if bash /tmp/xero-install.sh < /dev/tty; then
                     rm -f /tmp/xero-install.sh
                     printf '\n  %sBase system installed — reboot into it now.%s\n' "$C_GREEN" "$C_RESET"
-                    printf '  Remove the installation media, reboot, log in as the user you just created,\n'
-                    printf '  and run the desktop setup there:\n'
+                    printf '  Remove the installation media, reboot, log in as the user you just created.\n'
+                    printf '  If you chose no desktop, run the desktop setup there:\n'
                     printf '  %scurl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash%s\n' "$C_BOLD" "$C_RESET"
+                    printf '  (If you chose Hyprland/MangoWM it is already installed — that same command\n'
+                    printf '  post-reboot only adds browsers, Discord and extras.)\n'
                     printf '  (Running the steps below here would install into this live ISO as root —\n'
                     printf '  nothing would survive the reboot.)\n'
                     exit 0
