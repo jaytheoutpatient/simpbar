@@ -3,6 +3,8 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 
+// ligma
+
 // The drawer.
 //
 // Sits directly above the bar as a real layer-shell surface (anchored to the

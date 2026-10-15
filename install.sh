@@ -1,6 +1,7 @@
 #!/bin/bash
 # Simpbar Installer
 # Arch Linux only
+# ligma
 
 set -e
 

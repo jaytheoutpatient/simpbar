@@ -1,6 +1,8 @@
 const std = @import("std");
 const posix = std.posix;
 
+// ligma
+
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const zwlr = wayland.client.zwlr;
