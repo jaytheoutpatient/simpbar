@@ -393,9 +393,22 @@ install_repo_or_aur() {
     done
 
     if [ "${#repo[@]}" -gt 0 ]; then
-        run_spinner "pacman: ${#repo[@]} of $count packages from ${REPO_NAME}" \
-            sudo pacman -S --noconfirm --needed "${repo[@]}" \
-            || { warn "Some ${REPO_NAME} installs failed: ${repo[*]}"; return 1; }
+        # One bad package (a conflict, a 404) aborts the whole transaction
+        # under --noconfirm — so a batch failure retries per package, and
+        # only the true failures are reported at the end.
+        if ! run_spinner "pacman: ${#repo[@]} of $count packages from ${REPO_NAME}" \
+            sudo pacman -S --noconfirm --needed "${repo[@]}"; then
+            warn "Batch install failed — retrying packages individually"
+            local failed=() p
+            for p in "${repo[@]}"; do
+                run_spinner "pacman: $p" sudo pacman -S --noconfirm --needed "$p" \
+                    || { warn "Could not install $p — install manually: sudo pacman -S $p"; failed+=("$p"); }
+            done
+            if [ "${#failed[@]}" -gt 0 ]; then
+                warn "Some ${REPO_NAME} installs failed: ${failed[*]}"
+                return 1
+            fi
+        fi
     fi
 
     if [ "${#aur[@]}" -eq 0 ]; then
@@ -413,11 +426,31 @@ install_repo_or_aur() {
     fi
 
     if command -v yay >/dev/null; then
-        run_spinner "yay: installing ${#aur[@]} AUR packages" yay -S --noconfirm --needed "${aur[@]}" \
-            || { warn "Some AUR packages failed via yay — install manually: yay -S ${aur[*]}"; return 1; }
+        if ! run_spinner "yay: installing ${#aur[@]} AUR packages" yay -S --noconfirm --needed "${aur[@]}"; then
+            warn "Batch AUR install failed — retrying packages individually"
+            local afailed=() ap
+            for ap in "${aur[@]}"; do
+                run_spinner "yay: $ap" yay -S --noconfirm --needed "$ap" \
+                    || { warn "Could not install $ap via yay — install manually: yay -S $ap"; afailed+=("$ap"); }
+            done
+            if [ "${#afailed[@]}" -gt 0 ]; then
+                warn "Some AUR packages failed via yay — install manually: yay -S ${afailed[*]}"
+                return 1
+            fi
+        fi
     elif command -v paru >/dev/null; then
-        run_spinner "paru: installing ${#aur[@]} AUR packages" paru -S --noconfirm --needed "${aur[@]}" \
-            || { warn "Some AUR packages failed via paru — install manually: paru -S ${aur[*]}"; return 1; }
+        if ! run_spinner "paru: installing ${#aur[@]} AUR packages" paru -S --noconfirm --needed "${aur[@]}"; then
+            warn "Batch AUR install failed — retrying packages individually"
+            local afailed=() ap
+            for ap in "${aur[@]}"; do
+                run_spinner "paru: $ap" paru -S --noconfirm --needed "$ap" \
+                    || { warn "Could not install $ap via paru — install manually: paru -S $ap"; afailed+=("$ap"); }
+            done
+            if [ "${#afailed[@]}" -gt 0 ]; then
+                warn "Some AUR packages failed via paru — install manually: paru -S ${afailed[*]}"
+                return 1
+            fi
+        fi
     else
         warn "No AUR helper available — install manually: ${aur[*]}"
         return 1
@@ -650,6 +683,16 @@ fi
 rm -rf ~/.local/share/simpbar/simpbar-shell
 cp -r /tmp/simpbar-temp/simpbar-main/simpbar-shell ~/.local/share/simpbar/simpbar-shell
 ok "simpbar-shell source placed in ~/.local/share/simpbar/simpbar-shell"
+
+# The bar's config-pin icon stages with the sources: the /tmp archive is
+# cleaned below to free space for package installs and builds, long before
+# the .desktop/icon step runs — referencing the archive there always misses.
+mkdir -p ~/.local/share/simpbar/assets/icons
+if cp /tmp/simpbar-temp/simpbar-main/assets/icons/simpbar-config.svg ~/.local/share/simpbar/assets/icons/ 2>/dev/null; then
+    ok "simpbar-config icon staged"
+else
+    warn "simpbar-config.svg missing from the repo checkout (bar pin falls back to text)"
+fi
 
 # simpbar-matugen (the wallpaper→Material You recolor helper, tracked at the
 # repo root alongside the source) is staged beside the source now while the
@@ -993,10 +1036,14 @@ case "$DISCORD_CHOICE" in
     1) DISCORD_NAME="Discord"; PACMAN_PKGS+=(discord) ;;
     2) DISCORD_NAME="Vesktop"; DISCORD_AUR_PKG="vesktop-bin" ;;
     3) DISCORD_NAME="Equibop"
-       # Prefer the repo package name when the repos carry it (CachyOS
-       # ships `equibop`; bare `-bin` only exists in the AUR) — the AUR
-       # fallback stays for repo setups that don't.
-       if pacman -Si equibop >/dev/null 2>&1; then DISCORD_AUR_PKG="equibop"; else DISCORD_AUR_PKG="equibop-bin"; fi ;;
+       # Either installed twin satisfies the choice — installing the other
+       # would conflict-abort the whole batch (pacman can't resolve [y/N]
+       # under --noconfirm), so install nothing in that case. Otherwise
+       # prefer the repo package name (CachyOS ships `equibop`; bare
+       # `-bin` only exists in the AUR) with the AUR name as fallback.
+       if pacman -Qq equibop >/dev/null 2>&1 || pacman -Qq equibop-bin >/dev/null 2>&1; then DISCORD_AUR_PKG=""
+       elif pacman -Si equibop >/dev/null 2>&1; then DISCORD_AUR_PKG="equibop"
+       else DISCORD_AUR_PKG="equibop-bin"; fi ;;
     *) DISCORD_NAME="" ;;
 esac
 [ "$DISCORD_DETECTED" = 1 ] && [ -n "$DISCORD_NAME" ] && detected_note "Discord client" "$DISCORD_NAME"
@@ -1880,16 +1927,15 @@ CONFIGDESKTOPEOF
 
 # simpbar-config's bar icon (blue/purple cog): hicolor scalable, then
 # refresh the icon cache so the new icon resolves without a logout.
-if [ -f "/tmp/simpbar-temp/simpbar-main/assets/icons/simpbar-config.svg" ]; then
-    sudo install -Dm644 "/tmp/simpbar-temp/simpbar-main/assets/icons/simpbar-config.svg" /usr/share/icons/hicolor/scalable/apps/simpbar-config.svg \
+# Sourced from the staged copy (the /tmp archive is long cleaned by now).
+if [ -f ~/.local/share/simpbar/assets/icons/simpbar-config.svg ]; then
+    sudo install -Dm644 ~/.local/share/simpbar/assets/icons/simpbar-config.svg /usr/share/icons/hicolor/scalable/apps/simpbar-config.svg \
         && ok "simpbar-config icon installed to hicolor" \
         || warn "could not install simpbar-config icon (bar pin falls back to text)"
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 \
             || warn "icon cache refresh failed (log out and back in if the cog doesn't appear)"
     fi
-else
-    warn "assets/icons/simpbar-config.svg missing from the repo checkout (bar pin falls back to text)"
 fi
 
 cat > ~/.config/systemd/user/simpbar-welcome.service <<EOF
