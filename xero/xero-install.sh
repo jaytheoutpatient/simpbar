@@ -2195,7 +2195,7 @@ MANGOCONFSTUBEOF
 # simpbar-firstboot stub — launches the desktop installer once, then
 # retracts itself (see /usr/local/bin/simpbar-firstboot). Overwritten by
 # the real config when install.sh runs.
-exec-once = /usr/local/bin/simpbar-firstboot
+exec_once = /usr/local/bin/simpbar-firstboot
 MANGOSTUBEOF
     else
         # Hyprland 0.55+ loads hyprland.lua when present and otherwise falls
