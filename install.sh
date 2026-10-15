@@ -107,6 +107,15 @@ install_paru() {
     return 0
 }
 
+# Bash-builtin sleep for spinner/keepalive/retry waits. /usr/bin/sleep is a
+# dynamically linked external that cannot even execute mid-libc-upgrade
+# (the CachyOS repo step swaps libc under us — every tick then faults with
+# "cannot execute" / bus errors), while this already-running shell and its
+# builtins keep working. The fd opens once up front (RDWR so the pipe never
+# sees EOF) and `read -t` does the waiting: no fork, no exec.
+exec {SPIN_SLEEP_FD}<> <(:)
+spin_sleep() { read -t "${1:-0.1}" -u "$SPIN_SLEEP_FD" || true; }
+
 # Run a command quietly, showing a spinner, then a check/cross line.
 run_spinner() {
     local msg="$1"; shift
@@ -131,7 +140,7 @@ run_spinner() {
     while kill -0 "$pid" 2>/dev/null; do
         i=$(( (i + 1) % ${#spin} ))
         printf '\r  %s %s' "${spin:$i:1}" "$msg"
-        sleep 0.1
+        spin_sleep 0.1
     done
     if wait "$pid"; then
         printf '\r  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$msg"
@@ -320,13 +329,24 @@ prompt_choice() {
     done
     printf '  %sChoice [%s]: %s' "$C_BOLD" "$default" "$C_RESET"
 
-    if [ -r /dev/tty ]; then
-        read -r choice < /dev/tty
-    else
-        warn "No interactive terminal available — defaulting to option $default"
-        choice="$default"
-    fi
-    [ -z "$choice" ] && choice="$default"
+    # Validate: anything that isn't a number in range gets re-asked instead
+    # of sliding into the `*)` default arm (typing "brave" used to read as
+    # "skip the browser"). Empty (Enter) and unreadable tty still take the
+    # curated default, so the loop always terminates.
+    while true; do
+        if [ -r /dev/tty ]; then
+            read -r choice < /dev/tty || true
+        else
+            warn "No interactive terminal available — defaulting to option $default"
+            choice="$default"
+        fi
+        [ -z "$choice" ] && choice="$default"
+        if [ "$choice" -eq "$choice" ] 2>/dev/null && [ "$choice" -ge 1 ] && [ "$choice" -le "$opt_count" ]; then
+            break
+        fi
+        printf '  %sPlease type a number between 1 and %d.%s\n' "$C_RED" "$opt_count" "$C_RESET"
+        printf '  %sChoice [%s]: %s' "$C_BOLD" "$default" "$C_RESET"
+    done
 
     # Remember the answer so a future re-run/update doesn't ask it again.
     save_answer "$result_var" "$choice"
@@ -551,7 +571,7 @@ if ! sudo -v >/dev/null 2>&1; then
     die "Could not authenticate with sudo (wrong password?)."
 fi
 ok "Sudo access confirmed — one prompt, held for the whole run"
-( while true; do sudo -v >/dev/null 2>&1 || exit 1; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) &
+( while true; do sudo -v >/dev/null 2>&1 || exit 1; spin_sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) &
 SUDO_KEEPALIVE_PID=$!
 
 MISSING_PREREQS=()
@@ -742,7 +762,7 @@ else
                 _key_ok=1
                 break
             fi
-            [ "$_try" -lt 3 ] && sleep 5
+            [ "$_try" -lt 3 ] && spin_sleep 5
         done
         [ "$_key_ok" = 1 ] || die "Failed to import the Chaotic-AUR signing key."
 
@@ -960,7 +980,7 @@ case "$LAUNCHER_CHOICE" in
 esac
 [ "$LAUNCHER_DETECTED" = 1 ] && [ -n "$LAUNCHER_NAME" ] && detected_note "Game launchers" "$LAUNCHER_NAME"
 
-if reuse_detected DISCORD_CHOICE '1:discord' '2:vesktop-bin' '3:equibop-bin'; then
+if reuse_detected DISCORD_CHOICE '1:discord' '2:vesktop-bin' '3:equibop-bin equibop'; then
     DISCORD_DETECTED=1
 else
     DISCORD_DETECTED=0
@@ -972,7 +992,11 @@ DISCORD_AUR_PKG=""
 case "$DISCORD_CHOICE" in
     1) DISCORD_NAME="Discord"; PACMAN_PKGS+=(discord) ;;
     2) DISCORD_NAME="Vesktop"; DISCORD_AUR_PKG="vesktop-bin" ;;
-    3) DISCORD_NAME="Equibop"; DISCORD_AUR_PKG="equibop-bin" ;;
+    3) DISCORD_NAME="Equibop"
+       # Prefer the repo package name when the repos carry it (CachyOS
+       # ships `equibop`; bare `-bin` only exists in the AUR) — the AUR
+       # fallback stays for repo setups that don't.
+       if pacman -Si equibop >/dev/null 2>&1; then DISCORD_AUR_PKG="equibop"; else DISCORD_AUR_PKG="equibop-bin"; fi ;;
     *) DISCORD_NAME="" ;;
 esac
 [ "$DISCORD_DETECTED" = 1 ] && [ -n "$DISCORD_NAME" ] && detected_note "Discord client" "$DISCORD_NAME"

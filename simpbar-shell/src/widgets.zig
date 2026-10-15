@@ -111,7 +111,7 @@ pub fn cardSizeFor(id: WidgetId, font: *const font_mod.Font) [2]u32 {
     const lh: i64 = lineH(font);
     return switch (id) {
         .clock => .{ 190, @intCast(2 * CARD_PAD + 2 * lh + ROW_GAP) },
-        .weather => .{ 170, @intCast(2 * CARD_PAD + lh) },
+        .weather => .{ 190, @intCast(2 * CARD_PAD + 3 * lh + 2 * ROW_GAP) },
         .media => .{ @intCast(MEDIA_W), @intCast(2 * CARD_PAD + MEDIA_COVER + MEDIA_HEAD_GAP + MEDIA_PROG_H + MEDIA_TIME_GAP + lh + MEDIA_CTRL_GAP + lh) },
         .system => .{ 190, @intCast(2 * CARD_PAD + 3 * lh + 2 * ROW_GAP + 2 * BAR_H) },
         .calendar => .{ @intCast(CAL_W), @intCast(2 * CARD_PAD + 3 * lh + CAL_HEAD_GAP + CAL_WD_GAP + CAL_ROWS * CAL_CELL_H + CAL_FOOT_GAP) },
@@ -132,6 +132,19 @@ pub const Canvas = struct {
     height: u32,
     font: *font_mod.Font,
     theme: *const Theme,
+    /// Content zoom for corner-resized cards (1.0 = base size): the host
+    /// swaps `font` for a pixel-size-matched face AND sets this, and each
+    /// paint scales its layout constants with `zx` below. Text metrics
+    /// come from the swapped font automatically; only the compile-time
+    /// geometry needs explicit scaling at each use site.
+    zoom: f32 = 1.0,
+
+    /// Scale a layout constant into zoomed space (pads, gaps, radii,
+    /// cover/cell sizes — everything that isn't a font metric or a
+    /// rect-derived width).
+    pub fn zx(self: Canvas, v: i64) i64 {
+        return @intFromFloat(@round(@as(f32, @floatFromInt(v)) * self.zoom));
+    }
 
     /// Straight-alpha OVER blend of a 0xAARRGGBB src onto dst, preserving
     /// dst alpha — cards are translucent, so glyph coverage must composite
@@ -459,6 +472,260 @@ fn wttrIconFor(cp: u32) ?u32 {
     };
 }
 
+/// Condition tint for the weather icon, keyed on wttr.in's emoji exactly
+/// like wttrIconFor above. Same semantic colors as the bar's weatherIconTint
+/// (which keys on the shaped icon instead) — keep the two tables in sync.
+/// Null when the emoji is unmapped (caller falls back to the text color).
+fn wttrColorFor(cp: u32) ?u32 {
+    return switch (cp) {
+        0x2600 => 0xFFFFD60A, // ☀ clear gold
+        0x26C5, 0x1F324, 0x1F325 => 0xFFFFB340, // ⛅🌤🌥 partly amber
+        0x2601 => 0xFF9AA7B8, // ☁ overcast slate
+        0x1F326, 0x1F327 => 0xFF4AA8FF, // 🌦🌧 rain blue
+        0x26C8, 0x1F329 => 0xFFB48CFF, // ⛈🌩 storm violet
+        0x1F328, 0x2744 => 0xFFA8E6FF, // 🌨❄ snow ice
+        0x1F32B => 0xFF8E9AAF, // 🌫 fog gray
+        0x1F4A8, 0x1F32C => 0xFF7DE3D0, // 💨🌬 wind teal
+        0x1F32A => 0xFFFF8A8A, // 🌪 tornado red
+        else => null,
+    };
+}
+
+/// Blits an uncached oversized glyph (shared font_mod.glyphScaled) with its
+/// top-left at (`x0`, `y0`), coverage-blended via blendOver so translucent
+/// card edges composite instead of punching holes. Returns the advance.
+fn drawBigIcon(c: Canvas, x0: i64, y0: i64, big: *const font_mod.BigGlyph, color: u32) i64 {
+    for (0..big.height) |row| {
+        for (0..big.width) |col| {
+            const coverage = big.pixels[row * big.width + col];
+            if (coverage == 0) continue;
+            const px = x0 + @as(i64, big.bitmap_left) + @as(i64, @intCast(col));
+            const py = y0 + @as(i64, @intCast(row));
+            if (px < 0 or py < 0) continue;
+            const pxu: usize = @intCast(px);
+            const pyu: usize = @intCast(py);
+            if (pxu >= c.width or pyu >= c.height) continue;
+            const src = (@as(u32, coverage) << 24) | (color & 0x00FFFFFF);
+            c.pixels[pyu * c.width + pxu] = Canvas.blendOver(c.pixels[pyu * c.width + pxu], src);
+        }
+    }
+    return big.advance_x;
+}
+
+/// Condition effect kinds for the weather hover animation — mirrors the
+/// bar's WeatherFx table (the shell can't import main.zig, same as the
+/// wttr tables above).
+const WeatherFx = enum { none, rain, snow, storm, clear, cloud, fog, wind };
+
+/// Maps a shaped weather icon (U+E3xx) to its hover effect. Keep in sync
+/// with the bar's weatherFxKind.
+fn weatherFxKind(nf: u32) WeatherFx {
+    return switch (nf) {
+        0xE30D => .clear,
+        0xE302, 0xE304 => .cloud,
+        0xE335 => .cloud,
+        0xE319 => .rain,
+        0xE31D => .storm,
+        0xE31A => .snow,
+        0xE313 => .fog,
+        0xE34B => .wind,
+        0xE351 => .wind,
+        else => .none,
+    };
+}
+
+/// Condition-aware resolver (mirrors the bar's weatherFxFor): showers wear
+/// the partly-rainy icon but must RAIN.
+fn weatherFxFor(wttr: u32, nf: u32) WeatherFx {
+    if (wttr == 0x1F326) return .rain;
+    return weatherFxKind(nf);
+}
+
+/// Deterministic 0..1 scatter for particle `i` — same stateless clock as
+/// the bar's fxHash01.
+fn fxHash01(i: i64) f32 {
+    const h: u64 = @as(u64, @intCast(i)) *% 2654435761;
+    return @as(f32, @floatFromInt((h >> 8) & 0xFFFF)) / 65535.0;
+}
+
+/// 0xFFRRGGBB mix of two opaque colors (t toward b) — for tints the
+/// coverage-blend path can't express (it replaces alpha with coverage).
+fn mixRgb(a: u32, b: u32, t: f32) u32 {
+    const ar: f32 = @floatFromInt((a >> 16) & 0xFF);
+    const ag: f32 = @floatFromInt((a >> 8) & 0xFF);
+    const ab: f32 = @floatFromInt(a & 0xFF);
+    const br: f32 = @floatFromInt((b >> 16) & 0xFF);
+    const bg: f32 = @floatFromInt((b >> 8) & 0xFF);
+    const bb: f32 = @floatFromInt(b & 0xFF);
+    const r: u32 = @intFromFloat(ar + (br - ar) * t);
+    const g: u32 = @intFromFloat(ag + (bg - ag) * t);
+    const bl: u32 = @intFromFloat(ab + (bb - ab) * t);
+    return (@as(u32, 0xFF) << 24) | (r << 16) | (g << 8) | bl;
+}
+
+/// Warm radial glow for clear skies: soft halo centered on (cx, cy) with
+/// radius `rad`, hottest in the middle. Drawn under the condition icon so
+/// the glyph stays crisp — sunshine you can feel.
+fn drawSunGlow(c: Canvas, r: Rect, cx: i64, cy: i64, rad: i64) void {
+    if (rad <= 0) return;
+    const fr: f32 = @floatFromInt(rad);
+    var y = cy - rad;
+    while (y <= cy + rad) : (y += 1) {
+        var x = cx - rad;
+        while (x <= cx + rad) : (x += 1) {
+            const dx: f32 = @floatFromInt(x - cx);
+            const dy: f32 = @floatFromInt(y - cy);
+            const d = @sqrt(dx * dx + dy * dy) / fr;
+            if (d >= 1.0) continue;
+            const u = 1.0 - d;
+            const a: u8 = @intFromFloat(70.0 * u * u);
+            putCardFx(c, r, x, y, 0xFFE9A8, a);
+        }
+    }
+}
+
+/// One effect pixel inside the card rect, coverage-blended (alpha-safe for
+/// translucent cards, unlike the bar's opaque pipeline).
+fn putCardFx(c: Canvas, r: Rect, x: i64, y: i64, rgb: u32, alpha: u8) void {
+    const rx0: i64 = r.x;
+    const ry0: i64 = r.y;
+    const rx1: i64 = r.x + @as(i64, @intCast(r.w));
+    const ry1: i64 = r.y + @as(i64, @intCast(r.h));
+    if (x < rx0 or x >= rx1 or y < ry0 or y >= ry1) return;
+    if (x < 0 or y < 0) return;
+    const pxu: usize = @intCast(x);
+    const pyu: usize = @intCast(y);
+    if (pxu >= c.width or pyu >= c.height) return;
+    const src = (@as(u32, alpha) << 24) | (rgb & 0x00FFFFFF);
+    c.pixels[pyu * c.width + pxu] = Canvas.blendOver(c.pixels[pyu * c.width + pxu], src);
+}
+
+/// Hover overlay for the weather card: condition particles over the whole
+/// card rect, driven by the widget's 60ms anim_frame (see the union tick).
+/// Drawn after the content at low alpha — weather that moves when watched.
+fn drawWeatherFxCard(c: Canvas, r: Rect, wttr: u32, nf: u32, frame: u32, tint: u32) void {
+    const kind = weatherFxFor(wttr, nf);
+    if (kind == .none) return;
+    const w: i64 = @intCast(r.w);
+    const h: i64 = @intCast(r.h);
+    if (w <= 0 or h <= 0) return;
+    const fi: i64 = @intCast(frame % 100000);
+    const fw: f32 = @floatFromInt(w);
+    const fh: f32 = @floatFromInt(h);
+    const x0: i64 = r.x;
+    const y0: i64 = r.y;
+    switch (kind) {
+        .none => {},
+        .rain => {
+            var i: i64 = 0;
+            while (i < 18) : (i += 1) {
+                const fx = x0 + @as(i64, @intFromFloat(fxHash01(i * 2 + 1) * fw));
+                const fy = y0 + @mod(fi * 3 + @divTrunc(i * h, 18), h);
+                const rgb = tint & 0x00FFFFFF;
+                putCardFx(c, r, fx, fy, rgb, 100);
+                putCardFx(c, r, fx, fy + 1, rgb, 100);
+                putCardFx(c, r, fx, fy + 2, rgb, 100);
+            }
+        },
+        .snow => {
+            var i: i64 = 0;
+            while (i < 18) : (i += 1) {
+                const fy = y0 + @mod(@divTrunc(fi, 2) + @divTrunc(i * h, 18), h);
+                const sway = @round(2.0 * std.math.sin(@as(f32, @floatFromInt(fi)) * 0.08 + @as(f32, @floatFromInt(i)) * 1.7));
+                const fx = x0 + @as(i64, @intFromFloat(fxHash01(i * 2 + 3) * fw)) + @as(i64, @intFromFloat(sway));
+                putCardFx(c, r, fx, fy, 0xFFFFFF, 120);
+            }
+        },
+        .storm => {
+            var i: i64 = 0;
+            while (i < 14) : (i += 1) {
+                const fx = x0 + @as(i64, @intFromFloat(fxHash01(i * 2 + 1) * fw));
+                const fy = y0 + @mod(fi * 3 + @divTrunc(i * h, 14), h);
+                const rgb = tint & 0x00FFFFFF;
+                putCardFx(c, r, fx, fy, rgb, 90);
+                putCardFx(c, r, fx, fy + 1, rgb, 90);
+                putCardFx(c, r, fx, fy + 2, rgb, 90);
+            }
+            if (@mod(fi, 110) < 5) {
+                var yy = y0;
+                while (yy < y0 + h) : (yy += 1) {
+                    var xx = x0;
+                    while (xx < x0 + w) : (xx += 1) {
+                        putCardFx(c, r, xx, yy, 0xFFFFFF, 40);
+                    }
+                }
+            }
+        },
+        .clear => {
+            const sy = y0 + @mod(fi * 2, h + 8) - 4;
+            var yy = sy - 1;
+            while (yy <= sy + 1) : (yy += 1) {
+                const d: f32 = @floatFromInt(@abs(yy - sy));
+                const a: u8 = @intFromFloat(30.0 * (1.0 - d / 3.0));
+                var xx = x0;
+                while (xx < x0 + w) : (xx += 1) {
+                    putCardFx(c, r, xx, yy, 0xFFE9A8, a);
+                }
+            }
+        },
+        .cloud => {
+            var i: i64 = 0;
+            while (i < 4) : (i += 1) {
+                const px = x0 + @mod(fi + i * @divTrunc(w, 4), w);
+                const py = y0 + @as(i64, @intFromFloat(fxHash01(i * 2 + 5) * fh));
+                var ky: i64 = 0;
+                while (ky < 3) : (ky += 1) {
+                    var kx: i64 = 0;
+                    while (kx < 5) : (kx += 1) {
+                        putCardFx(c, r, px + kx, py + ky, 0xFFFFFF, 45);
+                    }
+                }
+            }
+        },
+        .fog => {
+            var q: i64 = 0;
+            while (q < 3) : (q += 1) {
+                const ly = y0 + @divTrunc((q + 1) * h, 4);
+                var xx = x0;
+                while (xx < x0 + w) : (xx += 1) {
+                    if (@mod(xx + fi * 2 + q * 6, 12) < 7) {
+                        putCardFx(c, r, xx, ly, tint & 0x00FFFFFF, 40);
+                    }
+                }
+            }
+        },
+        .wind => {
+            var i: i64 = 0;
+            while (i < 6) : (i += 1) {
+                const wy = y0 + @as(i64, @intFromFloat(fxHash01(i * 2 + 7) * fh));
+                const sx = x0 + @mod(i * @divTrunc(w, 6) - fi * 4, w);
+                var k: i64 = 0;
+                while (k < 6) : (k += 1) {
+                    putCardFx(c, r, sx + k, wy, tint & 0x00FFFFFF, 55);
+                }
+            }
+        },
+    }
+}
+
+/// Plain-language condition for the emoji (wttr.in's pipe format carries no
+/// text description, only the symbol). Shown under the temperature.
+fn wttrConditionFor(cp: u32) []const u8 {
+    return switch (cp) {
+        0x2600 => "Clear",
+        0x26C5, 0x1F324, 0x1F325 => "Partly cloudy",
+        0x2601 => "Cloudy",
+        0x1F326 => "Showers",
+        0x1F327 => "Rain",
+        0x26C8, 0x1F329 => "Thunderstorm",
+        0x1F328, 0x2744 => "Snow",
+        0x1F32B => "Fog",
+        0x1F4A8, 0x1F32C => "Windy",
+        0x1F32A => "Tornado",
+        else => "",
+    };
+}
+
 // --- spawn helper (ported from the bar's spawnDetached) -------------------
 
 const libc_proc = struct {
@@ -671,9 +938,11 @@ pub const ClockWidget = struct {
 
     pub fn paint(self: *const ClockWidget, c: Canvas, r: Rect) void {
         const lh = lineH(c.font);
-        const padx: i64 = r.x + CARD_PAD;
-        const b1 = r.y + CARD_PAD + c.font.ascentPx();
-        const b2 = b1 + lh + ROW_GAP;
+        const pad = c.zx(CARD_PAD);
+        const rg = c.zx(ROW_GAP);
+        const padx: i64 = r.x + pad;
+        const b1 = r.y + pad + c.font.ascentPx();
+        const b2 = b1 + lh + rg;
         _ = c.drawText(padx, b1, self.main_buf[0..self.main_len], c.theme.text_color);
         _ = c.drawText(padx, b2, self.sub_buf[0..self.sub_len], dim(c.theme.text_color, 0xCC));
     }
@@ -685,13 +954,32 @@ pub const ClockWidget = struct {
 
 // --- weather --------------------------------------------------------------
 
-const WEATHER_URL = "https://wttr.in/?format=1";
+// Rich pipe format (not format=1): emoji, temp, humidity and wind as four
+// |-separated fields, so the card can show condition + details and not just
+// a number. The bar keeps format=1 (it only ever draws icon + temp).
+const WEATHER_URL = "https://wttr.in/?format=%c|%t|%h|%w";
 
 pub const WeatherWidget = struct {
     icon_buf: [8]u8 = undefined,
     icon_len: usize = 0,
+    /// Shaped icon codepoint for the 2x raster (0 when unmapped).
+    icon_cp: u32 = 0,
+    /// Raw wttr.in emoji codepoint (0 when unmapped): disambiguates icons
+    /// shared by two conditions (showers vs sun-behind-cloud) for the fx
+    /// resolver and the sunny glow.
+    wttr_cp: u32 = 0,
+    /// Condition tint for the icon (0 = fall back to the text color).
+    icon_color: u32 = 0,
+    /// Last fetch start (mono ms): the tick repaints at 60ms for the
+    /// ambient animation, and past the 20-minute cadence it refetches.
+    last_fetch_ms: i64 = 0,
+    anim_frame: u32 = 0,
     temp_buf: [24]u8 = undefined,
     temp_len: usize = 0,
+    cond_buf: [32]u8 = undefined,
+    cond_len: usize = 0,
+    det_buf: [48]u8 = undefined,
+    det_len: usize = 0,
     fetch: Fetcher = .{},
     fetched: bool = false,
 
@@ -714,48 +1002,142 @@ pub const WeatherWidget = struct {
         self.fetched = trimmed.len > 0;
         if (!self.fetched) return true;
 
+        // Four |-separated fields (see WEATHER_URL): emoji, temp, humidity,
+        // wind. Any field may be missing on a weird response — parse resolve
+        // what's there and leave the rest blank rather than failing.
+        var fields: [4][]const u8 = .{ "", "", "", "" };
+        var fi: usize = 0;
+        var it = std.mem.splitScalar(u8, trimmed, '|');
+        while (it.next()) |f| {
+            if (fi >= fields.len) break;
+            fields[fi] = std.mem.trim(u8, f, " \t");
+            fi += 1;
+        }
+
         var i: usize = 0;
-        const cp = nextUtf8Codepoint(trimmed, &i) orelse {
-            self.icon_len = 0;
-            const t = trimmed[0..@min(trimmed.len, self.temp_buf.len)];
-            @memcpy(self.temp_buf[0..t.len], t);
-            self.temp_len = t.len;
-            return true;
-        };
+        const cp = nextUtf8Codepoint(fields[0], &i) orelse 0;
+        self.wttr_cp = cp;
         // Skip variation-selector/ZWJ codepoints attached to the same emoji
         // cluster before the plain text begins — even when the lead emoji is
         // unmapped, so a stray U+FE0F can't leak into the temp text (it has
         // no glyph and would render as tofu).
-        while (i < trimmed.len) {
+        while (i < fields[0].len) {
             const save = i;
-            const nc = nextUtf8Codepoint(trimmed, &i) orelse break;
+            const nc = nextUtf8Codepoint(fields[0], &i) orelse break;
             if (nc == 0xFE0F or nc == 0x200D) continue;
             i = save;
             break;
         }
         if (wttrIconFor(cp)) |ic| {
             self.icon_len = utf8Encode(ic, &self.icon_buf);
+            self.icon_cp = ic;
         } else {
             self.icon_len = 0;
+            self.icon_cp = 0;
         }
-        while (i < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t')) i += 1;
-        const rest = trimmed[i..];
-        const t = rest[0..@min(rest.len, self.temp_buf.len)];
+        if (wttrColorFor(cp)) |cc| {
+            self.icon_color = cc;
+        } else {
+            self.icon_color = 0;
+        }
+        const cl = wttrConditionFor(cp);
+        @memcpy(self.cond_buf[0..cl.len], cl);
+        self.cond_len = cl.len;
+        // wttr.in prefixes non-negative temperatures with "+" — noise next
+        // to an icon, so drop it (a leading "-" stays).
+        var tf = fields[1];
+        if (tf.len > 0 and tf[0] == '+') tf = tf[1..];
+        const t = tf[0..@min(tf.len, self.temp_buf.len)];
         @memcpy(self.temp_buf[0..t.len], t);
         self.temp_len = t.len;
+        // Details line: "69% · → 24km/h", either half optional.
+        self.det_len = 0;
+        if (fields[2].len > 0) {
+            const h = fields[2][0..@min(fields[2].len, self.det_buf.len)];
+            @memcpy(self.det_buf[0..h.len], h);
+            self.det_len = h.len;
+        }
+        if (fields[3].len > 0) {
+            const sep = " · ";
+            var w = fields[3];
+            if (w.len + sep.len + self.det_len <= self.det_buf.len) {
+                if (self.det_len > 0) {
+                    @memcpy(self.det_buf[self.det_len..][0..sep.len], sep);
+                    self.det_len += sep.len;
+                }
+            } else {
+                w = w[0..0];
+            }
+            const rest = @min(w.len, self.det_buf.len - self.det_len);
+            @memcpy(self.det_buf[self.det_len..][0..rest], w[0..rest]);
+            self.det_len += rest;
+        }
         return true;
     }
 
     pub fn paint(self: *const WeatherWidget, c: Canvas, r: Rect) void {
-        const b = r.y + CARD_PAD + c.font.ascentPx();
-        const padx: i64 = r.x + CARD_PAD;
+        const lh = lineH(c.font);
+        const b1 = r.y + c.zx(CARD_PAD) + c.font.ascentPx();
+        const b2 = b1 + lh + c.zx(ROW_GAP);
+        const b3 = b2 + lh + c.zx(ROW_GAP);
+        const padx: i64 = r.x + c.zx(CARD_PAD);
         if (!self.fetched) {
-            _ = c.drawText(padx, b, "…", c.theme.text_color);
+            _ = c.drawText(padx, b1, "…", c.theme.text_color);
             return;
         }
-        const icon_w = c.textWidth(self.icon_buf[0..self.icon_len]);
-        _ = c.drawText(padx, b, self.icon_buf[0..self.icon_len], c.theme.border_color);
-        _ = c.drawText(padx + icon_w + 8, b, self.temp_buf[0..self.temp_len], c.theme.text_color);
+        // Line 1: large tinted icon (left, spanning all three rows) plus
+        // bright temperature; condition and details stack right of the
+        // icon. Raster steps down (3x → 2x → 1x text) so an oversized
+        // glyph never breaks the card.
+        const icon_col = if (self.icon_color != 0) self.icon_color else c.theme.text_color;
+        const bg_rgb = c.theme.bg_color & 0x00FFFFFF;
+        const band3 = 3 * lh + 2 * c.zx(ROW_GAP);
+        var text_x = padx;
+        if (self.icon_cp != 0) {
+            // Ambient backdrop, under everything: the condition glyph blown
+            // up to a barely-there watermark on the card's right side (may
+            // bleed past the edges — the blit clips silently), so the card
+            // carries its weather even at a glance. Scales with the zoom.
+            const wm_scale: u32 = @max(2, @as(u32, @intFromFloat(@round(4.0 * c.zoom))));
+            if (c.font.glyphScaled(self.icon_cp, wm_scale)) |wm| {
+                defer c.font.gpa.free(wm.pixels);
+                const wx = r.x + @as(i64, @intCast(r.w)) - c.zx(CARD_PAD) - wm.advance_x;
+                const wy = r.y + c.zx(CARD_PAD) + @divTrunc(band3 - @as(i64, wm.height), 2);
+                _ = drawBigIcon(c, wx, wy, &wm, mixRgb(icon_col, bg_rgb, 0.88));
+            } else |_| {}
+            // Content icon steps down so an oversized glyph never breaks
+            // the card; the ladder starts at the zoomed size.
+            var si: u32 = @max(3, @as(u32, @intFromFloat(@round(3.0 * c.zoom))));
+            var drew_big = false;
+            while (si >= 2 and !drew_big) : (si -= 1) {
+                const big = c.font.glyphScaled(self.icon_cp, si) catch continue;
+                defer c.font.gpa.free(big.pixels);
+                if (@as(i64, big.height) > band3 + c.zx(ROW_GAP)) continue;
+                const iy = r.y + c.zx(CARD_PAD) + @divTrunc(band3 - @as(i64, big.height), 2);
+                // Clear skies get a warm halo behind the sun so fair
+                // weather reads sunny, not just empty.
+                if (self.wttr_cp == 0x2600) {
+                    const ir: i64 = @max(@as(i64, big.width), @as(i64, big.height));
+                    drawSunGlow(c, r, padx + @divTrunc(@as(i64, big.width), 2), iy + @divTrunc(@as(i64, big.height), 2), @divTrunc(ir, 2) + 10);
+                }
+                text_x += drawBigIcon(c, padx, iy, &big, icon_col) + 8;
+                drew_big = true;
+            }
+            if (!drew_big) {
+                text_x += c.drawText(padx, b1, self.icon_buf[0..self.icon_len], icon_col) + 8;
+            }
+        }
+        _ = c.drawText(text_x, b1, self.temp_buf[0..self.temp_len], c.theme.text_color);
+        // Line 2: condition label, dimmed. Line 3: humidity · wind, dimmer.
+        // Both align under the temperature, right of the icon.
+        _ = c.drawText(text_x, b2, self.cond_buf[0..self.cond_len], dim(c.theme.text_color, 0xCC));
+        _ = c.drawText(text_x, b3, self.det_buf[0..self.det_len], dim(c.theme.text_color, 0x99));
+        // Condition animation: particles over the card, driven by the
+        // union tick's 60ms anim_frame — ambient now, not hover-gated.
+        if (self.icon_cp != 0) {
+            const tint = if (self.icon_color != 0) self.icon_color else c.theme.text_color;
+            drawWeatherFxCard(c, r, self.wttr_cp, self.icon_cp, self.anim_frame, tint);
+        }
     }
 
     pub fn click(self: *const WeatherWidget) void {
@@ -1063,16 +1445,18 @@ pub const MediaWidget = struct {
         ctrl_bottom: i64,
     };
 
-    fn mediaLayout(r: Rect, font: *font_mod.Font) MediaLayout {
+    fn mediaLayout(r: Rect, font: *font_mod.Font, zoom: f32) MediaLayout {
         const ascent: i64 = font.ascentPx();
         const descent: i64 = font.descentPx();
-        const inner_x = r.x + CARD_PAD;
-        const inner_w = @as(i64, @intCast(r.w)) - 2 * CARD_PAD;
-        const title_b = r.y + CARD_PAD + ascent;
-        const artist_b = title_b + ascent + descent + MEDIA_TITLE_GAP;
-        const prog_y = r.y + CARD_PAD + MEDIA_COVER + MEDIA_HEAD_GAP;
-        const times_b = prog_y + MEDIA_PROG_H + MEDIA_TIME_GAP + ascent;
-        const ctrl_top = times_b + descent + MEDIA_CTRL_GAP;
+        const pad = zf(CARD_PAD, zoom);
+        const cover = zf(MEDIA_COVER, zoom);
+        const inner_x = r.x + pad;
+        const inner_w = @as(i64, @intCast(r.w)) - 2 * pad;
+        const title_b = r.y + pad + ascent;
+        const artist_b = title_b + ascent + descent + zf(MEDIA_TITLE_GAP, zoom);
+        const prog_y = r.y + pad + cover + zf(MEDIA_HEAD_GAP, zoom);
+        const times_b = prog_y + zf(MEDIA_PROG_H, zoom) + zf(MEDIA_TIME_GAP, zoom) + ascent;
+        const ctrl_top = times_b + descent + zf(MEDIA_CTRL_GAP, zoom);
         return .{
             .inner_x = inner_x,
             .inner_w = inner_w,
@@ -1088,8 +1472,8 @@ pub const MediaWidget = struct {
 
     /// Which transport control (if any) sits under surface point (px, py).
     /// Slots run shuffle / prev / play-pause / next / repeat left to right.
-    fn controlAt(r: Rect, font: *font_mod.Font, px: i32, py: i32) ?MediaControl {
-        const l = mediaLayout(r, font);
+    fn controlAt(r: Rect, font: *font_mod.Font, zoom: f32, px: i32, py: i32) ?MediaControl {
+        const l = mediaLayout(r, font, zoom);
         if (py < l.ctrl_top or py > l.ctrl_bottom) return null;
         if (px < l.inner_x or px >= l.inner_x + l.inner_w) return null;
         return switch (@divTrunc((@as(i64, px) - l.inner_x) * 5, l.inner_w)) {
@@ -1104,22 +1488,23 @@ pub const MediaWidget = struct {
 
     pub fn paint(self: *const MediaWidget, c: Canvas, r: Rect) void {
         if (!self.has_track) {
-            const b = r.y + CARD_PAD + c.font.ascentPx();
-            _ = c.drawText(r.x + CARD_PAD, b, "no media playing", dim(c.theme.text_color, 0x99));
+            const b = r.y + c.zx(CARD_PAD) + c.font.ascentPx();
+            _ = c.drawText(r.x + c.zx(CARD_PAD), b, "no media playing", dim(c.theme.text_color, 0x99));
             return;
         }
-        const l = mediaLayout(r, c.font);
+        const l = mediaLayout(r, c.font, c.zoom);
         const ascent: i64 = c.font.ascentPx();
         const descent: i64 = c.font.descentPx();
+        const cover = c.zx(MEDIA_COVER);
 
         // Cover tile — no image decoder in the shell, so a rounded tile with
         // a music glyph stands in for album art (mpris:artUrl is fetched but
         // not rendered).
         const tile = Rect{
             .x = @intCast(l.inner_x),
-            .y = @intCast(r.y + CARD_PAD),
-            .w = @intCast(MEDIA_COVER),
-            .h = @intCast(MEDIA_COVER),
+            .y = @intCast(r.y + c.zx(CARD_PAD)),
+            .w = @intCast(cover),
+            .h = @intCast(cover),
         };
         c.card(tile, c.theme.hover_color, c.theme.border_color);
         if (self.art == .ready and self.art_w > 0 and self.art_h > 0) {
@@ -1127,10 +1512,10 @@ pub const MediaWidget = struct {
             // ring, masked to the tile's inner corner radius.
             const aw: i64 = self.art_w;
             const ah: i64 = self.art_h;
-            const tile_r: i64 = @min(@as(i64, @intCast(c.theme.radius_px)), MEDIA_COVER / 2);
+            const tile_r: i64 = @min(@as(i64, @intCast(c.theme.radius_px)), @divTrunc(cover, 2));
             c.blitRgba(
-                l.inner_x + @divTrunc(MEDIA_COVER - aw, 2),
-                r.y + CARD_PAD + @divTrunc(MEDIA_COVER - ah, 2),
+                l.inner_x + @divTrunc(cover - aw, 2),
+                r.y + c.zx(CARD_PAD) + @divTrunc(cover - ah, 2),
                 @intCast(aw),
                 @intCast(ah),
                 self.art_rgba[0..@as(usize, self.art_w) * self.art_h * 4],
@@ -1140,16 +1525,16 @@ pub const MediaWidget = struct {
             const note: []const u8 = "\u{f001}";
             const note_w = c.textWidth(note);
             _ = c.drawText(
-                l.inner_x + @divTrunc(MEDIA_COVER - note_w, 2),
-                r.y + CARD_PAD + @divTrunc(MEDIA_COVER + ascent - descent, 2),
+                l.inner_x + @divTrunc(cover - note_w, 2),
+                r.y + c.zx(CARD_PAD) + @divTrunc(cover + ascent - descent, 2),
                 note,
                 dim(c.theme.text_color, 0xAA),
             );
         }
 
         // Title over artist, truncated to the space right of the cover.
-        const text_x = l.inner_x + MEDIA_COVER + 10;
-        const text_w = r.x + @as(i64, @intCast(r.w)) - CARD_PAD - text_x;
+        const text_x = l.inner_x + cover + c.zx(10);
+        const text_w = r.x + @as(i64, @intCast(r.w)) - c.zx(CARD_PAD) - text_x;
         var tclip: [300]u8 = undefined;
         var aclip: [160]u8 = undefined;
         const title = if (self.title_len > 0) self.title_buf[0..self.title_len] else "Unknown title";
@@ -1162,12 +1547,13 @@ pub const MediaWidget = struct {
         const pos = self.displayPosUs(monoMs());
         const clamped = @min(pos, self.len_us);
         const fill_w: u64 = if (self.len_us == 0) 0 else clamped * @as(u64, @intCast(l.inner_w)) / self.len_us;
-        c.fillRect(l.inner_x, l.prog_y, @intCast(l.inner_w), @intCast(MEDIA_PROG_H), dim(c.theme.text_color, 0x44));
-        if (fill_w > 0) c.fillRect(l.inner_x, l.prog_y, @intCast(fill_w), @intCast(MEDIA_PROG_H), c.theme.text_color);
+        const prog_h = c.zx(MEDIA_PROG_H);
+        c.fillRect(l.inner_x, l.prog_y, @intCast(l.inner_w), @intCast(prog_h), dim(c.theme.text_color, 0x44));
+        if (fill_w > 0) c.fillRect(l.inner_x, l.prog_y, @intCast(fill_w), @intCast(prog_h), c.theme.text_color);
         if (self.len_us > 0) {
-            const kw: i64 = 7;
+            const kw: i64 = c.zx(7);
             const kx = std.math.clamp(l.inner_x + @as(i64, @intCast(fill_w)) - @divTrunc(kw, 2), l.inner_x, l.inner_x + l.inner_w - kw);
-            c.fillRect(kx, l.prog_y - 1, @intCast(kw), @intCast(kw), c.theme.text_color);
+            c.fillRect(kx, l.prog_y + @divTrunc(prog_h - kw, 2), @intCast(kw), @intCast(kw), c.theme.text_color);
         }
         var ebuf: [16]u8 = undefined;
         _ = c.drawText(l.inner_x, l.times_b, fmtDur(pos, &ebuf), dim(c.theme.text_color, 0xAA));
@@ -1203,10 +1589,10 @@ pub const MediaWidget = struct {
     /// Left-click inside the card: transport controls act, anything else is a
     /// play-pause toggle like before. State flips optimistically; the next
     /// metadata refetch (<= 2 s) confirms it.
-    pub fn clickAt(self: *MediaWidget, r: Rect, font: *font_mod.Font, px: i32, py: i32) void {
+    pub fn clickAt(self: *MediaWidget, r: Rect, font: *font_mod.Font, zoom: f32, px: i32, py: i32) void {
         const now = monoMs();
         if (self.has_track) {
-            if (controlAt(r, font, px, py)) |ctl| {
+            if (controlAt(r, font, zoom, px, py)) |ctl| {
                 switch (ctl) {
                     .shuffle => {
                         spawnDetached("playerctl shuffle Toggle");
@@ -1350,33 +1736,38 @@ pub const SystemWidget = struct {
         self.updateLoad();
     }
 
-    fn drawBar(c: Canvas, x: i64, y: i64, w: i64, pct: u8) void {
-        c.fillRect(x, y, @intCast(w), BAR_H, dim(c.theme.border_color, 0x70));
+    fn drawBar(c: Canvas, x: i64, y: i64, w: i64, h: i64, pct: u8) void {
+        c.fillRect(x, y, @intCast(w), @intCast(h), dim(c.theme.border_color, 0x70));
         const fill_w: i64 = @divTrunc(w * pct, 100);
-        if (fill_w > 0) c.fillRect(x, y, @intCast(fill_w), BAR_H, c.theme.text_color);
+        if (fill_w > 0) c.fillRect(x, y, @intCast(fill_w), @intCast(h), c.theme.text_color);
     }
 
     pub fn paint(self: *const SystemWidget, c: Canvas, r: Rect) void {
-        const padx: i64 = r.x + CARD_PAD;
-        const inner_w: i64 = @as(i64, @intCast(r.w)) - 2 * CARD_PAD;
+        const pad = c.zx(CARD_PAD);
+        const rg = c.zx(ROW_GAP);
+        const barh = c.zx(BAR_H);
+        const gap4 = c.zx(4);
+        const gap6 = c.zx(6);
+        const padx: i64 = r.x + pad;
+        const inner_w: i64 = @as(i64, @intCast(r.w)) - 2 * pad;
         const ascent: i64 = c.font.ascentPx();
-        const b1 = r.y + CARD_PAD + ascent;
+        const b1 = r.y + pad + ascent;
         _ = c.drawText(padx, b1, "CPU", c.theme.text_color);
         var pct_buf: [16]u8 = undefined;
         const pct_str = std.fmt.bufPrint(&pct_buf, " {d}%", .{self.cpu_pct}) catch "";
-        const cpu_x = padx + c.textWidth("CPU") + 6;
+        const cpu_x = padx + c.textWidth("CPU") + gap6;
         _ = c.drawText(cpu_x, b1, pct_str, dim(c.theme.text_color, 0xCC));
-        drawBar(c, padx, b1 + 4, inner_w, self.cpu_pct);
+        drawBar(c, padx, b1 + gap4, inner_w, barh, self.cpu_pct);
 
-        const b2 = b1 + BAR_H + ROW_GAP + 4 + lineH(c.font);
+        const b2 = b1 + barh + rg + gap4 + lineH(c.font);
         _ = c.drawText(padx, b2, "MEM", c.theme.text_color);
         const mem_str = std.fmt.bufPrint(&pct_buf, " {d}%", .{self.mem_pct}) catch "";
         _ = c.drawText(cpu_x, b2, mem_str, dim(c.theme.text_color, 0xCC));
-        drawBar(c, padx, b2 + 4, inner_w, self.mem_pct);
+        drawBar(c, padx, b2 + gap4, inner_w, barh, self.mem_pct);
 
-        const b3 = b2 + BAR_H + ROW_GAP + 4 + lineH(c.font);
+        const b3 = b2 + barh + rg + gap4 + lineH(c.font);
         _ = c.drawText(padx, b3, "LOAD", c.theme.text_color);
-        _ = c.drawText(padx + c.textWidth("LOAD") + 6, b3, self.load_buf[0..self.load_len], dim(c.theme.text_color, 0xCC));
+        _ = c.drawText(padx + c.textWidth("LOAD") + gap6, b3, self.load_buf[0..self.load_len], dim(c.theme.text_color, 0xCC));
     }
 
     pub fn click(self: *const SystemWidget) void {
@@ -1950,14 +2341,19 @@ pub const CalendarWidget = struct {
         lh: i64,
     };
 
-    fn calLayout(r: Rect, font: *font_mod.Font) CalLayout {
+    fn calLayout(r: Rect, font: *font_mod.Font, zoom: f32) CalLayout {
         const lh = lineH(font);
         const ascent: i64 = font.ascentPx();
-        const padx = r.x + CARD_PAD;
-        const b1 = r.y + CARD_PAD + ascent;
-        const wd_b = r.y + CARD_PAD + lh + CAL_HEAD_GAP + ascent;
-        const grid_y = r.y + CARD_PAD + 2 * lh + CAL_HEAD_GAP + CAL_WD_GAP;
-        const foot_b = grid_y + CAL_ROWS * CAL_CELL_H + CAL_FOOT_GAP + ascent;
+        const pad = zf(CARD_PAD, zoom);
+        const head_gap = zf(CAL_HEAD_GAP, zoom);
+        const wd_gap = zf(CAL_WD_GAP, zoom);
+        const cell_h = zf(CAL_CELL_H, zoom);
+        const foot_gap = zf(CAL_FOOT_GAP, zoom);
+        const padx = r.x + pad;
+        const b1 = r.y + pad + ascent;
+        const wd_b = r.y + pad + lh + head_gap + ascent;
+        const grid_y = r.y + pad + 2 * lh + head_gap + wd_gap;
+        const foot_b = grid_y + CAL_ROWS * cell_h + foot_gap + ascent;
         return .{ .padx = padx, .grid_x = padx, .grid_y = grid_y, .b1 = b1, .wd_b = wd_b, .foot_b = foot_b, .lh = lh };
     }
 
@@ -1986,9 +2382,11 @@ pub const CalendarWidget = struct {
     }
 
     pub fn paint(self: *const CalendarWidget, c: Canvas, r: Rect) void {
-        const l = calLayout(r, c.font);
+        const l = calLayout(r, c.font, c.zoom);
         const ascent: i64 = c.font.ascentPx();
-        const grid_w: i64 = 7 * CAL_CELL_W;
+        const cell_w = c.zx(CAL_CELL_W);
+        const cell_h = c.zx(CAL_CELL_H);
+        const grid_w: i64 = 7 * cell_w;
 
         // Header: < Month YYYY > — chevrons from Font Awesome, title click
         // jumps back to the real month (see clickAt).
@@ -2007,7 +2405,7 @@ pub const CalendarWidget = struct {
         for (WD_ROW, 0..) |lbl, col| {
             const lw = c.textWidth(lbl);
             _ = c.drawText(
-                l.grid_x + @as(i64, @intCast(col)) * CAL_CELL_W + @divTrunc(CAL_CELL_W - lw, 2),
+                l.grid_x + @as(i64, @intCast(col)) * cell_w + @divTrunc(cell_w - lw, 2),
                 l.wd_b,
                 lbl,
                 dim(c.theme.text_color, 0x88),
@@ -2023,14 +2421,14 @@ pub const CalendarWidget = struct {
                 const col = @mod(pos, 7);
                 const row = @divFloor(pos, 7);
                 pos += 1;
-                const x0 = l.grid_x + col * CAL_CELL_W;
-                const y0 = l.grid_y + row * CAL_CELL_H;
+                const x0 = l.grid_x + col * cell_w;
+                const y0 = l.grid_y + row * cell_h;
                 const is_today = daysFromCivil(self.view_y, self.view_m, @intCast(day)) == self.today_days;
                 const hol = self.holidayFor(self.view_y, self.view_m, @intCast(day));
                 if (is_today) {
                     // Accent pill behind today's number.
                     c.card(
-                        .{ .x = @intCast(x0 + 1), .y = @intCast(y0 + 1), .w = @intCast(CAL_CELL_W - 2), .h = @intCast(CAL_CELL_H - 3) },
+                        .{ .x = @intCast(x0 + 1), .y = @intCast(y0 + 1), .w = @intCast(cell_w - 2), .h = @intCast(cell_h - 3) },
                         dim(c.theme.border_color, 0x33),
                         dim(c.theme.border_color, 0x99),
                     );
@@ -2041,9 +2439,10 @@ pub const CalendarWidget = struct {
                     if (h.global) c.theme.holiday_color else dim(c.theme.holiday_color, 0x99)
                 else if (is_today) c.theme.text_color //
                 else dim(c.theme.text_color, 0xE0);
-                _ = c.drawText(x0 + @divTrunc(CAL_CELL_W - c.textWidth(num), 2), y0 + 2 + ascent, num, num_col);
+                _ = c.drawText(x0 + @divTrunc(cell_w - c.textWidth(num), 2), y0 + 2 + ascent, num, num_col);
                 if (self.hasReminder(self.view_y, self.view_m, @intCast(day))) {
-                    c.fillRect(x0 + @divTrunc(CAL_CELL_W, 2) - 1, y0 + CAL_CELL_H - 4, 3, 3, c.theme.text_color);
+                    const dot: i64 = @max(2, c.zx(3));
+                    c.fillRect(x0 + @divTrunc(cell_w, 2) - @divTrunc(dot, 2), y0 + cell_h - c.zx(4), @intCast(dot), @intCast(dot), c.theme.text_color);
                 }
             }
         }
@@ -2078,24 +2477,27 @@ pub const CalendarWidget = struct {
 
     /// Left-click: header arrows step months, the month title jumps back to
     /// today, a day cell opens its rofi reminder menu.
-    pub fn clickAt(self: *CalendarWidget, r: Rect, font: *font_mod.Font, px: i32, py: i32) void {
+    pub fn clickAt(self: *CalendarWidget, r: Rect, font: *font_mod.Font, zoom: f32, px: i32, py: i32) void {
         if (!self.have_view) return;
-        const l = calLayout(r, font);
-        const grid_w: i64 = 7 * CAL_CELL_W;
+        const l = calLayout(r, font, zoom);
+        const cell_w = zf(CAL_CELL_W, zoom);
+        const cell_h = zf(CAL_CELL_H, zoom);
+        const arrow_zone = zf(CAL_ARROW_ZONE, zoom);
+        const grid_w: i64 = 7 * cell_w;
         const px64: i64 = px;
         const py64: i64 = py;
-        const head_top: i64 = r.y + CARD_PAD;
+        const head_top: i64 = r.y + zf(CARD_PAD, zoom);
         if (py64 >= head_top and py64 < head_top + l.lh) {
-            if (px64 < l.grid_x + CAL_ARROW_ZONE) navMonth(self, -1) //
-            else if (px64 >= l.grid_x + grid_w - CAL_ARROW_ZONE) navMonth(self, 1) //
+            if (px64 < l.grid_x + arrow_zone) navMonth(self, -1) //
+            else if (px64 >= l.grid_x + grid_w - arrow_zone) navMonth(self, 1) //
             else jumpToToday(self);
             return;
         }
-        if (py64 >= l.grid_y and py64 < l.grid_y + CAL_ROWS * CAL_CELL_H and
+        if (py64 >= l.grid_y and py64 < l.grid_y + CAL_ROWS * cell_h and
             px64 >= l.grid_x and px64 < l.grid_x + grid_w)
         {
-            const col = @divFloor(px64 - l.grid_x, CAL_CELL_W);
-            const row = @divFloor(py64 - l.grid_y, CAL_CELL_H);
+            const col = @divFloor(px64 - l.grid_x, cell_w);
+            const row = @divFloor(py64 - l.grid_y, cell_h);
             const first_col = @as(i64, monCol(wdayOf(daysFromCivil(self.view_y, self.view_m, 1))));
             const day = row * 7 + col - first_col + 1;
             if (day >= 1 and day <= daysInMonth(self.view_y, self.view_m)) {
@@ -2205,18 +2607,20 @@ pub const WatchWidget = struct {
     /// Dial center in the same tile-local coordinates paint uses.
     pub fn dialCenter(r: Rect) [2]f64 {
         return .{
-            @as(f64, @floatFromInt(r.x)) + @as(f64, WATCH_W) / 2.0,
-            @as(f64, @floatFromInt(r.y)) + @as(f64, WATCH_H) / 2.0,
+            @as(f64, @floatFromInt(r.x)) + @as(f64, @floatFromInt(r.w)) / 2.0,
+            @as(f64, @floatFromInt(r.y)) + @as(f64, @floatFromInt(r.h)) / 2.0,
         };
     }
 
-    /// True when (px, py) lands on the bezel ring (insert + knurled flank).
-    pub fn bezelHit(r: Rect, px: i32, py: i32) bool {
+    /// True when (px, py) lands on the bezel ring (insert + knurled flank),
+    /// scaled by the card's content zoom to match the paint.
+    pub fn bezelHit(r: Rect, zoom: f32, px: i32, py: i32) bool {
         const ctr = dialCenter(r);
         const dx = @as(f64, @floatFromInt(px)) - ctr[0];
         const dy = @as(f64, @floatFromInt(py)) - ctr[1];
         const dist = @sqrt(dx * dx + dy * dy);
-        return dist >= 56.0 and dist <= 89.0;
+        const z = @as(f64, zoom);
+        return dist >= 56.0 * z and dist <= 89.0 * z;
     }
 
     /// Pointer angle about the dial center: 0 at 12, growing clockwise
@@ -2310,8 +2714,12 @@ pub const WatchWidget = struct {
 
     pub fn paint(self: *const WatchWidget, c: Canvas, r: Rect) void {
         const P: Palette = if (self.dial == 0) BLACK_DIVER else BLUE_DIVER;
-        const cx_i: i64 = @as(i64, r.x) + WATCH_W / 2;
-        const cy_i: i64 = @as(i64, r.y) + WATCH_H / 2;
+        // Corner-resize zoom: the whole dial scales about the rect center
+        // (at base size the center and every radius match the old fixed
+        // geometry exactly). All radii below ride `z`.
+        const z = c.zoom;
+        const cx_i: i64 = @as(i64, r.x) + @divTrunc(@as(i64, @intCast(r.w)), 2);
+        const cy_i: i64 = @as(i64, r.y) + @divTrunc(@as(i64, @intCast(r.h)), 2);
         const cx: f64 = @floatFromInt(cx_i);
         const cy: f64 = @floatFromInt(cy_i);
 
@@ -2339,10 +2747,10 @@ pub const WatchWidget = struct {
         for ([2]bool{ true, false }) |is_top| {
             const s: f64 = if (is_top) -1.0 else 1.0;
             const lugs = [4]Canvas.FPt{
-                .{ .x = cx - 23, .y = cy + s * 76 },
-                .{ .x = cx + 23, .y = cy + s * 76 },
-                .{ .x = cx + 17, .y = cy + s * 97 },
-                .{ .x = cx - 17, .y = cy + s * 97 },
+                .{ .x = cx - 23 * z, .y = cy + s * 76 * z },
+                .{ .x = cx + 23 * z, .y = cy + s * 76 * z },
+                .{ .x = cx + 17 * z, .y = cy + s * 97 * z },
+                .{ .x = cx - 17 * z, .y = cy + s * 97 * z },
             };
             c.fillConvex(&lugs, STEEL_BODY);
         }
@@ -2350,23 +2758,23 @@ pub const WatchWidget = struct {
         // Crown at 4 o'clock (SKX puts it between 3 and 4), poking out
         // from behind the case: a radial stem plus the knurled knob.
         const crown_a = 120.0 * DEG;
-        baton(c, cx, cy, crown_a, 78, 90, 7.0, 7.0, STEEL_BODY);
+        baton(c, cx, cy, crown_a, 78 * z, 90 * z, 7.0 * z, 7.0 * z, STEEL_BODY);
         const cd = radial(crown_a);
-        const kx = cx + cd[0] * 90;
-        const ky = cy + cd[1] * 90;
-        c.fillCircleAA(kx, ky, 5.2, STEEL_BODY);
-        c.fillRingAA(kx, ky, 3.0, 5.2, STEEL_SHADOW);
+        const kx = cx + cd[0] * 90 * z;
+        const ky = cy + cd[1] * 90 * z;
+        c.fillCircleAA(kx, ky, 5.2 * z, STEEL_BODY);
+        c.fillRingAA(kx, ky, 3.0 * z, 5.2 * z, STEEL_SHADOW);
 
         // Case: brushed body, polished outer band, then the bezel stack.
-        c.fillCircleAA(cx, cy, WATCH_CASE_R, STEEL_BODY);
-        c.fillRingAA(cx, cy, WATCH_CASE_R - 3, WATCH_CASE_R, STEEL_POLISH);
+        c.fillCircleAA(cx, cy, WATCH_CASE_R * z, STEEL_BODY);
+        c.fillRingAA(cx, cy, (WATCH_CASE_R - 3) * z, WATCH_CASE_R * z, STEEL_POLISH);
         // Coin-edge knurling on the bezel flank.
         var e: u32 = 0;
         while (e < 60) : (e += 1) {
-            baton(c, cx, cy, @as(f64, @floatFromInt(e)) * 6.0 * DEG, 79.5, 83.0, 1.4, 1.4, STEEL_SHADOW);
+            baton(c, cx, cy, @as(f64, @floatFromInt(e)) * 6.0 * DEG, 79.5 * z, 83.0 * z, 1.4 * z, 1.4 * z, STEEL_SHADOW);
         }
         // Black 60-minute insert.
-        c.fillRingAA(cx, cy, 60, 79, P.bezel);
+        c.fillRingAA(cx, cy, 60 * z, 79 * z, P.bezel);
 
         // Bezel minute ticks — every minute for the first quarter like the
         // real insert, fives elsewhere — skipping the numeral/triangle spots.
@@ -2381,9 +2789,9 @@ pub const WatchWidget = struct {
             if (near_num or near_pip) continue;
             const a = @as(f64, @floatFromInt(i)) * 6.0 * DEG + bez_off;
             if (i % 5 == 0) {
-                baton(c, cx, cy, a, 72.5, 77.5, 2.0, 2.2, P.bezel_text);
+                baton(c, cx, cy, a, 72.5 * z, 77.5 * z, 2.0 * z, 2.2 * z, P.bezel_text);
             } else if (i <= 15) {
-                baton(c, cx, cy, a, 74.5, 77.5, 1.0, 1.0, BEZEL_DIM);
+                baton(c, cx, cy, a, 74.5 * z, 77.5 * z, 1.0 * z, 1.0 * z, BEZEL_DIM);
             }
         }
 
@@ -2392,15 +2800,15 @@ pub const WatchWidget = struct {
         {
             const pd = radial(bez_off);
             const t_out = [3]Canvas.FPt{
-                at(cx, cy, pd[0], pd[1], 77.5, -4.5),
-                at(cx, cy, pd[0], pd[1], 77.5, 4.5),
-                at(cx, cy, pd[0], pd[1], 63.0, 0),
+                at(cx, cy, pd[0], pd[1], 77.5 * z, -4.5 * z),
+                at(cx, cy, pd[0], pd[1], 77.5 * z, 4.5 * z),
+                at(cx, cy, pd[0], pd[1], 63.0 * z, 0),
             };
             c.fillConvex(&t_out, P.bezel_text);
             const t_in = [3]Canvas.FPt{
-                at(cx, cy, pd[0], pd[1], 75.5, -2.6),
-                at(cx, cy, pd[0], pd[1], 75.5, 2.6),
-                at(cx, cy, pd[0], pd[1], 65.5, 0),
+                at(cx, cy, pd[0], pd[1], 75.5 * z, -2.6 * z),
+                at(cx, cy, pd[0], pd[1], 75.5 * z, 2.6 * z),
+                at(cx, cy, pd[0], pd[1], 65.5 * z, 0),
             };
             c.fillConvex(&t_in, P.lume);
         }
@@ -2415,8 +2823,8 @@ pub const WatchWidget = struct {
         };
         for (numerals) |n| {
             const d = radial(n.deg * DEG + bez_off);
-            const px = cx + d[0] * 68.5;
-            const py = cy + d[1] * 68.5;
+            const px = cx + d[0] * 68.5 * z;
+            const py = cy + d[1] * 68.5 * z;
             const tw = c.textWidth(n.label);
             _ = c.drawText(
                 @as(i64, @intFromFloat(px)) - @divTrunc(tw, 2),
@@ -2427,17 +2835,17 @@ pub const WatchWidget = struct {
         }
 
         // Dial with a stepped edge out of the bezel.
-        c.fillRingAA(cx, cy, 58.5, 60.5, 0x88000000);
-        c.fillCircleAA(cx, cy, 59, P.dial);
+        c.fillRingAA(cx, cy, 58.5 * z, 60.5 * z, 0x88000000);
+        c.fillCircleAA(cx, cy, 59 * z, P.dial);
 
         // Dial minute track just inside the edge.
         var m: u32 = 0;
         while (m < 60) : (m += 1) {
             const a = @as(f64, @floatFromInt(m)) * 6.0 * DEG;
             if (m % 5 == 0) {
-                baton(c, cx, cy, a, 53.5, 58.0, 1.8, 2.0, P.five_tick);
+                baton(c, cx, cy, a, 53.5 * z, 58.0 * z, 1.8 * z, 2.0 * z, P.five_tick);
             } else {
-                baton(c, cx, cy, a, 55.0, 58.0, 0.9, 0.9, P.minute_tick);
+                baton(c, cx, cy, a, 55.0 * z, 58.0 * z, 0.9 * z, 0.9 * z, P.minute_tick);
             }
         }
 
@@ -2450,67 +2858,67 @@ pub const WatchWidget = struct {
             const d = radial(a);
             if (k == 0) {
                 const tri_out = [3]Canvas.FPt{
-                    at(cx, cy, d[0], d[1], 50, -5.5),
-                    at(cx, cy, d[0], d[1], 50, 5.5),
-                    at(cx, cy, d[0], d[1], 37, 0),
+                    at(cx, cy, d[0], d[1], 50 * z, -5.5 * z),
+                    at(cx, cy, d[0], d[1], 50 * z, 5.5 * z),
+                    at(cx, cy, d[0], d[1], 37 * z, 0),
                 };
                 c.fillConvex(&tri_out, PLOT_EDGE);
                 const tri_in = [3]Canvas.FPt{
-                    at(cx, cy, d[0], d[1], 48.5, -3.6),
-                    at(cx, cy, d[0], d[1], 48.5, 3.6),
-                    at(cx, cy, d[0], d[1], 38.5, 0),
+                    at(cx, cy, d[0], d[1], 48.5 * z, -3.6 * z),
+                    at(cx, cy, d[0], d[1], 48.5 * z, 3.6 * z),
+                    at(cx, cy, d[0], d[1], 38.5 * z, 0),
                 };
                 c.fillConvex(&tri_in, P.lume);
             } else if (k == 6 or k == 9) {
-                baton(c, cx, cy, a, 38, 50, 9.0, 9.0, PLOT_EDGE);
-                baton(c, cx, cy, a, 39.5, 48.5, 6.2, 6.2, P.lume);
+                baton(c, cx, cy, a, 38 * z, 50 * z, 9.0 * z, 9.0 * z, PLOT_EDGE);
+                baton(c, cx, cy, a, 39.5 * z, 48.5 * z, 6.2 * z, 6.2 * z, P.lume);
             } else {
-                c.fillCircleAA(cx + d[0] * 44, cy + d[1] * 44, 5.4, PLOT_EDGE);
-                c.fillCircleAA(cx + d[0] * 44, cy + d[1] * 44, 4.1, P.lume);
+                c.fillCircleAA(cx + d[0] * 44 * z, cy + d[1] * 44 * z, 5.4 * z, PLOT_EDGE);
+                c.fillCircleAA(cx + d[0] * 44 * z, cy + d[1] * 44 * z, 4.1 * z, P.lume);
             }
         }
 
         // Day-date window at 3 o'clock — smaller here to sit inside the
         // diver dial.
-        const win_x = cx_i + 10;
-        const win_y = cy_i - 10;
-        const win_w = 47;
-        const win_h = 20;
-        c.fillRect(win_x - 1, win_y - 1, win_w + 2, win_h + 2, WINDOW_BORDER);
-        c.fillRect(win_x, win_y, win_w, win_h, WINDOW_BG);
-        c.fillRect(win_x + 28, win_y + 1, 1, win_h - 2, 0xFF3A3A3E);
+        const win_x = cx_i + c.zx(10);
+        const win_y = cy_i - c.zx(10);
+        const win_w = c.zx(47);
+        const win_h = c.zx(20);
+        c.fillRect(win_x - 1, win_y - 1, @as(u64, @intCast(win_w + 2)), @as(u64, @intCast(win_h + 2)), WINDOW_BORDER);
+        c.fillRect(win_x, win_y, @as(u64, @intCast(win_w)), @as(u64, @intCast(win_h)), WINDOW_BG);
+        c.fillRect(win_x + c.zx(28), win_y + 1, 1, @as(u64, @intCast(win_h - 2)), 0xFF3A3A3E);
         var date_buf: [4]u8 = undefined;
         const date_str = std.fmt.bufPrint(&date_buf, "{d}", .{tm.mday}) catch " ";
         const day_str = DAYS_UPPER[@as(usize, @intCast(tm.wday))];
         const text_base = cy_i + @divTrunc(c.font.ascentPx(), 2);
         const day_w = c.textWidth(day_str);
-        _ = c.drawText(win_x + 1 + @divTrunc(26 - day_w, 2), text_base, day_str, P.window_fg);
+        _ = c.drawText(win_x + c.zx(1) + @divTrunc(c.zx(26) - day_w, 2), text_base, day_str, P.window_fg);
         const date_w = c.textWidth(date_str);
-        _ = c.drawText(win_x + 29 + @divTrunc(17 - date_w, 2), text_base, date_str, P.window_fg);
+        _ = c.drawText(win_x + c.zx(29) + @divTrunc(c.zx(17) - date_w, 2), text_base, date_str, P.window_fg);
 
         // Branding: SEIKO under the 12, Automatic above the 6 — no "5"
         // shield on a diver.
-        drawSpaced(c, cx_i, cy_i - 24, "SEIKO", 2, P.brand);
-        drawSpaced(c, cx_i, cy_i + 31, "Automatic", 1, P.brand);
+        drawSpaced(c, cx_i, cy_i - c.zx(24), "SEIKO", c.zx(2), P.brand);
+        drawSpaced(c, cx_i, cy_i + c.zx(31), "Automatic", c.zx(1), P.brand);
 
         // Hands: silver bodies with lume fill (sword minute over the
         // Mercedes hour), then the thin seconds hand with its lollipop pip,
         // stepping exactly 1° per beat.
-        baton(c, cx, cy, hr_a, -8, 30, 8.0, 6.0, P.hand);
-        baton(c, cx, cy, hr_a, -2, 26, 4.5, 3.5, P.lume);
+        baton(c, cx, cy, hr_a, -8 * z, 30 * z, 8.0 * z, 6.0 * z, P.hand);
+        baton(c, cx, cy, hr_a, -2 * z, 26 * z, 4.5 * z, 3.5 * z, P.lume);
         const hd = radial(hr_a);
-        c.fillCircleAA(cx + hd[0] * 21, cy + hd[1] * 21, 6.2, P.hand);
-        c.fillCircleAA(cx + hd[0] * 21, cy + hd[1] * 21, 4.6, P.lume);
-        baton(c, cx, cy, hr_a, 15, 27, 1.4, 1.4, P.hand); // Mercedes bar
-        baton(c, cx, cy, min_a, -9, 50, 7.0, 4.5, P.hand);
-        baton(c, cx, cy, min_a, 0, 44, 3.6, 2.6, P.lume);
-        baton(c, cx, cy, sec_a, -14, 56, 1.8, 1.8, P.seconds);
+        c.fillCircleAA(cx + hd[0] * 21 * z, cy + hd[1] * 21 * z, 6.2 * z, P.hand);
+        c.fillCircleAA(cx + hd[0] * 21 * z, cy + hd[1] * 21 * z, 4.6 * z, P.lume);
+        baton(c, cx, cy, hr_a, 15 * z, 27 * z, 1.4 * z, 1.4 * z, P.hand); // Mercedes bar
+        baton(c, cx, cy, min_a, -9 * z, 50 * z, 7.0 * z, 4.5 * z, P.hand);
+        baton(c, cx, cy, min_a, 0, 44 * z, 3.6 * z, 2.6 * z, P.lume);
+        baton(c, cx, cy, sec_a, -14 * z, 56 * z, 1.8 * z, 1.8 * z, P.seconds);
         const sd = radial(sec_a);
-        c.fillCircleAA(cx + sd[0] * 44, cy + sd[1] * 44, 4.6, P.seconds); // lollipop
-        c.fillCircleAA(cx + sd[0] * 44, cy + sd[1] * 44, 3.0, P.lume);
-        c.fillCircleAA(cx - sd[0] * 12, cy - sd[1] * 12, 2.8, P.seconds); // counterweight
-        c.fillCircleAA(cx, cy, 4.4, STEEL_CAP);
-        c.fillCircleAA(cx, cy, 1.8, P.hand);
+        c.fillCircleAA(cx + sd[0] * 44 * z, cy + sd[1] * 44 * z, 4.6 * z, P.seconds); // lollipop
+        c.fillCircleAA(cx + sd[0] * 44 * z, cy + sd[1] * 44 * z, 3.0 * z, P.lume);
+        c.fillCircleAA(cx - sd[0] * 12 * z, cy - sd[1] * 12 * z, 2.8 * z, P.seconds); // counterweight
+        c.fillCircleAA(cx, cy, 4.4 * z, STEEL_CAP);
+        c.fillCircleAA(cx, cy, 1.8 * z, P.hand);
     }
 };
 
@@ -2531,6 +2939,41 @@ pub const WatchWidget = struct {
 ///
 /// Text is capped at NOTE_MAX *bytes* so the fixed wrap-line array always
 /// fits the worst case (every byte a newline ⇒ text.len + 1 lines).
+/// Scale a layout constant by a zoom factor (corner-resize content zoom).
+/// Canvas.zx is the method form for paints; this covers layout/hit-test
+/// helpers without a canvas in scope.
+fn zf(base: i64, zoom: f32) i64 {
+    return @intFromFloat(@round(@as(f32, @floatFromInt(base)) * zoom));
+}
+
+/// Visible note lines for a card height: the base 6 at base size, growing
+/// with the rect (corner resize reflows the note instead of just padding
+/// it). Min 1 so a clamped card still edits line one.
+pub fn noteVisLines(card_h: i64, lh: i64) usize {
+    if (lh <= 0) return 1;
+    const v = @divTrunc(card_h - 2 * CARD_PAD, lh);
+    return @max(1, @as(usize, @intCast(@max(v, 0))));
+}
+
+test "notes: visible lines follow card height" {
+    const t = std.testing;
+    // Base card (2*14 pads + 6 lines at lh 20) shows 6; grown cards show
+    // more; degenerate inputs still edit line one.
+    try t.expectEqual(@as(usize, 6), noteVisLines(2 * CARD_PAD + 6 * 20, 20));
+    try t.expectEqual(@as(usize, 12), noteVisLines(2 * CARD_PAD + 12 * 20, 20));
+    try t.expectEqual(@as(usize, 1), noteVisLines(30, 20));
+    try t.expectEqual(@as(usize, 1), noteVisLines(148, 0));
+}
+
+test "zoom scales layout constants" {
+    const t = std.testing;
+    try t.expectEqual(@as(i64, 24), zf(24, 1.0));
+    try t.expectEqual(@as(i64, 36), zf(24, 1.5));
+    try t.expectEqual(@as(i64, 14), zf(7, 2.0));
+    try t.expectEqual(@as(i64, 10), zf(7, 1.4)); // 9.8 rounds to 10
+    try t.expectEqual(@as(i64, 0), zf(0, 3.0));
+}
+
 pub const NoteWidget = struct {
     pub const NOTE_MAX: usize = 1023;
     pub const MAX_WRAP_LINES: usize = 1025;
@@ -2710,9 +3153,9 @@ pub const NoteWidget = struct {
     }
 
     /// Scroll so the caret's wrapped line stays among the visible ones, and
-    /// keep the stored scroll honest when the text shrank under it.
-    fn keepVisible(self: *NoteWidget, lines: []const LayoutLine, count: usize) void {
-        const vis: usize = @intCast(VISIBLE_LINES);
+    /// keep the stored scroll honest when the text shrank under it. `vis`
+    /// is the card's current visible-line count (grows when resized).
+    fn keepVisible(self: *NoteWidget, lines: []const LayoutLine, count: usize, vis: usize) void {
         if (count > vis and self.scroll > count - vis) self.scroll = count - vis;
         if (count <= vis) self.scroll = 0;
         const li = caretLine(lines, count, self.caret);
@@ -2726,7 +3169,7 @@ pub const NoteWidget = struct {
     /// Returns what the host should do with the key afterward.
     pub const KeyResult = enum { ignored, handled, exited };
 
-    pub fn keyPress(self: *NoteWidget, measure: anytype, max_w: i64, keycode: u32, utf32: u32) KeyResult {
+    pub fn keyPress(self: *NoteWidget, measure: anytype, max_w: i64, vis: usize, keycode: u32, utf32: u32) KeyResult {
         if (keycode == KEY_ESC) {
             self.commit();
             self.endEditing();
@@ -2764,7 +3207,7 @@ pub const NoteWidget = struct {
             const li = caretLine(lines, count, self.caret);
             self.desired_x = self.caretX(measure, lines, li, self.caret);
         }
-        self.keepVisible(lines, count);
+        self.keepVisible(lines, count, vis);
         return .handled;
     }
 
@@ -2777,11 +3220,12 @@ pub const NoteWidget = struct {
         const ry: i64 = r.y;
         const lh = lineH(font);
         const max_w: i64 = @as(i64, @intCast(r.w)) - 2 * CARD_PAD;
+        const vis = noteVisLines(@as(i64, @intCast(r.h)), lh);
         var lines: [MAX_WRAP_LINES]LayoutLine = undefined;
         const count = wrapLines(FontMeasure{ .font = font }, self.text(), max_w, &lines);
         const rel_x = @max(@as(i64, px) - (rx + CARD_PAD), 0);
         var rel_y = @as(i64, py) - (ry + CARD_PAD);
-        rel_y = std.math.clamp(rel_y, 0, VISIBLE_LINES * lh - 1); // padding clicks → nearest line
+        rel_y = std.math.clamp(rel_y, 0, @as(i64, @intCast(vis)) * lh - 1); // padding clicks → nearest line
         var li = self.scroll + @as(usize, @intCast(@divTrunc(rel_y, lh)));
         if (li >= count) li = count - 1;
         const l = lines[li];
@@ -2798,7 +3242,7 @@ pub const NoteWidget = struct {
         const max_w: i64 = @as(i64, @intCast(r.w)) - 2 * CARD_PAD;
         var lines: [MAX_WRAP_LINES]LayoutLine = undefined;
         const count = wrapLines(FontMeasure{ .font = c.font }, self.text(), max_w, &lines);
-        const vis: usize = @intCast(VISIBLE_LINES);
+        const vis = noteVisLines(@as(i64, @intCast(r.h)), lh);
         var scroll = self.scroll;
         if (count > vis and scroll > count - vis) scroll = count - vis;
         if (count <= vis) scroll = 0;
@@ -2982,7 +3426,9 @@ pub const Widget = union(WidgetId) {
     pub fn intervalMs(self: Widget) i64 {
         return switch (self) {
             .clock => ClockWidget.interval_ms,
-            .weather => WeatherWidget.interval_ms,
+            // Weather animates its condition ambiently at 60ms; it only
+            // sleeps for its 20-minute fetch (kept warm by the tick).
+            .weather => 60,
             .media => MediaWidget.interval_ms,
             .system => SystemWidget.interval_ms,
             .calendar => CalendarWidget.interval_ms,
@@ -3005,8 +3451,17 @@ pub const Widget = union(WidgetId) {
                 break :blk true;
             },
             .weather => |*w| blk: {
-                w.refresh();
-                break :blk false;
+                // Ambient condition animation: advance the fx frame and
+                // repaint every tick (intervalMs holds 60ms). Fetch upkeep
+                // lives here too — refetch past the 20-minute cadence only,
+                // never every tick (that would fork curl at 60Hz).
+                w.anim_frame +%= 1;
+                const now = monoMs();
+                if (now - w.last_fetch_ms >= WeatherWidget.interval_ms and !w.fetch.busy()) {
+                    w.last_fetch_ms = now;
+                    w.refresh();
+                }
+                break :blk true;
             },
             .media => |*m| blk: {
                 break :blk m.tick();
@@ -3046,13 +3501,13 @@ pub const Widget = union(WidgetId) {
 
     /// Left-click action. Media and calendar get the click point plus their
     /// rect so their controls hit-test; every other widget ignores the extras.
-    pub fn click(self: *Widget, font: *font_mod.Font, r: Rect, x: i32, y: i32) void {
+    pub fn click(self: *Widget, font: *font_mod.Font, zoom: f32, r: Rect, x: i32, y: i32) void {
         switch (self.*) {
             .clock => |c| c.click(),
             .weather => |w| w.click(),
-            .media => |*m| m.clickAt(r, font, x, y),
+            .media => |*m| m.clickAt(r, font, zoom, x, y),
             .system => |s| s.click(),
-            .calendar => |*k| k.clickAt(r, font, x, y),
+            .calendar => |*k| k.clickAt(r, font, zoom, x, y),
             .note1 => |*n| n.clickAt(r, font, x, y),
             .watch => |*w| w.click(),
         }
@@ -3093,14 +3548,14 @@ pub fn noteSlot(w: *const Widget) ?u8 {
 test "watch bezel hit ring" {
     const r = Rect{ .x = 840, .y = 12, .w = 190, .h = 200 }; // cx=935, cy=112
     // On the ring at 12, 3, 6, 9 (r 60..79).
-    try std.testing.expect(WatchWidget.bezelHit(r, 935, 112 - 70));
-    try std.testing.expect(WatchWidget.bezelHit(r, 935 + 70, 112));
-    try std.testing.expect(WatchWidget.bezelHit(r, 935, 112 + 70));
-    try std.testing.expect(WatchWidget.bezelHit(r, 935 - 70, 112));
+    try std.testing.expect(WatchWidget.bezelHit(r, 1.0, 935, 112 - 70));
+    try std.testing.expect(WatchWidget.bezelHit(r, 1.0, 935 + 70, 112));
+    try std.testing.expect(WatchWidget.bezelHit(r, 1.0, 935, 112 + 70));
+    try std.testing.expect(WatchWidget.bezelHit(r, 1.0, 935 - 70, 112));
     // Dial center and far outside are not bezel.
-    try std.testing.expect(!WatchWidget.bezelHit(r, 935, 112));
-    try std.testing.expect(!WatchWidget.bezelHit(r, 935, 112 - 40));
-    try std.testing.expect(!WatchWidget.bezelHit(r, 0, 0));
+    try std.testing.expect(!WatchWidget.bezelHit(r, 1.0, 935, 112));
+    try std.testing.expect(!WatchWidget.bezelHit(r, 1.0, 935, 112 - 40));
+    try std.testing.expect(!WatchWidget.bezelHit(r, 1.0, 0, 0));
 }
 
 test "watch pointer angle quadrants" {
@@ -3214,28 +3669,28 @@ test "notes: keyPress edit commands, Enter, Esc" {
     const m = FixedAdv{};
     const K = NoteWidget.KeyResult;
     // Non-special keycodes with an xkb-decoded codepoint insert text.
-    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 999, 'a'));
-    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 999, 'b'));
-    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_ENTER, 0));
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 6, 999, 'a'));
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 6, 999, 'b'));
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 6, KEY_ENTER, 0));
     try std.testing.expectEqualSlices(u8, "ab\n", note.text());
     // Delete is exactly one codepoint, and Backspace undoes a newline.
     _ = note.moveLeft();
     _ = note.deleteForward();
     try std.testing.expectEqualSlices(u8, "ab", note.text());
-    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_BACKSPACE, 0));
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 6, KEY_BACKSPACE, 0));
     try std.testing.expectEqualSlices(u8, "a", note.text());
     // Home / End sweep the visual line.
-    _ = note.keyPress(m, 40, 999, 'b');
-    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_HOME, 0));
+    _ = note.keyPress(m, 40, 6, 999, 'b');
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 6, KEY_HOME, 0));
     try std.testing.expectEqual(@as(usize, 0), note.caret);
-    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_END, 0));
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 6, KEY_END, 0));
     try std.testing.expectEqual(@as(usize, 2), note.caret);
     // Non-printable / unmapped keys are ignored, not inserted.
-    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, 999, 0));
-    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, 999, 0x7F));
+    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, 6, 999, 0));
+    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, 6, 999, 0x7F));
     try std.testing.expectEqualSlices(u8, "ab", note.text());
     // Esc commits and hands the slot back.
-    try std.testing.expectEqual(K.exited, note.keyPress(m, 40, KEY_ESC, 0));
+    try std.testing.expectEqual(K.exited, note.keyPress(m, 40, 6, KEY_ESC, 0));
     try std.testing.expect(!note.editing);
 }
 
@@ -3247,15 +3702,15 @@ test "notes: up/down walk wrapped lines" {
     note.caret = note.text_len;
     note.desired_x = 0;
     // Line 3 -> line 2 at the same column.
-    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_UP, 0));
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 6, KEY_UP, 0));
     try std.testing.expectEqual(@as(usize, 5), note.caret); // start of "bbbb"
-    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_UP, 0));
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 6, KEY_UP, 0));
     try std.testing.expectEqual(@as(usize, 0), note.caret); // start of "aaaa"
     // At the top, Up is a no-op (ignored).
-    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, KEY_UP, 0));
+    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, 6, KEY_UP, 0));
     // And Down walks back down.
-    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_DOWN, 0));
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 6, KEY_DOWN, 0));
     try std.testing.expectEqual(@as(usize, 5), note.caret);
-    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, KEY_DOWN, 0));
-    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, KEY_DOWN, 0));
+    try std.testing.expectEqual(K.handled, note.keyPress(m, 40, 6, KEY_DOWN, 0));
+    try std.testing.expectEqual(K.ignored, note.keyPress(m, 40, 6, KEY_DOWN, 0));
 }

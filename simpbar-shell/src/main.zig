@@ -55,6 +55,10 @@ const JsonWidgetCfg = struct {
     id: []const u8 = "clock",
     x: i32 = 0,
     y: i32 = 0,
+    /// Card size override (corner resize persists it here); null/absent
+    /// means the type's base size from cardSizeFor.
+    w: ?u32 = null,
+    h: ?u32 = null,
 };
 
 const JsonConfig = struct {
@@ -79,6 +83,9 @@ const WidgetCfg = struct {
     id: widgets_mod.WidgetId,
     x: i32,
     y: i32,
+    /// Persisted size override, 0 = base size (matches absent JSON keys).
+    w: u32 = 0,
+    h: u32 = 0,
 };
 
 const ShellConfig = struct {
@@ -361,8 +368,27 @@ fn loadConfig(gpa: std.mem.Allocator) ShellConfig {
                 logging.warn("config: unknown widget id \"{s}\" — skipping", .{w.id});
                 continue;
             };
-            cfg.widget_cfgs[count] = .{ .id = id, .x = w.x, .y = w.y };
+            cfg.widget_cfgs[count] = .{ .id = id, .x = w.x, .y = w.y, .w = w.w orelse 0, .h = w.h orelse 0 };
             count += 1;
+        }
+        // Backfill defaults for widgets shell.json doesn't name (it only
+        // gains entries when a widget is dragged, so never-dragged widgets
+        // would otherwise vanish entirely): every widget always exists with
+        // a position, and widgets-disabled alone controls visibility. This
+        // mirrors the bar GUI's ensureKindsPresent for the same "modules
+        // disappeared" trap.
+        for (DEFAULT_WIDGETS) |dw| {
+            var found = false;
+            for (cfg.widget_cfgs[0..count]) |wc| {
+                if (wc.id == dw.id) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found and count < MAX_WIDGETS) {
+                cfg.widget_cfgs[count] = dw;
+                count += 1;
+            }
         }
         cfg.widget_count = count;
     }
@@ -527,6 +553,13 @@ const Host = struct {
     /// output (measured: 12% -> ~3% of a core).
     tiles: [MAX_WIDGETS]?[]u32 = [_]?[]u32{null} ** MAX_WIDGETS,
     tile_dirty: u16 = 0xFFFF, // all dirty until first paint; MAX_WIDGETS ≤ 16
+    /// Per-widget zoomed fonts (corner resize scales content, not just the
+    /// card): slot i holds a face at the integer pixel size matching the
+    /// widget's current zoom, or null when it renders at base size / the
+    /// scaled load failed. Re-created only when the size bucket changes.
+    /// Note1 never zooms (it reflows) and always uses the shared font.
+    zoom_fonts: [MAX_WIDGETS]?font_mod.Font = [_]?font_mod.Font{null} ** MAX_WIDGETS,
+    zoom_px: [MAX_WIDGETS]u32 = [_]u32{0} ** MAX_WIDGETS,
     hovered_index: ?usize = null,
     pointer_desktop: ?usize = null,
     pointer_x: i32 = 0,
@@ -549,6 +582,12 @@ const Host = struct {
     drag_index: ?usize = null,
     drag_off_x: i32 = 0,
     drag_off_y: i32 = 0,
+    /// Corner-resize grab: press on a card's bottom-right grip starts a
+    /// live resize (top-left pinned) instead of a click or a move. Offsets
+    /// keep the grabbed corner under the pointer, mirroring drag_off_*.
+    resize_index: ?usize = null,
+    resize_off_x: i32 = 0,
+    resize_off_y: i32 = 0,
     // Bezel-timer grab on the watch: press (no Ctrl) on the bezel ring
     // starts a circular turn. Angles are pointer angles about the dial
     // center (0 at 12, clockwise); the widget folds the swept angle into
@@ -568,7 +607,15 @@ const Host = struct {
 
 fn initWidgets(host: *Host, cfg: ShellConfig) void {
     for (cfg.widget_cfgs[0..cfg.widget_count]) |wc| {
-        const size = widgets_mod.cardSizeFor(wc.id, host.font);
+        // Base size for the type, overridden by a persisted corner resize
+        // (clamped: never below the designed base, never absurd — a
+        // hand-edited monster still gets a tile).
+        const base = widgets_mod.cardSizeFor(wc.id, host.font);
+        var size = base;
+        if (wc.w != 0) size[0] = @max(wc.w, base[0]);
+        if (wc.h != 0) size[1] = @max(wc.h, base[1]);
+        size[0] = @min(size[0], 2048);
+        size[1] = @min(size[1], 2048);
         host.widgets[host.widget_count] = switch (wc.id) {
             .clock => .{ .clock = .{} },
             .weather => .{ .weather = .{} },
@@ -697,8 +744,8 @@ fn saveConfig(host: *Host) void {
         const r = host.widget_rects[i];
         const tail: []const u8 = if (i + 1 == host.widget_count) "\n" else ",\n";
         if (!w.appendFmt(
-            "    {{ \"id\": \"{s}\", \"x\": {d}, \"y\": {d} }}{s}",
-            .{ @tagName(id), r.x, r.y, tail },
+            "    {{ \"id\": \"{s}\", \"x\": {d}, \"y\": {d}, \"w\": {d}, \"h\": {d} }}{s}",
+            .{ @tagName(id), r.x, r.y, r.w, r.h, tail },
         )) return;
     }
     if (!w.append("  ]\n}\n")) return;
@@ -768,24 +815,37 @@ fn paintDesktop(host: *Host, d: *Desktop) !void {
         // the old path memset the whole surface.
         @memset(tile, 0);
         const rect = host.widget_rects[i];
+        // Corner-resize zoom: content scales with the card (note1 reflows
+        // at base size instead). Font and layout zoom travel together via
+        // the swapped face + Canvas.zoom, so metrics never disagree.
+        const zoom = widgetZoom(host, i);
         const tc = widgets_mod.Canvas{
             .pixels = tile.ptr,
             .width = rect.w,
             .height = rect.h,
-            .font = host.font,
+            .font = zoomFontFor(host, i, zoom),
             .theme = &host.theme,
+            .zoom = zoom,
         };
         const tr = widgets_mod.Rect{ .x = 0, .y = 0, .w = rect.w, .h = rect.h };
         // The watch draws its own steel case — no frosted card behind it
-        // (the case and bracelet ARE the widget chrome).
+        // (the case and bracelet ARE the widget chrome). Cards never
+        // highlight on hover — the fill stays bg_color under the pointer;
+        // hover tracking itself (clicks, the weather condition-fx) is
+        // untouched, only the wash is gone.
         if (std.meta.activeTag(host.widgets[i]) != .watch) {
             const fill = widgets_mod.withAlpha(
-                if (host.hovered_index == i) host.theme.hover_color else host.theme.bg_color,
+                host.theme.bg_color,
                 host.theme.card_alpha,
             );
             tc.card(tr, fill, host.theme.border_color);
         }
         host.widgets[i].paint(tc, tr);
+        // Resize affordance over the content (tile-local): visible while
+        // hovered or grabbed, repainted away with the tile otherwise.
+        if (host.hovered_index == i or host.resize_index == i) {
+            drawResizeGrip(tc, tr);
+        }
     }
     host.tile_dirty = 0;
 
@@ -926,6 +986,26 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
                 // around the dial. Tiles are position-independent here too —
                 // only the bezel offset changed, so just re-render it.
                 turnBezel(host, i);
+            } else if (host.resize_index) |i| {
+                // Corner resize in progress: grow/shrink the card live with
+                // the top-left pinned, reallocating the paint tile as the
+                // size changes (content re-renders from the new rect, so
+                // rect-relative widgets like weather fx and notes reflow).
+                const r = &host.widget_rects[i];
+                const base = widgets_mod.cardSizeFor(std.meta.activeTag(host.widgets[i]), host.font);
+                const d = &host.desktops[host.pointer_desktop orelse 0];
+                var nw = host.pointer_x - r.x + host.resize_off_x;
+                var nh = host.pointer_y - r.y + host.resize_off_y;
+                nw = std.math.clamp(nw, @as(i32, @intCast(base[0])), @as(i32, @intCast(d.width)));
+                nh = std.math.clamp(nh, @as(i32, @intCast(base[1])), @as(i32, @intCast(d.height)));
+                if (@as(i64, nw) != @as(i64, r.w) or @as(i64, nh) != @as(i64, r.h)) {
+                    r.w = @intCast(nw);
+                    r.h = @intCast(nh);
+                    clampWidget(host, i); // keep the grown card on its output
+                    reallocTile(host, i); // frees, reallocs, marks dirty
+                    host.hovered_index = i;
+                    host.needs_repaint = true;
+                }
             } else if (host.drag_index) |i| {
                 // Ctrl+drag in progress: the card follows the pointer,
                 // clamped to the output it's being moved on. Tiles are
@@ -968,15 +1048,17 @@ fn pointerButton(host: *Host, btn: u32, pressed: bool) void {
             const pi = host.press_index;
             if (pi == null or pi != ei) endEdit(host);
         }
-        // Bezel ring (no Ctrl) starts a timer turn; anywhere else the press
-        // is a move when Ctrl is known (see tryStartDrag) or a click on
-        // release.
-        if (!tryStartBezel(host)) tryStartDrag(host);
+        // Bezel ring (no Ctrl) starts a timer turn; a corner grip starts a
+        // resize; anywhere else the press is a move when Ctrl is known (see
+        // tryStartDrag) or a click on release.
+        if (!tryStartBezel(host) and !tryStartResize(host)) tryStartDrag(host);
         logging.step("ptr: press hovered={?} ctrl={}", .{ host.hovered_index, host.ctrl_down });
     } else {
         host.left_down = false;
         if (host.drag_index != null) {
             endDrag(host);
+        } else if (host.resize_index != null) {
+            endResize(host);
         } else if (host.bezel_index) |i| {
             host.bezel_index = null;
             // Settle with the release point, then arm (or clear).
@@ -987,7 +1069,7 @@ fn pointerButton(host: *Host, btn: u32, pressed: bool) void {
             host.press_index = null;
             // A click is press + release over the same widget.
             if (host.widget_rects[i].contains(host.pointer_x, host.pointer_y)) {
-                host.widgets[i].click(host.font, host.widget_rects[i], host.pointer_x, host.pointer_y);
+                host.widgets[i].click(zoomFontFor(host, i, widgetZoom(host, i)), widgetZoom(host, i), host.widget_rects[i], host.pointer_x, host.pointer_y);
                 // Clicking a note opens the single-edit slot: the card took
                 // on_demand keyboard focus, so the compositor will route key
                 // events here. The widget owns text/caret; the host owns the
@@ -1012,7 +1094,7 @@ fn tryStartBezel(host: *Host) bool {
     const index = host.press_index orelse host.hovered_index orelse return false;
     if (std.meta.activeTag(host.widgets[index]) != .watch) return false;
     const r = host.widget_rects[index];
-    if (!widgets_mod.WatchWidget.bezelHit(r, host.pointer_x, host.pointer_y)) return false;
+    if (!widgets_mod.WatchWidget.bezelHit(r, widgetZoom(host, index), host.pointer_x, host.pointer_y)) return false;
     host.bezel_index = index;
     host.bezel_base = host.widgets[index].watch.bezel_min;
     host.bezel_last_a = widgets_mod.WatchWidget.pointerAngle(r, host.pointer_x, host.pointer_y);
@@ -1079,6 +1161,89 @@ fn endDrag(host: *Host) void {
     host.needs_repaint = true;
     refreshInputRegions(host);
     saveConfig(host);
+}
+
+/// Corner grip side (px): press inside the card's bottom-right square
+/// starts a resize instead of a click.
+const RESIZE_GRIP: i64 = 16;
+
+fn resizeHit(r: widgets_mod.Rect, x: i32, y: i32) bool {
+    const rx: i64 = r.x;
+    const ry: i64 = r.y;
+    const rw: i64 = r.w;
+    const rh: i64 = r.h;
+    const px: i64 = x;
+    const py: i64 = y;
+    return px >= rx + rw - RESIZE_GRIP and px < rx + rw and py >= ry + rh - RESIZE_GRIP and py < ry + rh;
+}
+
+/// Press landed on a card's resize grip: start a corner resize instead of
+/// a click or a move. An explicit target beats modifiers — Ctrl+corner
+/// resizes, it doesn't move.
+fn tryStartResize(host: *Host) bool {
+    if (!host.left_down or host.resize_index != null) return false;
+    if (host.drag_index != null or host.bezel_index != null) return false;
+    const index = host.press_index orelse host.hovered_index orelse return false;
+    const r = host.widget_rects[index];
+    if (!resizeHit(r, host.pointer_x, host.pointer_y)) return false;
+    host.resize_index = index;
+    host.resize_off_x = (r.x + @as(i32, @intCast(r.w))) - host.pointer_x;
+    host.resize_off_y = (r.y + @as(i32, @intCast(r.h))) - host.pointer_y;
+    host.press_index = null; // consumed: a resize is not a click
+    host.hovered_index = index;
+    markDirty(host, index); // repaint with the lit grip under the grab
+    return true;
+}
+
+/// Reallocate widget i's paint tile for its current rect (resize path).
+/// Refuses absurd areas instead of OOMing — paintDesktop skips null tiles,
+/// and the release re-clamps anyway.
+fn reallocTile(host: *Host, i: usize) void {
+    const r = host.widget_rects[i];
+    const area: usize = @as(usize, r.w) * @as(usize, r.h);
+    if (area == 0 or area > 16 * 1024 * 1024) {
+        logging.warn("widgets: refusing {d}x{d} tile", .{ r.w, r.h });
+        return;
+    }
+    if (host.tiles[i]) |old| host.gpa.free(old);
+    host.tiles[i] = host.gpa.alloc(u32, area) catch |err| {
+        logging.err("widgets: could not allocate {d}x{d} tile: {}", .{ r.w, r.h, err });
+        return;
+    };
+    markDirty(host, i);
+}
+
+/// Button released mid-resize: settle the size, re-arm the input regions
+/// (they still cover the pre-resize rect), and persist to shell.json.
+fn endResize(host: *Host) void {
+    const index = host.resize_index orelse return;
+    host.resize_index = null;
+    clampWidget(host, index);
+    host.needs_repaint = true;
+    refreshInputRegions(host);
+    saveConfig(host);
+    markDirty(host, index); // drop the lit grip
+}
+
+/// Resize affordance: three faint diagonal strokes in the card's
+/// bottom-right corner, painted into the tile while hovered or grabbed.
+fn drawResizeGrip(tc: widgets_mod.Canvas, r: widgets_mod.Rect) void {
+    const col = (@as(u32, 0x58) << 24) | (tc.theme.border_color & 0x00FFFFFF);
+    const w: i64 = r.w;
+    const h: i64 = r.h;
+    var k: i64 = 0;
+    while (k < 3) : (k += 1) {
+        var s: i64 = 0;
+        while (s < 5) : (s += 1) {
+            const x = w - 3 - k * 5 - s;
+            const y = h - 3 - (4 - s);
+            if (x < 0 or y < 0) continue;
+            const pxu: usize = @intCast(x);
+            const pyu: usize = @intCast(y);
+            if (pxu >= tc.width or pyu >= tc.height) continue;
+            tc.pixels[pyu * tc.width + pxu] = widgets_mod.Canvas.blendOver(tc.pixels[pyu * tc.width + pxu], col);
+        }
+    }
 }
 
 fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, host: *Host) void {
@@ -1210,7 +1375,7 @@ fn keyPress(host: *Host, keycode: u32) void {
     var utf32: u32 = 0;
     if (g_xkb_state) |st| utf32 = xkb.xkb_state_key_get_utf32(st, keycode + 8);
     const res = switch (host.widgets[i]) {
-        .note1 => |*n| n.keyPress(widgets_mod.FontMeasure{ .font = host.font }, noteMaxW(host, i), keycode, utf32),
+        .note1 => |*n| n.keyPress(widgets_mod.FontMeasure{ .font = host.font }, noteMaxW(host, i), noteVisLines(host, i), keycode, utf32),
         else => .ignored,
     };
     logging.step("kb: key={d} U+{x:0>4} edit={d} -> {s}", .{ keycode, utf32, i, @tagName(res) });
@@ -1232,9 +1397,49 @@ fn keyPress(host: *Host, keycode: u32) void {
     }
 }
 
+/// Content zoom for widget i: uniform min-ratio of its rect to the type's
+/// base size, never below 1 (cards can't shrink past base). Note1 is
+/// exempt — it reflows instead of zooming.
+fn widgetZoom(host: *Host, i: usize) f32 {
+    if (std.meta.activeTag(host.widgets[i]) == .note1) return 1.0;
+    const base = widgets_mod.cardSizeFor(std.meta.activeTag(host.widgets[i]), host.font);
+    const zw = @as(f32, @floatFromInt(host.widget_rects[i].w)) / @as(f32, @floatFromInt(base[0]));
+    const zh = @as(f32, @floatFromInt(host.widget_rects[i].h)) / @as(f32, @floatFromInt(base[1]));
+    return @max(1.0, @min(zw, zh));
+}
+
+/// Scaled face for widget i's content zoom (integer pixel buckets — a new
+/// face loads only when the bucket changes, so live drags don't reload
+/// per motion). Falls back to the shared face on any failure. The caller
+/// sets Canvas.zoom to match; font metrics and layout scaling stay in
+/// sync by construction.
+fn zoomFontFor(host: *Host, i: usize, zoom: f32) *font_mod.Font {
+    if (std.meta.activeTag(host.widgets[i]) == .note1) return host.font;
+    const want: u32 = @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(host.font.pixel_size)) * zoom))));
+    if (host.zoom_fonts[i] == null or host.zoom_px[i] != want) {
+        if (host.zoom_fonts[i]) |*f| f.deinit();
+        host.zoom_fonts[i] = null;
+        var pbuf: [512]u8 = undefined;
+        if (fontPathZ(g_shell_cfg.font_path, &pbuf)) |path_z| {
+            if (font_mod.Font.init(host.gpa, path_z, want)) |f| {
+                host.zoom_fonts[i] = f;
+                host.zoom_px[i] = want;
+            } else |_| {}
+        }
+    }
+    if (host.zoom_fonts[i]) |*f| return f;
+    return host.font;
+}
+
 /// Text width available inside the note card (match NoteWidget.paint).
 fn noteMaxW(host: *Host, i: usize) i64 {
     return @as(i64, @intCast(host.widget_rects[i].w)) - 2 * widgets_mod.CARD_PAD;
+}
+
+/// Visible note lines for widget i's current card height (reflows when
+/// corner-resized). Matches NoteWidget.paint's own computation.
+fn noteVisLines(host: *Host, i: usize) usize {
+    return widgets_mod.noteVisLines(@as(i64, @intCast(host.widget_rects[i].h)), widgets_mod.lineH(host.font));
 }
 
 /// Set up compositor-style auto-repeat (rate Hz, delay ms) for the key that
@@ -1631,6 +1836,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     initWidgets(&host, cfg);
     defer for (host.tiles) |t| if (t) |buf| gpa.free(buf); // leak-check clean
+    defer for (&host.zoom_fonts) |*slot| {
+        if (slot.*) |*f| f.deinit();
+        slot.* = null;
+    };
     logging.step("widgets: {d} placed on {d} output(s)", .{ host.widget_count, globals.outputs.count });
 
     // Overview mode (Alt+W): constructed once, surface created/destroyed
