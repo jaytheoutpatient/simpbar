@@ -1106,16 +1106,17 @@ fi
 
 printf '\n  %smatugen%s is the Material You colorscheme generator simpbar uses for\n' "$C_BOLD" "$C_RESET"
 printf '  auto-theming: pick a wallpaper and it recolors the bar to match it\n'
-printf '  (the bar has an %sAuto-theme with matugen%s toggle in simpbar-config). It\n' "$C_BOLD" "$C_RESET"
-printf '  is AUR-only and compiled from source, so it is the slowest install step.\n'
+printf '  (the bar has an %sAuto-theme with matugen%s toggle in simpbar-config).\n' "$C_BOLD" "$C_RESET"
+printf '  It is AUR-only and compiled from source, so it is the slowest install step.\n'
+# NOTE: matugen used to be a Yes/No prompt. It is now always installed:
+# auto-theming is core to the bar, not optional. A saved MATUGEN_CHOICE
+# answer in install-answers is inert.
 if reuse_detected MATUGEN_CHOICE '1:matugen'; then
     MATUGEN_DETECTED=1
 else
     MATUGEN_DETECTED=0
-    prompt_choice MATUGEN_CHOICE 1 "Would you like to install matugen for wallpaper-based auto-theming?" "Yes" "No"
 fi
-INSTALL_MATUGEN=0
-[ "$MATUGEN_CHOICE" = 1 ] && INSTALL_MATUGEN=1
+INSTALL_MATUGEN=1
 [ "$MATUGEN_DETECTED" = 1 ] && detected_note "matugen" "matugen"
 
 printf '  Installing %d packages via pacman:\n    %s\n' "${#PACMAN_PKGS[@]}" "${PACMAN_PKGS[*]}"
@@ -1640,10 +1641,17 @@ if [ -n "$DISCORD_NAME" ]; then
     fi
 fi
 if command -v "$FILE_MANAGER_BIN" >/dev/null 2>&1; then
-    SEED_PINS+=("Files|$FILE_MANAGER_BIN|$FILE_MANAGER_BIN")
+    # Empty icon: the bar derives it at runtime via the desktop index
+    # (Exec/WMClass/id-stem → real Icon=, e.g. nautilus → org.gnome.Nautilus),
+    # so whatever file manager was chosen wears its own theme icon. Seeding
+    # the binary name as the icon would bypass that lookup and usually
+    # resolve to nothing.
+    SEED_PINS+=("Files|$FILE_MANAGER_BIN|")
 fi
 if command -v "$TERMINAL_BIN" >/dev/null 2>&1; then
-    SEED_PINS+=("Term|$TERMINAL_BIN|$TERMINAL_BIN")
+    # Same derivation as above: kitty/foot/ghostty/etc. each resolve to
+    # their own icon without a per-terminal mapping here.
+    SEED_PINS+=("Term|$TERMINAL_BIN|")
 fi
 if command -v steam >/dev/null 2>&1; then
     SEED_PINS+=("Steam|steam|steam")
