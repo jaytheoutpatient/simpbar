@@ -2703,14 +2703,21 @@ EOF
 # ────────────────────────────────────────────────────────────────────────────────
 
 main() {
-    show_splash
     check_root
-    check_uefi
-    # Skip internet/deps check if launched from install.sh (deps already installed)
+    # Dependencies BEFORE any gum call: show_splash is all gum, and with
+    # set -Eeuo pipefail the first missing-gum call is instantly fatal
+    # (exit 127 before a single menu renders). check_internet and
+    # ensure_dependencies use no gum themselves, so they are safe here.
     if ! command -v gum &>/dev/null; then
         check_internet
         ensure_dependencies
     fi
+    if ! command -v gum &>/dev/null; then
+        echo "ERROR: 'gum' is required but could not be installed (pacman -S gum) — re-run once it is." >&2
+        exit 1
+    fi
+    show_splash
+    check_uefi
     show_main_menu
 }
 
