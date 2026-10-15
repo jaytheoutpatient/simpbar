@@ -471,21 +471,22 @@ command -v pacman >/dev/null || die "This script is Arch-only (pacman not found)
 
 # ── Step -1: XeroLinux provisioning (Arch ISO live environments only) ─
 # /run/archiso exists only on a booted Arch ISO. There — and ONLY there —
-# offer XeroLinux's own installer first: it provisions a whole system
-# (partitioning, base, users, drivers) where this script only ever
-# configures an already-running one. Opt-in behind a typed YES (it can
-# wipe disks); declining, or running on an installed system, continues
-# below with zero behavior change. Uses Xero's official short URL (stable
-# across their repo moves), downloaded first so a failed fetch can't feed
-# a half-pipe to bash. stdin is forced to /dev/tty so their prompts work
-# even when this script itself runs as `curl | bash`. When their installer
-# exits without rebooting, this one simply continues.
+# offer our Xero-based provisioning script first: it installs a whole base
+# system (partitioning, base, users, drivers, Limine bootloader — no
+# desktop environment) where this script only ever configures an
+# already-running one. Opt-in behind a typed YES (it can wipe disks);
+# declining, or running on an installed system, continues below with zero
+# behavior change. Fetched from this repo (versioned with it) rather than
+# Xero upstream, downloaded first so a failed fetch can't feed a half-pipe
+# to bash. stdin is forced to /dev/tty so its prompts work even when this
+# script itself runs as `curl | bash`. When it exits without rebooting,
+# this one simply continues.
 if [ -d /run/archiso ]; then
     printf '\n  %sArch ISO live environment detected.%s\n' "$C_YELLOW" "$C_RESET"
-    prompt_choice XERO_CHOICE 2 "Provision this machine with the XeroLinux installer first?" \
-        "Yes, run the XeroLinux installer" "No, configure with simpbar"
+    prompt_choice XERO_CHOICE 2 "Provision this machine with the simpbar base-system installer first?" \
+        "Yes, run the base installer" "No, configure with simpbar"
     if [ "$XERO_CHOICE" = 1 ]; then
-        printf '\n  %sWARNING: the XeroLinux installer partitions disks and can%s\n' "$C_RED" "$C_RESET"
+        printf '\n  %sWARNING: the base installer partitions disks and can%s\n' "$C_RED" "$C_RESET"
         printf '  %sDESTROY DATA. Only continue on a machine (or VM) you can wipe.%s\n' "$C_RED" "$C_RESET"
         printf '  %sType YES in capitals to launch it, anything else skips:%s ' "$C_BOLD" "$C_RESET"
         if [ -r /dev/tty ]; then
@@ -494,16 +495,16 @@ if [ -d /run/archiso ]; then
             xero_confirm=""
         fi
         if [ "$xero_confirm" = "YES" ]; then
-            if curl -fsSL https://urls.xerolinux.xyz/xeroinstall -o /tmp/xero-install.sh; then
+            if curl -fsSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/xero/xero-install.sh -o /tmp/xero-install.sh; then
                 bash /tmp/xero-install.sh < /dev/tty \
-                    || warn "XeroLinux installer exited early — continuing with simpbar setup"
+                    || warn "Base installer exited early — continuing with simpbar setup"
                 rm -f /tmp/xero-install.sh
                 ok "Continuing with simpbar setup"
             else
-                warn "Could not download the XeroLinux installer — continuing with simpbar setup"
+                warn "Could not download the base installer — continuing with simpbar setup"
             fi
         else
-            ok "Skipping XeroLinux provisioning"
+            ok "Skipping base-system provisioning"
         fi
         unset xero_confirm
     fi

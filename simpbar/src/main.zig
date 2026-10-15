@@ -2090,7 +2090,8 @@ const Appearance = struct {
     bezel_effect: []const u8,
     /// Bar background mode: "none" (default) is the plain bg_color fill;
     /// "cava" washes the equalizer across the whole background (uses the
-    /// Audio Visualizer color); "matrix" rains glyph streams (matrix_color).
+    /// Audio Visualizer color); "matrix" rains glyph streams (matrix_color);
+    /// "lava" floats metaball blobs upward (lava_color).
     /// Unrecognized values fall back to "none".
     bg_mode: []const u8,
     /// How strongly the cava background wash tints (0-100): 0 = invisible,
@@ -2104,6 +2105,14 @@ const Appearance = struct {
     cava_style: []const u8,
     /// Glyph-stream color for the "matrix" background mode.
     matrix_color: u32,
+    /// Lava-lamp accent (mid orange) for the "lava" background mode; deep
+    /// rim and hot core derive from it, so one knob themes the whole lamp.
+    lava_color: u32,
+    /// Lava tempo multiplier base: rise/sway speed = this / 3 (1-6, so 3
+    /// is the designed pace, 6 double-time). Mirrors matrix_speed's shape.
+    lava_speed: u32,
+    /// Lava blob radius percent (50-200, 100 = designed size).
+    lava_size: u8,
     /// Matrix fall speed, pixels per 60ms tick (1-6).
     matrix_speed: u32,
     /// Media progress display: "underline" (default) draws the accent dash
@@ -2246,6 +2255,9 @@ fn defaultConfig() Config {
             .cava_style = CAVA_STYLE_BARS,
             .matrix_color = 0xFF00FF41, // classic phosphor green
             .matrix_speed = 2,
+            .lava_color = 0xFFFF6A2A, // lava-lamp mid orange
+            .lava_speed = 3,
+            .lava_size = 100,
             .mpris_progress_style = MPRIS_PROGRESS_UNDERLINE,
             .volume_sink = "",
             .module_pill_opacity = 100,
@@ -2408,6 +2420,9 @@ const JsonAppearance = struct {
     cava_style: []const u8 = "bars",
     matrix_color: []const u8 = "#00FF41",
     matrix_speed: u32 = 2,
+    lava_color: []const u8 = "#FF6A2A",
+    lava_speed: u32 = 3,
+    lava_size: u8 = 100,
     mpris_progress_style: []const u8 = "underline",
     volume_sink: []const u8 = "",
     module_pill_opacity: u8 = 100,
@@ -2604,11 +2619,14 @@ fn parseAppearance(j: JsonAppearance) ?Appearance {
         .cava_color = parseHexColor(j.cava_color) catch return null,
         .module_bg_color = parseHexColor(j.module_bg_color) catch return null,
         .bezel_color = parseHexColor(j.bezel_color) catch return null,
-        .bg_mode = if (std.mem.eql(u8, j.bg_mode, BG_MODE_CAVA)) BG_MODE_CAVA else if (std.mem.eql(u8, j.bg_mode, BG_MODE_MATRIX)) BG_MODE_MATRIX else BG_MODE_NONE,
+        .bg_mode = if (std.mem.eql(u8, j.bg_mode, BG_MODE_CAVA)) BG_MODE_CAVA else if (std.mem.eql(u8, j.bg_mode, BG_MODE_MATRIX)) BG_MODE_MATRIX else if (std.mem.eql(u8, j.bg_mode, BG_MODE_LAVA)) BG_MODE_LAVA else BG_MODE_NONE,
         .cava_bg_strength = @min(j.cava_bg_strength, 100),
         .cava_style = cavaStyleOrDefault(j.cava_style),
         .matrix_color = parseHexColor(j.matrix_color) catch return null,
         .matrix_speed = std.math.clamp(j.matrix_speed, 1, 6),
+        .lava_color = parseHexColor(j.lava_color) catch return null,
+        .lava_speed = std.math.clamp(j.lava_speed, 1, 6),
+        .lava_size = @min(j.lava_size, 200),
         .mpris_progress_style = if (std.mem.eql(u8, j.mpris_progress_style, MPRIS_PROGRESS_BAR)) MPRIS_PROGRESS_BAR else MPRIS_PROGRESS_UNDERLINE,
         .volume_sink = j.volume_sink,
         .module_pill_opacity = @min(j.module_pill_opacity, 100),
@@ -7994,10 +8012,12 @@ const BEZEL_EFFECT_SOLID = "solid";
 /// Bar background modes (appearance.bg_mode values): what paints behind
 /// the modules — "none" (default) is today's plain bg_color fill, "cava"
 /// washes the cava equalizer across the whole background, "matrix" rains
-/// cmatrix-style glyph streams. Unrecognized values fall back to "none".
+/// cmatrix-style glyph streams, "lava" floats metaball blobs upward.
+/// Unrecognized values fall back to "none".
 const BG_MODE_NONE = "none";
 const BG_MODE_CAVA = "cava";
 const BG_MODE_MATRIX = "matrix";
+const BG_MODE_LAVA = "lava";
 
 /// Cava background shapes (appearance.cava_style values): "bars" rises
 /// each column from the bottom edge, "wave" mirrors around the vertical
@@ -8451,6 +8471,7 @@ fn bgEffectVisible() bool {
         return cava_state.has_data and current_config.appearance.cava_bg_strength > 0;
     }
     if (std.mem.eql(u8, mode, BG_MODE_MATRIX)) return true;
+    if (std.mem.eql(u8, mode, BG_MODE_LAVA)) return true;
     return false;
 }
 
@@ -8689,6 +8710,106 @@ fn paintBackgroundEffect(bar: *Bar, pixels: [*]u32, buf_width: u32, buf_height: 
         drawCavaBackground(pixels, buf_width, buf_height, x0, x1, y0, y1, radius);
     } else if (std.mem.eql(u8, mode, BG_MODE_MATRIX)) {
         drawMatrixBackground(bar, pixels, buf_width, buf_height, x0, x1, y0, y1, radius);
+    } else if (std.mem.eql(u8, mode, BG_MODE_LAVA)) {
+        drawLavaBackground(pixels, buf_width, buf_height, x0, x1, y0, y1, radius);
+    }
+}
+
+/// One lava-lamp blob: center + radius, all driven statelessly by the
+/// frame counter (same clock as the bezel breath), so the motion is
+/// deterministic and testable.
+const LavaBlob = struct { x: f32, y: f32, r: f32 };
+
+const LAVA_BLOBS: usize = 8;
+
+/// Blob i at `frame` over a region w×rh: slow rise with sinusoidal sway,
+/// shrinking toward the extremes so blobs appear to merge/split at the
+/// top and bottom like the real lamp. `tempo` scales the rise/sway rate
+/// (1.0 = designed pace), `girth` the radius. Pure for tests.
+fn lavaBlob(i: usize, frame: i64, w: f32, rh: f32, tempo: f32, girth: f32) LavaBlob {
+    const speed = (0.005 + 0.011 * fxHash01(@as(i64, @intCast(i)) * 8 + 1)) * tempo;
+    const t = @mod(@as(f32, @floatFromInt(frame)) * speed + fxHash01(@as(i64, @intCast(i)) * 8 + 2), 1.0);
+    const sway_ph = fxHash01(@as(i64, @intCast(i)) * 8 + 5) * 6.28;
+    const sway_sp = 0.015 * (0.5 + fxHash01(@as(i64, @intCast(i)) * 8 + 4)) * tempo;
+    const x = w * (0.08 + 0.84 * fxHash01(@as(i64, @intCast(i)) * 8 + 3)) + @sin(@as(f32, @floatFromInt(frame)) * sway_sp + sway_ph) * w * 0.04;
+    const y = rh + 4.0 - t * (rh + 8.0);
+    const shrink = 0.55 + 0.45 * @sqrt(@max(0.0, @sin(std.math.pi * t)));
+    const r = rh * (0.30 + 0.16 * fxHash01(@as(i64, @intCast(i)) * 8 + 6)) * shrink * girth;
+    return .{ .x = x, .y = y, .r = r };
+}
+
+/// Metaball field at (x, y): summed soft falloffs, so neighbors merge
+/// into goo instead of drawing as separate dots. Pure for tests.
+fn lavaField(x: f32, y: f32, blobs: []const LavaBlob) f32 {
+    var s: f32 = 0.0;
+    for (blobs) |b| {
+        const dx = x - b.x;
+        const dy = y - b.y;
+        const r2 = b.r * b.r;
+        s += r2 / (dx * dx + dy * dy + r2);
+    }
+    return s;
+}
+
+/// Lava color for field strength `s` around `mid` (the lava_color accent):
+/// dim rim → full body → hot yellow-white core where blobs overlap. Pure
+/// for tests.
+fn lavaColorFor(s: f32, mid: u32) u32 {
+    const mr: f32 = @floatFromInt((mid >> 16) & 0xFF);
+    const mg: f32 = @floatFromInt((mid >> 8) & 0xFF);
+    const mb: f32 = @floatFromInt(mid & 0xFF);
+    const shade = struct {
+        fn f(fac: f32, c: f32) u32 {
+            return @intFromFloat(@min(255.0, c * fac));
+        }
+    }.f;
+    if (s < 1.2) {
+        const f = @max(0.05, 0.35 + 0.4 * ((s - 0.8) / 0.4));
+        return (@as(u32, 0xFF) << 24) | (shade(f, mr) << 16) | (shade(f, mg) << 8) | shade(f, mb);
+    }
+    if (s < 2.0) {
+        const f = @min(1.0, 0.75 + 0.35 * ((s - 1.2) / 0.8));
+        return (@as(u32, 0xFF) << 24) | (shade(f, mr) << 16) | (shade(f, mg) << 8) | shade(f, mb);
+    }
+    const t = @min(1.0, (s - 2.0) / 1.0) * 0.9;
+    const hr: u32 = @intFromFloat(mr + (255.0 - mr) * t);
+    const hg: u32 = @intFromFloat(mg + (240.0 - mg) * t);
+    const hb: u32 = @intFromFloat(mb + (192.0 - mb) * t);
+    return (@as(u32, 0xFF) << 24) | (hr << 16) | (hg << 8) | hb;
+}
+
+/// Washes the lava lamp across the background rect [x0,x1)×[y0,y1) with
+/// corner `radius`: gooey metaballs rising through the region, tinted from
+/// lava_color (rim → body → hot core). Same bg_alpha as the flat fill, so
+/// bg_opacity fades wash and body alike.
+fn drawLavaBackground(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, x1: i64, y0: i64, y1: i64, radius: i64) void {
+    _ = buf_height;
+    const w = x1 - x0;
+    if (w <= 0) return;
+    const rh = y1 - y0;
+    if (rh <= 0) return;
+    const fw: f32 = @floatFromInt(w);
+    const frh: f32 = @floatFromInt(rh);
+    var blobs: [LAVA_BLOBS]LavaBlob = undefined;
+    const tempo: f32 = @as(f32, @floatFromInt(current_config.appearance.lava_speed)) / 3.0;
+    const girth: f32 = @as(f32, @floatFromInt(current_config.appearance.lava_size)) / 100.0;
+    for (0..LAVA_BLOBS) |i| blobs[i] = lavaBlob(i, hover_frame, fw, frh, tempo, girth);
+    const mid = current_config.appearance.lava_color & 0x00FFFFFF;
+    const bg_a: u32 = (@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100) << 24;
+    const X0 = 2 * x0;
+    const X1 = 2 * x1;
+    const Y0 = 2 * y0;
+    const Y1 = 2 * y1;
+    const R = 2 * radius;
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        var x = x0;
+        while (x < x1) : (x += 1) {
+            const s = lavaField(@as(f32, @floatFromInt(x - x0)), @as(f32, @floatFromInt(y - y0)), &blobs);
+            if (s <= 0.8) continue;
+            if (radius > 0 and !inRoundedRect2(2 * x + 1, 2 * y + 1, X0, Y0, X1, Y1, R)) continue;
+            pixels[@as(usize, @intCast(y)) * buf_width + @as(usize, @intCast(x))] = bg_a | lavaColorFor(s, mid);
+        }
     }
 }
 
@@ -10751,6 +10872,36 @@ test "cava curve interpolates" {
     // Past the ends it clamps instead of ringing.
     try t.expectApproxEqAbs(@as(f32, 0.25), cavaCurveFrac(0, 400), 1e-6);
     try t.expectApproxEqAbs(@as(f32, 1.0), cavaCurveFrac(399, 400), 1e-6);
+}
+
+test "lava lamp field and color" {
+    const t = std.testing;
+    // One blob dead-center reads ~1.0; far away reads ~0; neighbors add.
+    const one = [_]LavaBlob{.{ .x = 10.0, .y = 10.0, .r = 8.0 }};
+    try t.expectApproxEqAbs(@as(f32, 1.0), lavaField(10.0, 10.0, &one), 1e-5);
+    try t.expect(lavaField(200.0, 10.0, &one) < 0.05);
+    const two = [_]LavaBlob{ .{ .x = 10.0, .y = 10.0, .r = 8.0 }, .{ .x = 10.0, .y = 10.0, .r = 8.0 } };
+    try t.expectApproxEqAbs(@as(f32, 2.0), lavaField(10.0, 10.0, &two), 1e-5);
+    // Blobs are deterministic per frame and live inside the region.
+    const b0 = lavaBlob(0, 100, 600.0, 36.0, 1.0, 1.0);
+    const b0_again = lavaBlob(0, 100, 600.0, 36.0, 1.0, 1.0);
+    try t.expectEqual(b0.x, b0_again.x);
+    try t.expect(b0.r > 0.0);
+    const b1 = lavaBlob(1, 100, 600.0, 36.0, 1.0, 1.0);
+    try t.expect(b0.x != b1.x or b0.y != b1.y);
+    // Tempo moves blobs along their path; girth scales the radius.
+    const fast = lavaBlob(0, 100, 600.0, 36.0, 2.0, 1.0);
+    try t.expect(fast.y != b0.y);
+    const fat = lavaBlob(0, 100, 600.0, 36.0, 1.0, 2.0);
+    try t.expectApproxEqAbs(b0.r * 2.0, fat.r, 1e-4);
+    // Color ramp climbs rim → body → core (each channel non-decreasing).
+    const mid: u32 = 0xFFFF6A2A;
+    const rim = lavaColorFor(1.0, mid);
+    const body = lavaColorFor(1.8, mid);
+    const core = lavaColorFor(3.0, mid);
+    try t.expect((rim >> 16) & 0xFF <= (body >> 16) & 0xFF);
+    try t.expect((body >> 16) & 0xFF <= (core >> 16) & 0xFF);
+    try t.expect((core >> 16) & 0xFF >= 0xF0 and (core >> 8) & 0xFF >= 0xC0);
 }
 
 test "distro glyph tables" {

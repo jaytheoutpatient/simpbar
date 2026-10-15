@@ -219,6 +219,11 @@ const JsonAppearance = struct {
     cava_style: []const u8 = "bars",
     // Matrix fall speed. Matches main.zig exactly.
     matrix_speed: u32 = 2,
+    // Lava-lamp accent. Matches main.zig exactly.
+    lava_color: []const u8 = "#FF6A2A",
+    // Lava tempo 1-6 and blob size percent. Match main.zig exactly.
+    lava_speed: u32 = 3,
+    lava_size: u8 = 100,
     // "underline" (default) or "bar" — the media progress display.
     // Matches main.zig's JsonAppearance.mpris_progress_style exactly.
     mpris_progress_style: []const u8 = "underline",
@@ -482,7 +487,7 @@ fn rgbaToHex(c: gtk.GdkRGBA, buf: []u8) []const u8 {
 // Live in-memory config state
 // ---------------------------------------------------------------------
 
-const ColorField = enum { bg, text, border, hover, module_bg, cava, ws_active, ws_inactive, popup_bg, popup_hover, popup_separator, popup_disabled, bezel, matrix };
+const ColorField = enum { bg, text, border, hover, module_bg, cava, ws_active, ws_inactive, popup_bg, popup_hover, popup_separator, popup_disabled, bezel, matrix, lava };
 
 const ColorSpec = struct {
     field: ColorField,
@@ -508,6 +513,7 @@ const COLOR_SPECS = [_]ColorSpec{
     .{ .field = .popup_disabled, .default_hex = "#707070", .title = "Popup Disabled Text", .group = .popup },
     .{ .field = .bezel, .default_hex = "#DCDCDC", .title = "Bezel Color", .group = .bar },
     .{ .field = .matrix, .default_hex = "#00FF41", .title = "Matrix Rain", .group = .bar },
+    .{ .field = .lava, .default_hex = "#FF6A2A", .title = "Lava Lamp", .group = .bar },
 };
 
 var live_color_values: [COLOR_SPECS.len]gtk.GdkRGBA = undefined;
@@ -559,6 +565,9 @@ var live_bezel_effect: []const u8 = "rotating";
 var live_bg_mode: []const u8 = "none";
 // Cava background wash strength 0-100.
 var live_cava_bg_strength: u8 = 35;
+// Lava tempo 1-6 (3 = designed pace) and blob size percent.
+var live_lava_speed: u32 = 3;
+var live_lava_size: u8 = 100;
 // Cava background shape, one of CAVA_STYLE_CHOICES below (static literals).
 var live_cava_style: []const u8 = "bars";
 // Matrix fall speed, pixels per tick.
@@ -920,6 +929,7 @@ fn loadConfigFromDisk() void {
         j.popup_bg_color,              j.popup_hover_color,
         j.popup_separator_color,       j.popup_disabled_color,
         j.bezel_color,                 j.matrix_color,
+        j.lava_color,
     };
     for (hexes, 0..) |hex, i| {
         live_color_values[i] = hexToRgba(hex) orelse hexToRgba(COLOR_SPECS[i].default_hex).?;
@@ -943,8 +953,10 @@ fn loadConfigFromDisk() void {
     live_animations_enabled = j.animations_enabled;
     live_bezel_style = if (std.mem.eql(u8, j.bezel_style, "rainbow-puke")) "rainbow-puke" else if (std.mem.eql(u8, j.bezel_style, "solid")) "solid" else "matugen";
     live_bezel_effect = if (std.mem.eql(u8, j.bezel_effect, "breathing")) "breathing" else if (std.mem.eql(u8, j.bezel_effect, "solid")) "solid" else "rotating";
-    live_bg_mode = if (std.mem.eql(u8, j.bg_mode, "cava")) "cava" else if (std.mem.eql(u8, j.bg_mode, "matrix")) "matrix" else "none";
+    live_bg_mode = if (std.mem.eql(u8, j.bg_mode, "cava")) "cava" else if (std.mem.eql(u8, j.bg_mode, "matrix")) "matrix" else if (std.mem.eql(u8, j.bg_mode, "lava")) "lava" else "none";
     live_cava_bg_strength = @min(j.cava_bg_strength, 100);
+    live_lava_speed = std.math.clamp(j.lava_speed, 1, 6);
+    live_lava_size = @min(j.lava_size, 200);
     live_cava_style = if (std.mem.eql(u8, j.cava_style, "wave")) "wave" else if (std.mem.eql(u8, j.cava_style, "curve")) "curve" else "bars";
     live_matrix_speed = std.math.clamp(j.matrix_speed, 1, 6);
     live_mpris_progress_style = if (std.mem.eql(u8, j.mpris_progress_style, "bar")) "bar" else "underline";
@@ -1117,6 +1129,7 @@ fn buildConfigJson() ![]u8 {
             .popup_disabled => "popup_disabled_color",
             .bezel => "bezel_color",
             .matrix => "matrix_color",
+            .lava => "lava_color",
         };
         try appendJsonString(&list, key);
         try list.append(gpa, ':');
@@ -1169,6 +1182,10 @@ fn buildConfigJson() ![]u8 {
     try appendJsonString(&list, live_cava_style);
     try list.appendSlice(gpa, ",\"matrix_speed\":");
     try appendJsonInt(&list, u32, live_matrix_speed);
+    try list.appendSlice(gpa, ",\"lava_speed\":");
+    try appendJsonInt(&list, u32, live_lava_speed);
+    try list.appendSlice(gpa, ",\"lava_size\":");
+    try appendJsonInt(&list, u8, live_lava_size);
     try list.appendSlice(gpa, ",\"mpris_progress_style\":");
     try appendJsonString(&list, live_mpris_progress_style);
     try list.appendSlice(gpa, ",\"volume_sink\":");
@@ -1575,8 +1592,8 @@ const BEZEL_EFFECT_CHOICES = [_][]const u8{ "rotating", "breathing", "solid" };
 
 // Background mode choices (values must stay byte-for-byte in sync with
 // main.zig's BG_MODE_* — they are written straight into config.json).
-const BG_MODE_CHOICES = [_][]const u8{ "none", "cava", "matrix" };
-const BG_MODE_LABELS = [_][*:0]const u8{ "None", "Cava", "Matrix" };
+const BG_MODE_CHOICES = [_][]const u8{ "none", "cava", "matrix", "lava" };
+const BG_MODE_LABELS = [_][*:0]const u8{ "None", "Cava", "Matrix", "Lava Lamp" };
 
 /// Picks the bar background mode (appearance.bg_mode). Applies on the next
 /// SIGUSR1 reload like every other config.json change.
@@ -1590,7 +1607,7 @@ fn onBgModeChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) ca
 fn buildBgModeRow(group: *gtk.AdwPreferencesGroup) void {
     const row = gtk.adw_combo_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(row), "Background effect");
-    gtk.adw_action_row_set_subtitle(@ptrCast(row), "Animated backdrop behind the modules. Cava follows the music; Matrix rains on its own.");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "Animated backdrop behind the modules. Cava follows the music, Matrix rains on its own, Lava Lamp floats goo upward.");
 
     var buf: [BG_MODE_LABELS.len + 1]?[*:0]const u8 = undefined;
     for (BG_MODE_LABELS, 0..) |label, i| buf[i] = label;
@@ -1650,6 +1667,18 @@ fn buildCavaStyleRow(group: *gtk.AdwPreferencesGroup) void {
 /// Sets the matrix fall speed (appearance.matrix_speed).
 fn onMatrixSpeedChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c) void {
     live_matrix_speed = @as(u32, @intCast(gtk.gtk_spin_button_get_value_as_int(spin)));
+    saveAndSignal();
+}
+
+/// Sets the lava tempo (appearance.lava_speed, 1-6).
+fn onLavaSpeedChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c) void {
+    live_lava_speed = @as(u32, @intCast(gtk.gtk_spin_button_get_value_as_int(spin)));
+    saveAndSignal();
+}
+
+/// Sets the lava blob size (appearance.lava_size percent).
+fn onLavaSizeChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c) void {
+    live_lava_size = @intCast(@min(gtk.gtk_spin_button_get_value_as_int(spin), 200));
     saveAndSignal();
 }
 
@@ -2502,6 +2531,8 @@ fn buildAppearancePage() *gtk.GtkBox {
     buildBgModeRow(background_group);
     buildCavaStyleRow(background_group);
     addSpinRow(background_group, "Cava Strength (%)", 0, 100, @floatFromInt(live_cava_bg_strength), @ptrCast(&onCavaBgStrengthChanged));
+    addSpinRow(background_group, "Lava Speed", 1, 6, @floatFromInt(live_lava_speed), @ptrCast(&onLavaSpeedChanged));
+    addSpinRow(background_group, "Lava Size (%)", 50, 200, @floatFromInt(live_lava_size), @ptrCast(&onLavaSizeChanged));
     addSpinRow(background_group, "Matrix Speed", 1, 6, @floatFromInt(live_matrix_speed), @ptrCast(&onMatrixSpeedChanged));
     gtk.gtk_box_append(outer, @ptrCast(background_group));
 
