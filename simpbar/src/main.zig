@@ -47,6 +47,9 @@ const MODULE_GAP: i64 = 12;
 
 // Spacing for the custom/* launcher buttons and custom/power.
 const LAUNCHER_GAP: i64 = 16;
+/// Gap between system tray icons (and before the first one) — tighter than
+/// LAUNCHER_GAP so the tray reads as one cluster, in or out of the island.
+const TRAY_ICON_GAP: i64 = 8;
 const RIGHT_MARGIN: i64 = 8;
 
 /// Minimum on-screen width reserved for a single module, so every module gets
@@ -303,6 +306,272 @@ fn invalidateLauncherIcons() void {
     for (0..launcher_icons.len) |i| launcher_icons[i].resolved = false;
 }
 
+/// Installed-application icon index: lowercase lookup key (executable
+/// basename or StartupWMClass) → icon name as the .desktop file spells it
+/// (case preserved — theme filenames are case-sensitive). Built once at
+/// startup from enumerateInstalledApps; first source wins, so user
+/// overrides in ~/.local/share/applications beat system files, matching
+/// the app drawer's own listing order.
+const MAX_DESKTOP_IDX: usize = 384;
+const DesktopIdxEntry = struct {
+    key_buf: [64]u8 = undefined,
+    key_len: usize = 0,
+    icon_buf: [64]u8 = undefined,
+    icon_len: usize = 0,
+};
+var desktop_idx: [MAX_DESKTOP_IDX]DesktopIdxEntry = undefined;
+var desktop_idx_len: usize = 0;
+
+fn desktopIndexAdd(key: []const u8, icon: []const u8) void {
+    if (key.len == 0 or icon.len == 0 or desktop_idx_len >= desktop_idx.len) return;
+    for (desktop_idx[0..desktop_idx_len]) |*e| {
+        if (std.mem.eql(u8, e.key_buf[0..e.key_len], key)) return; // first wins
+    }
+    var e = &desktop_idx[desktop_idx_len];
+    e.key_len = lowerCopy(&e.key_buf, key);
+    const il = @min(e.icon_buf.len, icon.len);
+    @memcpy(e.icon_buf[0..il], icon[0..il]);
+    e.icon_len = il;
+    desktop_idx_len += 1;
+}
+
+/// Already-lowercased key → icon name, or null. Pure lookup over the
+/// startup-built index (tests populate it directly).
+fn desktopIndexLookup(key_norm: []const u8) ?[]const u8 {
+    for (desktop_idx[0..desktop_idx_len]) |*e| {
+        if (std.mem.eql(u8, e.key_buf[0..e.key_len], key_norm)) return e.icon_buf[0..e.icon_len];
+    }
+    return null;
+}
+
+/// Deep variant: the full key, then each of its '.'-separated components
+/// ("com.spotify.client" → the desktop entry keyed "spotify"). Skips
+/// registry-ish components (com/org/io/net/app) and stubs — those only
+/// ever false-positive. What makes wrapped flatpak ids resolve to the
+/// sandox's real icon instead of a label.
+fn desktopIndexLookupDeep(key_norm: []const u8) ?[]const u8 {
+    if (desktopIndexLookup(key_norm)) |icon| return icon;
+    var parts = std.mem.splitScalar(u8, key_norm, '.');
+    while (parts.next()) |part| {
+        if (part.len <= 2) continue;
+        if (std.mem.eql(u8, part, "com") or std.mem.eql(u8, part, "org") or std.mem.eql(u8, part, "net") or std.mem.eql(u8, part, "app")) continue;
+        if (desktopIndexLookup(part)) |icon| return icon;
+    }
+    return null;
+}
+
+fn buildDesktopIndex() void {
+    desktop_idx_len = 0;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var list: std.ArrayList(desktop_entries.DesktopEntry) = .empty;
+    desktop_entries.enumerateInstalledApps(arena.allocator(), &list) catch return;
+    for (list.items) |app| {
+        if (app.icon.len == 0) continue;
+        // Executable basename: "Exec=/usr/lib/fluxer/fluxer %U" → "fluxer".
+        var first = app.exec;
+        if (std.mem.indexOfScalar(u8, first, ' ')) |sp| first = first[0..sp];
+        if (std.mem.lastIndexOfScalar(u8, first, '/')) |sl| first = first[sl + 1 ..];
+        var kbuf: [64]u8 = undefined;
+        const kl = lowerCopy(&kbuf, first);
+        desktopIndexAdd(kbuf[0..kl], app.icon);
+        if (app.wm_class.len > 0) {
+            const wml = lowerCopy(&kbuf, app.wm_class);
+            desktopIndexAdd(kbuf[0..wml], app.icon);
+        }
+        // File stem: the stable key for sandboxed apps whose Exec is a
+        // flatpak wrapper and which set no WMClass.
+        if (app.id.len > 0) {
+            var sbuf: [64]u8 = undefined;
+            const sl = lowerCopy(&sbuf, app.id);
+            desktopIndexAdd(sbuf[0..sl], app.icon);
+        }
+    }
+}
+
+/// True when `binary` resolves in PATH (the probe loops in the
+/// simpbar-launch-* wrappers use `command -v`, this is the same check).
+fn binaryOnPath(binary: []const u8) bool {
+    const path_env = getenv("PATH") orelse return false;
+    var it = std.mem.splitScalar(u8, std.mem.sliceTo(path_env, 0), ':');
+    var cbuf: [256]u8 = undefined;
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const full = std.fmt.bufPrintZ(&cbuf, "{s}/{s}", .{ dir, binary }) catch continue;
+        if (access(full.ptr, 1) == 0) return true; // X_OK
+    }
+    return false;
+}
+
+/// Reads ~/.config/simpbar/<file> (the Welcome app's browser/discord
+/// choice) into `buf`, trimmed — "" when unset/unreadable.
+fn readChoiceBinary(file: []const u8, buf: []u8) []const u8 {
+    const home = getenv("HOME") orelse return "";
+    var pbuf: [256]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&pbuf, "{s}/.config/simpbar/{s}", .{ std.mem.sliceTo(home, 0), file }) catch return "";
+    const data = readFileAlloc(std.heap.page_allocator, path) catch return "";
+    defer std.heap.page_allocator.free(data);
+    const trimmed = std.mem.trim(u8, data, " \t\r\n");
+    const len = @min(buf.len, trimmed.len);
+    @memcpy(buf[0..len], trimmed[0..len]);
+    return buf[0..len];
+}
+
+/// Wrapper-script binaries in probe order (mirroring install.sh's
+/// simpbar-launch-browser / -discord loops — keep in sync by name).
+const BROWSER_BINS = [_][]const u8{ "brave", "brave-browser", "zen-browser", "zen", "vivaldi-stable", "vivaldi", "microsoft-edge-stable", "microsoft-edge", "librewolf", "firefox", "firefox-esr" };
+const DISCORD_BINS = [_][]const u8{ "vesktop", "equibop", "discord", "fluxer" };
+
+/// Icon name for a wrapper script: the user's chosen binary when set and
+/// installed, else the first probe binary that's either on PATH or has a
+/// resolvable icon (Fluxer lives outside PATH but has a theme icon).
+/// Null when nothing resolves — the pin falls back to its label.
+fn wrapperIconName(candidates: []const []const u8, choice_file: []const u8, out: []u8) ?[]const u8 {
+    var cbuf: [64]u8 = undefined;
+    const choice = readChoiceBinary(choice_file, &cbuf);
+    if (choice.len > 0 and binaryOnPath(choice)) {
+        if (desktopIndexLookup(choice)) |icon| {
+            const l = @min(out.len, icon.len);
+            @memcpy(out[0..l], icon[0..l]);
+            return out[0..l];
+        }
+        const l = @min(out.len, choice.len);
+        @memcpy(out[0..l], choice[0..l]);
+        return out[0..l];
+    }
+    for (candidates) |bin| {
+        if (!binaryOnPath(bin)) {
+            // Not launchable via PATH, but may still be the running app's
+            // icon (Fluxer lives outside PATH yet has a theme icon) —
+            // accept it when an icon resolves.
+            const icon = desktopIndexLookup(bin) orelse bin;
+            var pbuf: [512]u8 = undefined;
+            if (icontheme.resolveIconPath(icon, &pbuf) == null) continue;
+            const l = @min(out.len, icon.len);
+            @memcpy(out[0..l], icon[0..l]);
+            return out[0..l];
+        }
+        var kbuf: [64]u8 = undefined;
+        const kl = lowerCopy(&kbuf, bin);
+        const icon = desktopIndexLookup(kbuf[0..kl]) orelse bin;
+        const l = @min(out.len, icon.len);
+        @memcpy(out[0..l], icon[0..l]);
+        return out[0..l];
+    }
+    return null;
+}
+
+/// Icon name for a pinned command: the explicit config icon wins (handled
+/// by the caller — this is only the DERIVED fallback), the app-drawer pin
+/// has no icon (it wears the distro glyph instead), wrappers probe their
+/// families, and plain binaries go through the desktop index with the
+/// binary name itself as the last resort (decode decides resolvability).
+fn pinIconName(command: []const u8, out: []u8) ?[]const u8 {
+    if (launcherLaunchesAppdrawer(command)) return null;
+    if (std.mem.eql(u8, command, "simpbar-launch-browser")) return wrapperIconName(&BROWSER_BINS, "browser-choice", out);
+    if (std.mem.eql(u8, command, "simpbar-launch-discord")) return wrapperIconName(&DISCORD_BINS, "discord-choice", out);
+    var kbuf: [64]u8 = undefined;
+    const key = launcherMatchKey(command, &kbuf);
+    if (key.len == 0) return null;
+    const icon = desktopIndexLookupDeep(key) orelse key;
+    const l = @min(out.len, icon.len);
+    @memcpy(out[0..l], icon[0..l]);
+    return out[0..l];
+}
+
+/// Resolves an icon NAME to pixels in a 16px cache buffer. False when the
+/// theme has no such icon or decoding fails — callers keep the label
+/// fallback. Shared by pins and the taskbar tail.
+fn decodeIconIntoPixels(icon_name: []const u8, dst: []u32) bool {
+    var path_buf: [512]u8 = undefined;
+    const path_slice = icontheme.resolveIconPath(icon_name, &path_buf) orelse return false;
+    var path_z_buf: [520]u8 = undefined;
+    @memcpy(path_z_buf[0..path_slice.len], path_slice);
+    path_z_buf[path_slice.len] = 0;
+    const decoded = icontheme.decodeIcon(std.heap.page_allocator, path_z_buf[0..path_slice.len :0], LAUNCHER_ICON_SIZE) catch return false;
+    defer std.heap.page_allocator.free(decoded.pixels);
+    icontheme.copyIntoIconBuffer(decoded, dst, LAUNCHER_ICON_SIZE);
+    return true;
+}
+
+/// Running-app (tail) icon cache: appid → 16px pixels, resolved once and
+/// kept (negative results cached too, so a missing icon doesn't retry
+/// theme lookup on every draw). Sized to the tracker cap; eviction is
+/// first-unused-slot — a full cache just means later arrivals keep labels.
+var tail_icons: [MAX_RUNNING_APPS]TailIconCache = [_]TailIconCache{.{}} ** MAX_RUNNING_APPS;
+const TailIconCache = struct {
+    appid_buf: [64]u8 = undefined,
+    appid_len: usize = 0,
+    pixels: [LAUNCHER_ICON_SIZE * LAUNCHER_ICON_SIZE]u32 = [_]u32{0} ** (LAUNCHER_ICON_SIZE * LAUNCHER_ICON_SIZE),
+    has_icon: bool = false,
+    resolved: bool = false,
+};
+
+fn tailIconFind(appid_norm: []const u8) ?*TailIconCache {
+    for (&tail_icons) |*c| {
+        if (c.resolved and c.appid_len == appid_norm.len and std.mem.eql(u8, c.appid_buf[0..c.appid_len], appid_norm)) return c;
+    }
+    return null;
+}
+
+/// Decoded pixels for a running appid, or null (unknown or icon-less —
+/// both draw the label fallback). Never decodes: the tick's
+/// ensureTailIcons owns all resolving so draws never hitch on SVG raster.
+fn tailIconPixels(appid_norm: []const u8) ?[]const u32 {
+    const c = tailIconFind(appid_norm) orelse return null;
+    return if (c.has_icon) &c.pixels else null;
+}
+
+/// Resolves icons for running appids not yet in the cache (bounded per
+/// call so a burst of new windows spreads SVG raster across ticks).
+/// Candidates: desktop index by full appid, then by last DNS component,
+/// then the raw strings as icon names.
+fn ensureTailIcons() void {
+    var budget: usize = 4;
+    for (running_state.apps[0..running_state.len]) |*app| {
+        const id = app.appid();
+        if (id.len == 0 or tailIconFind(id) != null) continue;
+        if (budget == 0) return;
+        budget -= 1;
+        var slot: ?*TailIconCache = null;
+        for (&tail_icons) |*c| {
+            if (!c.resolved) {
+                slot = c;
+                break;
+            }
+        }
+        const s = slot orelse return; // full: late arrivals keep labels
+        s.resolved = true;
+        s.has_icon = false;
+        const al = @min(s.appid_buf.len, id.len);
+        @memcpy(s.appid_buf[0..al], id[0..al]);
+        s.appid_len = al;
+        var short = id;
+        if (std.mem.lastIndexOfScalar(u8, id, '.')) |dot| short = id[dot + 1 ..];
+        const cand = desktopIndexLookupDeep(id) orelse short;
+        if (decodeIconIntoPixels(cand, &s.pixels)) {
+            s.has_icon = true;
+            continue;
+        }
+        // Last resorts, in order: the full appid as a literal icon name,
+        // then each DNS component (a theme may ship "spotify" while the
+        // running id is the full "com.spotify.client").
+        if (!std.mem.eql(u8, cand, id) and decodeIconIntoPixels(id, &s.pixels)) {
+            s.has_icon = true;
+            continue;
+        }
+        var parts = std.mem.splitScalar(u8, id, '.');
+        while (parts.next()) |part| {
+            if (part.len <= 2 or std.mem.eql(u8, part, short)) continue;
+            if (std.mem.eql(u8, part, "com") or std.mem.eql(u8, part, "org") or std.mem.eql(u8, part, "net") or std.mem.eql(u8, part, "app")) continue;
+            if (decodeIconIntoPixels(part, &s.pixels)) {
+                s.has_icon = true;
+                break;
+            }
+        }
+    }
+}
+
 /// Decodes the icon for every not-yet-resolved launcher button into the
 /// inline cache. Each slot is resolved at most once per config load: a null
 /// or unresolvable icon marks the slot resolved-but-without-icon so the
@@ -326,17 +595,12 @@ fn ensureLauncherIcons() void {
             continue;
         }
 
-        const icon = btn.icon orelse continue;
-        if (icon.len == 0) continue;
-        var path_buf: [512]u8 = undefined;
-        const path_slice = icontheme.resolveIconPath(icon, &path_buf) orelse continue;
-        var path_z_buf: [520]u8 = undefined;
-        @memcpy(path_z_buf[0..path_slice.len], path_slice);
-        path_z_buf[path_slice.len] = 0;
-        const decoded = icontheme.decodeIcon(std.heap.page_allocator, path_z_buf[0..path_slice.len :0], LAUNCHER_ICON_SIZE) catch continue;
-        defer std.heap.page_allocator.free(decoded.pixels);
-        icontheme.copyIntoIconBuffer(decoded, &cache.pixels, LAUNCHER_ICON_SIZE);
-        cache.has_icon = true;
+        // Explicit config icon first; otherwise derive one from the desktop
+        // database so pins render icon-only with zero per-pin setup.
+        var nbuf: [64]u8 = undefined;
+        const icon: ?[]const u8 = if (btn.icon) |ex| (if (ex.len > 0) ex else pinIconName(btn.command, &nbuf)) else pinIconName(btn.command, &nbuf);
+        const iname = icon orelse continue;
+        if (decodeIconIntoPixels(iname, &cache.pixels)) cache.has_icon = true;
     }
 }
 
@@ -745,7 +1009,735 @@ const Workspaces = struct {
             logging.err("workspace step ({s}) failed: {}", .{ if (direction > 0) "next" else "prev", err });
         };
     }
+
+    /// Focuses one running client by its `addr` token (see RunningApp):
+    /// Hyprland's `0x...` window address, Mango's decimal client id. Same
+    /// dispatch bridge the overview's activateTile uses, so the bar and the
+    /// overview agree on how a window is raised by construction.
+    fn focusClient(self: *const Workspaces, addr: []const u8, ws_id: i32) void {
+        // Jump to the client's tag/workspace first: raising a window on a
+        // hidden tag without switching leaves the user staring at the old
+        // tag wondering why nothing happened.
+        if (ws_id >= 0) {
+            self.switchTo(ws_id) catch |err| {
+                logging.err("client tag switch ({d}) failed: {}", .{ ws_id, err });
+            };
+        }
+        var cmd_buf: [160]u8 = undefined;
+        const cmd = switch (self.mode) {
+            .hyprland => std.fmt.bufPrint(&cmd_buf, "dispatch hl.dsp.focus({{ window = \"address:{s}\" }})", .{addr}) catch return,
+            .mango => std.fmt.bufPrint(&cmd_buf, "dispatch focusid,{s}", .{addr}) catch return,
+        };
+        self.dispatchCommand(cmd) catch |err| {
+            logging.err("client focus ({s}) failed: {}", .{ addr, err });
+        };
+    }
 };
+
+/// One live window, reduced to what the launcher/taskbar layer needs: who
+/// owns it (`appid_norm`, lowercased at parse time so matching never
+/// allocates) and how to raise it (`addr` — Hyprland's `0x...` address or
+/// Mango's decimal client id, the exact token focusClient expects).
+const RunningApp = struct {
+    addr_buf: [20]u8 = undefined,
+    addr_len: usize = 0,
+    appid_buf: [64]u8 = undefined,
+    appid_len: usize = 0,
+    title_buf: [64]u8 = undefined,
+    title_len: usize = 0,
+    focused: bool = false,
+    /// Tag (Mango) / workspace id (Hyprland) holding the window, -1 when
+    /// unknown — click-to-focus switches there before raising it.
+    ws: i32 = -1,
+
+    fn addr(self: *const RunningApp) []const u8 {
+        return self.addr_buf[0..self.addr_len];
+    }
+    fn appid(self: *const RunningApp) []const u8 {
+        return self.appid_buf[0..self.appid_len];
+    }
+    fn title(self: *const RunningApp) []const u8 {
+        return self.title_buf[0..self.title_len];
+    }
+};
+
+/// Cap on tracked windows (fixed backing array, same spirit as the tray's
+/// bounds — a bar that needs more than 32 live taskbar entries has bigger
+/// layout problems than a dropped tail).
+const MAX_RUNNING_APPS: usize = 32;
+
+/// Live window list behind the pinned-launcher running dots and the
+/// unpinned taskbar buttons. Mirrors Workspaces' shape (mode + socket +
+/// refresh on compositor events, cheap enough to also poll every couple of
+/// seconds since focus-within-a-tag may not move Mango's all-tags stream).
+const RunningApps = struct {
+    gpa: std.mem.Allocator,
+    mode: CompositorMode,
+    sock_path_buf: [108]u8 = undefined,
+    sock_path_len: usize = 0,
+    apps: [MAX_RUNNING_APPS]RunningApp = undefined,
+    len: usize = 0,
+
+    fn empty() RunningApps {
+        return .{ .gpa = std.heap.page_allocator, .mode = .hyprland };
+    }
+
+    fn init(gpa: std.mem.Allocator, mode: CompositorMode, sock_path: []const u8) RunningApps {
+        var self = RunningApps{ .gpa = gpa, .mode = mode, .sock_path_len = @min(sock_path.len, 108) };
+        @memcpy(self.sock_path_buf[0..self.sock_path_len], sock_path[0..self.sock_path_len]);
+        const changed = self.refresh() catch |err| blk: {
+            logging.warn("running apps: initial refresh failed: {}", .{err});
+            break :blk false;
+        };
+        _ = changed;
+        return self;
+    }
+
+    fn sockPath(self: *const RunningApps) []const u8 {
+        return self.sock_path_buf[0..self.sock_path_len];
+    }
+
+    /// Re-reads the client list; on IPC failure the previous list is kept
+    /// (a transient socket hiccup shouldn't blink every running dot out).
+    /// Returns true when the set changed, so the tick can skip redundant
+    /// redraws... (callers redraw on the clock tick anyway; kept for tests).
+    fn refresh(self: *RunningApps) !bool {
+        if (self.sock_path_len == 0) return false;
+        var next: [MAX_RUNNING_APPS]RunningApp = undefined;
+        const n = switch (self.mode) {
+            .hyprland => try self.refreshHyprland(&next),
+            .mango => try self.refreshMango(&next),
+        };
+        if (n == self.len) {
+            var same = true;
+            for (next[0..n], self.apps[0..self.len]) |a, b| {
+                if (!std.mem.eql(u8, a.addr(), b.addr()) or a.focused != b.focused or a.ws != b.ws or !std.mem.eql(u8, a.appid(), b.appid())) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) return false;
+        }
+        @memcpy(self.apps[0..n], next[0..n]);
+        self.len = n;
+        return true;
+    }
+
+    fn refreshHyprland(self: *RunningApps, out: *[MAX_RUNNING_APPS]RunningApp) !usize {
+        const clients_json = try hyprctlRequest(self.gpa, self.sockPath(), "j/clients");
+        defer self.gpa.free(clients_json);
+        // Focused address from the active window (clients themselves carry
+        // no focused flag — same two-request shape as refreshHyprland's
+        // workspaces/activeworkspace pair).
+        var focused_addr: []const u8 = "";
+        if (hyprctlRequest(self.gpa, self.sockPath(), "j/activewindow")) |active_json| {
+            defer self.gpa.free(active_json);
+            if (extractJsonString(active_json, "\"address\"")) |a| focused_addr = a;
+        } else |_| {}
+        var n: usize = 0;
+        var objs = topLevelObjects(clients_json);
+        while (objs.next()) |obj| {
+            if (n >= out.len) break;
+            const class = extractJsonString(obj, "\"class\"") orelse continue;
+            const address = extractJsonString(obj, "\"address\"") orelse continue;
+            const title = extractJsonString(obj, "\"title\"") orelse "";
+            var app = RunningApp{};
+            const al = @min(address.len, app.addr_buf.len);
+            @memcpy(app.addr_buf[0..al], address[0..al]);
+            app.addr_len = al;
+            app.appid_len = lowerCopy(&app.appid_buf, class);
+            app.title_len = lowerCopy(&app.title_buf, title);
+            app.focused = focused_addr.len > 0 and std.mem.eql(u8, address, focused_addr);
+            app.ws = extractWorkspaceId(obj) orelse -1;
+            out[n] = app;
+            n += 1;
+        }
+        return n;
+    }
+
+    fn refreshMango(self: *RunningApps, out: *[MAX_RUNNING_APPS]RunningApp) !usize {
+        const clients_json = try mangoRequest(self.gpa, self.sockPath(), "get all-clients");
+        defer self.gpa.free(clients_json);
+        var n: usize = 0;
+        var objs = topLevelObjects(clients_json);
+        while (objs.next()) |obj| {
+            if (n >= out.len) break;
+            const appid = extractJsonString(obj, "\"appid\"") orelse continue;
+            if (appid.len == 0) continue;
+            var app = RunningApp{};
+            if (extractJsonInt(obj, "\"id\"")) |id| {
+                var id_buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch continue;
+                @memcpy(app.addr_buf[0..s.len], s);
+                app.addr_len = s.len;
+            } else continue;
+            app.appid_len = lowerCopy(&app.appid_buf, appid);
+            if (extractJsonString(obj, "\"title\"")) |t| app.title_len = lowerCopy(&app.title_buf, t);
+            app.focused = std.mem.indexOf(u8, obj, "\"is_focused\":true") != null;
+            // First tag owns the window for jump-to purposes (multi-tagged
+            // windows are rare; the overview treats tags the same way).
+            app.ws = extractFirstTagId(obj) orelse -1;
+            out[n] = app;
+            n += 1;
+        }
+        return n;
+    }
+};
+
+/// Lowercases `src` into `dst`, returning the bytes written (truncated at
+/// `dst.len` — appids/titles longer than the taskbar's fixed fields lose
+/// their tail, which only costs a match in pathological cases).
+fn lowerCopy(dst: []u8, src: []const u8) usize {
+    const n = @min(dst.len, src.len);
+    for (src[0..n], 0..) |c, i| dst[i] = std.ascii.toLower(c);
+    return n;
+}
+
+/// Splits a top-level JSON array (`[...]`), bare or behind a wrapper object
+/// (`{"clients":[...]}`), into its `{...}` element objects. Only `[`/`]
+/// move the depth counter; the element scan itself is brace-balanced and
+/// string-aware, so nested objects (Hyprland's per-client `"workspace"`),
+/// arrays (Mango's `"tags"`), and braces/quotes inside titles can't end an
+/// element early.
+const TopLevelObjects = struct {
+    text: []const u8,
+    pos: usize,
+    /// Array depth at `pos` — kept across next() calls, since the opening
+    /// `[` is only scanned once (before the first element).
+    arr_depth: usize = 0,
+
+    fn next(self: *TopLevelObjects) ?[]const u8 {
+        var i = self.pos;
+        var in_str = false;
+        var esc = false;
+        while (i < self.text.len) : (i += 1) {
+            const c = self.text[i];
+            if (in_str) {
+                if (esc) {
+                    esc = false;
+                } else if (c == '\\') {
+                    esc = true;
+                } else if (c == '"') {
+                    in_str = false;
+                }
+                continue;
+            }
+            switch (c) {
+                '"' => in_str = true,
+                '[' => self.arr_depth += 1,
+                ']' => self.arr_depth -|= 1,
+                '{' => {
+                    if (self.arr_depth != 1) continue;
+                    // Element start: scan to its matching close.
+                    const start = i;
+                    var edepth: usize = 1;
+                    var j = i + 1;
+                    var sstr = false;
+                    var sesc = false;
+                    while (j < self.text.len) : (j += 1) {
+                        const d = self.text[j];
+                        if (sstr) {
+                            if (sesc) {
+                                sesc = false;
+                            } else if (d == '\\') {
+                                sesc = true;
+                            } else if (d == '"') {
+                                sstr = false;
+                            }
+                            continue;
+                        }
+                        if (d == '"') {
+                            sstr = true;
+                        } else if (d == '{' or d == '[') {
+                            edepth += 1;
+                        } else if (d == '}' or d == ']') {
+                            edepth -= 1;
+                            if (edepth == 0) {
+                                self.pos = j + 1;
+                                return self.text[start .. j + 1];
+                            }
+                        }
+                    }
+                    return null; // unterminated tail; stop
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+};
+
+fn topLevelObjects(array_json: []const u8) TopLevelObjects {
+    return .{ .text = array_json, .pos = 0 };
+}
+
+/// Reads `"key":"value"` from a flat JSON object substring (no unescaping —
+/// appids/addresses never carry escapes; titles may, and only lose an exact
+/// fallback match when they do). Returns null when the key is absent.
+fn extractJsonString(obj: []const u8, key: []const u8) ?[]const u8 {
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, obj, search, key)) |pos| {
+        var i = pos + key.len;
+        while (i < obj.len and (obj[i] == ' ' or obj[i] == ':')) : (i += 1) {}
+        if (i < obj.len and obj[i] == '"') {
+            const start = i + 1;
+            var j = start;
+            var esc = false;
+            while (j < obj.len) : (j += 1) {
+                const c = obj[j];
+                if (esc) {
+                    esc = false;
+                } else if (c == '\\') {
+                    esc = true;
+                } else if (c == '"') {
+                    return obj[start..j];
+                }
+            }
+            return null;
+        }
+        search = i;
+    }
+    return null;
+}
+
+/// Reads `"key":123` (signed) from a flat JSON object substring.
+fn extractJsonInt(obj: []const u8, key: []const u8) ?i32 {
+    const pos = std.mem.indexOf(u8, obj, key) orelse return null;
+    var i = pos + key.len;
+    while (i < obj.len and (obj[i] == ' ' or obj[i] == ':')) : (i += 1) {}
+    return parseIdAt(obj, i);
+}
+
+/// Reads the first id in Mango's `"tags":[1, ...]` array (the tag a window
+/// is on). Null for missing/empty arrays (sticky or global windows).
+fn extractFirstTagId(obj: []const u8) ?i32 {
+    const pos = std.mem.indexOf(u8, obj, "\"tags\"") orelse return null;
+    const open = std.mem.indexOfPos(u8, obj, pos, "[") orelse return null;
+    return parseIdAt(obj, open + 1);
+}
+
+/// Reads Hyprland's nested `"workspace":{"id":N, ...}` id. Scoped to the
+/// workspace object so a same-named key elsewhere in the client can't win.
+fn extractWorkspaceId(obj: []const u8) ?i32 {
+    const wpos = std.mem.indexOf(u8, obj, "\"workspace\"") orelse return null;
+    const open = std.mem.indexOfPos(u8, obj, wpos, "{") orelse return null;
+    const close = std.mem.indexOfPos(u8, obj, open, "}") orelse obj.len;
+    const seg = obj[open..close];
+    const ipos = std.mem.indexOf(u8, seg, "\"id\"") orelse return null;
+    var i = ipos + "\"id\"".len;
+    while (i < seg.len and (seg[i] == ' ' or seg[i] == ':')) : (i += 1) {}
+    return parseIdAt(seg, i);
+}
+
+/// True when a tail group's app has a resolved icon (read-only lookup —
+/// resolving stays on the tick, so measures and draws never decode).
+fn tailHasIcon(g: *const UnpinnedGroup) bool {
+    if (g.client_idx >= running_state.len) return false;
+    return tailIconPixels(running_state.apps[g.client_idx].appid()) != null;
+}
+
+/// Tail button content width: one icon cell when resolved, label width as
+/// the fallback. Single source for the left measure, left draw, and center
+/// compose passes so the three can never disagree.
+fn tailButtonWidth(font: *font_mod.Font, g: *const UnpinnedGroup) i64 {
+    if (tailHasIcon(g)) return LAUNCHER_ICON_SIZE;
+    return textPixelWidth(font, g.name());
+}
+
+/// Live window list the launcher/taskbar layer reads. Global (like
+/// current_config/launcher_icons/hover_frame) so the half-dozen draw Width
+/// helpers don't all grow a new parameter for one feature's data.
+var running_state: RunningApps = RunningApps.empty();
+
+/// Wrapper-script launchers resolve to several possible appids (the Welcome
+/// app's choice file, else the fallback probe order in install.sh) — match
+/// any of them. Kept next to the scripts' own lists by name so drift is
+/// greppable: BROWSER_APPIDS ↔ simpbar-launch-browser's probe loop.
+const BROWSER_APPIDS = [_][]const u8{ "brave", "brave-browser", "zen", "zen-browser", "vivaldi", "vivaldi-stable", "edge", "microsoft-edge", "librewolf", "firefox", "firefox-esr", "chromium", "google-chrome", "chrome" };
+/// DISCORD_APPIDS ↔ simpbar-launch-discord's probe loop ("fluxer" covers
+/// app.fluxer.FluxerDesktop via substring, same as the other entries).
+const DISCORD_APPIDS = [_][]const u8{ "vesktop", "equibop", "discord", "fluxer" };
+
+/// True when `appid_norm` (already lowercased) names the app `key`
+/// (lowercase): exact hit, reverse-DNS component hit
+/// ("org.gnome.nautilus" ↔ "nautilus"), or substring either way (covers
+/// "zen-browser" ↔ "zen" and wrapper families without enumerating builds).
+fn appidMatchesKey(appid_norm: []const u8, key: []const u8) bool {
+    if (key.len == 0 or appid_norm.len == 0) return false;
+    if (std.mem.eql(u8, appid_norm, key)) return true;
+    var parts = std.mem.splitScalar(u8, appid_norm, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0) continue;
+        if (std.mem.eql(u8, part, key)) return true;
+        if (std.mem.indexOf(u8, part, key) != null) return true;
+        if (std.mem.indexOf(u8, key, part) != null) return true;
+    }
+    // Flat (non-DNS) appids skip the loop above meaningfully only on exact
+    // hits, so give them the same substring chance ("Alacritty" is flat).
+    if (std.mem.indexOfScalar(u8, appid_norm, '.') == null) {
+        if (std.mem.indexOf(u8, appid_norm, key) != null) return true;
+        if (std.mem.indexOf(u8, key, appid_norm) != null) return true;
+    }
+    return false;
+}
+
+/// Command → match key: first shell word's basename, lowercased
+/// ("org.gnome.Nautilus" never appears here — commands are binaries, the
+/// DNS-splitting happens on the appid side). Flatpak/snap wrappers resolve
+/// to the wrapped app id (`flatpak run … com.spotify.Client @@` → the id,
+/// not "flatpak" — otherwise every sandboxed pin matches nothing and
+/// spawns duplicates). Empty when unmatchable.
+fn launcherMatchKey(command: []const u8, buf: []u8) []const u8 {
+    var word = command;
+    if (std.mem.indexOfScalar(u8, word, ' ')) |sp| word = word[0..sp];
+    if (std.mem.lastIndexOfScalar(u8, word, '/')) |sl| word = word[sl + 1 ..];
+    if (std.mem.endsWith(u8, word, ".desktop")) word = word[0 .. word.len - ".desktop".len];
+    if (word.len == 0) return "";
+    if (std.mem.eql(u8, word, "flatpak") or std.mem.eql(u8, word, "snap")) {
+        if (wrappedAppId(command, buf)) |id| return id;
+        // `flatpak update`-style verbs with no app: fall through to the
+        // wrapper name itself (matches nothing, launches fine).
+    }
+    return buf[0..lowerCopy(buf, word)];
+}
+
+/// Pulls the wrapped app id out of a `flatpak run …` / `snap run …`
+/// command: first token past `run` that isn't a flag. Flatpak ids always
+/// carry dots (com.spotify.Client); snap names are bare (spotify), so the
+/// dot rule only applies to flatpak. `=`-bearing tokens (--command=x,
+/// --branch=x) and @@-forwarding placeholders never qualify.
+fn wrappedAppId(command: []const u8, buf: []u8) ?[]const u8 {
+    const is_snap = blk: {
+        var w = command;
+        if (std.mem.indexOfScalar(u8, w, ' ')) |sp| w = w[0..sp];
+        const base = if (std.mem.lastIndexOfScalar(u8, w, '/')) |sl| w[sl + 1 ..] else w;
+        break :blk std.mem.eql(u8, base, "snap");
+    };
+    var toks = std.mem.splitScalar(u8, command, ' ');
+    var past_run = false;
+    while (toks.next()) |tok| {
+        if (!past_run) {
+            if (std.mem.eql(u8, tok, "run")) past_run = true;
+            continue;
+        }
+        if (tok.len == 0 or tok[0] == '-' or std.mem.indexOfScalar(u8, tok, '=') != null) continue;
+        if (!is_snap and std.mem.indexOfScalar(u8, tok, '.') == null) continue;
+        return buf[0..lowerCopy(buf, tok)];
+    }
+    return null;
+}
+
+/// True when the running client (`appid_norm` + `title_norm`, both
+/// lowercased) belongs to `command`'s app. The app-drawer power button and
+/// friends launch panels, not windows, and never match; the two wrapper
+/// scripts match their whole candidate family; everything else matches its
+/// binary name against appid (falling back to window title for odd hosts
+/// like Steam's per-game appids).
+fn clientMatchesLauncher(command: []const u8, appid_norm: []const u8, title_norm: []const u8) bool {
+    if (launcherLaunchesAppdrawer(command)) return false;
+    if (std.mem.eql(u8, command, "simpbar-launch-browser")) {
+        for (BROWSER_APPIDS) |cand| if (appidMatchesKey(appid_norm, cand)) return true;
+        return false;
+    }
+    if (std.mem.eql(u8, command, "simpbar-launch-discord")) {
+        for (DISCORD_APPIDS) |cand| if (appidMatchesKey(appid_norm, cand)) return true;
+        return false;
+    }
+    var kbuf: [64]u8 = undefined;
+    const key = launcherMatchKey(command, &kbuf);
+    if (key.len == 0) return false;
+    if (appidMatchesKey(appid_norm, key)) return true;
+    // Title fallback: "nautilus" also appears in file-manager titles, while
+    // appids stay canonical — weak on purpose (contains only, one way).
+    if (title_norm.len > 0 and std.mem.indexOf(u8, title_norm, key) != null) return true;
+    return false;
+}
+
+/// Aggregate liveness for one pinned launcher: how many of its windows are
+/// up, whether any has focus, and the client index to raise on click (the
+/// focused one when exactly one is focused, else the first — cycling
+/// handled by the click handler).
+const LauncherLive = struct {
+    count: usize = 0,
+    focused: bool = false,
+    client_idx: ?usize = null,
+};
+
+fn launcherLive(command: []const u8) LauncherLive {
+    var live = LauncherLive{};
+    for (running_state.apps[0..running_state.len], 0..) |*app, i| {
+        if (!clientMatchesLauncher(command, app.appid(), app.title())) continue;
+        if (live.count == 0) live.client_idx = i;
+        live.count += 1;
+        if (app.focused) {
+            live.focused = true;
+            live.client_idx = i;
+        }
+    }
+    return live;
+}
+
+/// One unpinned running app group (all windows sharing an appid with no
+/// pin): the taskbar tail after the pinned launchers. Display name is the
+/// last reverse-DNS component ("FluxerDesktop", "Alacritty") so rows stay
+/// short; the focused flag lights the same dot pinned icons wear.
+const MAX_UNPINNED_GROUPS: usize = 16;
+const UnpinnedGroup = struct {
+    name_buf: [24]u8 = undefined,
+    name_len: usize = 0,
+    client_idx: usize = 0,
+    count: usize = 0,
+    focused: bool = false,
+
+    fn name(self: *const UnpinnedGroup) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
+fn collectUnpinned(out: *[MAX_UNPINNED_GROUPS]UnpinnedGroup) usize {
+    var n: usize = 0;
+    for (running_state.apps[0..running_state.len], 0..) |*app, ci| {
+        // Pinned? Belongs to a launcher — not tail material.
+        var pinned = false;
+        for (current_config.launchers) |btn| {
+            if (clientMatchesLauncher(btn.command, app.appid(), app.title())) {
+                pinned = true;
+                break;
+            }
+        }
+        if (pinned) continue;
+        // Group by appid: second window of the same app folds into the row.
+        var found: ?usize = null;
+        for (out[0..n], 0..) |*g, gi| {
+            const other = &running_state.apps[g.client_idx];
+            if (std.mem.eql(u8, app.appid(), other.appid())) {
+                found = gi;
+                break;
+            }
+        }
+        if (found) |gi| {
+            out[gi].count += 1;
+            if (app.focused) {
+                out[gi].focused = true;
+                out[gi].client_idx = ci;
+            }
+            continue;
+        }
+        if (n >= out.len) break;
+        var g = UnpinnedGroup{ .client_idx = ci, .count = 1, .focused = app.focused };
+        const id = app.appid();
+        var short = id;
+        if (std.mem.lastIndexOfScalar(u8, id, '.')) |dot| short = id[dot + 1 ..];
+        if (short.len == 0) short = id;
+        const nl = @min(g.name_buf.len, short.len);
+        @memcpy(g.name_buf[0..nl], short[0..nl]);
+        g.name_len = nl;
+        out[n] = g;
+        n += 1;
+    }
+    return n;
+}
+
+/// Display order of pinned launchers: position → index into
+/// current_config.launchers. Identity outside a drag; a drag permutes it
+/// live for feedback while config.json (and the icon cache, which is also
+/// config-indexed) stay untouched until the drop commits through
+/// simpbar-config --move-launcher. Reset on every config load.
+var launcher_view_order: [MAX_LAUNCHERS]usize = undefined;
+var launcher_view_len: usize = 0;
+
+fn resetLauncherViewOrder() void {
+    const n = @min(current_config.launchers.len, launcher_view_order.len);
+    for (0..n) |i| launcher_view_order[i] = i;
+    launcher_view_len = n;
+}
+
+/// Position of config-index `li` in the current view order, or null (config
+/// changed under us — the reload path resets the order, so this is purely
+/// defensive).
+fn launcherPosition(li: usize) ?usize {
+    for (launcher_view_order[0..launcher_view_len], 0..) |v, p| {
+        if (v == li) return p;
+    }
+    return null;
+}
+
+/// Moves config-index `li` to view position `q` (clamped). True when the
+/// order actually changed (the motion handler only redraws on true). `q`
+/// is in post-removal coordinates — exactly what dropPositionAt counts
+/// (other pins at/left of x) — so no index adjustment is needed.
+fn moveLauncherView(li: usize, q: usize) bool {
+    const p = launcherPosition(li) orelse return false;
+    const t = @min(q, launcher_view_len - 1);
+    if (t == p) return false;
+    var i = p;
+    while (i + 1 < launcher_view_len) : (i += 1) launcher_view_order[i] = launcher_view_order[i + 1];
+    var j = launcher_view_len - 1;
+    while (j > t) : (j -= 1) launcher_view_order[j] = launcher_view_order[j - 1];
+    launcher_view_order[t] = li;
+    return true;
+}
+
+/// Drop target for the dragged launcher at pointer x: how many OTHER pins'
+/// regions sit at/left of x (centers, so gaps split evenly). Regions only —
+/// no layout knowledge — so left and center groups share it.
+fn dropPositionAt(regions: *const ClickRegions, li: usize, x: i32) usize {
+    var count: usize = 0;
+    for (regions.items[0..regions.len]) |*r| {
+        if (r.action != .launcher) continue;
+        if (r.action.launcher == li) continue;
+        if (@divTrunc(r.x_start + r.x_end, 2) <= x) count += 1;
+    }
+    return count;
+}
+
+/// True when the view order still matches config.json (a drop that ended
+/// where it started needs no helper round-trip).
+fn launcherViewIsIdentity() bool {
+    if (launcher_view_len != @min(current_config.launchers.len, launcher_view_order.len)) return false;
+    for (launcher_view_order[0..launcher_view_len], 0..) |v, p| {
+        if (v != p) return false;
+    }
+    return true;
+}
+
+/// Click-vs-drag threshold for pins, in px (same 4px language as the
+/// mixer's VOL_DRAG_PX disambiguation).
+const LAUNCH_DRAG_PX: i32 = 4;
+
+/// Resolves an armed launcher press on left-button release: a clean press
+/// is the ordinary click (focus/launch); a dragged one commits the live
+/// view order to config.json.
+fn releaseLauncherPress(bar: *Bar) void {
+    const li = bar.launch_press_li orelse return;
+    const was_drag = bar.launch_dragging;
+    bar.launch_press_li = null;
+    bar.launch_dragging = false;
+    if (!was_drag) {
+        handleAction(bar, .{ .launcher = li });
+        return;
+    }
+    commitLauncherDrop(bar, li);
+}
+
+/// Commits a finished drag: the headless helper rewrites config.json's
+/// launcher order, ground truth is verified by re-reading the file, and a
+/// match reloads through the standard SIGUSR1 path (icon invalidation,
+/// view reset, redraw — all free). A mismatch snaps the live view back to
+/// the file rather than displaying an order that isn't saved.
+fn commitLauncherDrop(bar: *Bar, li: usize) void {
+    const q = launcherPosition(li) orelse {
+        resetLauncherViewOrder();
+        drawAndCommit(bar) catch |err| {
+            logging.err("draw failed: {}", .{err});
+        };
+        return;
+    };
+    if (launcherViewIsIdentity()) return;
+    const spawned = spawnMoveLauncher(li, q);
+    const matches = if (spawned) dropMatchesFile() else false;
+    logging.step("launcher drop: from={d} to={d} spawned={} matches={}", .{ li, q, spawned, matches });
+    if (spawned and matches) {
+        if (g_sigusr1_write_fd >= 0) {
+            const b = [_]u8{0x1};
+            _ = posix.system.write(g_sigusr1_write_fd, &b, b.len);
+        }
+        return;
+    }
+    logging.warn("launcher drop: commit failed, keeping file order", .{});
+    resetLauncherViewOrder();
+    drawAndCommit(bar) catch |err| {
+        logging.err("draw failed: {}", .{err});
+    };
+}
+
+/// Re-reads config.json and checks the file's launcher order matches the
+/// live view order (compared by command — indices are meaningless across
+/// the rewrite). Ground truth for the drop commit: exit codes can't cover
+/// the tick's reapChildren grabbing the helper first.
+///
+/// Parses into a THROWAWAY arena, never via loadConfigFromFile: a
+/// successful load resets the inactive config arena and flips
+/// config_arena_active, so calling it here would corrupt the reload
+/// protocol — the next real reload would wipe the LIVE config's arena and
+/// read stale slices (use-after-free → the segfault seen on drops).
+fn dropMatchesFile() bool {
+    const bytes = readFileAlloc(std.heap.page_allocator, config_json_path) catch return false;
+    defer std.heap.page_allocator.free(bytes);
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const parsed = std.json.parseFromSliceLeaky(JsonConfig, scratch.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return false;
+    if (parsed.launchers.len != launcher_view_len) return false;
+    for (launcher_view_order[0..launcher_view_len], 0..) |li, p| {
+        if (li >= current_config.launchers.len) return false;
+        if (!std.mem.eql(u8, parsed.launchers[p].command, current_config.launchers[li].command)) return false;
+    }
+    return true;
+}
+
+/// Runs `simpbar-config --move-launcher FROM TO` to completion. Blocking
+/// (~50ms for a JSON rewrite — a discrete drop action, never a frame), so
+/// the file is settled before dropMatchesFile reads it. Absolute path, not
+/// $PATH: a stale shadow binary elsewhere would silently eat the flag.
+fn spawnMoveLauncher(from: usize, to: usize) bool {
+    var from_buf: [8]u8 = undefined;
+    var to_buf: [8]u8 = undefined;
+    const from_s = std.fmt.bufPrintZ(&from_buf, "{d}", .{from}) catch return false;
+    const to_s = std.fmt.bufPrintZ(&to_buf, "{d}", .{to}) catch return false;
+    // argv[0] is the program name — env-style launches must repeat it
+    // (an array starting at the flag makes env parse OUR flag as ITS
+    // option and die 125, which is exactly what happened here).
+    var argv = [_:null]?[*:0]const u8{ "/usr/bin/simpbar-config", "--move-launcher", from_s.ptr, to_s.ptr, null };
+    return spawnAndWait("/usr/bin/simpbar-config", &argv);
+}
+
+/// Blocking spawn-and-wait (fork/exec/waitpid) for drop commits — the one
+/// place the bar needs a child's completion before proceeding. A delivered
+/// signal (SIGUSR1's handler only writes a pipe byte) EINTRs the wait, so
+/// retry past INTR with a breath; anything else (ECHILD — the tick's
+/// reapChildren grabbed the already-exited child) ends the wait and lets
+/// dropMatchesFile verify ground truth. Gives up past ~5s.
+fn spawnAndWait(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) bool {
+    const pid = libc_proc.fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        _ = std.c.execve(path, argv, std.c.environ);
+        std.c._exit(127);
+    }
+    const eintr: c_int = @intCast(@intFromEnum(std.posix.E.INTR));
+    var status: c_int = 0;
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const w = std.c.waitpid(pid, &status, 0);
+        if (w == pid) {
+            const st: u32 = @bitCast(status);
+            const ok = std.posix.W.IFEXITED(st) and std.posix.W.EXITSTATUS(st) == 0;
+            if (!ok) logging.step("spawnAndWait: child {d} status {d}", .{ pid, status });
+            return ok;
+        }
+        if (w < 0 and std.c._errno().* == eintr) {
+            var dummy = [_]posix.pollfd{};
+            _ = posix.poll(&dummy, 10) catch {};
+            continue;
+        }
+        if (w < 0) logging.step("spawnAndWait: waitpid errno {d}", .{std.c._errno().*});
+        return true;
+    }
+    logging.step("spawnAndWait: child {d} timed out", .{pid});
+    return false;
+}
+
+/// Running dot under a launcher/taskbar cell: 5px accent pill sitting in
+/// the hover-underline slot (same y as drawPill's dash, so the two never
+/// stack into a double bar). Focused windows read full-accent, background
+/// ones dimmed toward the bar bg — the same dimming language the muted OSD
+/// uses for inactive state.
+fn drawRunningDot(pixels: [*]u32, buf_width: u32, buf_height: u32, cx: i64, focused: bool) void {
+    const h: i64 = @intCast(buf_height);
+    const uy1 = h - HOVER_UNDERLINE_BOTTOM_GAP;
+    const col = if (focused) current_config.appearance.workspace_active_color else lerpColor(current_config.appearance.bg_color, current_config.appearance.workspace_active_color, 0.45);
+    fillRoundedRect(pixels, buf_width, buf_height, cx - 2, uy1 - 4, cx + 3, uy1, 2, col);
+}
 
 /// A click-through rectangle (currently horizontal-only, since the whole bar
 /// is one row) mapped to an action, recomputed on every draw since module
@@ -755,6 +1747,13 @@ const MprisControl = enum { previous, play_pause, next };
 const Action = union(enum) {
     switch_workspace: i32,
     spawn: [:0]const u8,
+    /// Pinned launcher click (index into current_config.launchers): raises
+    /// the app's window when it's running, launches it when it isn't.
+    launcher: usize,
+    /// Unpinned taskbar button click (index into running_state.apps):
+    /// raises that window. Bounds-checked at click time — a refresh between
+    /// draw and click may have shifted the list.
+    focus_client: usize,
     toggle_drawer,
     activate_tray: usize,
     context_menu_tray: usize,
@@ -763,6 +1762,9 @@ const Action = union(enum) {
     open_layout_picker,
     /// Applies the layout at `MANGO_LAYOUTS[index]` (a picker row click).
     set_layout: usize,
+    /// Opens the volume mixer popup (the volume module's click). Toggles:
+    /// clicking again while open closes it.
+    open_volume_mixer,
 };
 
 /// What a vertical scroll wheel does over a ClickRegion. Separate from Action
@@ -773,6 +1775,10 @@ const Action = union(enum) {
 const ScrollAction = enum {
     /// Step to the adjacent EXISTING workspace, in the scroll direction.
     step_workspace,
+    /// Adjust the master volume ±5% per notch (volume module + mixer/OSD).
+    /// Negative axis (scroll up) = louder, matching the measured workspace
+    /// sign convention.
+    adjust_volume,
 };
 
 const ClickRegion = struct {
@@ -783,7 +1789,7 @@ const ClickRegion = struct {
     scroll_action: ?ScrollAction = null, // scroll wheel; most regions don't have one
 };
 
-const MAX_CLICK_REGIONS = 32;
+const MAX_CLICK_REGIONS = 64;
 
 const ClickRegions = struct {
     items: [MAX_CLICK_REGIONS]ClickRegion = undefined,
@@ -929,27 +1935,11 @@ const LauncherButton = struct {
     // carried through config for forward-compat with an icon-aware GUI/
     // pinning flow added in a later step.
     icon: ?[]const u8 = null,
-    /// How this launcher renders in the bar: "label" (app name only),
-    /// "both" (name + icon, the default), or "icon" (icon only — falls back
-    /// to the name when no icon decodes, so the button is never invisible).
-    /// Curated string matching config_main.zig's DISPLAY_CHOICES; anything
-    /// unrecognized renders as "both".
+    /// Retained for config-file compat (the GUI still writes it); rendering
+    /// is icon-only now — the label only appears when no icon resolves, so
+    /// a button is never invisible.
     display: []const u8 = "both",
 };
-
-const LAUNCHER_DISPLAY_LABEL = "label";
-const LAUNCHER_DISPLAY_BOTH = "both";
-const LAUNCHER_DISPLAY_ICON = "icon";
-
-/// Resolves a launcher's `display` mode against the curated string choices
-/// (permissive: unknown → "both", same spirit as every other curated config
-/// field). Shared by the left chain and the center group's compose pass so
-/// both render a given launcher identically.
-fn launcherDisplayMode(display: []const u8) enum { label, both, icon } {
-    if (std.mem.eql(u8, display, LAUNCHER_DISPLAY_LABEL)) return .label;
-    if (std.mem.eql(u8, display, LAUNCHER_DISPLAY_ICON)) return .icon;
-    return .both;
-}
 
 // The custom/* launcher buttons from ~/.config/waybar/config's
 // "modules-center", minus their icons (our font is uppercase-only for now).
@@ -973,13 +1963,14 @@ const CENTER_LAUNCHERS = [_]LauncherButton{
 // off); wlogout is no longer installed, so this opens that menu instead.
 const POWER_BUTTON = LauncherButton{ .label = "\u{f0425}", .command = "appdrawer power" };
 
-// Real config's drawer toggle glyph (▾) — doesn't flip direction when
-// expanded like the real one's rotating chevron does, but it's the actual
-// character now instead of a stand-in letter.
-const DRAWER_TOGGLE_LABEL = "\u{25be}";
+// Drawer toggle chevrons (Nerd Font Font Awesome, matching the power and
+// launcher icon language — not text glyphs). Up chevron while the drawer is
+// open. Measured separately (not assumed equal advance) so the cell stays
+// exact.
+const DRAWER_TOGGLE_LABEL = "\u{f078}";
 /// Drawer toggle glyph while the drawer is open. Measured separately (not
 /// assumed equal advance to the down chevron) so the cell stays exact.
-const DRAWER_TOGGLE_LABEL_UP = "\u{25b4}";
+const DRAWER_TOGGLE_LABEL_UP = "\u{f077}";
 
 // --- runtime config (module layout, appearance, launcher pins) -----------
 //
@@ -1104,10 +2095,24 @@ const Appearance = struct {
     /// 100 = full cava_color on lit pixels. Module pills/text stay opaque
     /// above it regardless.
     cava_bg_strength: u8,
+    /// Cava background shape: "bars" (default) rises each column from the
+    /// bottom edge, "wave" mirrors around the vertical center, "curve"
+    /// smooths the tops into a filled wave with a bright crest.
+    /// Unrecognized values fall back to "bars".
+    cava_style: []const u8,
     /// Glyph-stream color for the "matrix" background mode.
     matrix_color: u32,
     /// Matrix fall speed, pixels per 60ms tick (1-6).
     matrix_speed: u32,
+    /// Media progress display: "underline" (default) draws the accent dash
+    /// under the track text; "bar" fills the pill behind it, subtly.
+    /// Unrecognized values fall back to "underline".
+    mpris_progress_style: []const u8,
+    /// Volume device both the module and the mixer follow: a PipeWire sink
+    /// name (e.g. a USB DAC whose knob drives it directly, bypassing the
+    /// default sink), or "" for the default output (today's behavior).
+    /// Applies live — every poll/fetch/set reads it fresh.
+    volume_sink: []const u8,
     bar_height: u32,
     /// Four independent edges (px), replacing the old single top-only
     /// border_px — which edge "faces the desktop" flips with `position`, but
@@ -1236,8 +2241,11 @@ fn defaultConfig() Config {
             .bezel_color = 0xFFDCDCDC, // solid-bezel default: accent-white, same as the active workspace color
             .bg_mode = BG_MODE_NONE,
             .cava_bg_strength = 35,
+            .cava_style = CAVA_STYLE_BARS,
             .matrix_color = 0xFF00FF41, // classic phosphor green
             .matrix_speed = 2,
+            .mpris_progress_style = MPRIS_PROGRESS_UNDERLINE,
+            .volume_sink = "",
             .module_pill_opacity = 100,
             .module_border_width = 1,
             .module_pills = true,
@@ -1395,8 +2403,11 @@ const JsonAppearance = struct {
     bezel_color: []const u8 = "#DCDCDC",
     bg_mode: []const u8 = "none",
     cava_bg_strength: u8 = 35,
+    cava_style: []const u8 = "bars",
     matrix_color: []const u8 = "#00FF41",
     matrix_speed: u32 = 2,
+    mpris_progress_style: []const u8 = "underline",
+    volume_sink: []const u8 = "",
     module_pill_opacity: u8 = 100,
     module_border_width: u32 = 1,
     module_pills: bool = true,
@@ -1593,8 +2604,11 @@ fn parseAppearance(j: JsonAppearance) ?Appearance {
         .bezel_color = parseHexColor(j.bezel_color) catch return null,
         .bg_mode = if (std.mem.eql(u8, j.bg_mode, BG_MODE_CAVA)) BG_MODE_CAVA else if (std.mem.eql(u8, j.bg_mode, BG_MODE_MATRIX)) BG_MODE_MATRIX else BG_MODE_NONE,
         .cava_bg_strength = @min(j.cava_bg_strength, 100),
+        .cava_style = cavaStyleOrDefault(j.cava_style),
         .matrix_color = parseHexColor(j.matrix_color) catch return null,
         .matrix_speed = std.math.clamp(j.matrix_speed, 1, 6),
+        .mpris_progress_style = if (std.mem.eql(u8, j.mpris_progress_style, MPRIS_PROGRESS_BAR)) MPRIS_PROGRESS_BAR else MPRIS_PROGRESS_UNDERLINE,
+        .volume_sink = j.volume_sink,
         .module_pill_opacity = @min(j.module_pill_opacity, 100),
         .module_border_width = @min(j.module_border_width, 8),
         .module_pills = j.module_pills,
@@ -1642,6 +2656,12 @@ fn validClockFormat(raw: []const u8) []const u8 {
 
 /// Reads + parses ~/.config/simpbar/config.json. Returns null on ANY
 /// failure (missing file, unreadable, malformed JSON, bad color hex, ...) —
+///
+/// WARNING: only call this from startup and the SIGUSR1 reload handler. A
+/// successful load resets the inactive config arena and flips
+/// config_arena_active; any OTHER caller (verification peeks, tick work,
+/// ...) corrupts the reload protocol and the next real reload reads freed
+/// memory. For read-only peeks, parse into your own arena instead.
 /// callers decide what null means: loadConfig() (startup) falls back to
 /// defaultConfig(), while the SIGUSR1 reload handler in main() instead keeps
 /// whatever current_config already is, so a bad edit never reverts a
@@ -2225,6 +3245,23 @@ const PopupMenu = struct {
     pointer_y: i32 = -1,
     rows: [MAX_POPUP_ROWS]PopupRow = undefined,
     row_count: usize = 0,
+    /// Volume-mixer snapshot: how many vol_entries rows the surface was
+    /// sized for at open. A refresh that changes the count rebuilds the
+    /// popup (close + reopen); same count redraws in place. Only meaningful
+    /// when kind == .volume — like `menu` is dbusmenu-only.
+    vol_count: usize = 0,
+    /// 60ms-tick frame the volume OSD was (re)armed on; the tick dismisses
+    /// it past VOL_OSD_ALIVE_TICKS. Only meaningful for .volume_osd.
+    osd_since: u32 = 0,
+    /// Mixer slider drag: entry being dragged (or null), its live value,
+    /// the press origin, and whether the pointer moved past click threshold.
+    /// Only meaningful for .volume; cleared on release.
+    vol_drag_row: ?usize = null,
+    vol_drag_val: u8 = 0,
+    vol_press_id: i32 = -99,
+    vol_press_x: i32 = 0,
+    vol_press_y: i32 = 0,
+    vol_drag_moved: bool = false,
     /// Per-row hover fade level (0..1), eased on the scroll-timer tick like
     /// the bar's own hover anims. Indexed parallel to rows.
     row_hover: [MAX_POPUP_ROWS]f32 = [_]f32{0} ** MAX_POPUP_ROWS,
@@ -2256,7 +3293,7 @@ const PopupMenu = struct {
 
 /// What a PopupMenu's rows are sourced from; selects the draw and click
 /// paths in drawPopup / the pointer-button handler.
-const PopupKind = enum { dbusmenu, layout_picker };
+const PopupKind = enum { dbusmenu, layout_picker, volume, volume_osd };
 
 /// Creates the xdg_popup surface a popup menu draws on, anchored to a thin
 /// rect at the clicked x position and spanning the bar's full height — the
@@ -2271,7 +3308,7 @@ const PopupSurface = struct {
     popup: *xdg.Popup,
 };
 
-fn createPopupSurface(bar: *Bar, width: i32, height: i32) ?PopupSurface {
+fn createPopupSurface(bar: *Bar, width: i32, height: i32, centered: bool) ?PopupSurface {
     const wm_base = bar.wm_base orelse return null;
     const surface = bar.compositor.createSurface() catch return null;
     const xdg_surface = wm_base.getXdgSurface(surface) catch {
@@ -2286,10 +3323,22 @@ fn createPopupSurface(bar: *Bar, width: i32, height: i32) ?PopupSurface {
     defer positioner.destroy();
 
     positioner.setSize(width, height);
-    const anchor_x: i32 = @max(0, bar.pointer_x - 4);
+    // Click-anchored panels follow the pointer; the volume OSD centers on
+    // the output edge instead (bottom-center under a bottom bar, top-center
+    // under a top bar — the side facing the desktop, so it never hides
+    // behind the bar it reports on).
+    const anchor_x: i32 = @intCast(@max(@as(i64, 0), if (centered and bar.width > 0)
+        @divTrunc(@as(i64, @intCast(bar.width)), 2) - 4
+    else
+        @as(i64, bar.pointer_x) - 4));
     positioner.setAnchorRect(anchor_x, 0, 8, @intCast(bar.height));
-    positioner.setAnchor(.top);
-    positioner.setGravity(.top);
+    if (centered and std.mem.eql(u8, current_config.appearance.position, "top")) {
+        positioner.setAnchor(.bottom);
+        positioner.setGravity(.bottom);
+    } else {
+        positioner.setAnchor(.top);
+        positioner.setGravity(.top);
+    }
     positioner.setConstraintAdjustment(.{ .slide_x = true, .slide_y = true, .flip_y = true });
 
     const popup = xdg_surface.getPopup(null, positioner) catch {
@@ -2356,7 +3405,7 @@ fn openTrayContextMenu(bar: *Bar, tray_index: usize) void {
     }
     if (total_h < POPUP_ROW_HEIGHT) total_h = POPUP_ROW_HEIGHT;
 
-    const ps = createPopupSurface(bar, max_w, total_h) orelse return;
+    const ps = createPopupSurface(bar, max_w, total_h, false) orelse return;
 
     var pm = PopupMenu{
         .surface = ps.surface,
@@ -2369,7 +3418,7 @@ fn openTrayContextMenu(bar: *Bar, tray_index: usize) void {
     @memcpy(pm.path_buf[0..pm.path_len], menu_path[0..pm.path_len]);
     bar.popup = pm;
 
-    wirePopup(bar, ps);
+    wirePopup(bar, ps, true);
 }
 
 /// Left-click on the Mango layout module: shows a popup listing every layout
@@ -2394,7 +3443,7 @@ fn openLayoutPicker(bar: *Bar) void {
     if (max_w > POPUP_MAX_WIDTH) max_w = POPUP_MAX_WIDTH;
     const total_h: i32 = @as(i32, @intCast(MANGO_LAYOUTS.len)) * POPUP_ROW_HEIGHT;
 
-    const ps = createPopupSurface(bar, max_w, total_h) orelse return;
+    const ps = createPopupSurface(bar, max_w, total_h, false) orelse return;
 
     const pm = PopupMenu{
         .surface = ps.surface,
@@ -2404,16 +3453,18 @@ fn openLayoutPicker(bar: *Bar) void {
     };
     bar.popup = pm;
 
-    wirePopup(bar, ps);
+    wirePopup(bar, ps, true);
 }
 
 /// Finishes bringing up a just-created popup: hooks up its configure listeners
 /// and (if we hold a seat) grabs it, then does the initial null commit that
 /// triggers the first configure. Shared by every popup kind.
-fn wirePopup(bar: *Bar, ps: PopupSurface) void {
+fn wirePopup(bar: *Bar, ps: PopupSurface, grab: bool) void {
     ps.xdg_surface.setListener(*Bar, popupXdgSurfaceListener, bar);
     ps.popup.setListener(*Bar, popupEventListener, bar);
-    if (bar.seat) |seat| ps.popup.grab(seat, bar.last_pointer_serial);
+    if (grab) {
+        if (bar.seat) |seat| ps.popup.grab(seat, bar.last_pointer_serial);
+    }
 
     ps.surface.commit(); // initial null commit — triggers the first configure
 }
@@ -2457,6 +3508,677 @@ fn popupEventListener(_: *xdg.Popup, event: xdg.Popup.Event, bar: *Bar) void {
 /// pattern as drawAndCommit, just for the popup's own surface and a much
 /// simpler (single-column list) layout. Also (re)populates `rows` for
 /// hit-testing hover/click. The row source depends on pm.kind.
+// --- volume mixer popup ------------------------------------------------------
+//
+// Clicking the volume module opens a mixer panel (this popup kind): master
+// plus one row per PipeWire sink input. Click toggles that row's mute, the
+// wheel adjusts ±5% per notch — neither closes the panel, so levels can be
+// dialed in without reopening. Data comes from one `pactl` run per refresh
+// (master volume/mute + `list sink-inputs` concatenated), parsed by the pure
+// parseVolumeList below (canned pactl text in tests); set-commands go out
+// fire-and-forget and the next refresh shows their result. Refreshed every
+// second while open; a refresh that changes the row count rebuilds the
+// popup, same count redraws in place.
+
+const VOL_MAX_ENTRIES: usize = 8; // master + 7 apps (surface sized on open)
+const VOL_WHEEL_STEP_PCT: i8 = 5; // per wheel notch
+
+const VolumeEntry = struct {
+    id: i32 = -1, // pactl sink-input id; -1 = master
+    name_buf: [48]u8 = undefined,
+    name_len: usize = 0,
+    vol_pct: u8 = 0,
+    muted: bool = false,
+    fn name(self: *const VolumeEntry) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
+var vol_entries: [VOL_MAX_ENTRIES]VolumeEntry = [_]VolumeEntry{.{}} ** VOL_MAX_ENTRIES;
+var vol_count: usize = 0;
+var vol_fetch_fd: posix.fd_t = -1;
+var vol_fetch_buf: [4096]u8 = undefined;
+var vol_fetch_len: usize = 0;
+/// hover_frame value when the in-flight fetch started (60ms ticks; the
+/// watchdog below abandons a wedged fetch past ~5s via wrapping subtract).
+var vol_fetch_since_frame: u32 = 0;
+/// Bar whose volume click started the in-flight fetch (fixed backing array,
+/// so the pointer stays valid for the fetch's ~50ms life). Cleared on open.
+var vol_open_bar: ?*Bar = null;
+/// Long-lived `pactl subscribe` pipe: PipeWire change events land here in
+/// real time (a knob turn, media keys, other mixers), and each batch kicks
+/// a prompt volume re-poll — this is what makes the OSD fire in ~100ms
+/// instead of on the 5s timer's schedule. Event-driven like Noctalia's
+/// PipeWire service; the timer poll stays as fallback. -1 when down (the 1s
+/// tick respawns past CAVA-style delay via vol_sub_dead_since).
+var vol_sub_fd: posix.fd_t = -1;
+var vol_sub_dead_since: i64 = 0;
+/// Poll-change OSD suppressions remaining (60ms ticks): a mixer-driven
+/// master set would otherwise echo as an OSD ~100ms later when the wpctl
+/// poll notices it — Noctalia suppresses panel-driven changes the same way.
+/// Only master-output sets arm it (app/mic sets never move the sink poll).
+/// Direct wheel adjustments bypass it via showVolumeOSD (explicit action).
+var vol_osd_suppress_left: i32 = 0;
+
+/// Copies `s` into an entry name slot (truncated, never fails).
+fn volSetName(e: *VolumeEntry, s: []const u8) void {
+    const n = @min(s.len, e.name_buf.len);
+    @memcpy(e.name_buf[0..n], s[0..n]);
+    e.name_len = n;
+}
+
+/// Unquotes a `key = "value"` pactl property tail (`"Firefox"` -> `Firefox`,
+/// bare tokens pass through).
+fn volUnquote(s: []const u8) []const u8 {
+    const t = std.mem.trim(u8, s, " \t");
+    if (t.len >= 2 and t[0] == '"' and t[t.len - 1] == '"') return t[1 .. t.len - 1];
+    return t;
+}
+
+/// First `NN%` in `line`, saturated to u8, or null when there is none.
+fn volFirstPercent(line: []const u8) ?u8 {
+    const pct = std.mem.indexOfScalar(u8, line, '%') orelse return null;
+    var s = pct;
+    while (s > 0 and line[s - 1] >= '0' and line[s - 1] <= '9') : (s -= 1) {}
+    if (s == pct) return null;
+    const v = std.fmt.parseInt(u16, line[s..pct], 10) catch return null;
+    return @intCast(@min(v, 255));
+}
+
+/// Parses `pactl get-sink-volume @DEFAULT_SINK@`, `pactl get-sink-mute
+/// @DEFAULT_SINK@`, `pactl get-source-volume @DEFAULT_SOURCE@`, `pactl
+/// get-source-mute @DEFAULT_SOURCE@` and `pactl list sink-inputs`
+/// concatenated (in that order, master pairs tagged `[sink]` / `[source]`
+/// by the fetch script) into `out`: sink master at 0, mic master at 1 when
+/// present, then apps. Returns the entry count; 0 means unusable (caller
+/// keeps the old list / never opens). Pure — feed it canned pactl text in
+/// tests.
+fn parseVolumeList(text: []const u8, out: *[VOL_MAX_ENTRIES]VolumeEntry) usize {
+    var sink_vol: ?u8 = null;
+    var sink_mute = false;
+    var mic_vol: ?u8 = null;
+    var mic_mute = false;
+    var master_slot: usize = 0; // 0 = sink pair, 1 = source pair
+    var n_apps: usize = 0;
+    var cur: ?usize = null; // app slot being filled (index into out)
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.eql(u8, line, "[sink]")) {
+            master_slot = 0;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "[source]")) {
+            master_slot = 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "Sink Input #")) {
+            const num = std.mem.trim(u8, line["Sink Input #".len..], " \t");
+            var id: i32 = 0;
+            var ok = num.len > 0;
+            for (num) |c| {
+                if (c < '0' or c > '9') {
+                    ok = false;
+                    break;
+                }
+                id = id * 10 + (c - '0');
+            }
+            // Slots 0-1 are the masters; apps start at 2.
+            if (!ok or 2 + n_apps >= VOL_MAX_ENTRIES) {
+                cur = null;
+                continue;
+            }
+            out[2 + n_apps] = .{ .id = id };
+            cur = 2 + n_apps;
+            n_apps += 1;
+        } else if (std.mem.startsWith(u8, line, "application.name")) {
+            if (std.mem.indexOfScalar(u8, line, '=')) |eq| {
+                if (cur) |c| volSetName(&out[c], volUnquote(line[eq + 1 ..]));
+            }
+        } else if (std.mem.startsWith(u8, line, "application.process.binary")) {
+            if (std.mem.indexOfScalar(u8, line, '=')) |eq| {
+                // Fallback when application.name is absent; never overwrites.
+                if (cur) |c| {
+                    if (out[c].name_len == 0) volSetName(&out[c], volUnquote(line[eq + 1 ..]));
+                }
+            }
+        } else if (std.mem.startsWith(u8, line, "Volume:")) {
+            if (volFirstPercent(line)) |pct| {
+                if (cur) |c| {
+                    out[c].vol_pct = pct;
+                } else if (master_slot == 0) {
+                    sink_vol = pct;
+                } else {
+                    mic_vol = pct;
+                }
+            }
+        } else if (std.mem.startsWith(u8, line, "Mute:")) {
+            const m = std.mem.eql(u8, std.mem.trim(u8, line["Mute:".len..], " \t"), "yes");
+            if (cur) |c| {
+                out[c].muted = m;
+            } else if (master_slot == 0) {
+                sink_mute = m;
+            } else {
+                mic_mute = m;
+            }
+        }
+    }
+    const sv = sink_vol orelse return 0;
+    out[0] = .{ .id = -1, .vol_pct = sv, .muted = sink_mute };
+    volSetName(&out[0], "Master");
+    var base: usize = 1;
+    // Mic row only when the source query actually answered (the [source]
+    // marker alone proves nothing — the commands after it may have failed).
+    // Without it the apps staged at [2..] compact down so entries stay dense.
+    if (mic_vol) |mv| {
+        out[1] = .{ .id = -2, .vol_pct = mv, .muted = mic_mute };
+        volSetName(&out[1], "Mic");
+        base = 2;
+    } else if (n_apps > 0) {
+        std.mem.copyForwards(VolumeEntry, out[1..][0..n_apps], out[2..][0..n_apps]);
+    }
+    // Unnamed streams still need a label (some loopbacks carry no
+    // application properties at all).
+    for (out[base .. base + n_apps]) |*e| {
+        if (e.name_len == 0) {
+            var nb: [48]u8 = undefined;
+            const s = std.fmt.bufPrint(&nb, "Stream #{d}", .{e.id}) catch "Stream";
+            volSetName(e, s);
+        }
+    }
+    return base + n_apps;
+}
+
+/// Display value for a row: "muted" or "NN%". Same string the measurer and
+/// the painter use, so widths never drift. Takes the resolved mute/level
+/// (not the entry) so a mid-drag override renders identically.
+fn volValueText(muted: bool, pct: u8, buf: []u8) []const u8 {
+    if (muted) return "muted";
+    return std.fmt.bufPrint(buf, "{d}%", .{pct}) catch "?";
+}
+
+fn drawVolumeRows(bar: *Bar, pm: *PopupMenu, pixels: [*]u32) void {
+    const text_color = current_config.appearance.text_color;
+    const dim_color = current_config.appearance.popup_disabled_color;
+    pm.row_count = 0;
+    var y: i32 = 0;
+    var idx: usize = 0;
+    const n = @min(vol_count, VOL_MAX_ENTRIES);
+    var sep_done = false;
+    while (idx < n) : (idx += 1) {
+        const e = &vol_entries[idx];
+        if (e.id >= 0 and !sep_done) {
+            // Separator between masters and apps (same look as dbusmenu's).
+            sep_done = true;
+            const line_y = y + @divTrunc(POPUP_SEPARATOR_HEIGHT, 2);
+            if (line_y >= 0 and line_y < pm.height) {
+                var x: u32 = 0;
+                while (x < pm.width) : (x += 1) pixels[@as(u32, @intCast(line_y)) * pm.width + x] = current_config.appearance.popup_separator_color;
+            }
+            if (pm.row_count < pm.rows.len) {
+                pm.rows[pm.row_count] = .{ .y_start = y, .y_end = y + POPUP_SEPARATOR_HEIGHT, .item_id = null };
+                pm.row_count += 1;
+            }
+            y += POPUP_SEPARATOR_HEIGHT;
+        }
+        const y_start = y;
+        const y_end = y + VOL_ROW_H;
+        if (pm.row_count < pm.rows.len) {
+            pm.rows[pm.row_count] = .{ .y_start = y_start, .y_end = y_end, .item_id = @intCast(idx) };
+            pm.row_count += 1;
+        }
+        fillPopupRowBand(pixels, pm, y_start, y_end, pm.row_hover[idx]);
+        // Live drag value wins over the fetched level for the dragged row.
+        const disp_pct = if (pm.vol_drag_row) |dr| (if (dr == idx) pm.vol_drag_val else e.vol_pct) else e.vol_pct;
+        const color = if (e.muted) dim_color else text_color;
+        const baseline = y_start + @divTrunc(POPUP_ROW_HEIGHT + bar.font.ascentPx() - bar.font.descentPx(), 2);
+        var vbuf: [8]u8 = undefined;
+        const value = volValueText(e.muted, disp_pct, &vbuf);
+        const value_w = textPixelWidth(bar.font, value);
+        var ni: usize = 0;
+        var x0: i64 = POPUP_PADDING_X;
+        while (nextUtf8Codepoint(e.name(), &ni)) |cp| {
+            x0 += drawGlyphAt(pixels, pm.width, pm.height, bar.font, x0, baseline, cp, color, 0, pm.width);
+        }
+        var vi: usize = 0;
+        var vx = @as(i64, @intCast(pm.width)) - POPUP_PADDING_X - value_w;
+        while (nextUtf8Codepoint(value, &vi)) |cp| {
+            vx += drawGlyphAt(pixels, pm.width, pm.height, bar.font, vx, baseline, cp, color, 0, pm.width);
+        }
+        // Slider band under the label: track + accent fill + thumb. Dimmed
+        // wholesale while muted (level still visible underneath).
+        const tr = volSliderTrack(pm.width);
+        const ty: i64 = @as(i64, y_start + POPUP_ROW_HEIGHT) + @divTrunc(@as(i64, VOL_SLIDER_H) - VOL_TRACK_H, 2);
+        const scol = if (e.muted) dim_color else text_color;
+        fillRoundedRect(pixels, pm.width, pm.height, tr.x0, ty, tr.x1, ty + VOL_TRACK_H, 3, current_config.appearance.popup_separator_color);
+        const fillx = volSliderValToX(tr.x0, tr.x1, disp_pct);
+        if (fillx > tr.x0) {
+            fillRoundedRect(pixels, pm.width, pm.height, tr.x0, ty, fillx, ty + VOL_TRACK_H, 3, scol);
+        }
+        const tcy = ty + @divTrunc(VOL_TRACK_H, 2);
+        fillRoundedRect(pixels, pm.width, pm.height, fillx - VOL_THUMB_R, tcy - VOL_THUMB_R, fillx + VOL_THUMB_R, tcy + VOL_THUMB_R, @intCast(VOL_THUMB_R), scol);
+        y = y_end;
+    }
+}
+
+/// Opens the mixer sized to the current list (masters + up to 6 apps).
+/// No-op without data or with a popup already up (one at a time).
+fn openVolumeMixer(bar: *Bar) void {
+    if (bar.popup != null) return;
+    const n = @min(vol_count, VOL_MAX_ENTRIES);
+    if (n == 0) return;
+    var max_w: i32 = POPUP_MIN_WIDTH;
+    var idx: usize = 0;
+    var apps: usize = 0;
+    while (idx < n) : (idx += 1) {
+        const e = &vol_entries[idx];
+        if (e.id >= 0) apps += 1;
+        var vbuf: [8]u8 = undefined;
+        const value = volValueText(e.muted, e.vol_pct, &vbuf);
+        const w: i32 = @intCast(textPixelWidth(bar.font, e.name()) + VOL_NAME_VALUE_GAP + textPixelWidth(bar.font, value) + POPUP_PADDING_X * 2);
+        if (w > max_w) max_w = w;
+    }
+    if (max_w > POPUP_MAX_WIDTH) max_w = POPUP_MAX_WIDTH;
+    const total_h: i32 = @as(i32, @intCast(n)) * VOL_ROW_H + (if (apps > 0) POPUP_SEPARATOR_HEIGHT else 0);
+    const ps = createPopupSurface(bar, max_w, total_h, false) orelse return;
+    bar.popup = PopupMenu{
+        .surface = ps.surface,
+        .xdg_surface = ps.xdg_surface,
+        .popup = ps.popup,
+        .kind = .volume,
+        .vol_count = n,
+    };
+    wirePopup(bar, ps, true);
+}
+
+/// Gap between a mixer row's name and its right-aligned value.
+const VOL_NAME_VALUE_GAP: i64 = 24;
+/// Mixer row geometry: 20px label line + 14px slider band (6px track).
+const VOL_ROW_H: i32 = 34;
+const VOL_SLIDER_H: i32 = 14;
+const VOL_TRACK_H: i64 = 6;
+const VOL_THUMB_R: i64 = 6;
+/// Press/release travel counting as a slider drag rather than a mute click.
+const VOL_DRAG_PX: i32 = 4;
+
+/// Track x-bounds within a popup of width `pm_width`.
+fn volSliderTrack(pm_width: u32) struct { x0: i64, x1: i64 } {
+    return .{ .x0 = POPUP_PADDING_X, .x1 = @as(i64, @intCast(pm_width)) - POPUP_PADDING_X };
+}
+
+/// Thumb center x for a 0-100 value on a track.
+fn volSliderValToX(x0: i64, x1: i64, val: u8) i64 {
+    return x0 + @divTrunc((x1 - x0) * @as(i64, val), 100);
+}
+
+/// 0-100 value for a pointer x on a track (clamped for overshoot).
+fn volSliderXToVal(x0: i64, x1: i64, x: i64) u8 {
+    if (x1 <= x0) return 0;
+    const v = @divTrunc((x - x0) * 100, x1 - x0);
+    if (v < 0) return 0;
+    if (v > 100) return 100;
+    return @intCast(v);
+}
+
+/// True when any bar currently shows the mixer (refreshes go out then).
+fn anyVolumePopupOpen(bars: []Bar) bool {
+    for (bars) |*b| {
+        if (b.popup) |pm| {
+            if (pm.kind == .volume) return true;
+        }
+    }
+    return false;
+}
+
+/// pactl-side device reference for the mixer list/set commands and the wheel
+/// adjust: the single-quoted configured sink, or @DEFAULT_SINK@ when none is
+/// set. Names with a single quote are refused (null → caller skips) — pactl
+/// node names never contain one, which keeps the sh -c interpolation below
+/// injection-free without an escaping layer.
+fn pactlSinkArg(buf: []u8) ?[]const u8 {
+    const sk = current_config.appearance.volume_sink;
+    if (sk.len == 0) return "@DEFAULT_SINK@";
+    if (std.mem.indexOfScalar(u8, sk, '\'') != null) return null;
+    return std.fmt.bufPrint(buf, "'{s}'", .{sk}) catch null;
+}
+
+/// Starts one `pactl` list run feeding vol_entries on EOF. No-op while one
+/// is in flight; the 60ms tick abandons a wedged fetch after ~5s.
+fn startVolumeListFetch() void {
+    if (vol_fetch_fd >= 0) return;
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return;
+    const read_fd = pipe_fds[0];
+    const write_fd = pipe_fds[1];
+    setCloexec(read_fd);
+    _ = std.c.fcntl(read_fd, posix.F.SETFL, @as(c_int, 0o4000));
+    const pid = libc_proc.fork();
+    if (pid < 0) {
+        _ = posix.system.close(read_fd);
+        _ = posix.system.close(write_fd);
+        return;
+    }
+    if (pid == 0) {
+        _ = std.c.dup2(write_fd, 1);
+        _ = posix.system.close(write_fd);
+        _ = posix.system.close(read_fd);
+        // Master sides follow the configured volume device (see
+        // pactlSinkArg); app listing is device-independent. The [sink] /
+        // [source] markers tell the parser which master pair follows (sink
+        // output first, then microphone input).
+        var sbuf: [160]u8 = undefined;
+        const sink = pactlSinkArg(&sbuf) orelse std.c._exit(127);
+        var cbuf: [512]u8 = undefined;
+        const cmd = std.fmt.bufPrintZ(&cbuf, "echo '[sink]'; pactl get-sink-volume {s} 2>/dev/null; pactl get-sink-mute {s} 2>/dev/null; echo '[source]'; pactl get-source-volume @DEFAULT_SOURCE@ 2>/dev/null; pactl get-source-mute @DEFAULT_SOURCE@ 2>/dev/null; pactl list sink-inputs 2>/dev/null", .{ sink, sink }) catch std.c._exit(127);
+        var argv = [_:null]?[*:0]const u8{ "sh", "-c", cmd.ptr, null };
+        _ = std.c.execve("/bin/sh", &argv, std.c.environ);
+        std.c._exit(127);
+    }
+    _ = posix.system.close(write_fd);
+    vol_fetch_fd = read_fd;
+    vol_fetch_len = 0;
+    vol_fetch_since_frame = hover_frame;
+}
+
+/// Starts the long-lived `pactl subscribe` feed (see vol_sub_fd). No-op
+/// while one runs. Same fork/exec pipe plumbing as the list fetch, minus
+/// the output handling — events are drained and discarded, they only exist
+/// to kick a prompt volume re-poll.
+fn startVolumeSubscribe() void {
+    if (vol_sub_fd >= 0) return;
+    var pipe_fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return;
+    const read_fd = pipe_fds[0];
+    const write_fd = pipe_fds[1];
+    setCloexec(read_fd);
+    _ = std.c.fcntl(read_fd, posix.F.SETFL, @as(c_int, 0o4000));
+    const pid = libc_proc.fork();
+    if (pid < 0) {
+        _ = posix.system.close(read_fd);
+        _ = posix.system.close(write_fd);
+        return;
+    }
+    if (pid == 0) {
+        _ = std.c.dup2(write_fd, 1);
+        _ = posix.system.close(write_fd);
+        _ = posix.system.close(read_fd);
+        var argv = [_:null]?[*:0]const u8{ "env", "pactl", "subscribe", null };
+        _ = std.c.execve("/usr/bin/env", &argv, std.c.environ);
+        std.c._exit(127);
+    }
+    _ = posix.system.close(write_fd);
+    vol_sub_fd = read_fd;
+}
+
+/// Drains pending subscribe events; true when the feed died (EOF/error) and
+/// the caller should close it for the 1s-tick respawn. Any events at all
+/// mean audio state may have moved — kick a volume re-poll (guarded
+/// no-op while one is in flight, so bursts coalesce).
+fn readVolumeSubscribe(cmd: *PolledCommand) bool {
+    if (vol_sub_fd < 0) return true;
+    var chunk: [512]u8 = undefined;
+    var saw_data = false;
+    while (true) {
+        const n = posix.read(vol_sub_fd, &chunk) catch |err| {
+            if (err == error.WouldBlock) break;
+            return true;
+        };
+        if (n == 0) return true;
+        saw_data = true;
+    }
+    // Events mean audio state may have moved — kick a volume re-poll. The
+    // fetch's in-flight guard coalesces a knob turn's burst into one run.
+    if (saw_data) startVolumeFetch(cmd);
+    return false;
+}
+
+/// Reads one chunk; true when the fetch finished (EOF/error/full) and the
+/// caller should finalize (parse + redraw/rebuild, then close).
+fn readVolumeFetch() bool {
+    if (vol_fetch_fd < 0) return true;
+    var chunk: [512]u8 = undefined;
+    const n = posix.read(vol_fetch_fd, &chunk) catch return true;
+    if (n == 0) return true;
+    const free = vol_fetch_buf.len - vol_fetch_len;
+    if (free == 0) return true; // absurdly large output; parse the head
+    const copy_len = @min(n, free);
+    @memcpy(vol_fetch_buf[vol_fetch_len..][0..copy_len], chunk[0..copy_len]);
+    vol_fetch_len += copy_len;
+    return false;
+}
+
+fn closeVolumeFetch() void {
+    if (vol_fetch_fd >= 0) _ = posix.system.close(vol_fetch_fd);
+    vol_fetch_fd = -1;
+    vol_fetch_len = 0;
+}
+
+/// Parses a finished fetch into the live list. Returns the entry count (0 =
+/// unusable: PipeWire/pactl down — callers keep any open popup untouched
+/// rather than blanking it).
+fn finishVolumeFetch() usize {
+    var tmp: [VOL_MAX_ENTRIES]VolumeEntry = [_]VolumeEntry{.{}} ** VOL_MAX_ENTRIES;
+    const n = parseVolumeList(vol_fetch_buf[0..vol_fetch_len], &tmp);
+    closeVolumeFetch();
+    if (n == 0) return 0;
+    vol_entries = tmp;
+    vol_count = n;
+    return n;
+}
+
+/// Settles a finished list fetch: opens the pending mixer, or refreshes
+/// open ones (rebuild on row-count change, redraw otherwise). A failed
+/// fetch (0 entries) changes nothing — the click that asked simply shows
+/// no panel, and live panels keep their last good values.
+fn finishVolumeListFetch(bars: []Bar) void {
+    const opener = vol_open_bar;
+    vol_open_bar = null;
+    if (finishVolumeFetch() == 0) return;
+    if (opener) |b| {
+        openVolumeMixer(b);
+        return;
+    }
+    for (bars) |*b| {
+        if (b.popup) |*pm| {
+            if (pm.kind != .volume) continue;
+            // A mid-drag rebuild would drop the gesture; the release
+            // triggers its own refresh right after.
+            if (pm.vol_drag_row != null) continue;
+            if (vol_count != pm.vol_count) {
+                closePopup(b);
+                openVolumeMixer(b);
+            } else {
+                drawPopup(b) catch |err| {
+                    logging.err("popup draw failed: {}", .{err});
+                };
+            }
+        }
+    }
+}
+
+/// Fires a pactl set/mute at one entry. `delta_pct` 0 = mute toggle, else a
+/// signed step (wheel). Ids come from our own parse (numeric-checked), names
+/// never interpolated — no shell-injection surface.
+fn spawnVolumeSet(entry_idx: usize, delta_pct: i8) void {
+    if (entry_idx >= vol_count) return;
+    const e = &vol_entries[entry_idx];
+    var buf: [128]u8 = undefined;
+    // Master side follows the configured volume device.
+    var sbuf: [160]u8 = undefined;
+    const sink = pactlSinkArg(&sbuf) orelse return;
+    // Sink-master sets move the wpctl poll the OSD watches: suppress its
+    // echo so the panel doesn't double-show (see vol_osd_suppress_left).
+    if (e.id == -1) vol_osd_suppress_left = 100;
+    const cmd = if (delta_pct == 0) blk: {
+        if (e.id == -1) {
+            break :blk std.fmt.bufPrintZ(&buf, "pactl set-sink-mute {s} toggle", .{sink}) catch return;
+        }
+        if (e.id == -2) {
+            break :blk std.fmt.bufPrintZ(&buf, "pactl set-source-mute @DEFAULT_SOURCE@ toggle", .{}) catch return;
+        }
+        break :blk std.fmt.bufPrintZ(&buf, "pactl set-sink-input-mute {d} toggle", .{e.id}) catch return;
+    } else blk: {
+        const step: u8 = @intCast(@abs(delta_pct));
+        const sign: u8 = if (delta_pct > 0) '+' else '-';
+        if (e.id == -1) {
+            break :blk std.fmt.bufPrintZ(&buf, "pactl set-sink-volume {s} {c}{d}%", .{ sink, sign, step }) catch return;
+        }
+        if (e.id == -2) {
+            break :blk std.fmt.bufPrintZ(&buf, "pactl set-source-volume @DEFAULT_SOURCE@ {c}{d}%", .{ sign, step }) catch return;
+        }
+        break :blk std.fmt.bufPrintZ(&buf, "pactl set-sink-input-volume {d} {c}{d}%", .{ e.id, sign, step }) catch return;
+    };
+    spawnDetached(cmd);
+}
+
+/// Fires an absolute pactl set at one entry (slider commit). Same
+/// injection-safety contract as spawnVolumeSet.
+fn spawnVolumeSetAbs(entry_idx: usize, pct: u8) void {
+    if (entry_idx >= vol_count) return;
+    const e = &vol_entries[entry_idx];
+    var buf: [128]u8 = undefined;
+    var sbuf: [160]u8 = undefined;
+    const sink = pactlSinkArg(&sbuf) orelse return;
+    // Same panel-echo suppression as the relative variant below.
+    if (e.id == -1) vol_osd_suppress_left = 100;
+    const cmd = if (e.id == -1) blk: {
+        break :blk std.fmt.bufPrintZ(&buf, "pactl set-sink-volume {s} {d}%", .{ sink, pct }) catch return;
+    } else if (e.id == -2) blk: {
+        break :blk std.fmt.bufPrintZ(&buf, "pactl set-source-volume @DEFAULT_SOURCE@ {d}%", .{pct}) catch return;
+    } else blk: {
+        break :blk std.fmt.bufPrintZ(&buf, "pactl set-sink-input-volume {d} {d}%", .{ e.id, pct }) catch return;
+    };
+    spawnDetached(cmd);
+}
+
+/// Click-to-open from the volume module: starts the list fetch; the popup
+/// opens sized once it lands (~one frame later, imperceptible).
+fn openVolumeMixerFetch(bar: *Bar) void {
+    if (bar.popup != null) return;
+    if (vol_fetch_fd >= 0) return;
+    vol_open_bar = bar;
+    startVolumeListFetch();
+}
+
+/// Steps the master sink ±VOL_WHEEL_STEP_PCT per notch (negative axis =
+/// scroll up = louder, matching the measured workspace sign convention),
+/// kicks a prompt volume re-poll so the OSD corrects within ~100ms, and
+/// shows the OSD. Shared by the module wheel and the OSD wheel (the mixer
+/// panel adjusts per-row instead and refreshes through its own fetch).
+fn adjustMasterVolume(bar: *Bar, steps: i32) void {
+    var s = steps;
+    if (s > WORKSPACE_SCROLL_MAX_STEPS) s = WORKSPACE_SCROLL_MAX_STEPS;
+    if (s < -WORKSPACE_SCROLL_MAX_STEPS) s = -WORKSPACE_SCROLL_MAX_STEPS;
+    if (s == 0) return;
+    const delta: i8 = @intCast(-s * VOL_WHEEL_STEP_PCT);
+    const step: u8 = @intCast(@abs(delta));
+    const sign: u8 = if (delta > 0) '+' else '-';
+    var buf: [128]u8 = undefined;
+    var sbuf: [160]u8 = undefined;
+    const sink = pactlSinkArg(&sbuf) orelse return;
+    const cmd = std.fmt.bufPrintZ(&buf, "pactl set-sink-volume {s} {c}{d}%", .{ sink, sign, step }) catch return;
+    spawnDetached(cmd);
+    startVolumeFetch(bar.volume);
+    showVolumeOSD(bar);
+}
+
+// --- volume OSD ------------------------------------------------------------
+//
+// Transient level feedback: a small grab-less popup above the bar showing
+// the master percentage plus a level bar, auto-dismissed ~2s after the last
+// change. Triggered by wheel adjustments and by any other master change the
+// 5s volume poll notices (media keys, pavucontrol) — never while the mixer
+// panel is open (the panel is its own feedback). No grab: an OSD that stole
+// pointer focus on every wheel tick would be unusable.
+
+const VOL_OSD_WIDTH: i32 = 300;
+const VOL_OSD_HEIGHT: i32 = 52;
+const VOL_OSD_PAD: i64 = 14;
+const VOL_OSD_BAR_H: i64 = 8;
+const VOL_OSD_ALIVE_TICKS: u32 = 34; // ~2s on the 60ms tick
+
+/// Shows (or refreshes + re-arms) the OSD on `bar`. No-op without a volume
+/// reading, and never over the mixer panel.
+fn showVolumeOSD(bar: *Bar) void {
+    var pbuf: [16]u8 = undefined;
+    if (!parseVolumePoll(bar.volume.text(), &pbuf).ok) return;
+    if (bar.popup) |pm| {
+        if (pm.kind == .volume) return;
+        if (pm.kind != .volume_osd) closePopup(bar);
+    }
+    if (bar.popup == null) {
+        const ps = createPopupSurface(bar, VOL_OSD_WIDTH, VOL_OSD_HEIGHT, true) orelse return;
+        bar.popup = PopupMenu{
+            .surface = ps.surface,
+            .xdg_surface = ps.xdg_surface,
+            .popup = ps.popup,
+            .kind = .volume_osd,
+            .osd_since = hover_frame,
+        };
+        wirePopup(bar, ps, false);
+    } else {
+        bar.popup.?.osd_since = hover_frame;
+        drawPopup(bar) catch |err| {
+            logging.err("popup draw failed: {}", .{err});
+        };
+    }
+}
+
+fn drawVolumeOSD(bar: *Bar, pm: *PopupMenu, pixels: [*]u32) void {
+    const text_color = current_config.appearance.text_color;
+    var pbuf: [16]u8 = undefined;
+    const vol = parseVolumePoll(bar.volume.text(), &pbuf);
+    if (!vol.ok) return;
+    // Muted reads dimmed throughout (Noctalia's inactive state); the bar
+    // underneath still shows where it will land on unmute.
+    const col = if (vol.muted) current_config.appearance.popup_disabled_color else text_color;
+    const pct = vol.pct;
+    var vbuf: [8]u8 = undefined;
+    const shown = if (vol.muted) "muted" else std.fmt.bufPrint(&vbuf, "{d}%", .{pct}) catch "?";
+    const mid: i64 = @divTrunc(@as(i64, VOL_OSD_HEIGHT), 2);
+    const baseline = mid + @divTrunc(@as(i64, bar.font.ascentPx()) - @as(i64, bar.font.descentPx()), 2);
+    // Speaker icon, oversized like the bar's module glyphs, vertically
+    // centered. Falls back to 1x on raster failure.
+    var ii: usize = 0;
+    const icp = nextUtf8Codepoint(volumeIconFor(pct), &ii) orelse 0;
+    const big = if (ii > 0) bar.font.glyphScaled(icp, 2) catch null else null;
+    defer if (big) |b| bar.font.gpa.free(b.pixels);
+    var x0: i64 = VOL_OSD_PAD;
+    if (big) |b| {
+        const iy = mid - @divTrunc(@as(i64, @intCast(b.height)), 2);
+        blitBigGlyph(pixels, pm.width, pm.height, x0 + @as(i64, b.bitmap_left), iy, &b, col, pm.width);
+        x0 += @as(i64, b.advance_x);
+    } else {
+        var gi: usize = 0;
+        const icon = volumeIconFor(pct);
+        while (nextUtf8Codepoint(icon, &gi)) |cp| {
+            x0 += drawGlyphAt(pixels, pm.width, pm.height, bar.font, x0, baseline, cp, col, 0, pm.width);
+        }
+    }
+    x0 += 10;
+    // Percentage right-aligned; slider fills the middle.
+    const value_w = textPixelWidth(bar.font, shown);
+    const vx = @as(i64, @intCast(pm.width)) - VOL_OSD_PAD - value_w;
+    var ti: usize = 0;
+    var tx = vx;
+    while (nextUtf8Codepoint(shown, &ti)) |cp| {
+        tx += drawGlyphAt(pixels, pm.width, pm.height, bar.font, tx, baseline, cp, col, 0, pm.width);
+    }
+    const sx0 = x0;
+    const sx1 = vx - 10;
+    if (sx1 > sx0) {
+        const sy = mid - @divTrunc(VOL_OSD_BAR_H, 2);
+        const track_col = current_config.appearance.popup_separator_color;
+        const fill_col = if (vol.muted) current_config.appearance.popup_disabled_color else current_config.appearance.workspace_active_color;
+        fillRoundedRect(pixels, pm.width, pm.height, sx0, sy, sx1, sy + VOL_OSD_BAR_H, 4, track_col);
+        const fw: i64 = @divTrunc((sx1 - sx0) * @as(i64, pct), 100);
+        if (fw > 0) {
+            fillRoundedRect(pixels, pm.width, pm.height, sx0, sy, sx0 + fw, sy + VOL_OSD_BAR_H, 4, fill_col);
+        }
+    }
+}
+
 fn drawPopup(bar: *Bar) !void {
     var pm = &(bar.popup orelse return);
     if (!pm.configured or pm.width == 0 or pm.height == 0) return;
@@ -2478,6 +4200,8 @@ fn drawPopup(bar: *Bar) !void {
     switch (pm.kind) {
         .dbusmenu => drawDbusMenuRows(bar, pm, pixels),
         .layout_picker => drawLayoutPickerRows(bar, pm, pixels),
+        .volume => drawVolumeRows(bar, pm, pixels),
+        .volume_osd => drawVolumeOSD(bar, pm, pixels),
     }
 
     const pool = try bar.shm.createPool(fd, @intCast(size));
@@ -2684,8 +4408,16 @@ const Bar = struct {
     configured: bool = false,
     click_regions: ClickRegions = .{},
     pointer_x: i32 = -1,
+    pointer_y: i32 = -1,
     pointer_over_popup: bool = false,
     last_pointer_serial: u32 = 0,
+    /// Launcher drag-and-drop: a press over a pin arms (li + press point)
+    /// instead of acting; release without motion is the click, motion past
+    /// LAUNCH_DRAG_PX live-reorders launcher_view_order, release commits.
+    launch_press_li: ?usize = null,
+    launch_press_x: i32 = 0,
+    launch_press_y: i32 = 0,
+    launch_dragging: bool = false,
     drawer_expanded: bool = false, // target state, flipped instantly on click
     drawer_anim: f32 = 0.0, // 0=collapsed..1=expanded, eased toward drawer_expanded each tick
     /// Dock-mode packing: last frame's per-group content widths. The pack
@@ -2736,6 +4468,19 @@ const Bar = struct {
     matrix_chars: [16]u32 = [_]u32{0} ** 16,
     matrix_chars_len: usize = 0,
     matrix_charset_done: bool = false,
+    /// Drawer island span: min/max x of last frame's drawn in-drawer cells.
+    /// The island's shared resting pill paints from these bounds before each
+    /// walk (dock-pack style — content settles a frame later), so no measure
+    /// pass duplicates the right group's per-kind width logic.
+    drawer_island_x0: i64 = 0,
+    drawer_island_x1: i64 = 0,
+    drawer_island_set: bool = false,
+    /// Weather hover bounds: the live cell span, refreshed every walk that
+    /// draws the module (cleared when it doesn't). The tick's redraw gate
+    /// and the condition-fx overlay both read last frame's bounds.
+    weather_fx_x0: i64 = 0,
+    weather_fx_x1: i64 = 0,
+    weather_fx_set: bool = false,
     /// Media progress fraction (position/length) for the progress underline,
     /// or null when the player doesn't report both. Refreshed with the
     /// mpris poll (2s cadence — smooth enough for a thin bar that moves a
@@ -2876,6 +4621,7 @@ fn realMain() !void {
     resolveConfigPaths();
     current_config = loadConfig();
     invalidateLauncherIcons();
+    resetLauncherViewOrder();
     writePidfile();
     logging.step("config loaded from {s}", .{config_json_path});
 
@@ -2986,6 +4732,15 @@ fn realMain() !void {
     };
     defer workspaces.deinit();
 
+    // Live window list for the launcher running-dots + taskbar tail: same
+    // compositor socket as workspaces, refreshed on compositor events and
+    // every other clock tick (focus-within-a-tag may not move Mango's
+    // all-tags stream, so events alone can miss a focus change).
+    running_state = RunningApps.init(gpa, workspaces.mode, workspaces.sockPath());
+    // Icon names for pins and tail buttons (one .desktop scan; the theme
+    // lookups themselves stay lazy per pin/appid).
+    buildDesktopIndex();
+
     var event_sock_path_buf: [128]u8 = undefined;
     const comp_event_fd: posix.fd_t = if (hypr_sock_dir) |dir| blk: {
         const event_path = std.fmt.bufPrint(&event_sock_path_buf, "{s}/.socket2.sock", .{dir}) catch break :blk -1;
@@ -3012,6 +4767,7 @@ fn realMain() !void {
     startPacmanFetch(&pacman_updates);
     var volume: PolledCommand = .{};
     startVolumeFetch(&volume);
+    startVolumeSubscribe();
     var mpris: PolledCommand = .{};
     startMprisFetch(&mpris);
     var tray = Tray.init(gpa);
@@ -3261,6 +5017,8 @@ fn realMain() !void {
         .{ .fd = custom_script_timer_fds[3], .events = posix.POLL.IN, .revents = 0 }, // [27]
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [28] custom_scripts[3].pending_fd, refreshed below
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [29] cava visualizer pipe, refreshed below
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [30] vol_fetch_fd, refreshed below
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, // [31] vol_sub_fd (pactl subscribe), refreshed below
     };
     comptime {
         if (MAX_CUSTOM_SCRIPTS != 4) @compileError("poll_fds' custom-script slots [21..28] are hand-unrolled for MAX_CUSTOM_SCRIPTS == 4; update both if that changes");
@@ -3283,6 +5041,8 @@ fn realMain() !void {
         poll_fds[26].fd = custom_scripts[2].pending_fd;
         poll_fds[28].fd = custom_scripts[3].pending_fd;
         poll_fds[29].fd = cava_state.pending_fd;
+        poll_fds[30].fd = vol_fetch_fd;
+        poll_fds[31].fd = vol_sub_fd;
 
         _ = try posix.poll(&poll_fds, -1);
 
@@ -3299,6 +5059,31 @@ fn realMain() !void {
             // reaping exactly at EOF, so it's retried until it succeeds.
             reapChildren();
             second_count += 1;
+            // Focus changes don't always move the compositor event stream
+            // (nothing about the tag set changes), so poll the client list
+            // on a slow cadence as well — socket IPC, no fork, cheap. The
+            // drawAllBars at the end of this tick picks up any change.
+            // Silent on failure (the event path above already warns, and a
+            // dead compositor socket would otherwise spam once per 2s).
+            if (@rem(second_count, 2) == 0) {
+                _ = running_state.refresh() catch false;
+                // New arrivals get their taskbar icons outside the draw
+                // path (SVG raster would hitch frames), bounded per tick.
+                ensureTailIcons();
+            }
+            // pactl subscribe feed can die (pactl upgrade, PipeWire restart);
+            // respawn it on the slow tick rather than wedging the OSD's
+            // event-driven path — the timer poll below still covers the gap.
+            if (vol_sub_fd < 0) {
+                if (vol_sub_dead_since == 0) {
+                    vol_sub_dead_since = second_count;
+                } else if (second_count - vol_sub_dead_since >= 2) {
+                    vol_sub_dead_since = 0;
+                    startVolumeSubscribe();
+                }
+            } else {
+                vol_sub_dead_since = 0;
+            }
             // A dead/vacant cava visualizer is retried on a slow timer rather
             // than wedged: cava can exit on its own (audio sink dropped) and
             // the initial spawn above can race the pulseaudio socket appearing.
@@ -3312,6 +5097,24 @@ fn realMain() !void {
                 cava_state.dead_since_tick = second_count;
                 startCavaFetch();
             }
+            // Mixer panel refresh: levels drift (other mixers, keys, streams
+            // coming and going), so re-list while any panel is open. A wedged
+            // fetch (PipeWire down mid-run) is abandoned past ~5s.
+            if (vol_fetch_fd >= 0 and hover_frame -% vol_fetch_since_frame > 83) {
+                closeVolumeFetch();
+                vol_open_bar = null;
+            } else {
+                for (bars[0..bar_count]) |*b| {
+                    if (b.popup) |pm| {
+                        // A mid-drag refresh would snap the slider out from
+                        // under the pointer; the release triggers its own.
+                        if (pm.kind == .volume and pm.vol_drag_row == null) {
+                            startVolumeListFetch();
+                            break;
+                        }
+                    }
+                }
+            }
             drawAllBars(bars[0..bar_count]);
         }
         if (poll_fds[2].revents & posix.POLL.IN != 0) {
@@ -3324,6 +5127,13 @@ fn realMain() !void {
             workspaces.refresh() catch |err| {
                 logging.warn("workspaces refresh failed: {}", .{err});
             };
+            // Same event means windows may have opened/closed/focused —
+            // re-read the client list so dots and tail track it.
+            const running_changed = running_state.refresh() catch |err| blk: {
+                logging.warn("running apps refresh failed: {}", .{err});
+                break :blk false;
+            };
+            _ = running_changed;
             drawAllBars(bars[0..bar_count]);
         }
         if (poll_fds[3].revents & posix.POLL.IN != 0) {
@@ -3364,9 +5174,32 @@ fn realMain() !void {
             startVolumeFetch(&volume);
         }
         if (poll_fds[8].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+            // Master level changed out from under us (media keys,
+            // pavucontrol, the mixer): show the OSD unless a mixer panel is
+            // already giving feedback. Compared before the read overwrites.
+            const prev_len = volume.text_len;
+            var prev: [256]u8 = undefined;
+            @memcpy(prev[0..prev_len], volume.text_buf[0..prev_len]);
             if (volume.onReadable()) {
                 _ = posix.system.close(volume.pending_fd);
                 volume.pending_fd = -1;
+                const now = volume.text();
+                if (now.len != prev_len or !std.mem.eql(u8, now, prev[0..prev_len])) {
+                    var mixer_open = false;
+                    for (bars[0..bar_count]) |*b| {
+                        if (b.popup) |pm| {
+                            if (pm.kind == .volume) {
+                                mixer_open = true;
+                                break;
+                            }
+                        }
+                    }
+                    // Panel-driven master sets suppress their own echo (set
+                    // alongside the set-command); anything else pops the OSD.
+                    if (!mixer_open and vol_osd_suppress_left <= 0) {
+                        for (bars[0..bar_count]) |*b| showVolumeOSD(b);
+                    }
+                }
                 drawAllBars(bars[0..bar_count]);
             }
         }
@@ -3389,6 +5222,8 @@ fn realMain() !void {
             // anything is hovered (wrapping is fine; phase math is modulo).
             // Matrix streams ride the same clock.
             hover_frame +%= 1;
+            // Mixer-echo suppressions tick down here (see spawnVolumeSet).
+            if (vol_osd_suppress_left > 0) vol_osd_suppress_left -= 1;
             if (current_config.appearance.animations_enabled and std.mem.eql(u8, current_config.appearance.bg_mode, BG_MODE_MATRIX)) {
                 for (bars[0..bar_count]) |*b| updateMatrixHeads(b);
             }
@@ -3469,9 +5304,21 @@ fn realMain() !void {
                             }
                         }
                     }
+                    // A pulsing urgent pill needs frames too (same gating as
+                    // the bezel above; frozen when animations are off).
+                    if (!needs_redraw) {
+                        for (b.workspaces.list.items) |ws| {
+                            if (ws.urgent and !ws.active) {
+                                needs_redraw = true;
+                                break;
+                            }
+                        }
+                    }
                     // Animated backgrounds repaint every tick while visible
                     // (same cost class as the always-on bezel above).
                     if (!needs_redraw and bgEffectVisible()) needs_redraw = true;
+                    // Hovered weather plays its condition fx — same deal.
+                    if (!needs_redraw and weatherHovered(b)) needs_redraw = true;
                 }
                 if (needs_redraw) {
                     drawAndCommit(b) catch |err| {
@@ -3483,6 +5330,11 @@ fn realMain() !void {
                 // (the bezel keeps animating under a parked pointer). Both
                 // collapse to snap + no forced redraws with animations off.
                 if (b.popup) |*pm| {
+                    // The volume OSD is timed, not hovered: dismiss ~2s
+                    // after its last change.
+                    if (pm.kind == .volume_osd and hover_frame -% pm.osd_since > VOL_OSD_ALIVE_TICKS) {
+                        closePopup(b);
+                    }
                     var popup_redraw = false;
                     var ri: usize = 0;
                     while (ri < pm.row_count) : (ri += 1) {
@@ -3549,6 +5401,13 @@ fn realMain() !void {
                     !std.mem.eql(u8, old_bar_mode, cfg.appearance.bar_mode);
                 current_config = cfg;
                 invalidateLauncherIcons();
+                resetLauncherViewOrder();
+                // A reload mid-drag (GUI save, drop commit) strands the
+                // armed press — its indices belong to the old order.
+                for (bars[0..bar_count]) |*b| {
+                    b.launch_press_li = null;
+                    b.launch_dragging = false;
+                }
                 logging.step("config: reloaded {s}", .{config_json_path});
                 // Toggling auto-hide off while hidden must reveal the bar —
                 // otherwise it stays invisible with the feature disabled.
@@ -3701,6 +5560,20 @@ fn realMain() !void {
                 .none => {},
             }
         }
+        if (poll_fds[30].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+            // One-shot pactl list run for the mixer: read until EOF, then
+            // settle (open pending panel / refresh live ones).
+            if (readVolumeFetch()) finishVolumeListFetch(bars[0..bar_count]);
+        }
+        if (poll_fds[31].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+            // PipeWire change event: re-poll volume immediately so the OSD
+            // tracks the knob/keys in ~100ms rather than on the timer's
+            // schedule. Dead feed (HUP) is respawned by the 1s tick below.
+            if (readVolumeSubscribe(&volume)) {
+                _ = posix.system.close(vol_sub_fd);
+                vol_sub_fd = -1;
+            }
+        }
     }
 }
 
@@ -3744,9 +5617,15 @@ fn reapChildren() void {
 /// and custom/pacman (and wireplumber's polled `wpctl` read), which only
 /// differ in what they exec and how often.
 const PolledCommand = struct {
-    text_buf: [64]u8 = undefined,
+    /// Final text, trimmed. Sized for the longest single producer: the
+    /// mpris two-liner ("PLAYER|STATUS|ARTIST - TITLE\nPOSITION|LENGTH"),
+    /// whose first line is an unbounded track title — anything shorter
+    /// truncates the position/length tail and silently kills progress.
+    text_buf: [256]u8 = undefined,
     text_len: usize = 0,
-    read_buf: [256]u8 = undefined,
+    /// Staging for one fetch's raw output; must cover text_buf or the tail
+    /// never survives to be trimmed into it (see above).
+    read_buf: [1024]u8 = undefined,
     read_len: usize = 0,
     pending_fd: posix.fd_t = -1,
 
@@ -4135,7 +6014,7 @@ fn sampleRam() void {
 
 /// Scans `text` for a "<key>   <number> kB" line (/proc/meminfo's format)
 /// and returns the number — hand-rolled in the same substring-scan style as
-/// extractFirstId/parseVolumePercent above.
+/// extractFirstId above.
 fn parseMeminfoField(text: []const u8, key: []const u8) ?u64 {
     const pos = std.mem.indexOf(u8, text, key) orelse return null;
     var i = pos + key.len;
@@ -4576,8 +6455,59 @@ fn startPacmanFetch(cmd: *PolledCommand) void {
 }
 
 fn startVolumeFetch(cmd: *PolledCommand) void {
-    var argv = [_:null]?[*:0]const u8{ "env", "wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@", null };
-    cmd.startFetch("/usr/bin/env", &argv);
+    // pactl takes node names (wpctl only takes numeric IDs, which shift on
+    // every restart); grep/tr reduce each answer to one plain line so the
+    // poll text stays trivially parseable below: "<digits>" plus a "MUTED"
+    // line when muted. Copied onto the stack: argv only needs to live
+    // through the fork/exec below.
+    var sbuf: [160]u8 = undefined;
+    const sink = pactlSinkArg(&sbuf) orelse return;
+    var cbuf: [384]u8 = undefined;
+    // -m1 alone doesn't suffice: it stops after one matching LINE while -o
+    // still prints every % on it (stereo pairs), so head -1 keeps exactly
+    // the front-left figure the module shows.
+    const command = std.fmt.bufPrintZ(&cbuf, "pactl get-sink-volume {s} 2>/dev/null | grep -o '[0-9]*%' | head -1 | tr -d '%'; pactl get-sink-mute {s} 2>/dev/null | grep -q yes && echo MUTED", .{ sink, sink }) catch return;
+    var argv = [_:null]?[*:0]const u8{ "sh", "-c", command.ptr, null };
+    cmd.startFetch("/bin/sh", &argv);
+}
+
+/// Parsed volume poll text ("<digits>[\nMUTED]"): the level, the mute flag,
+/// and the digits slice for labels. `ok` is false on empty/garbled output
+/// (PipeWire down, unknown sink) — callers show nothing rather than stale.
+const VolumePoll = struct {
+    pct: u8 = 0,
+    muted: bool = false,
+    text: []const u8 = "",
+    ok: bool = false,
+};
+
+fn parseVolumePoll(text: []const u8, buf: []u8) VolumePoll {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var digits: []const u8 = "";
+    var muted = false;
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.eql(u8, line, "MUTED")) {
+            muted = true;
+            continue;
+        }
+        if (digits.len == 0) {
+            var all_digits = true;
+            for (line) |c| {
+                if (c < '0' or c > '9') {
+                    all_digits = false;
+                    break;
+                }
+            }
+            if (all_digits) digits = line;
+        }
+    }
+    if (digits.len == 0) return .{};
+    const pct: u8 = @intCast(@min(std.fmt.parseInt(u32, digits, 10) catch 0, 255));
+    const n = @min(digits.len, buf.len);
+    @memcpy(buf[0..n], digits[0..n]);
+    return .{ .pct = pct, .muted = muted, .text = buf[0..n], .ok = true };
 }
 
 // Finds the first playerctl-visible player that's actually Playing or
@@ -4646,19 +6576,6 @@ fn parseMprisPos(s: []const u8) i64 {
 /// into `buf`. Hand-rolled integer parsing (assumes exactly the two decimal
 /// places wpctl always prints) rather than std.fmt.parseFloat, to sidestep
 /// yet another moving-target stdlib API.
-fn parseVolumePercent(text: []const u8, buf: []u8) []const u8 {
-    const prefix = "Volume: ";
-    const idx = std.mem.indexOf(u8, text, prefix) orelse return "";
-    const rest = std.mem.trim(u8, text[idx + prefix.len ..], " \t\r\n");
-    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return "";
-    const whole = std.fmt.parseInt(i64, rest[0..dot], 10) catch return "";
-    var frac_str = rest[dot + 1 ..];
-    if (frac_str.len > 2) frac_str = frac_str[0..2];
-    const frac = std.fmt.parseInt(i64, frac_str, 10) catch 0;
-    const frac_scaled = if (frac_str.len == 1) frac * 10 else frac;
-    return std.fmt.bufPrint(buf, "{d}", .{whole * 100 + frac_scaled}) catch "";
-}
-
 /// Turns MPRIS_SCRIPT's "STATUS|ARTIST - TITLE" into "STATUS ARTIST -
 /// TITLE" for display (drawMpris uppercases it at draw time).
 /// Encodes one codepoint as UTF-8 into `out` (needs >= 4 bytes), returning
@@ -4685,6 +6602,217 @@ fn utf8Encode(cp: u32, out: []u8) usize {
         out[3] = @intCast(0x80 | (cp & 0x3F));
         return 4;
     }
+}
+
+/// Condition effects for the weather hover animation (bar module + desktop
+/// card): what plays while the pointer sits on the widget, Noctalia-style.
+/// Mapped from the shaped weather icon, like the tint.
+const WeatherFx = enum { none, rain, snow, storm, clear, cloud, fog, wind };
+
+/// Maps a shaped weather icon (U+E3xx) to its hover effect. Pure so tests
+/// pin it — the shell duplicates this table (it can't import main.zig).
+fn weatherFxKind(nf: u32) WeatherFx {
+    return switch (nf) {
+        0xE30D => .clear,
+        0xE302, 0xE304 => .cloud,
+        0xE335 => .cloud,
+        0xE319 => .rain,
+        0xE31D => .storm,
+        0xE31A => .snow,
+        0xE313 => .fog,
+        0xE34B => .wind,
+        0xE351 => .wind,
+        else => .none,
+    };
+}
+
+/// Condition-aware resolver: showers (0x1F326) wear the partly-rainy icon
+/// but must RAIN, not drift cloud puffs — the icon alone can't tell them
+/// from sun-behind-cloud (0x1F324). Everything else follows the icon
+/// table. Pure so tests pin it; mirrored by the shell.
+fn weatherFxFor(wttr: u32, nf: u32) WeatherFx {
+    if (wttr == 0x1F326) return .rain;
+    return weatherFxKind(nf);
+}
+
+/// Deterministic 0..1 scatter for particle `i` (stateless effects need no
+/// RNG state — the frame clock is the only input). Pure so tests pin it.
+fn fxHash01(i: i64) f32 {
+    const h: u64 = @as(u64, @intCast(i)) *% 2654435761;
+    return @as(f32, @floatFromInt((h >> 8) & 0xFFFF)) / 65535.0;
+}
+
+/// One effect pixel, clipped to the effect rect. The caller owns the bounds;
+/// out-of-shape pixels (rounded pill corners) simply don't get drawn.
+fn putFxPixel(pixels: [*]u32, buf_width: u32, buf_height: u32, x: i64, y: i64, x0: i64, x1: i64, yT: i64, yB: i64, rgb: u32) void {
+    if (x < x0 or x >= x1 or y < yT or y >= yB) return;
+    if (x < 0 or y < 0) return;
+    const ux: usize = @intCast(x);
+    const uy: usize = @intCast(y);
+    if (ux >= buf_width or uy >= buf_height) return;
+    pixels[uy * buf_width + ux] = rgb;
+}
+
+/// Hover overlay for the weather module: condition particles inside
+/// [x0,x1) at the pill band, driven by the free-running frame clock (no
+/// per-bar animation state — the tick's redraw gate keeps frames coming
+/// while hovered). `interior` is the pill fill to nest into (pillFillColor
+/// when pills are on, bar bg otherwise) and `tint` the condition color;
+/// both come from the caller, so this function reads no theme globals and
+/// tests can render it into a scratch buffer (see the smoke test below).
+fn drawWeatherFx(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, x1: i64, wttr: u32, nf: u32, frame: u32, interior: u32, tint: u32) void {
+    const kind = weatherFxFor(wttr, nf);
+    if (kind == .none) return;
+    const w = x1 - x0;
+    if (w <= 0) return;
+    const h: i64 = @intCast(buf_height);
+    const yT = HOVER_PILL_PAD_Y + 1;
+    const yB = h - HOVER_PILL_PAD_Y - 1;
+    const H = yB - yT;
+    if (H <= 0) return;
+    const fi: i64 = @intCast(frame % 100000);
+    const fw: f32 = @floatFromInt(w);
+    const fh: f32 = @floatFromInt(H);
+    switch (kind) {
+        .none => {},
+        .rain => {
+            var i: i64 = 0;
+            while (i < 10) : (i += 1) {
+                const fx = x0 + @as(i64, @intFromFloat(fxHash01(i * 2 + 1) * fw));
+                const fy = yT + @mod(fi * 3 + @divTrunc(i * H, 10), H);
+                const col = lerpColor(interior, tint, 0.55);
+                putFxPixel(pixels, buf_width, buf_height, fx, fy, x0, x1, yT, yB, col);
+                putFxPixel(pixels, buf_width, buf_height, fx, fy + 1, x0, x1, yT, yB, col);
+                putFxPixel(pixels, buf_width, buf_height, fx, fy + 2, x0, x1, yT, yB, col);
+            }
+        },
+        .snow => {
+            var i: i64 = 0;
+            while (i < 9) : (i += 1) {
+                const fy = yT + @mod(@divTrunc(fi, 2) + @divTrunc(i * H, 9), H);
+                const sway = @round(1.5 * std.math.sin(@as(f32, @floatFromInt(fi)) * 0.08 + @as(f32, @floatFromInt(i)) * 1.7));
+                const fx = x0 + @as(i64, @intFromFloat(fxHash01(i * 2 + 3) * fw)) + @as(i64, @intFromFloat(sway));
+                putFxPixel(pixels, buf_width, buf_height, fx, fy, x0, x1, yT, yB, lerpColor(interior, 0xFFFFFFFF, 0.7));
+            }
+        },
+        .storm => {
+            var i: i64 = 0;
+            while (i < 7) : (i += 1) {
+                const fx = x0 + @as(i64, @intFromFloat(fxHash01(i * 2 + 1) * fw));
+                const fy = yT + @mod(fi * 3 + @divTrunc(i * H, 7), H);
+                const col = lerpColor(interior, tint, 0.55);
+                putFxPixel(pixels, buf_width, buf_height, fx, fy, x0, x1, yT, yB, col);
+                putFxPixel(pixels, buf_width, buf_height, fx, fy + 1, x0, x1, yT, yB, col);
+                putFxPixel(pixels, buf_width, buf_height, fx, fy + 2, x0, x1, yT, yB, col);
+            }
+            if (@mod(fi, 110) < 5) {
+                const flash = lerpColor(interior, 0xFFFFFFFF, 0.22);
+                var yy = yT;
+                while (yy < yB) : (yy += 1) {
+                    var xx = x0;
+                    while (xx < x1) : (xx += 1) {
+                        putFxPixel(pixels, buf_width, buf_height, xx, yy, x0, x1, yT, yB, flash);
+                    }
+                }
+            }
+        },
+        .clear => {
+            // Shine sweep: a soft bright band sliding down and wrapping.
+            const sy = yT + @mod(fi * 2, H + 6) - 3;
+            var yy = sy - 1;
+            while (yy <= sy + 1) : (yy += 1) {
+                const d: f32 = @floatFromInt(@abs(yy - sy));
+                const col = lerpColor(interior, 0xFFFFE9A8, 0.18 * (1.0 - d / 2.0));
+                var xx = x0;
+                while (xx < x1) : (xx += 1) {
+                    putFxPixel(pixels, buf_width, buf_height, xx, yy, x0, x1, yT, yB, col);
+                }
+            }
+        },
+        .cloud => {
+            var i: i64 = 0;
+            while (i < 3) : (i += 1) {
+                const px = x0 + @mod(fi + i * @divTrunc(w, 3), w);
+                const py = yT + @as(i64, @intFromFloat(fxHash01(i * 2 + 5) * fh));
+                const col = lerpColor(interior, 0xFFFFFFFF, 0.22);
+                putFxPixel(pixels, buf_width, buf_height, px, py, x0, x1, yT, yB, col);
+                putFxPixel(pixels, buf_width, buf_height, px + 1, py, x0, x1, yT, yB, col);
+                putFxPixel(pixels, buf_width, buf_height, px + 2, py, x0, x1, yT, yB, col);
+                putFxPixel(pixels, buf_width, buf_height, px, py + 1, x0, x1, yT, yB, col);
+                putFxPixel(pixels, buf_width, buf_height, px + 1, py + 1, x0, x1, yT, yB, col);
+                putFxPixel(pixels, buf_width, buf_height, px + 2, py + 1, x0, x1, yT, yB, col);
+            }
+        },
+        .fog => {
+            var r: i64 = 0;
+            while (r < 2) : (r += 1) {
+                const ly = yT + @divTrunc((r + 1) * H, 3);
+                const col = lerpColor(interior, tint, 0.2);
+                var xx = x0;
+                while (xx < x1) : (xx += 1) {
+                    if (@mod(xx + fi * 2 + r * 6, 12) < 7) {
+                        putFxPixel(pixels, buf_width, buf_height, xx, ly, x0, x1, yT, yB, col);
+                    }
+                }
+            }
+        },
+        .wind => {
+            var i: i64 = 0;
+            while (i < 5) : (i += 1) {
+                const wy = yT + @as(i64, @intFromFloat(fxHash01(i * 2 + 7) * fh));
+                const sx = x0 + @mod(i * @divTrunc(w, 5) - fi * 4, w);
+                const col = lerpColor(interior, tint, 0.3);
+                var k: i64 = 0;
+                while (k < 5) : (k += 1) {
+                    putFxPixel(pixels, buf_width, buf_height, sx + k, wy, x0, x1, yT, yB, col);
+                }
+            }
+        },
+    }
+}
+
+/// True while the pointer sits on the weather cell: animations on, cell
+/// recorded, pointer inside its span on the bar surface itself (leave resets
+/// pointer_x to -1; popups route elsewhere). Read by the tick's redraw gate
+/// and the .weather arm's overlay.
+fn weatherHovered(bar: *const Bar) bool {
+    if (!current_config.appearance.animations_enabled) return false;
+    if (!bar.weather_fx_set) return false;
+    if (bar.pointer_over_popup) return false;
+    const px: i64 = @as(i64, bar.pointer_x);
+    return px >= bar.weather_fx_x0 - 4 and px <= bar.weather_fx_x1 + 4;
+}
+/// Tint for a SHAPED weather icon (the U+E3xx codepoints formatWeatherText
+/// emits): semantic condition colors that stay vivid across themes. Keyed on
+/// the icon rather than wttr.in's emoji because the .weather arm only ever
+/// sees the shaped label; every icon from one condition shares its tint, so
+/// the mapping matches the shell's emoji-keyed table in intent (see
+/// ~/.local/share/simpbar/simpbar-shell/src/widgets.zig). Unlisted icons
+/// wear `fallback` (the caller passes the text color). Pure so tests pin it.
+fn weatherIconTint(nf: u32, fallback: u32) u32 {
+    return switch (nf) {
+        0xE30D => 0xFFFFD60A, // clear gold
+        0xE302, 0xE304 => 0xFFFFB340, // partly amber
+        0xE335 => 0xFF9AA7B8, // overcast slate
+        0xE319 => 0xFF4AA8FF, // rain blue
+        0xE31D => 0xFFB48CFF, // storm violet
+        0xE31A => 0xFFA8E6FF, // snow ice
+        0xE313 => 0xFF8E9AAF, // fog gray
+        0xE34B => 0xFF7DE3D0, // wind teal
+        0xE351 => 0xFFFF8A8A, // tornado red
+        else => fallback,
+    };
+}
+
+/// Splits a shaped weather label ("<icon> <temp>") back into its icon
+/// codepoint and the display text after it: the bar draws the icon tinted
+/// (wttrColorFor) with the temperature in the text color, but measures the
+/// joined string so widths never drift from the single-label days.
+fn splitWeatherLabel(text: []const u8) struct { icon: u32, icon_len: usize, rest: []const u8 } {
+    var i: usize = 0;
+    const icon = nextUtf8Codepoint(text, &i) orelse return .{ .icon = 0, .icon_len = 0, .rest = text };
+    const rest = std.mem.trim(u8, text[i..], " \t");
+    return .{ .icon = icon, .icon_len = i, .rest = rest };
 }
 
 /// Maps wttr.in's emoji (Miscellaneous Symbols / Emoji blocks — mostly
@@ -4731,7 +6859,10 @@ fn formatWeatherText(raw: []const u8, buf: []u8) []const u8 {
         i = save;
         break;
     }
-    const rest = std.mem.trim(u8, trimmed[i..], " \t\r\n");
+    var rest = std.mem.trim(u8, trimmed[i..], " \t\r\n");
+    // wttr.in prefixes non-negative temperatures with "+" ("+21°C") — noise
+    // next to an icon, so drop it (a leading "-" is significant and stays).
+    if (rest.len > 0 and rest[0] == '+') rest = rest[1..];
 
     var icon_bytes: [4]u8 = undefined;
     const icon_len = utf8Encode(icon, &icon_bytes);
@@ -4878,6 +7009,49 @@ fn drawGlyphAt(
     return g.advance_x;
 }
 
+/// Blits an uncached oversized glyph (see Font.glyphScaled) with its top-left
+/// at (`x0`, `y0`), coverage-blended over dst exactly like drawGlyphAt (the
+/// opaque pipeline: blendPixel forces opaque). No pen advance is returned —
+/// callers advance by `big.advance_x` themselves.
+fn blitBigGlyph(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, y0: i64, big: *const font_mod.BigGlyph, color: u32, clip_x_max: i64) void {
+    for (0..big.height) |row| {
+        for (0..big.width) |col| {
+            const coverage = big.pixels[row * big.width + col];
+            if (coverage == 0) continue;
+            const px = x0 + @as(i64, @intCast(col));
+            const py = y0 + @as(i64, @intCast(row));
+            if (px < 0 or px >= clip_x_max or py < 0) continue;
+            const pxu: usize = @intCast(px);
+            const pyu: usize = @intCast(py);
+            if (pxu >= buf_width or pyu >= buf_height) continue;
+            const idx = pyu * buf_width + pxu;
+            pixels[idx] = blendPixel(pixels[idx], color, coverage);
+        }
+    }
+}
+
+/// Layout metrics for an oversized icon blit: the cell content width covers
+/// the whole ink extent (glyph bitmaps routinely overhang their advance —
+/// weather/layout icons run ~1.6x wider — so measuring the advance alone
+/// clips the pill ring straight through the ink), and the pen origin shifts
+/// so the ink starts exactly at the content's left edge. Returns null when
+/// there is no raster or it is taller than `avail_h` (caller draws 1x).
+/// Pure (operates on the struct, never the font) so tests pin it.
+const BigLayout = struct {
+    b: *const font_mod.BigGlyph,
+    content_w: i64,
+    pen_off: i64,
+    adv: i64,
+};
+
+fn bigIconLayout(big: ?*const font_mod.BigGlyph, avail_h: i64) ?BigLayout {
+    const b = big orelse return null;
+    if (@as(i64, b.height) > avail_h) return null;
+    const lo: i64 = @min(@as(i64, 0), @as(i64, b.bitmap_left));
+    const hi: i64 = @max(@as(i64, b.advance_x), @as(i64, b.bitmap_left) + @as(i64, @intCast(b.width)));
+    return .{ .b = b, .content_w = hi - lo, .pen_off = -lo, .adv = hi };
+}
+
 /// Sum of each codepoint's advance width in `text`.
 fn textPixelWidth(font: *font_mod.Font, text: []const u8) i64 {
     var total: i64 = 0;
@@ -4954,6 +7128,13 @@ fn drawWorkspaces(
         const hover_start = region_start - @divTrunc(workspace_gap, 2);
         const hover_end = region_start + textPixelWidth(font, text) + @divTrunc(workspace_gap, 2);
         if (ws.active) drawActivePill(pixels, buf_width, buf_height, hover_start, hover_end);
+        // Urgent (not active) digits wear the amber alert instead: pulsing
+        // while animations are on, steady while off. Drawn under the hover
+        // wash so a parked pointer overdraws it.
+        if (!ws.active and ws.urgent) {
+            const pulse: f32 = if (current_config.appearance.animations_enabled) bezelBreathAt(hover_frame) else 1.0;
+            drawUrgentPill(pixels, buf_width, buf_height, hover_start, hover_end, pulse);
+        }
         // Hover wash only — the shared resting pill above owns the ring (no
         // inner seams). Same geometry the per-digit resting pill used, so a
         // parked pointer paints identically.
@@ -4962,7 +7143,6 @@ fn drawWorkspaces(
         while (nextUtf8Codepoint(text, &i)) |cp| {
             x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, color, 0, buf_width);
         }
-        drawUrgentDot(pixels, buf_width, buf_height, @divTrunc(region_start + x0, 2), ws.urgent);
         click_regions.addScrollable(@intCast(hover_start), @intCast(hover_end), .{ .switch_workspace = ws.id }, .step_workspace);
         x0 += workspace_gap;
     }
@@ -5007,6 +7187,31 @@ fn drawMprisProgress(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, r
 /// static text, progress underline, toggle hover wash. Returns the pen past
 /// the button (no trailing gap; callers add spacing like every other module
 /// kind). Empty text draws nothing and advances nothing.
+/// Media progress bar fill: the "bar" mpris_progress_style. Fills the pill
+/// interior behind the text from the left by `frac`, nesting inside the ring
+/// exactly like hover washes do (same shared thickness). Subtle by design —
+/// accent at 0.35 over the pill fill — so it reads as progress without
+/// shouting over the track text. No-op when frac is null (unknown length)
+/// or zero. Pure pixels except theme reads (see drawWeatherFx), so tests
+/// render it into a scratch buffer below.
+fn drawMprisBarFill(pixels: [*]u32, buf_width: u32, buf_height: u32, px0: i64, px1: i64, frac: ?f32) void {
+    const f = frac orelse return;
+    if (f <= 0.0) return;
+    const w = px1 - px0;
+    if (w <= 0) return;
+    const h: i64 = @intCast(buf_height);
+    const y0 = HOVER_PILL_PAD_Y;
+    const y1 = h - HOVER_PILL_PAD_Y;
+    if (y1 <= y0) return;
+    const fw: i64 = @intFromFloat(@as(f32, @floatFromInt(w)) * @min(f, 1.0));
+    if (fw <= 0) return;
+    const t: i64 = bezelThick(w, h - 2 * HOVER_PILL_PAD_Y);
+    const tr: i32 = @intCast(@max(@as(i64, 0), @as(i64, HOVER_PILL_RADIUS) - t));
+    const base = if (current_config.appearance.module_pills) pillFillColor() else current_config.appearance.bg_color;
+    const col = lerpColor(base, current_config.appearance.workspace_active_color, 0.35);
+    fillRoundedRect(pixels, buf_width, buf_height, px0 + t, y0 + t, px0 + fw, y1 - t, tr, col);
+}
+
 fn drawMprisPill(pixels: [*]u32, buf_width: u32, buf_height: u32, font: *font_mod.Font, y0: i64, x0_start: i64, text: []const u8, playing: bool, frac: ?f32, click_regions: *ClickRegions) i64 {
     if (text.len == 0) return x0_start;
     const side = mprisToggleSide(font, playing);
@@ -5014,12 +7219,20 @@ fn drawMprisPill(pixels: [*]u32, buf_width: u32, buf_height: u32, font: *font_mo
     var x0 = x0_start;
     // Resting pill over text + toggle as one bar (pad matches the static
     // segments' ±4px rhythm).
-    drawRestingPill(pixels, buf_width, buf_height, x0 - 4, x0 + text_w + MPRIS_CONTROL_GAP + side + 4);
+    const pill_x0 = x0 - 4;
+    const pill_x1 = x0 + text_w + MPRIS_CONTROL_GAP + side + 4;
+    drawRestingPill(pixels, buf_width, buf_height, pill_x0, pill_x1);
+    // Bar-style progress lives UNDER the glyphs (it spans the text run);
+    // the underline lives below them, so it draws after.
+    const bar_fill = std.mem.eql(u8, current_config.appearance.mpris_progress_style, MPRIS_PROGRESS_BAR);
+    if (bar_fill) drawMprisBarFill(pixels, buf_width, buf_height, pill_x0, pill_x1, frac);
     var i: usize = 0;
     while (nextUtf8Codepoint(text, &i)) |cp| {
         x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
     }
-    drawMprisProgress(pixels, buf_width, buf_height, x0_start, text_w, frac);
+    if (!bar_fill) {
+        drawMprisProgress(pixels, buf_width, buf_height, x0_start, text_w, frac);
+    }
     x0 += MPRIS_CONTROL_GAP;
     // Toggle hover wash only (the resting pill above owns ring + fill).
     drawPill(pixels, buf_width, buf_height, x0 - 2, x0 + side + 2, click_regions.nextHover());
@@ -5103,20 +7316,30 @@ fn drawLeftGroup(
                 // in `display`). Icon-only falls back to the name when no
                 // icon decodes, so the button stays clickable/visible, and
                 // name-only skips the icon entirely. Either way: icon (if
-                // drawn), label (if drawn), hover highlight, spawn click.
+                // drawn), label (if drawn), hover highlight, launcher click
+                // (raises the app when running, launches when not).
+                // Unpinned running apps trail the pins as text buttons
+                // (Windows-taskbar style), wearing the same running dot.
                 // Measure pass: span ONE resting pill across the whole button
                 // run instead of separated per-button pills. Width logic
                 // mirrors the draw loop below — keep in sync.
+                var unpinned: [MAX_UNPINNED_GROUPS]UnpinnedGroup = undefined;
+                const unpinned_n = collectUnpinned(&unpinned);
                 var run_x = x0;
                 var run_first = true;
                 var run_start: i64 = 0;
                 var run_end: i64 = 0;
-                for (current_config.launchers, 0..) |mbtn, mli| {
-                    const mmode = launcherDisplayMode(mbtn.display);
+                for (0..launcher_view_len) |vp| {
+                    const mli = launcher_view_order[vp];
+                    if (mli >= current_config.launchers.len) continue;
+                    const mbtn = current_config.launchers[mli];
                     const mhas = mli < launcher_icons.len and launcher_icons[mli].has_icon;
                     const mdistro: u32 = if (mli < launcher_icons.len) launcher_icons[mli].distro_glyph else 0;
-                    const mdraw_icon = (mhas or mdistro != 0) and mmode != .label;
-                    const mdraw_label = mmode != .icon or (!mhas and mdistro == 0);
+                    // Icon-only taskbar: the label survives solely as the
+                    // fallback when no icon resolved, so a button is never
+                    // invisible.
+                    const mdraw_icon = (mhas or mdistro != 0);
+                    const mdraw_label = !mdraw_icon;
                     var mdg: [4]u8 = undefined;
                     const munit: i64 = if (mhas and mdistro == 0) LAUNCHER_ICON_SIZE else if (mdistro != 0) textPixelWidth(font, encodeBmpCodepoint(mdistro, &mdg)) else 0;
                     const mw = (if (mdraw_label) textPixelWidth(font, mbtn.label) else 0) + (if (mdraw_icon) munit + (if (mdraw_label) LAUNCHER_ICON_TEXT_GAP else 0) else 0);
@@ -5129,15 +7352,28 @@ fn drawLeftGroup(
                     run_x += mw;
                     run_end = run_x + @divTrunc(LAUNCHER_GAP, 2);
                 }
+                for (unpinned[0..unpinned_n]) |g| {
+                    const mw = tailButtonWidth(font, &g);
+                    if (run_first) {
+                        run_start = run_x - @divTrunc(LAUNCHER_GAP, 2);
+                        run_first = false;
+                    } else {
+                        run_x += LAUNCHER_GAP;
+                    }
+                    run_x += mw;
+                    run_end = run_x + @divTrunc(LAUNCHER_GAP, 2);
+                }
                 if (!run_first) drawRestingPill(pixels, buf_width, buf_height, run_start, run_end);
-                for (current_config.launchers, 0..) |btn, li| {
-                    const mode = launcherDisplayMode(btn.display);
+                for (0..launcher_view_len) |vp| {
+                    const li = launcher_view_order[vp];
+                    if (li >= current_config.launchers.len) continue;
+                    const btn = current_config.launchers[li];
                     const has_icon = li < launcher_icons.len and launcher_icons[li].has_icon;
                     const distro: u32 = if (li < launcher_icons.len) launcher_icons[li].distro_glyph else 0;
-                    const draw_png = has_icon and distro == 0 and mode != .label;
-                    const draw_glyph = distro != 0 and mode != .label;
+                    const draw_png = has_icon and distro == 0;
+                    const draw_glyph = distro != 0;
                     const draw_icon = draw_png or draw_glyph;
-                    const draw_label = mode != .icon or (!has_icon and distro == 0);
+                    const draw_label = !draw_icon;
                     // The text gap only separates an icon from a following
                     // label — in icon-only mode it would be 5px of dead space
                     // trailing the icon, sitting the icon left-of-center in
@@ -5169,7 +7405,30 @@ fn drawLeftGroup(
                             x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
                         }
                     }
-                    click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .spawn = btn.command });
+                    const live = launcherLive(btn.command);
+                    if (live.count > 0) drawRunningDot(pixels, buf_width, buf_height, region_start + @divTrunc(label_w, 2), live.focused);
+                    click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .launcher = li });
+                    x0 += LAUNCHER_GAP;
+                }
+                for (unpinned[0..unpinned_n]) |g| {
+                    const uw = tailButtonWidth(font, &g);
+                    const uregion_start = x0;
+                    const uhover_start = uregion_start - @divTrunc(LAUNCHER_GAP, 2);
+                    const uhover_end = uregion_start + uw + @divTrunc(LAUNCHER_GAP, 2);
+                    drawPill(pixels, buf_width, buf_height, uhover_start, uhover_end, click_regions.nextHover());
+                    if (tailHasIcon(&g)) {
+                        if (tailIconPixels(running_state.apps[g.client_idx].appid())) |px| {
+                            blitIcon16(pixels, buf_width, buf_height, x0, px);
+                        }
+                        x0 += uw;
+                    } else {
+                        var ui: usize = 0;
+                        while (nextUtf8Codepoint(g.name(), &ui)) |cp| {
+                            x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
+                        }
+                    }
+                    drawRunningDot(pixels, buf_width, buf_height, uregion_start + @divTrunc(uw, 2), g.focused);
+                    click_regions.add(@intCast(uhover_start), @intCast(uhover_end), .{ .focus_client = g.client_idx });
                     x0 += LAUNCHER_GAP;
                 }
             },
@@ -5198,7 +7457,7 @@ fn drawLeftGroup(
 // buttons and clock text (the original two), plus workspace number pills
 // and the mpris track label once cross-group drag lets them be placed in
 // center. Cap is generous because workspaces contribute one segment each.
-const MAX_CENTER_SEGMENTS = 48;
+const MAX_CENTER_SEGMENTS = 64;
 
 /// One drawable piece of the center group. Kinds:
 /// - launcher button: `command` set, `icon_w`/`launcher_idx` when it has an
@@ -5230,6 +7489,13 @@ const CenterSegment = struct {
     ws_id: ?i32 = null,
     ws_active: bool = false,
     ws_urgent: bool = false,
+    /// Set when this is an unpinned running-app button (taskbar tail):
+    /// index into running_state.apps to raise on click. `label` points at
+    /// this segment's own `task_buf` (same self-owned pattern as ws
+    /// label_buf), `task_focused` lights the running dot.
+    focus_idx: ?usize = null,
+    task_focused: bool = false,
+    task_buf: [24]u8 = undefined,
     /// True when this static segment is the mpris track label (gets the
     /// progress underline when the player reports position/length).
     mpris: bool = false,
@@ -5275,15 +7541,17 @@ fn composeCenterSegments(out: *CenterSegments, font: *font_mod.Font, time_text: 
                 }
             },
             .launchers => {
-                for (current_config.launchers, 0..) |btn, i| {
+                for (0..launcher_view_len) |vp| {
+                    const i = launcher_view_order[vp];
+                    if (i >= current_config.launchers.len) continue;
+                    const btn = current_config.launchers[i];
                     if (out.len >= out.items.len) break;
-                    const mode = launcherDisplayMode(btn.display);
                     const has_icon = i < launcher_icons.len and launcher_icons[i].has_icon;
                     const distro: u32 = if (i < launcher_icons.len) launcher_icons[i].distro_glyph else 0;
-                    const draw_png = has_icon and distro == 0 and mode != .label;
-                    const draw_glyph = distro != 0 and mode != .label;
+                    const draw_png = has_icon and distro == 0;
+                    const draw_glyph = distro != 0;
                     const draw_icon = draw_png or draw_glyph;
-                    const draw_label = mode != .icon or (!has_icon and distro == 0);
+                    const draw_label = !draw_icon;
                     // A distro logo is a font glyph, not a 16px PNG: measure
                     // it so icon_w (and everything downstream — centering,
                     // hover bounds, pen advance) stays exact.
@@ -5296,6 +7564,25 @@ fn composeCenterSegments(out: *CenterSegments, font: *font_mod.Font, time_text: 
                         .icon_w = if (draw_icon) icon_unit + (if (draw_label) LAUNCHER_ICON_TEXT_GAP else 0) else 0,
                         .launcher_idx = i,
                     };
+                    out.len += 1;
+                }
+                // Taskbar tail: unpinned running apps as text buttons after
+                // the pins (same order as the left group's, one shared
+                // collectUnpinned source so the two can never disagree).
+                var tail: [MAX_UNPINNED_GROUPS]UnpinnedGroup = undefined;
+                const tail_n = collectUnpinned(&tail);
+                for (tail[0..tail_n]) |g| {
+                    if (out.len >= out.items.len) break;
+                    var seg = &out.items[out.len];
+                    seg.* = .{ .label = "", .gap_after = LAUNCHER_GAP, .focus_idx = g.client_idx, .task_focused = g.focused };
+                    if (tailHasIcon(&g)) {
+                        // Icon-only: no label, no icon→text gap.
+                        seg.icon_w = LAUNCHER_ICON_SIZE;
+                    } else {
+                        const nl = @min(g.name().len, seg.task_buf.len);
+                        @memcpy(seg.task_buf[0..nl], g.name()[0..nl]);
+                        seg.label = seg.task_buf[0..nl];
+                    }
                     out.len += 1;
                 }
             },
@@ -5381,7 +7668,7 @@ fn drawCenterGroup(
     var wscan_last_end: i64 = 0;
     for (segs.items[0..segs.len]) |seg| {
         const seg_w = seg.icon_w + textPixelWidth(font, seg.label);
-        const is_launcher = seg.command != null and seg.ws_id == null;
+        const is_launcher = (seg.command != null or seg.focus_idx != null) and seg.ws_id == null;
         if (is_launcher and !scan_run) {
             scan_run = true;
             scan_start = scan_x - @divTrunc(LAUNCHER_GAP, 2);
@@ -5413,6 +7700,12 @@ fn drawCenterGroup(
             const hover_start = region_start - @divTrunc(workspace_gap, 2);
             const hover_end = region_start + textPixelWidth(font, seg.label) + @divTrunc(workspace_gap, 2);
             if (seg.ws_active) drawActivePill(pixels, buf_width, buf_height, hover_start, hover_end);
+            // Urgent (not active) digits wear the amber alert instead (see
+            // the left workspaces loop for the layering).
+            if (!seg.ws_active and seg.ws_urgent) {
+                const pulse: f32 = if (current_config.appearance.animations_enabled) bezelBreathAt(hover_frame) else 1.0;
+                drawUrgentPill(pixels, buf_width, buf_height, hover_start, hover_end, pulse);
+            }
             // Hover wash only — the shared run pill from the measure pass
             // owns the ring (no inner seams).
             drawPill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
@@ -5420,9 +7713,8 @@ fn drawCenterGroup(
             while (nextUtf8Codepoint(seg.label, &i)) |cp| {
                 x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, color, 0, buf_width);
             }
-            drawUrgentDot(pixels, buf_width, buf_height, @divTrunc(region_start + x0, 2), seg.ws_urgent);
             click_regions.addScrollable(@intCast(hover_start), @intCast(hover_end), .{ .switch_workspace = ws_id }, .step_workspace);
-        } else if (seg.command) |cmd| {
+        } else if (seg.command != null) {
             const region_start = x0;
             const label_w = seg.icon_w + textPixelWidth(font, seg.label);
             const hover_start = region_start - @divTrunc(LAUNCHER_GAP, 2);
@@ -5449,7 +7741,39 @@ fn drawCenterGroup(
             while (nextUtf8Codepoint(seg.label, &i)) |cp| {
                 x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
             }
-            click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .spawn = cmd });
+            // Pinned icon doubles as its running app (same launcherLive
+            // source as the left group); guard the index for a config that
+            // reloaded between compose and draw (same frame — can't happen,
+            // but the union payload would raise the wrong pin otherwise).
+            if (seg.launcher_idx < current_config.launchers.len) {
+                const live = launcherLive(current_config.launchers[seg.launcher_idx].command);
+                if (live.count > 0) drawRunningDot(pixels, buf_width, buf_height, region_start + @divTrunc(label_w, 2), live.focused);
+                click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .launcher = seg.launcher_idx });
+            }
+        } else if (seg.focus_idx) |fci| {
+            // Unpinned running-app button: icon when resolved (icon-only
+            // like the pins), label fallback otherwise, focus click, same
+            // running dot (a tail row only exists while up, so always lit).
+            const region_start = x0;
+            const label_w = seg.icon_w + textPixelWidth(font, seg.label);
+            const hover_start = region_start - @divTrunc(LAUNCHER_GAP, 2);
+            const hover_end = region_start + label_w + @divTrunc(LAUNCHER_GAP, 2);
+            drawPill(pixels, buf_width, buf_height, hover_start, hover_end, click_regions.nextHover());
+            if (seg.icon_w > 0) {
+                if (fci < running_state.len) {
+                    if (tailIconPixels(running_state.apps[fci].appid())) |px| {
+                        blitIcon16(pixels, buf_width, buf_height, x0, px);
+                    }
+                }
+                x0 += seg.icon_w;
+            } else {
+                var i: usize = 0;
+                while (nextUtf8Codepoint(seg.label, &i)) |cp| {
+                    x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, current_config.appearance.text_color, 0, buf_width);
+                }
+            }
+            drawRunningDot(pixels, buf_width, buf_height, region_start + @divTrunc(label_w, 2), seg.task_focused);
+            click_regions.add(@intCast(hover_start), @intCast(hover_end), .{ .focus_client = fci });
         } else if (seg.mpris) {
             // mpris shares the left module's pill wholesale (one bar, one
             // code path) — text, progress, round toggle and all.
@@ -5479,11 +7803,16 @@ fn drawCenterGroup(
 /// at top) with its left edge at `x0`, vertically centered, alpha-blended
 /// against the bar's background the same way the tray path blends its icons
 /// (dst is always opaque here, so coverage-weighted RGB is exact).
-fn drawLauncherIcon(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, cache: *const LauncherIconCache) void {
+/// Blits a LAUNCHER_ICON_SIZE square (row-0 at top) with its left edge at
+/// `x0`, vertically centered, alpha-blended against the bar's background
+/// the same way the tray path blends its icons (dst is always opaque here,
+/// so coverage-weighted RGB is exact). Shared by launcher pins and the
+/// taskbar tail — both caches hold the same 16px format.
+fn blitIcon16(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, icon: []const u32) void {
     const y0 = @divTrunc(@as(i64, @intCast(buf_height)) - LAUNCHER_ICON_SIZE, 2);
     for (0..LAUNCHER_ICON_SIZE) |iy| {
         for (0..LAUNCHER_ICON_SIZE) |ix| {
-            const src = cache.pixels[iy * LAUNCHER_ICON_SIZE + ix];
+            const src = icon[iy * LAUNCHER_ICON_SIZE + ix];
             const coverage: u8 = @intCast((src >> 24) & 0xFF);
             if (coverage == 0) continue;
             const px = x0 + @as(i64, @intCast(ix));
@@ -5498,10 +7827,35 @@ fn drawLauncherIcon(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, ca
     }
 }
 
+/// Draws a launcher's decoded app icon (kept as the thin wrapper so the
+/// existing call sites read unchanged).
+fn drawLauncherIcon(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, cache: *const LauncherIconCache) void {
+    blitIcon16(pixels, buf_width, buf_height, x0, &cache.pixels);
+}
+
 /// Draws `label` ending at `x_end` (its right edge), returns the x
 /// coordinate of its left edge — so callers can chain right-to-left layout
 /// by feeding each call's result in as the next one's `x_end`. Registers a
 /// click region (with a few px of padding) when `action` is given.
+/// Span accumulator for the drawer island: the min/max x of one frame's
+/// drawn in-drawer cells. Recorded during drawRightGroup's walk and painted
+/// (from the previous frame's span, dock-pack style) before the next walk.
+const IslandSpan = struct {
+    set: bool = false,
+    x0: i64 = 0,
+    x1: i64 = 0,
+    fn include(self: *IslandSpan, lo: i64, hi: i64) void {
+        if (!self.set) {
+            self.set = true;
+            self.x0 = lo;
+            self.x1 = hi;
+        } else {
+            self.x0 = @min(self.x0, lo);
+            self.x1 = @max(self.x1, hi);
+        }
+    }
+};
+
 fn drawRightAligned(
     pixels: [*]u32,
     buf_width: u32,
@@ -5513,19 +7867,34 @@ fn drawRightAligned(
     color: u32,
     action: ?Action,
     click_regions: *ClickRegions,
+    island: ?*IslandSpan,
+    scroll_action: ?ScrollAction,
 ) i64 {
     const region_start = x_end - textPixelWidth(font, label);
-    // Every module gets its resting pill; only clickable labels can light it
-    // — static readouts pass a zero fade level outright, since they register
-    // no region and must not mirror a neighbor's animation.
-    drawModulePill(pixels, buf_width, buf_height, region_start - 4, x_end + 4, if (action != null) click_regions.nextHover() else 0.0);
+    if (island) |sp| {
+        // Drawer-island member: the shared island pill (painted from last
+        // frame's span before this walk) owns the ring — hover wash only, on
+        // the same bounds the resting pill used, so a parked pointer paints
+        // identically to the separated-pill days.
+        sp.include(region_start - 4, x_end + 4);
+        drawPill(pixels, buf_width, buf_height, region_start - 4, x_end + 4, if (action != null) click_regions.nextHover() else 0.0);
+    } else {
+        // Every module gets its resting pill; only clickable labels can light it
+        // — static readouts pass a zero fade level outright, since they register
+        // no region and must not mirror a neighbor's animation.
+        drawModulePill(pixels, buf_width, buf_height, region_start - 4, x_end + 4, if (action != null) click_regions.nextHover() else 0.0);
+    }
     var x0 = region_start;
     var i: usize = 0;
     while (nextUtf8Codepoint(label, &i)) |cp| {
         x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, color, 0, buf_width);
     }
     if (action) |a| {
-        click_regions.add(@intCast(region_start - 4), @intCast(x0 + 4), a);
+        if (scroll_action) |sa| {
+            click_regions.addScrollable(@intCast(region_start - 4), @intCast(x0 + 4), a, sa);
+        } else {
+            click_regions.add(@intCast(region_start - 4), @intCast(x0 + 4), a);
+        }
     }
     return region_start;
 }
@@ -5581,21 +7950,29 @@ const HOVER_UNDERLINE_BOTTOM_GAP: i32 = 2;
 
 /// Urgent-workspace dot color: warm amber, fixed (urgency reads
 /// conventionally, not thematically — matching the reference look rather
-/// than the palette).
-const URGENT_DOT_COLOR: u32 = 0xFFF5A524;
-/// Radius of the urgent dot / its lift above the underline slot (which stays
-/// free for the hover dash, so the two never collide).
-const URGENT_DOT_R: i64 = 2;
-const URGENT_DOT_LIFT: i64 = 4;
-
-/// Marks an urgent workspace with a dot centered under its digit, floating
-/// just above the underline slot so a hovered urgent pill shows both.
-/// No-op for non-urgent digits.
-fn drawUrgentDot(pixels: [*]u32, buf_width: u32, buf_height: u32, digit_cx: i64, urgent: bool) void {
-    if (!urgent) return;
+/// than the palette). Also tints the alert pill below.
+const URGENT_AMBER: u32 = 0xFFF5A524;
+/// Urgent-workspace alert: amber wash + amber dash at `strength` (0..1),
+/// no bezel of its own (it nests inside the shared workspace-run ring like
+/// every other wash). Drawn under the hover layer so a hovered urgent digit
+/// simply overdraws it. Strength comes from bezelBreathAt's 0.55..1.0 swell
+/// while animations are on (gentle pulse until visited), flat 1.0 while off.
+fn drawUrgentPill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64, x_end: i64, strength: f32) void {
+    if (strength <= 0.0) return;
+    const bg = current_config.appearance.bg_color;
+    const a = strength * HOVER_MAX_ALPHA;
+    const wash = lerpColor(bg, URGENT_AMBER, a);
+    const line = lerpColor(bg, URGENT_AMBER, a);
     const h: i64 = @intCast(buf_height);
-    const cy = h - HOVER_UNDERLINE_BOTTOM_GAP - HOVER_UNDERLINE_H - URGENT_DOT_LIFT;
-    fillRoundedRect(pixels, buf_width, buf_height, digit_cx - URGENT_DOT_R, cy - URGENT_DOT_R, digit_cx + URGENT_DOT_R, cy + URGENT_DOT_R, @intCast(URGENT_DOT_R), URGENT_DOT_COLOR);
+    const wt: i64 = bezelThick(x_end - x_start, h - 2 * HOVER_PILL_PAD_Y);
+    const wr: i32 = @intCast(@max(@as(i64, 0), @as(i64, HOVER_PILL_RADIUS) - wt));
+    fillRoundedRect(pixels, buf_width, buf_height, x_start + wt, HOVER_PILL_PAD_Y + wt, x_end - wt, h - HOVER_PILL_PAD_Y - wt, wr, wash);
+    const w = x_end - x_start;
+    const uw = @max(@as(i64, 8), @divTrunc(w, 3));
+    const cx = @divTrunc(x_start + x_end, 2);
+    const ux0 = cx - @divTrunc(uw, 2);
+    const uy1 = h - HOVER_UNDERLINE_BOTTOM_GAP;
+    fillRoundedRect(pixels, buf_width, buf_height, ux0, uy1 - HOVER_UNDERLINE_H, ux0 + uw, uy1, @divTrunc(HOVER_UNDERLINE_H + 1, 2), line);
 }
 
 /// Frames elapsed on the scroll-timer tick — the clock for the hover bezel
@@ -5620,6 +7997,53 @@ const BEZEL_EFFECT_SOLID = "solid";
 const BG_MODE_NONE = "none";
 const BG_MODE_CAVA = "cava";
 const BG_MODE_MATRIX = "matrix";
+
+/// Cava background shapes (appearance.cava_style values): "bars" rises
+/// each column from the bottom edge, "wave" mirrors around the vertical
+/// center, "curve" smooths the tops into a filled wave with a bright
+/// crest. Unrecognized values fall back to "bars".
+const CAVA_STYLE_BARS = "bars";
+const CAVA_STYLE_WAVE = "wave";
+const CAVA_STYLE_CURVE = "curve";
+
+/// Curated cava_style: unknown → bars. The loader and the GUI's own load
+/// mirror this same fallback.
+fn cavaStyleOrDefault(raw: []const u8) []const u8 {
+    if (std.mem.eql(u8, raw, CAVA_STYLE_WAVE)) return CAVA_STYLE_WAVE;
+    if (std.mem.eql(u8, raw, CAVA_STYLE_CURVE)) return CAVA_STYLE_CURVE;
+    return CAVA_STYLE_BARS;
+}
+
+/// One daemon bar as a 0..1 fraction of the reference max. Pure for tests.
+fn cavaBarFrac(i: usize) f32 {
+    if (i >= cava_state.bar_count) return 0.0;
+    return @as(f32, @floatFromInt(@min(cava_state.bars[i], CAVA_REFERENCE_MAX))) / @as(f32, @floatFromInt(CAVA_REFERENCE_MAX));
+}
+
+/// Smooth curve value at column ux of uw: cosine interpolation between
+/// adjacent bar centers (bar i centers on (i+0.5)*uw/n). Clamps past the
+/// ends instead of ringing. Pure for tests.
+fn cavaCurveFrac(ux: usize, uw: usize) f32 {
+    const n = cava_state.bar_count;
+    if (n == 0 or uw == 0) return 0.0;
+    const fn_: f32 = @floatFromInt(n);
+    const f = (@as(f32, @floatFromInt(ux)) + 0.5) * fn_ / @as(f32, @floatFromInt(uw)) - 0.5;
+    if (f <= 0.0) return cavaBarFrac(0);
+    if (f >= fn_ - 1.0) return cavaBarFrac(n - 1);
+    const idx0: usize = @intFromFloat(f);
+    const t = f - @as(f32, @floatFromInt(idx0));
+    const a = cavaBarFrac(idx0);
+    const b = cavaBarFrac(@min(idx0 + 1, n - 1));
+    const u = 0.5 - 0.5 * @cos(t * std.math.pi);
+    return a + (b - a) * u;
+}
+
+/// Media progress display (appearance.mpris_progress_style values): what
+/// shows playback position on the mpris pill — "underline" (default) is the
+/// accent dash under the track text, "bar" is a subtle fill across the pill
+/// itself.
+const MPRIS_PROGRESS_UNDERLINE = "underline";
+const MPRIS_PROGRESS_BAR = "bar";
 
 /// Breath period in ticks (60 × 60ms ≈ 3.6s per in-out cycle).
 const BEZEL_BREATH_PERIOD: u32 = 60;
@@ -5870,6 +8294,13 @@ fn drawActivePill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64,
 /// (faded) and active-workspace (full) states. The dash wears the matugen
 /// accent (workspace_active_color) solid so the wallpaper palette reads at
 /// a glance; the bezel shimmers around the accent hue around it.
+/// Resting pill fill: module_bg blended toward the opaque bar background by
+/// module_pill_opacity (the faked translucency). Shared by drawRestingPill
+/// and the weather fx interior, so particles nest in the fill exactly.
+fn pillFillColor() u32 {
+    const pct: f32 = @as(f32, @floatFromInt(current_config.appearance.module_pill_opacity)) / 100.0;
+    return lerpColor(current_config.appearance.bg_color, current_config.appearance.module_bg_color, pct);
+}
 /// Resting module pill: the living bezel outside, flat module_bg_color
 /// inside. Every module wears one, so the whole bar shares one rotating
 /// phase (synchronized rings, and no extra redraw cost past what the active
@@ -5880,10 +8311,7 @@ fn drawActivePill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64,
 fn drawRestingPill(pixels: [*]u32, buf_width: u32, buf_height: u32, x_start: i64, x_end: i64) void {
     if (!current_config.appearance.module_pills) return;
     const h: i64 = @intCast(buf_height);
-    // Resting fill honors module_pill_opacity (blended toward the opaque bar
-    // background — see the field doc for the approximation this implies).
-    const pct: f32 = @as(f32, @floatFromInt(current_config.appearance.module_pill_opacity)) / 100.0;
-    const pill_col = lerpColor(current_config.appearance.bg_color, current_config.appearance.module_bg_color, pct);
+    const pill_col = pillFillColor();
     const t: i64 = bezelThick(x_end - x_start, h - 2 * HOVER_PILL_PAD_Y);
     const tr: i32 = @intCast(@max(@as(i64, 0), @as(i64, HOVER_PILL_RADIUS) - t));
     strokeBezel(pixels, buf_width, buf_height, x_start, HOVER_PILL_PAD_Y, x_end, h - HOVER_PILL_PAD_Y, HOVER_PILL_RADIUS, current_config.appearance.bg_color, 1.0);
@@ -5949,8 +8377,11 @@ fn drawTrayIconEndingAt(pixels: [*]u32, buf_width: u32, buf_height: u32, x_end: 
     const y0 = @divTrunc(@as(i64, @intCast(buf_height)) - TRAY_ICON_SIZE, 2);
     const p = std.math.clamp(progress, 0.0, 1.0);
     // Same -2/+2 padding as the click region this icon gets at the call
-    // site, so the highlight and the clickable area agree.
-    _ = drawModulePill(pixels, buf_width, buf_height, x0 - 2, x_end + 2, anim);
+    // site, so the highlight and the clickable area agree. Hover wash only —
+    // tray icons deliberately wear no resting pill of their own (they sit on
+    // the bar background, or in the drawer island's shared pill when flagged
+    // in-drawer).
+    _ = drawPill(pixels, buf_width, buf_height, x0 - 2, x_end + 2, anim);
     for (0..TRAY_ICON_SIZE) |iy| {
         for (0..TRAY_ICON_SIZE) |ix| {
             const px = x0 + @as(i64, @intCast(ix));
@@ -6179,8 +8610,10 @@ fn drawMatrixBackground(bar: *Bar, pixels: [*]u32, buf_width: u32, buf_height: u
 }
 
 /// Washes the cava equalizer across the background rect [x0,x1)×[y0,y1)
-/// with corner `radius`: the 24 daemon values stretch over the width, each
-/// column rising from the region's bottom edge, tinted toward cava_color by
+/// with corner `radius`, shaped by appearance.cava_style: "bars" rises
+/// each column from the bottom edge (the original look), "wave" mirrors
+/// around the vertical center, "curve" fills under cosine-smoothed tops
+/// with a brighter crest line. Tinted toward cava_color by
 /// cava_bg_strength. Same bg_alpha as the flat fill, so bg_opacity fades
 /// wash and body alike.
 fn drawCavaBackground(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, x1: i64, y0: i64, y1: i64, radius: i64) void {
@@ -6192,27 +8625,54 @@ fn drawCavaBackground(pixels: [*]u32, buf_width: u32, buf_height: u32, x0: i64, 
     if (w <= 0) return;
     const rh = y1 - y0;
     if (rh <= 0) return;
+    const style = cavaStyleOrDefault(current_config.appearance.cava_style);
+    const is_wave = std.mem.eql(u8, style, CAVA_STYLE_WAVE);
+    const is_curve = std.mem.eql(u8, style, CAVA_STYLE_CURVE);
     const bg_rgb = current_config.appearance.bg_color & 0x00FFFFFF;
     const cav_rgb = current_config.appearance.cava_color & 0x00FFFFFF;
     const bg_a: u32 = (@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100) << 24;
     const uw: usize = @intCast(w);
+    const n = cava_state.bar_count;
     const X0 = 2 * x0;
     const X1 = 2 * x1;
     const Y0 = 2 * y0;
     const Y1 = 2 * y1;
     const R = 2 * radius;
+    const col = lerpColor(bg_rgb, cav_rgb, s);
+    const crest_col = lerpColor(bg_rgb, cav_rgb, @min(1.0, s + 0.35));
+    const cy = @divTrunc(y0 + y1, 2);
     var x = x0;
     while (x < x1) : (x += 1) {
         const ux: usize = @intCast(x - x0);
-        const sample = cava_state.bars[ux * cava_state.bar_count / uw];
-        const frac = @as(f32, @floatFromInt(sample)) / @as(f32, @floatFromInt(CAVA_REFERENCE_MAX));
-        const bh: i64 = @intFromFloat(frac * @as(f32, @floatFromInt(rh)));
-        if (bh <= 0) continue;
-        var y = y1 - bh;
-        while (y < y1) : (y += 1) {
+        const frac = if (is_curve) cavaCurveFrac(ux, uw) else cavaBarFrac(ux * n / uw);
+        // Fill span for this column; the crest (curve only) paints over
+        // the fill's top right after, same x, so no second pass is needed.
+        var fy0: i64 = y1;
+        var fy1: i64 = y1;
+        var crest: i64 = -1;
+        if (is_wave) {
+            const half: i64 = @intFromFloat(frac * @as(f32, @floatFromInt(rh)) / 2.0);
+            fy0 = cy - half;
+            fy1 = cy + half;
+        } else {
+            const ch: i64 = @intFromFloat(frac * @as(f32, @floatFromInt(rh)));
+            if (ch <= 0) continue;
+            fy0 = y1 - ch;
+            if (is_curve) crest = fy0;
+        }
+        if (fy1 <= fy0) continue;
+        var y = fy0;
+        while (y < fy1) : (y += 1) {
             if (radius > 0 and !inRoundedRect2(2 * x + 1, 2 * y + 1, X0, Y0, X1, Y1, R)) continue;
-            const col = lerpColor(bg_rgb, cav_rgb, s);
             pixels[@as(usize, @intCast(y)) * buf_width + @as(usize, @intCast(x))] = bg_a | (col & 0x00FFFFFF);
+        }
+        if (crest >= 0) {
+            var cy2 = crest - 1;
+            while (cy2 <= crest + 1) : (cy2 += 1) {
+                if (cy2 < y0 or cy2 >= y1) continue;
+                if (radius > 0 and !inRoundedRect2(2 * x + 1, 2 * cy2 + 1, X0, Y0, X1, Y1, R)) continue;
+                pixels[@as(usize, @intCast(cy2)) * buf_width + @as(usize, @intCast(x))] = bg_a | (crest_col & 0x00FFFFFF);
+            }
         }
     }
 }
@@ -6253,6 +8713,13 @@ fn paintBackgroundEffect(bar: *Bar, pixels: [*]u32, buf_width: u32, buf_height: 
 /// LAUNCHER_GAP instead: a cell per icon would space them arbitrarily far
 /// apart, and their width is data-driven rather than a label's, so there is
 /// no meaningful "natural width" to pad out to a minimum.
+/// Speaker icon tier for a 0-100 volume (wireplumber's "default"
+/// format-icons array: low/medium/high, U+F026/F027/F028). Shared by the
+/// volume module and the OSD so they never disagree.
+fn volumeIconFor(pct: u8) []const u8 {
+    return if (pct >= 67) "\u{f028}" else if (pct >= 34) "\u{f027}" else "\u{f026}";
+}
+
 fn drawRightGroup(
     pixels: [*]u32,
     buf_width: u32,
@@ -6267,6 +8734,7 @@ fn drawRightGroup(
     center_start_x: i64,
     x_end_start: i64,
     click_regions: *ClickRegions,
+    bar: *Bar,
 ) i64 {
     const y0: i64 = baselineY(buf_height, font);
     var x_end: i64 = x_end_start;
@@ -6274,6 +8742,18 @@ fn drawRightGroup(
     var custom_script_draw_index: usize = 0;
     const text_color = current_config.appearance.text_color;
     const drawer_color = lerpColor(current_config.appearance.bg_color, text_color, drawer_anim);
+    // Weather hover bounds start cleared every walk; the .weather arm sets
+    // them when it draws (see weatherHovered).
+    bar.weather_fx_set = false;
+
+    // Drawer island: one shared resting pill over last frame's in-drawer
+    // span (dock-pack style — a changed drawer settles a frame later, which
+    // the 240ms open fade masks). Gated on the fade so a closed drawer
+    // paints nothing from stale bounds.
+    if (drawer_anim > 0.0 and bar.drawer_island_set and bar.drawer_island_x1 > bar.drawer_island_x0) {
+        drawRestingPill(pixels, buf_width, buf_height, bar.drawer_island_x0, bar.drawer_island_x1);
+    }
+    var island_now = IslandSpan{};
 
     for (current_config.modules.right) |entry| {
         if (!entry.enabled) continue;
@@ -6291,7 +8771,7 @@ fn drawRightGroup(
                 first = false;
                 const cell = reserveRightCell(x_end, textPixelWidth(font, POWER_BUTTON.label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, POWER_BUTTON.label, text_color, .{ .spawn = POWER_BUTTON.command }, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, POWER_BUTTON.label, text_color, .{ .spawn = POWER_BUTTON.command }, click_regions, if (entry.in_drawer) &island_now else null, null);
             },
             .drawer_toggle => {
                 if (!first) x_end -= MODULE_GAP;
@@ -6305,20 +8785,18 @@ fn drawRightGroup(
                 const cell = reserveRightCell(x_end, textPixelWidth(font, toggle_label), center_start_x);
                 x_end = cell.next_pen;
                 if (drawer_open) drawActivePill(pixels, buf_width, buf_height, cell.content_start, cell.content_end);
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, toggle_label, if (drawer_open) current_config.appearance.workspace_active_color else text_color, .toggle_drawer, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, toggle_label, if (drawer_open) current_config.appearance.workspace_active_color else text_color, .toggle_drawer, click_regions, if (entry.in_drawer) &island_now else null, null);
             },
             .volume => {
                 if (!first) x_end -= MODULE_GAP;
                 first = false;
-                // Volume icon tiers match wireplumber's real "default"
-                // format-icons array (low/medium/high, U+F026/F027/F028).
-                const vol_pct = std.fmt.parseInt(u32, volume_text, 10) catch 0;
-                const vol_icon: []const u8 = if (vol_pct >= 67) "\u{f028}" else if (vol_pct >= 34) "\u{f027}" else "\u{f026}";
+                const vol_pct: u8 = @intCast(@min(std.fmt.parseInt(u32, volume_text, 10) catch 0, 255));
+                const vol_icon: []const u8 = volumeIconFor(vol_pct);
                 var vol_buf: [24]u8 = undefined;
                 const vol_label = std.fmt.bufPrint(&vol_buf, "{s} {s}", .{ vol_icon, volume_text }) catch vol_icon;
                 const cell = reserveRightCell(x_end, textPixelWidth(font, vol_label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, vol_label, drawer_color, null, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, vol_label, drawer_color, .open_volume_mixer, click_regions, if (entry.in_drawer) &island_now else null, .adjust_volume);
             },
             .waypaper => {
                 // Tombstone (see ModuleKind): old configs still parse, but
@@ -6327,26 +8805,27 @@ fn drawRightGroup(
             .pacman => {
                 if (!first) x_end -= MODULE_GAP;
                 first = false;
-                // custom/pacman's real format is "<big>ᗧ</big> {}" (Pac-Man
-                // glyph + count, no "UPD" text) — that exact character
-                // (U+15E7) isn't in this Nerd Font, so a Debian logo glyph
-                // stands in instead (pacman being the package manager Debian
-                // actually ships with).
+                // Package-update count badged with this machine's distro
+                // logo (same glyph the drawer brands itself with) — never
+                // a hardcoded Debian swirl on Arch-family machines.
                 var pac_buf: [24]u8 = undefined;
-                const pac_label = std.fmt.bufPrint(&pac_buf, "\u{f306} {s}", .{pacman_text}) catch "\u{f306}";
+                var dg_buf: [4]u8 = undefined;
+                const pac_label = std.fmt.bufPrint(&pac_buf, "{s} {s}", .{ encodeBmpCodepoint(distroLogoCodepoint(), &dg_buf), pacman_text }) catch pacman_text;
                 const cell = reserveRightCell(x_end, textPixelWidth(font, pac_label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, pac_label, drawer_color, null, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, pac_label, drawer_color, null, click_regions, if (entry.in_drawer) &island_now else null, null);
             },
             .tray => {
                 // icon-only items, no text label; skipped entirely if an
                 // item hasn't gotten its first successful icon fetch yet.
                 for (tray.items[0..tray.item_count], 0..) |item, i| {
                     if (!item.has_icon) continue;
-                    if (!first) x_end -= LAUNCHER_GAP;
+                    if (!first) x_end -= TRAY_ICON_GAP;
                     first = false;
+                    const region_hi = x_end + 2;
                     const icon_left = drawTrayIconEndingAt(pixels, buf_width, buf_height, x_end, &item.pixels, drawer_anim, click_regions.nextHover());
                     click_regions.addWithRight(@intCast(icon_left - 2), @intCast(x_end + 2), .{ .activate_tray = i }, .{ .context_menu_tray = i });
+                    if (entry.in_drawer) island_now.include(icon_left - 2, region_hi);
                     x_end = icon_left;
                 }
             },
@@ -6357,9 +8836,66 @@ fn drawRightGroup(
                 if (weather_text.len > 0) {
                     if (!first) x_end -= MODULE_GAP;
                     first = false;
-                    const cell = reserveRightCell(x_end, textPixelWidth(font, weather_text), center_start_x);
+                    // Oversized condition icon (2x raster, vertically
+                    // centered) plus text-color temperature. The layout
+                    // metrics cover the ink extent (not just the advance) so
+                    // the pill ring clears the bitmap; falls back to the 1x
+                    // two-tone label when the raster is missing or too tall
+                    // for the pill (only shaped U+E300-U+E3E3 icons go big —
+                    // anything else would rasterize FreeType's .notdef box).
+                    const parts = splitWeatherLabel(weather_text);
+                    const icon_col = weatherIconTint(parts.icon, text_color);
+                    const big = if (parts.icon_len > 0 and parts.icon >= 0xE300 and parts.icon <= 0xE3FF) font.glyphScaled(parts.icon, 2) catch null else null;
+                    defer if (big) |b| font.gpa.free(b.pixels);
+                    const avail_h: i64 = @as(i64, @intCast(buf_height)) - 2 * @as(i64, HOVER_PILL_PAD_Y) - 2;
+                    const lay = if (big) |*b| bigIconLayout(b, avail_h) else null;
+                    const space_adv: i64 = if (font.glyph(@as(u32, ' ')) catch null) |g| @as(i64, g.advance_x) else 0;
+                    const temp_w: i64 = textPixelWidth(font, parts.rest);
+                    const icon_adv: i64 = if (lay) |l| l.adv else textPixelWidth(font, weather_text[0..parts.icon_len]);
+                    const content_w = icon_adv + space_adv + temp_w;
+                    const cell = reserveRightCell(x_end, content_w, center_start_x);
                     x_end = cell.next_pen;
-                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, weather_text, text_color, null, click_regions);
+                    const rs = cell.content_end - content_w;
+                    bar.weather_fx_x0 = rs - 4;
+                    bar.weather_fx_x1 = cell.content_end + 4;
+                    bar.weather_fx_set = true;
+                    if (entry.in_drawer) {
+                        island_now.include(rs - 4, cell.content_end + 4);
+                        drawPill(pixels, buf_width, buf_height, rs - 4, cell.content_end + 4, 0.0);
+                    } else {
+                        drawModulePill(pixels, buf_width, buf_height, rs - 4, cell.content_end + 4, 0.0);
+                    }
+                    // Condition fx overlay (behind the glyphs): plays while
+                    // hovered, frozen otherwise. Interior nests in the pill
+                    // fill exactly (see drawWeatherFx).
+                    if (weatherHovered(bar)) {
+                        const interior = if (current_config.appearance.module_pills) pillFillColor() else current_config.appearance.bg_color;
+                        // Raw poll text leads with the wttr emoji (format=1
+                        // keeps "<emoji> <temp>") — the fx resolver needs it
+                        // to tell showers apart from sun-behind-cloud.
+                        var wi: usize = 0;
+                        const wttr_cp = nextUtf8Codepoint(bar.weather.text(), &wi) orelse 0;
+                        drawWeatherFx(pixels, buf_width, buf_height, rs - 4, cell.content_end + 4, wttr_cp, parts.icon, hover_frame, interior, icon_col);
+                    }
+                    var x0 = rs;
+                    if (lay) |l| {
+                        const iy = @divTrunc(@as(i64, @intCast(buf_height)) - @as(i64, @intCast(l.b.height)), 2);
+                        blitBigGlyph(pixels, buf_width, buf_height, rs + l.pen_off + @as(i64, l.b.bitmap_left), iy, l.b, icon_col, buf_width);
+                        x0 = rs + l.adv;
+                        x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, @as(u32, ' '), text_color, 0, buf_width);
+                        var ti: usize = 0;
+                        while (nextUtf8Codepoint(parts.rest, &ti)) |cp| {
+                            x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, text_color, 0, buf_width);
+                        }
+                    } else {
+                        var wi: usize = 0;
+                        while (true) {
+                            const s = wi;
+                            const cp = nextUtf8Codepoint(weather_text, &wi) orelse break;
+                            const col = if (s < parts.icon_len) icon_col else text_color;
+                            x0 += drawGlyphAt(pixels, buf_width, buf_height, font, x0, y0, cp, col, 0, buf_width);
+                        }
+                    }
                 }
             },
             .cpu => {
@@ -6369,7 +8905,7 @@ fn drawRightGroup(
                 const cpu_label = std.fmt.bufPrint(&cpu_buf, "\u{f2db} {d}%", .{sys_stats.cpu_pct}) catch "\u{f2db}";
                 const cell = reserveRightCell(x_end, textPixelWidth(font, cpu_label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, cpu_label, color, null, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, cpu_label, color, null, click_regions, if (entry.in_drawer) &island_now else null, null);
             },
             .ram => {
                 if (!first) x_end -= MODULE_GAP;
@@ -6378,7 +8914,7 @@ fn drawRightGroup(
                 const ram_label = std.fmt.bufPrint(&ram_buf, "\u{f538} {d}%", .{sys_stats.ram_pct}) catch "\u{f538}";
                 const cell = reserveRightCell(x_end, textPixelWidth(font, ram_label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, ram_label, color, null, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, ram_label, color, null, click_regions, if (entry.in_drawer) &island_now else null, null);
             },
             .disk => {
                 if (!first) x_end -= MODULE_GAP;
@@ -6387,7 +8923,7 @@ fn drawRightGroup(
                 const disk_label = std.fmt.bufPrint(&disk_buf, "\u{f0a0} {d}%", .{disk_pct}) catch "\u{f0a0}";
                 const cell = reserveRightCell(x_end, textPixelWidth(font, disk_label), center_start_x);
                 x_end = cell.next_pen;
-                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, disk_label, color, null, click_regions);
+                _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, disk_label, color, null, click_regions, if (entry.in_drawer) &island_now else null, null);
             },
             .battery => {
                 if (battery_state.found) {
@@ -6398,7 +8934,7 @@ fn drawRightGroup(
                     const bat_label = std.fmt.bufPrint(&bat_buf, "{s} {d}%", .{ bat_icon, battery_state.capacity }) catch bat_icon;
                     const cell = reserveRightCell(x_end, textPixelWidth(font, bat_label), center_start_x);
                     x_end = cell.next_pen;
-                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, bat_label, color, null, click_regions);
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, bat_label, color, null, click_regions, if (entry.in_drawer) &island_now else null, null);
                 }
             },
             .cpu_temp => {
@@ -6410,7 +8946,7 @@ fn drawRightGroup(
                     const temp_label = std.fmt.bufPrint(&temp_buf, "\u{f2c9} {d}\u{00b0}C", .{celsius}) catch "\u{f2c9}";
                     const cell = reserveRightCell(x_end, textPixelWidth(font, temp_label), center_start_x);
                     x_end = cell.next_pen;
-                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, temp_label, color, null, click_regions);
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, temp_label, color, null, click_regions, if (entry.in_drawer) &island_now else null, null);
                 }
             },
             .network => {
@@ -6427,21 +8963,49 @@ fn drawRightGroup(
                     const net_label = std.fmt.bufPrint(&net_buf, "\u{f1eb} {s}", .{value}) catch "\u{f1eb}";
                     const cell = reserveRightCell(x_end, textPixelWidth(font, net_label), center_start_x);
                     x_end = cell.next_pen;
-                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, net_label, color, null, click_regions);
+                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, net_label, color, null, click_regions, if (entry.in_drawer) &island_now else null, null);
                 }
             },
             .layout => {
                 // Mango layout indicator: the active tag's layout as its own
-                // distinct glyph, so a glance tells you which layout you're in.
+                // distinct glyph, oversized (2x raster, vertically centered —
+                // same treatment as the weather icon), so a glance tells you
+                // which layout you're in. The layout metrics cover the ink
+                // extent so the pill ring clears the bitmap; falls back to
+                // 1x when the raster is missing or too tall for the pill.
                 // Clicking opens the picker popup. Hidden entirely (no cell
                 // reserved) when the layout is unknown — Hyprland, or before
                 // the first Mango refresh — so it costs nothing there.
                 if (layoutBySymbol(workspaces.layout())) |l| {
                     if (!first) x_end -= MODULE_GAP;
                     first = false;
-                    const cell = reserveRightCell(x_end, textPixelWidth(font, l.icon), center_start_x);
+                    var li: usize = 0;
+                    const lcp = nextUtf8Codepoint(l.icon, &li) orelse 0;
+                    const big = if (li > 0) font.glyphScaled(lcp, 2) catch null else null;
+                    defer if (big) |b| font.gpa.free(b.pixels);
+                    const avail_h: i64 = @as(i64, @intCast(buf_height)) - 2 * @as(i64, HOVER_PILL_PAD_Y) - 2;
+                    const lay = if (big) |*b| bigIconLayout(b, avail_h) else null;
+                    const content_w: i64 = if (lay) |t| t.adv else textPixelWidth(font, l.icon);
+                    const cell = reserveRightCell(x_end, content_w, center_start_x);
                     x_end = cell.next_pen;
-                    _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, l.icon, color, .open_layout_picker, click_regions);
+                    const rs = cell.content_end - content_w;
+                    if (entry.in_drawer) {
+                        island_now.include(rs - 4, cell.content_end + 4);
+                        drawPill(pixels, buf_width, buf_height, rs - 4, cell.content_end + 4, click_regions.nextHover());
+                    } else {
+                        drawModulePill(pixels, buf_width, buf_height, rs - 4, cell.content_end + 4, click_regions.nextHover());
+                    }
+                    if (lay) |t| {
+                        const iy = @divTrunc(@as(i64, @intCast(buf_height)) - @as(i64, @intCast(t.b.height)), 2);
+                        blitBigGlyph(pixels, buf_width, buf_height, rs + t.pen_off + @as(i64, t.b.bitmap_left), iy, t.b, color, buf_width);
+                    } else {
+                        var gx = rs;
+                        var gi: usize = 0;
+                        while (nextUtf8Codepoint(l.icon, &gi)) |cp| {
+                            gx += drawGlyphAt(pixels, buf_width, buf_height, font, gx, y0, cp, color, 0, buf_width);
+                        }
+                    }
+                    click_regions.add(@intCast(rs - 4), @intCast(cell.content_end + 4), .open_layout_picker);
                 }
             },
             .custom_script => {
@@ -6459,7 +9023,7 @@ fn drawRightGroup(
                             text;
                         const cell = reserveRightCell(x_end, textPixelWidth(font, script_label), center_start_x);
                         x_end = cell.next_pen;
-                        _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, script_label, color, null, click_regions);
+                        _ = drawRightAligned(pixels, buf_width, buf_height, font, y0, cell.content_end, script_label, color, null, click_regions, if (entry.in_drawer) &island_now else null, null);
                     }
                 }
             },
@@ -6472,12 +9036,19 @@ fn drawRightGroup(
                 if (cava_state.has_data) {
                     if (!first) x_end -= LAUNCHER_GAP;
                     first = false;
+                    const cava_hi = x_end;
                     x_end = drawCavaEqualizer(pixels, buf_width, buf_height, x_end);
+                    if (entry.in_drawer) island_now.include(x_end, cava_hi);
                 }
             },
             .workspaces, .mpris, .clock, .launchers => {}, // not valid in the right group; ignore defensively
         }
     }
+    // Publish this frame's island span for the next frame's pill (or clear
+    // it so a closed/emptied drawer paints nothing from stale bounds).
+    bar.drawer_island_x0 = island_now.x0;
+    bar.drawer_island_x1 = island_now.x1;
+    bar.drawer_island_set = island_now.set;
     // Pen end = content start (right edge of the leftmost drawn module).
     return x_end;
 }
@@ -6591,6 +9162,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                 if (bar.popup) |*pm| pm.hovered_row = pm.hitTestRowIndex(pm.pointer_y);
             } else {
                 bar.pointer_x = e.surface_x.toInt();
+                bar.pointer_y = e.surface_y.toInt();
                 bar.click_regions.hovered = bar.click_regions.hitTestIndex(bar.pointer_x);
                 // Redraw for the hover highlight — entering already over a
                 // button (e.g. the pointer didn't move but focus/workspace
@@ -6617,7 +9189,19 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                 }
             } else {
                 bar.pointer_x = -1;
+                bar.pointer_y = -1;
                 bar.click_regions.hovered = null; // tick fades the pill out
+                // A drag that leaves the bar is a cancelled drop: forget the
+                // press and snap the live order back to config.json (no
+                // release will arrive — without a grab it goes to whatever
+                // surface is under the pointer instead).
+                if (bar.launch_press_li != null) {
+                    bar.launch_press_li = null;
+                    if (bar.launch_dragging) {
+                        bar.launch_dragging = false;
+                        resetLauncherViewOrder();
+                    }
+                }
                 drawAndCommit(bar) catch |err| { // first fade-out frame
                     logging.err("draw failed: {}", .{err});
                 };
@@ -6639,6 +9223,24 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                         pm.hovered_row = pm.hitTestRowIndex(new_y);
                         drawPopup(bar) catch {}; // first fade frame
                     }
+                    // Mixer slider drag: past threshold it stops being a
+                    // mute click; the value tracks the pointer live (commit
+                    // on release), repainting only on value change.
+                    if (pm.kind == .volume and pm.vol_drag_row != null) {
+                        const dx = pm.pointer_x - pm.vol_press_x;
+                        const dy = pm.pointer_y - pm.vol_press_y;
+                        if (!pm.vol_drag_moved and dx * dx + dy * dy > VOL_DRAG_PX * VOL_DRAG_PX) {
+                            pm.vol_drag_moved = true;
+                        }
+                        if (pm.vol_drag_moved) {
+                            const tr = volSliderTrack(pm.width);
+                            const v = volSliderXToVal(tr.x0, tr.x1, @as(i64, pm.pointer_x));
+                            if (v != pm.vol_drag_val) {
+                                pm.vol_drag_val = v;
+                                drawPopup(bar) catch {};
+                            }
+                        }
+                    }
                 }
             } else {
                 // Only redraw when the hovered button actually changes —
@@ -6646,6 +9248,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                 // only needs its first frame here; the tick animates the rest.
                 const old_idx = bar.click_regions.hitTestIndex(bar.pointer_x);
                 bar.pointer_x = e.surface_x.toInt();
+                bar.pointer_y = e.surface_y.toInt();
                 const new_idx = bar.click_regions.hitTestIndex(bar.pointer_x);
                 bar.click_regions.hovered = new_idx;
                 if (old_idx != new_idx) {
@@ -6653,12 +9256,37 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                         logging.err("draw failed: {}", .{err});
                     };
                 }
+                // Launcher drag: past threshold the armed press becomes a
+                // reorder — the view order tracks the pointer live (guide:
+                // dropPositionAt), repainting only when a pin actually
+                // moves. Click-vs-drag, same 4px language as the mixer.
+                if (bar.launch_press_li) |li| {
+                    const dx = bar.pointer_x - bar.launch_press_x;
+                    const dy = bar.pointer_y - bar.launch_press_y;
+                    if (!bar.launch_dragging and dx * dx + dy * dy > LAUNCH_DRAG_PX * LAUNCH_DRAG_PX) {
+                        bar.launch_dragging = true;
+                    }
+                    if (bar.launch_dragging) {
+                        if (moveLauncherView(li, dropPositionAt(&bar.click_regions, li, bar.pointer_x))) {
+                            drawAndCommit(bar) catch |err| {
+                                logging.err("draw failed: {}", .{err});
+                            };
+                        }
+                    }
+                }
             }
         },
         .button => |e| {
             const bar = &router.bars[router.current orelse return];
             bar.last_pointer_serial = e.serial;
-            if (e.state != .pressed) return;
+            // Releases only resolve an armed launcher press (click vs
+            // drop-commit) — everything else has always been press-only.
+            if (e.state != .pressed) {
+                if (e.button == BTN_LEFT and bar.launch_press_li != null) {
+                    releaseLauncherPress(bar);
+                }
+                return;
+            }
 
             // A press on the hidden strip reveals the bar instead of doing
             // anything else (there are no modules to hit-test while hidden).
@@ -6670,6 +9298,11 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
             if (bar.pointer_over_popup) {
                 if (e.button != BTN_LEFT) return;
                 const pm = &(bar.popup orelse return);
+                // The OSD is pure feedback: any click dismisses it.
+                if (pm.kind == .volume_osd) {
+                    closePopup(bar);
+                    return;
+                }
                 const row = pm.hitTestRow(pm.pointer_y) orelse return;
                 const kind = pm.kind; // copy: closePopup nulls bar.popup
                 if (row.item_id) |id| {
@@ -6690,7 +9323,51 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                                 dbusmenu.sendClickEvent(c, dest_buf[0..dest_len], path_buf[0..path_len], id);
                             }
                         },
+                        .volume => {
+                            // Click-vs-drag, resolved on release: a press
+                            // arms a potential slider drag, a clean release
+                            // mutes the row, a moved release commits the
+                            // dragged level. Either way the panel stays open
+                            // (a closing panel couldn't dial anything in).
+                            if (id < 0) return;
+                            const idx: usize = @intCast(id);
+                            var mpm: ?*PopupMenu = null;
+                            if (bar.popup) |*mp| {
+                                if (mp.kind == .volume) mpm = mp;
+                            }
+                            const m = mpm orelse return;
+                            if (e.state == .pressed) {
+                                if (idx >= vol_count) return;
+                                m.vol_drag_row = idx;
+                                m.vol_drag_val = vol_entries[idx].vol_pct;
+                                m.vol_press_id = vol_entries[idx].id;
+                                m.vol_press_x = m.pointer_x;
+                                m.vol_press_y = m.pointer_y;
+                                m.vol_drag_moved = false;
+                                return;
+                            }
+                            const pr = m.vol_drag_row orelse return;
+                            const val = m.vol_drag_val;
+                            const moved = m.vol_drag_moved;
+                            m.vol_drag_row = null;
+                            m.vol_drag_moved = false;
+                            // A 1s refresh may have reordered rows mid-press;
+                            // the pressed pactl id staying put is what makes
+                            // the release act on the right entry.
+                            if (pr >= vol_count or vol_entries[pr].id != m.vol_press_id) return;
+                            if (moved) {
+                                spawnVolumeSetAbs(pr, val);
+                            } else {
+                                spawnVolumeSet(pr, 0);
+                            }
+                            startVolumeListFetch();
+                            return;
+                        },
+                        .volume_osd => {}, // dismissed before hit-test above; unreachable here
                     }
+                } else if (kind == .volume) {
+                    // Separator row: nothing to mute, panel stays open.
+                    return;
                 }
                 closePopup(bar);
                 return;
@@ -6706,7 +9383,18 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
             const region = bar.click_regions.hitTest(bar.pointer_x);
             if (region) |r| {
                 if (e.button == BTN_LEFT) {
-                    handleAction(bar, r.action);
+                    // Launcher pins arm a press instead of firing: the
+                    // release decides click (focus/launch) vs drag (drop
+                    // commits a reorder). Every other module fires on press
+                    // exactly as before.
+                    if (r.action == .launcher) {
+                        bar.launch_press_li = r.action.launcher;
+                        bar.launch_press_x = bar.pointer_x;
+                        bar.launch_press_y = bar.pointer_y;
+                        bar.launch_dragging = false;
+                    } else {
+                        handleAction(bar, r.action);
+                    }
                 } else if (e.button == BTN_RIGHT) {
                     if (r.right_action) |ra| handleAction(bar, ra);
                 }
@@ -6719,14 +9407,46 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
         },
         .axis => |e| {
             // Scroll wheel. Horizontal scroll is left alone deliberately: this
-            // bar has no horizontal-scroll meaning for any module, and volume
-            // changes belong to the volume module's own keyboard path, not to
-            // whichever region happens to be under the pointer.
+            // bar has no horizontal-scroll meaning for any module.
             if (e.axis != .vertical_scroll) return;
             const bar = &router.bars[router.current orelse return];
-            // Popup rows are a separate hit-test space (by y, not x) with no
-            // scroll semantics, so scrolling there is not ours to interpret.
-            if (bar.pointer_over_popup) return;
+            // The mixer panel interprets wheel itself (per-row ±5%); every
+            // other popup kind has no scroll semantics.
+            if (bar.pointer_over_popup) {
+                if (bar.popup) |pm| {
+                    if (pm.kind == .volume_osd) {
+                        // Wheel over the OSD keeps adjusting master (and
+                        // re-arms the dismiss timer via showVolumeOSD).
+                        bar.scroll_accum += e.value.toDouble();
+                        var steps: i32 = @intFromFloat(@divTrunc(bar.scroll_accum, WORKSPACE_SCROLL_STEP));
+                        if (steps > WORKSPACE_SCROLL_MAX_STEPS) steps = WORKSPACE_SCROLL_MAX_STEPS;
+                        if (steps < -WORKSPACE_SCROLL_MAX_STEPS) steps = -WORKSPACE_SCROLL_MAX_STEPS;
+                        bar.scroll_accum -= @as(f64, @floatFromInt(steps)) * WORKSPACE_SCROLL_STEP;
+                        if (steps == 0) return;
+                        adjustMasterVolume(bar, steps);
+                        return;
+                    }
+                    if (pm.kind == .volume) {
+                        const hrow = pm.hovered_row orelse return;
+                        if (hrow >= pm.rows.len) return;
+                        const item = pm.rows[hrow].item_id orelse return;
+                        if (item < 0) return;
+                        // Same notch accumulation as workspaces: sub-notch
+                        // touchpad deltas gather into whole steps. Negative
+                        // axis is scroll-up (measured), so up = louder.
+                        bar.scroll_accum += e.value.toDouble();
+                        var steps: i32 = @intFromFloat(@divTrunc(bar.scroll_accum, WORKSPACE_SCROLL_STEP));
+                        if (steps > WORKSPACE_SCROLL_MAX_STEPS) steps = WORKSPACE_SCROLL_MAX_STEPS;
+                        if (steps < -WORKSPACE_SCROLL_MAX_STEPS) steps = -WORKSPACE_SCROLL_MAX_STEPS;
+                        bar.scroll_accum -= @as(f64, @floatFromInt(steps)) * WORKSPACE_SCROLL_STEP;
+                        if (steps == 0) return;
+                        const delta: i8 = @intCast(-steps * VOL_WHEEL_STEP_PCT);
+                        spawnVolumeSet(@intCast(item), delta);
+                        startVolumeListFetch();
+                    }
+                }
+                return;
+            }
             // The region is re-read from the CURRENT pointer_x every event
             // rather than latched on .enter, so moving along the bar mid-gesture
             // can't keep firing the module the scroll started over.
@@ -6757,7 +9477,8 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
             // be drained from the accumulator while fewer steps actually ran.)
             bar.scroll_accum -= @as(f64, @floatFromInt(steps)) * WORKSPACE_SCROLL_STEP;
             if (steps == 0) return;
-            if (scroll_action.? == .step_workspace) {
+            switch (scroll_action.?) {
+                .step_workspace => {
                 // Direction, measured against the desktop's own binds rather
                 // than assumed: hyprland.lua binds mainMod+mouse_down/up to
                 // focus({workspace="e+1"/"e-1"}), and driving those exact
@@ -6776,6 +9497,12 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                 while (n < @as(usize, @intCast(@abs(steps)))) : (n += 1) {
                     bar.workspaces.stepWorkspace(direction);
                 }
+                },
+                .adjust_volume => {
+                    // Negative axis is scroll-up (measured above), so up =
+                    // louder. Reuses the same notch accumulation.
+                    adjustMasterVolume(bar, steps);
+                },
             }
         },
         else => {},
@@ -6790,6 +9517,41 @@ fn handleAction(bar: *Bar, action: Action) void {
             };
         },
         .spawn => |command| spawnDetached(command),
+        .launcher => |idx| {
+            // Pinned icon doubles as its running app: raise when up,
+            // launch when not. A focused single window is already where
+            // the user wants it (plain focus, no minimize toggle); with
+            // several windows up, clicking past the focused one cycles.
+            if (idx >= current_config.launchers.len) return;
+            const btn = current_config.launchers[idx];
+            const live = launcherLive(btn.command);
+            if (live.count == 0 or live.client_idx == null) {
+                spawnDetached(btn.command);
+                return;
+            }
+            const apps = running_state.apps[0..running_state.len];
+            if (live.count > 1 and live.focused) {
+                const cur = live.client_idx.?;
+                var i: usize = 0;
+                while (i < apps.len) : (i += 1) {
+                    const j = (cur + 1 + i) % apps.len;
+                    if (j == cur) break;
+                    if (clientMatchesLauncher(btn.command, apps[j].appid(), apps[j].title())) {
+                        bar.workspaces.focusClient(apps[j].addr(), apps[j].ws);
+                        return;
+                    }
+                }
+                return;
+            }
+            const ci = live.client_idx.?;
+            if (ci < apps.len and !(live.count == 1 and apps[ci].focused)) {
+                bar.workspaces.focusClient(apps[ci].addr(), apps[ci].ws);
+            }
+        },
+        .focus_client => |ci| {
+            if (ci >= running_state.len) return;
+            bar.workspaces.focusClient(running_state.apps[ci].addr(), running_state.apps[ci].ws);
+        },
         .toggle_drawer => {
             // Only flips the target — bar.drawer_anim eases toward it on
             // the scroll timer's tick (see its handler), producing the
@@ -6813,6 +9575,15 @@ fn handleAction(bar: *Bar, action: Action) void {
             spawnPlayerctlCommand(bar.mpris_player_buf[0..bar.mpris_player_len], cmd);
         },
         .open_layout_picker => openLayoutPicker(bar),
+        .open_volume_mixer => {
+            if (bar.popup) |pm| {
+                // Toggle: clicking volume with the mixer open closes it;
+                // any other popup keeps the one-at-a-time rule.
+                if (pm.kind == .volume) closePopup(bar);
+                return;
+            }
+            openVolumeMixerFetch(bar);
+        },
         .set_layout => |index| {
             if (index >= MANGO_LAYOUTS.len) return;
             bar.workspaces.setLayout(MANGO_LAYOUTS[index].name) catch |err| {
@@ -6872,7 +9643,10 @@ fn actionName(a: Action) []const u8 {
         .context_menu_tray => "context_menu_tray",
         .mpris_control => "mpris_control",
         .open_layout_picker => "open_layout_picker",
+        .open_volume_mixer => "open_volume_mixer",
         .set_layout => "set_layout",
+        .launcher => "launcher",
+        .focus_client => "focus_client",
     };
 }
 
@@ -6993,7 +9767,7 @@ fn paintDock(bar: *Bar, pixels: [*]u32, time_text: []const u8, mpris_text: []con
     bar.dock_left_w = @max(0, left_end - pack_start);
     const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, bar.mpris_frac, mpris_playing, center_start_last, &bar.click_regions);
     bar.dock_center_w = @max(0, center_end - center_start_last);
-    const right_start = drawRightGroup(pixels, bar.width, bar.height, bar.font, weather_text, bar.pacman.text(), volume_text, bar.drawer_anim, bar.tray, bar.workspaces, center_end, right_end_last, &bar.click_regions);
+    const right_start = drawRightGroup(pixels, bar.width, bar.height, bar.font, weather_text, bar.pacman.text(), volume_text, bar.drawer_anim, bar.tray, bar.workspaces, center_end, right_end_last, &bar.click_regions, bar);
     bar.dock_right_w = @max(0, right_end_last - right_start);
 
     // Input follows the pill: without this the full-width transparent
@@ -7054,7 +9828,7 @@ fn paintMorph(bar: *Bar, pixels: [*]u32, e: f32, time_text: []const u8, mpris_te
     bar.dock_left_w = @max(0, left_end - L);
     const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, bar.mpris_frac, mpris_playing, C, &bar.click_regions);
     bar.dock_center_w = @max(0, center_end - C);
-    const right_start = drawRightGroup(pixels, bar.width, bar.height, bar.font, weather_text, bar.pacman.text(), volume_text, bar.drawer_anim, bar.tray, bar.workspaces, center_end, Rend, &bar.click_regions);
+    const right_start = drawRightGroup(pixels, bar.width, bar.height, bar.font, weather_text, bar.pacman.text(), volume_text, bar.drawer_anim, bar.tray, bar.workspaces, center_end, Rend, &bar.click_regions, bar);
     bar.dock_right_w = @max(0, Rend - right_start);
 
     // Input follows the morphing pill (same change-detect fields as dock).
@@ -7212,7 +9986,8 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     }
     const center_start_x = centerGroupStartX(bar.width, bar.font, time_text, bar.workspaces.list.items, mpris_text, mpris_playing);
     var volume_buf: [16]u8 = undefined;
-    const volume_text = parseVolumePercent(bar.volume.text(), &volume_buf);
+    const vol_poll = parseVolumePoll(bar.volume.text(), &volume_buf);
+    const volume_text = vol_poll.text;
     var weather_buf: [32]u8 = undefined;
     const weather_text = formatWeatherText(bar.weather.text(), &weather_buf);
     if (e >= 1.0) {
@@ -7260,6 +10035,7 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
             center_start_x,
             right_anchor,
             &bar.click_regions,
+            bar,
         );
         bar.dock_right_w = @max(0, right_anchor - right_start);
     } else {
@@ -7404,6 +10180,24 @@ test "bezel breath phases" {
     try t.expect(bezelBreathAt(BEZEL_BREATH_PERIOD + 1) == bezelBreathAt(1));
 }
 
+test "island span accumulates" {
+    const t = std.testing;
+    var sp = IslandSpan{};
+    try t.expect(!sp.set);
+    sp.include(100, 140);
+    try t.expect(sp.set);
+    try t.expectEqual(@as(i64, 100), sp.x0);
+    try t.expectEqual(@as(i64, 140), sp.x1);
+    // Grows both ways, never shrinks.
+    sp.include(60, 120);
+    sp.include(130, 200);
+    try t.expectEqual(@as(i64, 60), sp.x0);
+    try t.expectEqual(@as(i64, 200), sp.x1);
+    sp.include(80, 90);
+    try t.expectEqual(@as(i64, 60), sp.x0);
+    try t.expectEqual(@as(i64, 200), sp.x1);
+}
+
 test "matrix falloff" {
     const t = std.testing;
     const eps = 1e-5;
@@ -7413,6 +10207,89 @@ test "matrix falloff" {
     try t.expect(matrixFalloff(MATRIX_TAIL_PX) == 0.0);
     try t.expect(matrixFalloff(MATRIX_TAIL_PX + 40) == 0.0);
     try t.expect(matrixFalloff(-5) == 0.0);
+}
+
+test "weather tint and split" {
+    const t = std.testing;
+    const fb: u32 = 0xFFDCDCDC;
+    // Semantic tints per icon; unlisted icons wear the fallback.
+    try t.expectEqual(@as(u32, 0xFFFFD60A), weatherIconTint(0xE30D, fb));
+    try t.expectEqual(@as(u32, 0xFF4AA8FF), weatherIconTint(0xE319, fb));
+    try t.expectEqual(@as(u32, 0xFFA8E6FF), weatherIconTint(0xE31A, fb));
+    try t.expectEqual(fb, weatherIconTint(0x0041, fb));
+    // Split: first codepoint is the icon, rest trimmed of the gap space.
+    const icon_bytes = [_]u8{ 0xEE, 0x8C, 0x8D }; // U+E30D sunny
+    var buf: [32]u8 = undefined;
+    @memcpy(buf[0..3], &icon_bytes);
+    @memcpy(buf[3..10], " +21°C");
+    const parts = splitWeatherLabel(buf[0..10]);
+    try t.expectEqual(@as(u32, 0xE30D), parts.icon);
+    try t.expectEqual(@as(usize, 3), parts.icon_len);
+    try t.expectEqualStrings("+21°C", parts.rest);
+}
+
+test "scaled glyph restores size" {
+    const t = std.testing;
+    var font = font_mod.Font.init(t.allocator, font_mod.FONT_PATH, 11) catch return error.SkipZigTest;
+    defer font.deinit();
+    const small = try font.glyph(0xE30D);
+    const big = try font.glyphScaled(0xE30D, 2);
+    defer t.allocator.free(big.pixels);
+    // Roughly double in both axes with a bigger advance...
+    try t.expect(big.width >= small.width * 3 / 2);
+    try t.expect(big.height >= small.height * 3 / 2);
+    try t.expect(big.advance_x > small.advance_x);
+    // ...and the face size is restored: the cached 1x glyph is untouched.
+    const small_again = try font.glyph(0xE30D);
+    try t.expectEqual(small.width, small_again.width);
+    try t.expectEqual(small.height, small_again.height);
+    try t.expectEqual(small.advance_x, small_again.advance_x);
+}
+
+test "weather fx mapping and render" {
+    const t = std.testing;
+    // Every shaped icon maps somewhere sane; unknown icons stay still.
+    try t.expectEqual(WeatherFx.clear, weatherFxFor(0, 0xE30D));
+    try t.expectEqual(WeatherFx.cloud, weatherFxFor(0, 0xE302));
+    try t.expectEqual(WeatherFx.cloud, weatherFxFor(0, 0xE335));
+    try t.expectEqual(WeatherFx.rain, weatherFxFor(0, 0xE319));
+    try t.expectEqual(WeatherFx.storm, weatherFxFor(0, 0xE31D));
+    try t.expectEqual(WeatherFx.snow, weatherFxFor(0, 0xE31A));
+    try t.expectEqual(WeatherFx.fog, weatherFxFor(0, 0xE313));
+    try t.expectEqual(WeatherFx.wind, weatherFxFor(0, 0xE34B));
+    try t.expectEqual(WeatherFx.wind, weatherFxFor(0, 0xE351));
+    try t.expectEqual(WeatherFx.none, weatherFxFor(0, 0x0041));
+    // Showers wear the partly-rainy icon but must RAIN; sun-behind-cloud
+    // shares that icon and stays cloudy.
+    try t.expectEqual(WeatherFx.rain, weatherFxFor(0x1F326, 0xE304));
+    try t.expectEqual(WeatherFx.cloud, weatherFxFor(0x1F324, 0xE304));
+    // Scatter stays in range.
+    var hi: i64 = 0;
+    while (hi < 200) : (hi += 1) {
+        const v = fxHash01(hi);
+        try t.expect(v >= 0.0 and v < 1.0);
+    }
+    // Render smoke: rain lights pixels inside its rect and only there; the
+    // none kind leaves the buffer untouched.
+    var buf: [40 * 200]u32 = [_]u32{0xFF101010} ** (40 * 200);
+    drawWeatherFx(&buf, 200, 40, 10, 190, 0, 0xE319, 7, 0xFF101010, 0xFF4AA8FF);
+    var lit: usize = 0;
+    var leaked: usize = 0;
+    var yy: usize = 0;
+    while (yy < 40) : (yy += 1) {
+        var xx: usize = 0;
+        while (xx < 200) : (xx += 1) {
+            if (buf[yy * 200 + xx] != 0xFF101010) {
+                lit += 1;
+                if (xx < 10 or xx >= 190) leaked += 1;
+            }
+        }
+    }
+    try t.expect(lit > 5);
+    try t.expectEqual(@as(usize, 0), leaked);
+    var buf2: [40 * 200]u32 = [_]u32{0xFF101010} ** (40 * 200);
+    drawWeatherFx(&buf2, 200, 40, 10, 190, 0, 0x0041, 7, 0xFF101010, 0xFF4AA8FF);
+    for (buf2) |px| try t.expectEqual(@as(u32, 0xFF101010), px);
 }
 
 test "waypaper tombstone still parses" {
@@ -7441,4 +10318,459 @@ test "waypaper tombstone still parses" {
     try t.expectEqual(ModuleKind.waypaper, parsed.modules.right[0].kind);
     try t.expect(parsed.modules.right[0].in_drawer);
     try t.expectEqual(ModuleKind.weather, parsed.modules.right[1].kind);
+}
+
+test "mpris progress styles" {
+    const t = std.testing;
+    current_config.appearance.bg_color = 0xFF101010;
+    current_config.appearance.module_bg_color = 0xFF1E1E1E;
+    current_config.appearance.module_pill_opacity = 100;
+    current_config.appearance.workspace_active_color = 0xFFDCDCDC;
+    current_config.appearance.module_pills = true;
+    current_config.appearance.pill_borders = true;
+    // Underline: pixels change only in the bottom dash band.
+    var u: [32 * 200]u32 = [_]u32{0xFF101010} ** (32 * 200);
+    drawMprisProgress(&u, 200, 32, 10, 100, 0.5);
+    var u_min: usize = 32;
+    var u_max: usize = 0;
+    var u_lit: usize = 0;
+    // Bar fill: spans vertically through the pill interior, wider total.
+    var b: [32 * 200]u32 = [_]u32{0xFF101010} ** (32 * 200);
+    drawMprisBarFill(&b, 200, 32, 6, 150, 0.5);
+    var b_min: usize = 32;
+    var b_max: usize = 0;
+    var b_lit: usize = 0;
+    var yy: usize = 0;
+    while (yy < 32) : (yy += 1) {
+        var xx: usize = 0;
+        while (xx < 200) : (xx += 1) {
+            if (u[yy * 200 + xx] != 0xFF101010) {
+                u_lit += 1;
+                u_min = @min(u_min, yy);
+                u_max = @max(u_max, yy);
+            }
+            if (b[yy * 200 + xx] != 0xFF101010) {
+                b_lit += 1;
+                b_min = @min(b_min, yy);
+                b_max = @max(b_max, yy);
+            }
+        }
+    }
+    try t.expect(u_lit > 0);
+    try t.expect(u_max - u_min <= 4);
+    try t.expect(u_min >= 24);
+    try t.expect(b_lit > u_lit * 2);
+    try t.expect(b_max - b_min > 12);
+    // Null/zero fractions draw nothing in either style.
+    var n1: [32 * 200]u32 = [_]u32{0xFF101010} ** (32 * 200);
+    drawMprisProgress(&n1, 200, 32, 10, 100, null);
+    var n2: [32 * 200]u32 = [_]u32{0xFF101010} ** (32 * 200);
+    drawMprisBarFill(&n2, 200, 32, 6, 150, 0.0);
+    for (n1) |px| try t.expectEqual(@as(u32, 0xFF101010), px);
+    for (n2) |px| try t.expectEqual(@as(u32, 0xFF101010), px);
+}
+
+test "urgent pill lights amber" {
+    const t = std.testing;
+    current_config.appearance.bg_color = 0xFF101010;
+    current_config.appearance.module_pill_opacity = 100;
+    current_config.appearance.module_bg_color = 0xFF1E1E1E;
+    current_config.appearance.module_pills = true;
+    current_config.appearance.pill_borders = true;
+    current_config.appearance.module_border_width = 1;
+    // Full strength paints wash + dash; zero strength is a no-op.
+    var lit: [32 * 200]u32 = [_]u32{0xFF101010} ** (32 * 200);
+    drawUrgentPill(&lit, 200, 32, 50, 110, 1.0);
+    var n_lit: usize = 0;
+    var amber: usize = 0;
+    for (lit) |px| {
+        if (px != 0xFF101010) {
+            n_lit += 1;
+            // Amber tint: red channel leads (0xF5A524-ish blends).
+            const r: i32 = @intCast((px >> 16) & 0xFF);
+            const b: i32 = @intCast(px & 0xFF);
+            if (r > b + 20) amber += 1;
+        }
+    }
+    try t.expect(n_lit > 50);
+    try t.expect(amber > n_lit / 2);
+    var dark: [32 * 200]u32 = [_]u32{0xFF101010} ** (32 * 200);
+    drawUrgentPill(&dark, 200, 32, 50, 110, 0.0);
+    for (dark) |px| try t.expectEqual(@as(u32, 0xFF101010), px);
+}
+
+test "big icon layout covers ink" {
+    const t = std.testing;
+    var pxbuf: [32]u8 = [_]u8{0} ** 32;
+    // Overhanging bitmap (21px ink on a 13px advance, bearing -4): the cell
+    // must span the ink [-4, 17), not the advance — advance-only measuring
+    // is what clipped the old layout pill's ring through the glyph.
+    const over = font_mod.BigGlyph{ .width = 21, .height = 18, .bitmap_left = -4, .bitmap_top = 17, .advance_x = 13, .pixels = &pxbuf };
+    const lay = bigIconLayout(&over, 26) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(i64, 21), lay.content_w);
+    try t.expectEqual(@as(i64, 4), lay.pen_off);
+    try t.expectEqual(@as(i64, 17), lay.adv);
+    // Ink inside the advance: advance wins, no shift.
+    const norm = font_mod.BigGlyph{ .width = 10, .height = 10, .bitmap_left = 1, .bitmap_top = 9, .advance_x = 13, .pixels = &pxbuf };
+    const lay2 = bigIconLayout(&norm, 26) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(i64, 13), lay2.content_w);
+    try t.expectEqual(@as(i64, 0), lay2.pen_off);
+    try t.expectEqual(@as(i64, 13), lay2.adv);
+    // Taller than the pill interior: no layout (caller draws 1x instead).
+    const tall = font_mod.BigGlyph{ .width = 10, .height = 30, .bitmap_left = 0, .bitmap_top = 20, .advance_x = 13, .pixels = &pxbuf };
+    try t.expect(bigIconLayout(&tall, 26) == null);
+    // Null raster: null.
+    try t.expect(bigIconLayout(null, 26) == null);
+}
+
+test "volume list parses pactl" {
+    const t = std.testing;
+    // Sink selection: blank means the default placeholder for each tool,
+    // a name gets single-quoted, a quote in the name refuses (no shell
+    // interpolation of attacker-influenced text, ever).
+    current_config.appearance.volume_sink = "";
+    var abuf: [160]u8 = undefined;
+    try t.expectEqualStrings("@DEFAULT_SINK@", pactlSinkArg(&abuf).?);
+    current_config.appearance.volume_sink = "alsa_output.usb-GC7.analog-stereo";
+    try t.expectEqualStrings("'alsa_output.usb-GC7.analog-stereo'", pactlSinkArg(&abuf).?);
+    current_config.appearance.volume_sink = "we'ird";
+    try t.expect(pactlSinkArg(&abuf) == null);
+    current_config.appearance.volume_sink = "";
+    var out: [VOL_MAX_ENTRIES]VolumeEntry = [_]VolumeEntry{.{}} ** VOL_MAX_ENTRIES;
+    // Master + muted app + unnamed stream + boosted (>100%) level.
+    const sample =
+        \\Volume: front-left: 42598 /  65% / -11.22 dB,   front-right: 42598 /  65% / -11.22 dB
+        \\Mute: no
+        \\Sink Input #6
+        \\    Driver: protocol-native.c
+        \\    Properties:
+        \\        application.name = "Firefox"
+        \\    Volume: front-left: 30455 /  46% / -20.07 dB,   front-right: 30455 /  46% / -20.07 dB
+        \\            balance 0.00
+        \\    Mute: yes
+        \\Sink Input #9
+        \\    Volume: mono: 65536 / 100% / 0.00 dB
+        \\    Mute: no
+        \\Sink Input #12
+        \\    Properties:
+        \\        application.name = "Strawberry"
+        \\    Volume: front-left: 80000 / 122% / 5.15 dB,   front-right: 80000 / 122% / 5.15 dB
+        \\    Mute: no
+    ;
+    const n = parseVolumeList(sample, &out);
+    try t.expectEqual(@as(usize, 4), n);
+    try t.expectEqual(@as(i32, -1), out[0].id);
+    try t.expectEqualStrings("Master", out[0].name());
+    try t.expectEqual(@as(u8, 65), out[0].vol_pct);
+    try t.expect(!out[0].muted);
+    try t.expectEqual(@as(i32, 6), out[1].id);
+    try t.expectEqualStrings("Firefox", out[1].name());
+    try t.expectEqual(@as(u8, 46), out[1].vol_pct);
+    try t.expect(out[1].muted);
+    try t.expectEqualStrings("Stream #9", out[2].name());
+    try t.expectEqual(@as(u8, 100), out[2].vol_pct);
+    try t.expectEqual(@as(u8, 122), out[3].vol_pct);
+    // Sink + source master pairs land at 0/1 with apps after them.
+    var outm: [VOL_MAX_ENTRIES]VolumeEntry = [_]VolumeEntry{.{}} ** VOL_MAX_ENTRIES;
+    const samplem =
+        \\[sink]
+        \\Volume: front-left: 42598 /  65% / -11.22 dB
+        \\Mute: no
+        \\[source]
+        \\Volume: front-left: 20000 /  30% / -31.0 dB
+        \\Mute: yes
+        \\Sink Input #6
+        \\    application.name = "Firefox"
+        \\    Volume: front-left: 30455 /  46% / -20.07 dB
+        \\    Mute: no
+    ;
+    const nm = parseVolumeList(samplem, &outm);
+    try t.expectEqual(@as(usize, 3), nm);
+    try t.expectEqualStrings("Master", outm[0].name());
+    try t.expectEqual(@as(i32, -2), outm[1].id);
+    try t.expectEqualStrings("Mic", outm[1].name());
+    try t.expectEqual(@as(u8, 30), outm[1].vol_pct);
+    try t.expect(outm[1].muted);
+    try t.expectEqualStrings("Firefox", outm[2].name());
+    // No sink master volume: unusable, keep the old list.
+    var out2: [VOL_MAX_ENTRIES]VolumeEntry = [_]VolumeEntry{.{}} ** VOL_MAX_ENTRIES;
+    try t.expectEqual(@as(usize, 0), parseVolumeList("Mute: no\nSink Input #6\n\tMute: no\n", &out2));
+    // Garbage: unusable too.
+    try t.expectEqual(@as(usize, 0), parseVolumeList("hello\nworld\n", &out2));
+    // Master only: single row, still openable.
+    try t.expectEqual(@as(usize, 1), parseVolumeList("Volume: mono: 10 /  0% / -inf dB\nMute: yes\n", &out2));
+    try t.expect(out2[0].muted);
+}
+
+test "volume poll and slider math" {
+    const t = std.testing;
+    // Volume poll text ("67" / "67\nMUTED") parses to level + mute flag.
+    var pbuf: [16]u8 = undefined;
+    const p1 = parseVolumePoll("67\n", &pbuf);
+    try t.expect(p1.ok);
+    try t.expectEqual(@as(u8, 67), p1.pct);
+    try t.expect(!p1.muted);
+    try t.expectEqualStrings("67", p1.text);
+    const p2 = parseVolumePoll("0\nMUTED\n", &pbuf);
+    try t.expect(p2.ok);
+    try t.expect(p2.muted);
+    try t.expectEqual(@as(u8, 0), p2.pct);
+    const p3 = parseVolumePoll("", &pbuf);
+    try t.expect(!p3.ok);
+    const p4 = parseVolumePoll("hello\n", &pbuf);
+    try t.expect(!p4.ok);
+    // Track geometry round-trips: value -> thumb x -> value.
+    const tr = volSliderTrack(200);
+    try t.expectEqual(@as(i64, POPUP_PADDING_X), tr.x0);
+    try t.expectEqual(@as(i64, 200) - POPUP_PADDING_X, tr.x1);
+    try t.expectEqual(tr.x0, volSliderValToX(tr.x0, tr.x1, 0));
+    try t.expectEqual(tr.x1, volSliderValToX(tr.x0, tr.x1, 100));
+    try t.expectEqual(@as(u8, 0), volSliderXToVal(tr.x0, tr.x1, tr.x0));
+    try t.expectEqual(@as(u8, 100), volSliderXToVal(tr.x0, tr.x1, tr.x1));
+    try t.expectEqual(@as(u8, 50), volSliderXToVal(tr.x0, tr.x1, @divTrunc(tr.x0 + tr.x1, 2)));
+    // Overshoot clamps both ways; degenerate tracks read 0.
+    try t.expectEqual(@as(u8, 0), volSliderXToVal(tr.x0, tr.x1, tr.x0 - 40));
+    try t.expectEqual(@as(u8, 100), volSliderXToVal(tr.x0, tr.x1, tr.x1 + 40));
+    try t.expectEqual(@as(u8, 0), volSliderXToVal(50, 50, 60));
+    // Value text honors mute.
+    var vb: [8]u8 = undefined;
+    try t.expectEqualStrings("muted", volValueText(true, 80, &vb));
+    try t.expectEqualStrings("80%", volValueText(false, 80, &vb));
+}
+
+test "running app matching and taskbar tail" {
+    const t = std.testing;
+    // appid keys: exact, reverse-DNS component, substring both ways.
+    try t.expect(appidMatchesKey("nautilus", "nautilus"));
+    try t.expect(appidMatchesKey("org.gnome.nautilus", "nautilus"));
+    try t.expect(appidMatchesKey("app.fluxer.fluxerdesktop", "fluxer"));
+    try t.expect(appidMatchesKey("zen-browser", "zen"));
+    try t.expect(appidMatchesKey("firefox", "firefox-esr"));
+    try t.expect(appidMatchesKey("alacritty", "alacritty"));
+    try t.expect(!appidMatchesKey("alacritty", "foot"));
+    try t.expect(!appidMatchesKey("org.gnome.nautilus", ""));
+    try t.expect(!appidMatchesKey("", "foot"));
+    // Command keys: basename, argv, desktop suffix.
+    var kb: [64]u8 = undefined;
+    try t.expectEqualStrings("nautilus", launcherMatchKey("nautilus", &kb));
+    try t.expectEqualStrings("foot", launcherMatchKey("/usr/bin/foot --app-id foo", &kb));
+    try t.expectEqualStrings("steam", launcherMatchKey("steam.desktop", &kb));
+    try t.expectEqualStrings("", launcherMatchKey("", &kb));
+    // Launcher matching: wrappers cover families, drawer never matches,
+    // plain binaries match appid (title as fallback).
+    try t.expect(clientMatchesLauncher("simpbar-launch-browser", "firefox", ""));
+    try t.expect(clientMatchesLauncher("simpbar-launch-browser", "zen-browser", ""));
+    try t.expect(!clientMatchesLauncher("simpbar-launch-browser", "vesktop", ""));
+    try t.expect(clientMatchesLauncher("simpbar-launch-discord", "vesktop", ""));
+    try t.expect(clientMatchesLauncher("simpbar-launch-discord", "app.fluxer.fluxerdesktop", ""));
+    try t.expect(!clientMatchesLauncher("appdrawer power", "appdrawer", ""));
+    try t.expect(!clientMatchesLauncher("appdrawer power", "quickshell", ""));
+    try t.expect(clientMatchesLauncher("nautilus", "org.gnome.nautilus", ""));
+    try t.expect(clientMatchesLauncher("steam", "steam", ""));
+    try t.expect(!clientMatchesLauncher("foot", "alacritty", "~ - fish"));
+    // JSON plumbing: nested objects don't end the element early, braces in
+    // titles don't confuse the splitter, string/int fields extract.
+    const sample =
+        \\{"clients":[{"id":7,"title":"a {b} \"c\"","appid":"Alacritty","tags":[1],"is_focused":true},{"id":9,"title":"x","appid":"org.gnome.Nautilus","tags":[4],"is_focused":false}]}
+    ;
+    var objs = topLevelObjects(sample);
+    const o1 = objs.next() orelse return error.MissingObj;
+    try t.expectEqualStrings("Alacritty", extractJsonString(o1, "\"appid\"") orelse "");
+    try t.expectEqual(@as(i32, 7), extractJsonInt(o1, "\"id\"") orelse -1);
+    try t.expect(std.mem.indexOf(u8, o1, "\"is_focused\":true") != null);
+    const o2 = objs.next() orelse return error.MissingObj;
+    try t.expectEqualStrings("org.gnome.Nautilus", extractJsonString(o2, "\"appid\"") orelse "");
+    try t.expect(objs.next() == null);
+    // Hyprland shape: nested workspace object inside the client element.
+    const hp =
+        \\[{"address":"0x1a2b","class":"firefox","title":"Tabs","workspace":{"id":1,"name":"1"}},{"address":"0x3c4d","class":"foot","title":"~","workspace":{"id":2,"name":"2"}}]
+    ;
+    var hobjs = topLevelObjects(hp);
+    const h1 = hobjs.next() orelse return error.MissingObj;
+    try t.expectEqualStrings("0x1a2b", extractJsonString(h1, "\"address\"") orelse "");
+    try t.expectEqualStrings("firefox", extractJsonString(h1, "\"class\"") orelse "");
+    const h2 = hobjs.next() orelse return error.MissingObj;
+    try t.expectEqualStrings("foot", extractJsonString(h2, "\"class\"") orelse "");
+    try t.expect(hobjs.next() == null);
+    // Workspace/tag extraction: Mango's first tags[] entry, Hyprland's
+    // nested workspace object.
+    try t.expectEqual(@as(i32, 1), extractFirstTagId(o1) orelse -1);
+    try t.expectEqual(@as(i32, 4), extractFirstTagId(o2) orelse -1);
+    try t.expectEqual(@as(i32, 1), extractWorkspaceId(h1) orelse -1);
+    try t.expectEqual(@as(i32, 2), extractWorkspaceId(h2) orelse -1);
+    try t.expect(extractFirstTagId("{\"tags\":[]}") == null);
+    try t.expect(extractWorkspaceId("{\"class\":\"x\"}") == null);
+    // liveness + tail over a fake window set (globals restored after).
+    const saved_launchers = current_config.launchers;
+    const saved_apps = running_state.apps;
+    const saved_len = running_state.len;
+    defer {
+        current_config.launchers = saved_launchers;
+        running_state.apps = saved_apps;
+        running_state.len = saved_len;
+    }
+    const fake_launchers = [_]LauncherButton{
+        .{ .label = "Term", .command = "foot" },
+        .{ .label = "Browser", .command = "simpbar-launch-browser" },
+    };
+    current_config.launchers = &fake_launchers;
+    running_state.len = 3;
+    running_state.apps[0] = .{};
+    running_state.apps[0].appid_len = lowerCopy(&running_state.apps[0].appid_buf, "foot");
+    running_state.apps[0].addr_len = 1;
+    running_state.apps[0].focused = true;
+    running_state.apps[1] = .{};
+    running_state.apps[1].appid_len = lowerCopy(&running_state.apps[1].appid_buf, "org.gnome.Nautilus");
+    running_state.apps[1].addr_len = 1;
+    running_state.apps[2] = .{};
+    running_state.apps[2].appid_len = lowerCopy(&running_state.apps[2].appid_buf, "Alacritty");
+    running_state.apps[2].addr_len = 1;
+    const live = launcherLive("foot");
+    try t.expectEqual(@as(usize, 1), live.count);
+    try t.expect(live.focused);
+    try t.expectEqual(@as(usize, 0), live.client_idx.?);
+    try t.expectEqual(@as(usize, 0), launcherLive("simpbar-launch-browser").count);
+    var tail: [MAX_UNPINNED_GROUPS]UnpinnedGroup = undefined;
+    const tail_n = collectUnpinned(&tail);
+    try t.expectEqual(@as(usize, 2), tail_n);
+    try t.expectEqualStrings("nautilus", tail[0].name());
+    try t.expectEqualStrings("alacritty", tail[1].name());
+}
+
+test "launcher drag reorder math" {
+    const t = std.testing;
+    const saved_order = launcher_view_order;
+    const saved_len = launcher_view_len;
+    defer {
+        launcher_view_order = saved_order;
+        launcher_view_len = saved_len;
+    }
+    launcher_view_len = 4;
+    launcher_view_order[0] = 0;
+    launcher_view_order[1] = 1;
+    launcher_view_order[2] = 2;
+    launcher_view_order[3] = 3;
+    try t.expectEqual(@as(usize, 0), launcherPosition(0).?);
+    try t.expect(launcherPosition(9) == null);
+    try t.expect(moveLauncherView(0, 2));
+    try t.expectEqual(@as(usize, 1), launcher_view_order[0]);
+    try t.expectEqual(@as(usize, 2), launcher_view_order[1]);
+    try t.expectEqual(@as(usize, 0), launcher_view_order[2]);
+    try t.expectEqual(@as(usize, 3), launcher_view_order[3]);
+    try t.expect(!moveLauncherView(0, 2)); // already there
+    try t.expect(!moveLauncherView(9, 0)); // unknown index
+    try t.expect(moveLauncherView(3, 0));
+    try t.expectEqual(@as(usize, 3), launcher_view_order[0]);
+    try t.expect(moveLauncherView(1, 99)); // clamps to the end
+    try t.expectEqual(@as(usize, 1), launcher_view_order[3]);
+    // Drop targets count other pins' centers at/left of x (gaps split
+    // evenly; non-launcher regions ignored).
+    var regs: ClickRegions = .{};
+    regs.add(0, 10, .{ .launcher = 0 });
+    regs.add(12, 18, .{ .switch_workspace = 1 });
+    regs.add(20, 30, .{ .launcher = 1 });
+    regs.add(40, 50, .{ .launcher = 2 });
+    try t.expectEqual(@as(usize, 2), dropPositionAt(&regs, 0, 45));
+    try t.expectEqual(@as(usize, 0), dropPositionAt(&regs, 0, 5));
+    try t.expectEqual(@as(usize, 2), dropPositionAt(&regs, 1, 100));
+    try t.expectEqual(@as(usize, 0), dropPositionAt(&regs, 1, 0));
+}
+
+test "taskbar icons resolve" {
+    const t = std.testing;
+    const saved_idx_len = desktop_idx_len;
+    defer desktop_idx_len = saved_idx_len;
+    desktopIndexAdd("nautilus", "org.gnome.Nautilus");
+    desktopIndexAdd("alacritty", "Alacritty");
+    desktopIndexAdd("nautilus", "second-wins-never");
+    try t.expectEqualStrings("org.gnome.Nautilus", desktopIndexLookup("nautilus") orelse "");
+    try t.expectEqualStrings("Alacritty", desktopIndexLookup("alacritty") orelse "");
+    try t.expect(desktopIndexLookup("nope") == null);
+    // Pin names: drawer has none (glyph path), plain binaries go through
+    // the index with the binary itself as fallback, junk wrappers miss.
+    var nbuf: [64]u8 = undefined;
+    try t.expect(pinIconName("appdrawer power", &nbuf) == null);
+    try t.expectEqualStrings("org.gnome.Nautilus", pinIconName("nautilus", &nbuf) orelse "");
+    try t.expectEqualStrings("foot", pinIconName("foot", &nbuf) orelse "");
+    try t.expect(pinIconName("", &nbuf) == null);
+    // Wrapped sandbox commands resolve to the wrapped app id, not the
+    // wrapper binary — otherwise every flatpak pin matches nothing and
+    // spawns duplicates.
+    var fbuf: [64]u8 = undefined;
+    try t.expectEqualStrings("com.spotify.client", launcherMatchKey("/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=spotify --file-forwarding com.spotify.Client @@u @@", &fbuf));
+    try t.expectEqualStrings("org.gnome.boxes", launcherMatchKey("/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=gnome-boxes --file-forwarding org.gnome.Boxes @@u %U @@", &fbuf));
+    try t.expectEqualStrings("spotify", launcherMatchKey("snap run spotify", &fbuf));
+    try t.expectEqualStrings("flatpak", launcherMatchKey("flatpak update", &fbuf));
+    try t.expect(clientMatchesLauncher("/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=spotify --file-forwarding com.spotify.Client @@u @@", "spotify", ""));
+    try t.expect(clientMatchesLauncher("/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=gnome-boxes --file-forwarding org.gnome.Boxes @@u %U @@", "org.gnome.boxes", ""));
+    try t.expect(!clientMatchesLauncher("/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=spotify --file-forwarding com.spotify.Client @@u @@", "alacritty", ""));
+    // Deep index: full key, then DNS components (middle ones included).
+    desktopIndexAdd("spotify", "com.spotify.Client");
+    try t.expectEqualStrings("com.spotify.Client", desktopIndexLookupDeep("com.spotify.client") orelse "");
+    try t.expect(desktopIndexLookupDeep("org.unknown.app") == null);
+    const junk = [_][]const u8{"no-such-bin-xyz"};
+    var wbuf: [64]u8 = undefined;
+    try t.expect(wrapperIconName(&junk, "no-such-choice-xyz", &wbuf) == null);
+    // Empty tail cache: lookups miss, no icon anywhere.
+    try t.expect(tailIconFind("alacritty") == null);
+    try t.expect(tailIconPixels("alacritty") == null);
+    var g = UnpinnedGroup{ .client_idx = 99999 };
+    try t.expect(!tailHasIcon(&g));
+}
+
+test "cava curve interpolates" {
+    const t = std.testing;
+    try t.expectEqualStrings("bars", cavaStyleOrDefault(""));
+    try t.expectEqualStrings("bars", cavaStyleOrDefault("nope"));
+    try t.expectEqualStrings("wave", cavaStyleOrDefault("wave"));
+    try t.expectEqualStrings("curve", cavaStyleOrDefault("curve"));
+    // Fake daemon frame over the globals (restored after).
+    const saved_bars = cava_state.bars;
+    const saved_count = cava_state.bar_count;
+    defer {
+        cava_state.bars = saved_bars;
+        cava_state.bar_count = saved_count;
+    }
+    cava_state.bars[0] = 250;
+    cava_state.bars[1] = 500;
+    cava_state.bars[2] = 750;
+    cava_state.bars[3] = 1000;
+    cava_state.bar_count = 4;
+    try t.expectApproxEqAbs(@as(f32, 0.25), cavaBarFrac(0), 1e-6);
+    try t.expectApproxEqAbs(@as(f32, 1.0), cavaBarFrac(3), 1e-6);
+    try t.expectEqual(@as(f32, 0.0), cavaBarFrac(4));
+    try t.expectEqual(@as(f32, 0.0), cavaCurveFrac(0, 0));
+    // Bar centers reproduce their own values (4 bars over 4 columns).
+    try t.expectApproxEqAbs(@as(f32, 0.25), cavaCurveFrac(0, 4), 1e-6);
+    try t.expectApproxEqAbs(@as(f32, 1.0), cavaCurveFrac(3, 4), 1e-6);
+    // Quarter-blend between bar 0 (.25) and bar 1 (.5): cosine ease at
+    // t=0.25 is 0.5-0.5*cos(pi/4).
+    const u = 0.5 - 0.5 * @cos(0.25 * std.math.pi);
+    try t.expectApproxEqAbs(@as(f32, 0.25 + 0.25 * u), cavaCurveFrac(1, 8), 1e-5);
+    // Past the ends it clamps instead of ringing.
+    try t.expectApproxEqAbs(@as(f32, 0.25), cavaCurveFrac(0, 400), 1e-6);
+    try t.expectApproxEqAbs(@as(f32, 1.0), cavaCurveFrac(399, 400), 1e-6);
+}
+
+test "distro glyph tables" {
+    const t = std.testing;
+    // Direct hits (this machine is CachyOS; the tables must agree).
+    try t.expectEqual(@as(u32, 0xF385), DISTRO_GLYPHS.get("cachyos").?);
+    try t.expectEqual(@as(u32, 0xF303), DISTRO_GLYPHS.get("arch").?);
+    try t.expectEqual(@as(u32, 0xF306), DISTRO_GLYPHS.get("debian").?);
+    try t.expectEqual(@as(u32, 0xF30A), DISTRO_FAMILY_GLYPHS.get("fedora").?);
+    try t.expect(DISTRO_GLYPHS.get("no-such-distro") == null);
+    // The live detector agrees with the tables on whatever host runs
+    // this (cache cleared first and restored after, so test order never
+    // matters). Only asserted when the host ID hits the table directly —
+    // family fallback has its own paths below the detector.
+    const saved = g_distro_glyph;
+    defer g_distro_glyph = saved;
+    g_distro_glyph = null;
+    var idbuf: [64]u8 = undefined;
+    if (osReleaseValue("ID", &idbuf)) |id| {
+        if (DISTRO_GLYPHS.get(id)) |cp| {
+            try t.expectEqual(cp, distroLogoCodepoint());
+        }
+    }
 }

@@ -26,6 +26,17 @@ pub const Glyph = struct {
     pixels: []u8,
 };
 
+/// Rasterized bitmap returned by value from Font.glyphScaled (caller frees
+/// `pixels` with the font's allocator).
+pub const BigGlyph = struct {
+    width: u32,
+    height: u32,
+    bitmap_left: i32,
+    bitmap_top: i32,
+    advance_x: i32,
+    pixels: []u8,
+};
+
 pub const Font = struct {
     gpa: std.mem.Allocator,
     library: c.FT_Library,
@@ -100,5 +111,37 @@ pub const Font = struct {
             .pixels = pixels,
         };
         return gop.value_ptr;
+    }
+
+    /// Rasterizes one codepoint at `scale`× the font's pixel size WITHOUT
+    /// touching the cache (oversized one-off icons — the weather glyph):
+    /// sets the face size, loads, copies the bitmap out, and restores the
+    /// font's own size on every path (defer), so later cached loads are
+    /// unaffected. Note FreeType substitutes its .notdef box for genuinely
+    /// missing glyphs instead of failing — callers that must not show tofu
+    /// (the weather arm) gate on codepoint coverage themselves.
+    pub fn glyphScaled(self: *Font, codepoint: u32, scale: u32) !BigGlyph {
+        if (scale < 1) return error.SetPixelSizeFailed;
+        if (c.FT_Set_Pixel_Sizes(self.face, 0, self.pixel_size * scale) != 0) return error.SetPixelSizeFailed;
+        defer _ = c.FT_Set_Pixel_Sizes(self.face, 0, self.pixel_size);
+        if (c.FT_Load_Char(self.face, codepoint, c.FT_LOAD_RENDER) != 0) return error.GlyphLoadFailed;
+        const slot = self.face.*.glyph;
+        const bmp = slot.*.bitmap;
+        const pixels = try self.gpa.alloc(u8, @as(usize, bmp.width) * bmp.rows);
+        errdefer self.gpa.free(pixels);
+        const pitch: usize = @intCast(@abs(bmp.pitch));
+        var row: u32 = 0;
+        while (row < bmp.rows) : (row += 1) {
+            const src = bmp.buffer[row * pitch ..][0..bmp.width];
+            @memcpy(pixels[row * bmp.width ..][0..bmp.width], src);
+        }
+        return BigGlyph{
+            .width = bmp.width,
+            .height = bmp.rows,
+            .bitmap_left = slot.*.bitmap_left,
+            .bitmap_top = slot.*.bitmap_top,
+            .advance_x = @intCast(slot.*.advance.x >> 6),
+            .pixels = pixels,
+        };
     }
 };

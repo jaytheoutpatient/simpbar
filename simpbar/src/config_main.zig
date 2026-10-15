@@ -214,8 +214,17 @@ const JsonAppearance = struct {
     bg_mode: []const u8 = "none",
     // Cava background wash strength 0-100. Matches main.zig exactly.
     cava_bg_strength: u8 = 35,
+    // "bars" (default), "wave" or "curve" — the cava background shape.
+    // Matches main.zig's JsonAppearance.cava_style exactly.
+    cava_style: []const u8 = "bars",
     // Matrix fall speed. Matches main.zig exactly.
     matrix_speed: u32 = 2,
+    // "underline" (default) or "bar" — the media progress display.
+    // Matches main.zig's JsonAppearance.mpris_progress_style exactly.
+    mpris_progress_style: []const u8 = "underline",
+    // PipeWire sink the volume module/mixer/OSD follow ("" = default
+    // output). Matches main.zig's JsonAppearance.volume_sink exactly.
+    volume_sink: []const u8 = "",
     bar_height: u32 = 28,
     border_top_px: u32 = 2,
     border_bottom_px: u32 = 0,
@@ -550,8 +559,16 @@ var live_bezel_effect: []const u8 = "rotating";
 var live_bg_mode: []const u8 = "none";
 // Cava background wash strength 0-100.
 var live_cava_bg_strength: u8 = 35;
+// Cava background shape, one of CAVA_STYLE_CHOICES below (static literals).
+var live_cava_style: []const u8 = "bars";
 // Matrix fall speed, pixels per tick.
 var live_matrix_speed: u32 = 2;
+// Media progress display, one of MPRIS_PROGRESS_CHOICES below (static literals).
+var live_mpris_progress_style: []const u8 = "underline";
+// Volume device name, or "" for the default output. Arena-backed from
+// config.json (stable for this GUI's lifetime, like live_monitor), or a
+// discovered-sink buffer below — reassigning outright is always safe.
+var live_volume_sink: []const u8 = "";
 // Resting pill opacity 0-100.
 var live_module_pill_opacity: u8 = 100;
 // Bezel outline thickness in px.
@@ -752,24 +769,6 @@ var live_right: ModuleGroup = .{};
 // current address at call time.
 const MAX_LAUNCHERS = 32;
 
-/// Per-launcher bar rendering choice (the Shortcuts tab's Pinned Launchers
-/// dropdown): name only, name + icon, or icon only. The value round-trips
-/// through config.json's launcher `display` field, which main.zig's
-/// renderer interprets the same way — the labels here are what the dropdown
-/// shows, and index order matches DISPLAY_CHOICES.
-const DISPLAY_CHOICES = [_][]const u8{ "label", "both", "icon" };
-const DISPLAY_LABELS = [_][*:0]const u8{ "Name", "Name + icon", "Icon" };
-
-/// Maps a launcher's stored `display` value to its DISPLAY_CHOICES index
-/// (unrecognized → "both"). Mirrors main.zig's permissive, default-falling
-/// handling of curated string config fields.
-fn displayIndex(display: []const u8) c_uint {
-    for (DISPLAY_CHOICES, 0..) |choice, i| {
-        if (std.mem.eql(u8, display, choice)) return @intCast(i);
-    }
-    return 1; // "both"
-}
-
 const LauncherRow = struct {
     label_buf: [MAX_ROW_TEXT]u8 = undefined,
     label_len: usize = 0,
@@ -781,22 +780,16 @@ const LauncherRow = struct {
     icon_buf: [MAX_ROW_TEXT]u8 = undefined,
     icon_len: usize = 0,
     has_icon: bool = false,
-    // DISPLAY_CHOICES index ("label"/"both"/"icon") — stored by index so the
-    // whole struct stays a plain value copy (no slice ownership to fix up),
-    // and 1 ("both") is the default for rows that never had a choice.
-    display_idx: usize = 1,
 
     fn button(self: *const LauncherRow) LauncherButton {
         return .{
             .label = self.label_buf[0..self.label_len],
             .command = self.command_buf[0..self.command_len :0],
             .icon = if (self.has_icon) self.icon_buf[0..self.icon_len] else null,
-            .display = DISPLAY_CHOICES[self.display_idx],
+            // Rendering is icon-only now; the field is still written (as
+            // "both") so config files keep their shape for old bars.
+            .display = "both",
         };
-    }
-
-    fn setDisplay(self: *LauncherRow, idx: c_uint) void {
-        if (idx < DISPLAY_CHOICES.len) self.display_idx = idx;
     }
 };
 
@@ -834,21 +827,36 @@ const LauncherGroup = struct {
             self.setLabel(i, src[i].label);
             self.setCommand(i, src[i].command);
             if (src[i].icon) |ic| self.setIcon(i, ic);
-            self.rows[i].setDisplay(displayIndex(src[i].display));
         }
     }
 
     /// Appends a new pinned launcher (Shortcuts tab's "Pin to Bar"). Returns
     /// false (no-op) once MAX_LAUNCHERS is reached.
-    fn append(self: *LauncherGroup, label: []const u8, command: []const u8, icon: ?[]const u8, display_idx: c_uint) bool {
+    fn append(self: *LauncherGroup, label: []const u8, command: []const u8, icon: ?[]const u8) bool {
         if (self.len >= self.rows.len) return false;
         const i = self.len;
         self.rows[i] = .{};
         self.setLabel(i, label);
         self.setCommand(i, command);
         if (icon) |ic| self.setIcon(i, ic);
-        self.rows[i].setDisplay(display_idx);
         self.len += 1;
+        return true;
+    }
+
+    /// Moves the row at `from` to position `to` (`to` clamps to the last
+    /// slot; a no-op move still returns true). False on out-of-range
+    /// `from`. Pure row surgery (no GUI calls) so the bar's headless
+    /// --move-launcher and tests share it. Rows are plain value copies,
+    /// so a memmove pair suffices — no fixupPointers concerns.
+    fn move(self: *LauncherGroup, from: usize, to: usize) bool {
+        if (from >= self.len) return false;
+        const row = self.rows[from];
+        var i = from;
+        while (i + 1 < self.len) : (i += 1) self.rows[i] = self.rows[i + 1];
+        const t = @min(to, self.len - 1);
+        var j = self.len - 1;
+        while (j > t) : (j -= 1) self.rows[j] = self.rows[j - 1];
+        self.rows[t] = row;
         return true;
     }
 
@@ -937,7 +945,10 @@ fn loadConfigFromDisk() void {
     live_bezel_effect = if (std.mem.eql(u8, j.bezel_effect, "breathing")) "breathing" else if (std.mem.eql(u8, j.bezel_effect, "solid")) "solid" else "rotating";
     live_bg_mode = if (std.mem.eql(u8, j.bg_mode, "cava")) "cava" else if (std.mem.eql(u8, j.bg_mode, "matrix")) "matrix" else "none";
     live_cava_bg_strength = @min(j.cava_bg_strength, 100);
+    live_cava_style = if (std.mem.eql(u8, j.cava_style, "wave")) "wave" else if (std.mem.eql(u8, j.cava_style, "curve")) "curve" else "bars";
     live_matrix_speed = std.math.clamp(j.matrix_speed, 1, 6);
+    live_mpris_progress_style = if (std.mem.eql(u8, j.mpris_progress_style, "bar")) "bar" else "underline";
+    live_volume_sink = j.volume_sink;
     live_module_pill_opacity = @min(j.module_pill_opacity, 100);
     live_module_border_width = @min(j.module_border_width, 8);
     live_module_pills = j.module_pills;
@@ -1154,8 +1165,14 @@ fn buildConfigJson() ![]u8 {
     try appendJsonString(&list, live_bg_mode);
     try list.appendSlice(gpa, ",\"cava_bg_strength\":");
     try appendJsonInt(&list, u8, live_cava_bg_strength);
+    try list.appendSlice(gpa, ",\"cava_style\":");
+    try appendJsonString(&list, live_cava_style);
     try list.appendSlice(gpa, ",\"matrix_speed\":");
     try appendJsonInt(&list, u32, live_matrix_speed);
+    try list.appendSlice(gpa, ",\"mpris_progress_style\":");
+    try appendJsonString(&list, live_mpris_progress_style);
+    try list.appendSlice(gpa, ",\"volume_sink\":");
+    try appendJsonString(&list, live_volume_sink);
     try list.appendSlice(gpa, ",\"module_pill_opacity\":");
     try appendJsonInt(&list, u8, live_module_pill_opacity);
     try list.appendSlice(gpa, ",\"module_border_width\":");
@@ -1266,6 +1283,35 @@ fn restartBar() void {
 
 fn onRestartBarClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     restartBar();
+}
+
+/// Headless `--move-launcher FROM TO`: reorders the pinned launchers in
+/// config.json (indices in file order) and exits 0/1. Returns (doesn't
+/// throw) so realMain can pass it straight to exit().
+fn moveLauncherCli(from_s: []const u8, to_s: []const u8) u8 {
+    const from = std.fmt.parseInt(usize, from_s, 10) catch {
+        logging.err("config: --move-launcher: bad index {s}", .{from_s});
+        return 1;
+    };
+    const to = std.fmt.parseInt(usize, to_s, 10) catch {
+        logging.err("config: --move-launcher: bad index {s}", .{to_s});
+        return 1;
+    };
+    loadConfigFromDisk();
+    if (!live_launchers.move(from, to)) {
+        logging.err("config: --move-launcher: {d} out of range ({d} launchers)", .{ from, live_launchers.len });
+        return 1;
+    }
+    const bytes = buildConfigJson() catch |err| {
+        logging.err("config: failed to build config.json: {}", .{err});
+        return 1;
+    };
+    defer gpa.free(bytes);
+    if (!writeFileAll(config_json_path, bytes)) {
+        logging.err("config: failed to write {s}", .{config_json_path});
+        return 1;
+    }
+    return 0;
 }
 
 fn saveAndSignal() void {
@@ -1567,10 +1613,78 @@ fn onCavaBgStrengthChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c
     saveAndSignal();
 }
 
+// Cava shape choices (values must stay byte-for-byte in sync with
+// main.zig's CAVA_STYLE_* — they are written straight into config.json).
+const CAVA_STYLE_CHOICES = [_][]const u8{ "bars", "wave", "curve" };
+const CAVA_STYLE_LABELS = [_][*:0]const u8{ "Bars", "Wave", "Curve" };
+
+/// Picks the cava background shape (appearance.cava_style). Applies on the
+/// next SIGUSR1 reload like every other config.json change.
+fn onCavaStyleChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx >= CAVA_STYLE_CHOICES.len) return;
+    live_cava_style = CAVA_STYLE_CHOICES[idx];
+    saveAndSignal();
+}
+
+fn buildCavaStyleRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Cava style");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "Equalizer shape behind the modules: bottom-up bars, a centered wave, or a smooth filled curve.");
+
+    var buf: [CAVA_STYLE_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (CAVA_STYLE_LABELS, 0..) |label, i| buf[i] = label;
+    buf[CAVA_STYLE_LABELS.len] = null;
+    gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+
+    var selected_idx: c_uint = 0;
+    for (CAVA_STYLE_CHOICES, 0..) |choice, i| {
+        if (std.mem.eql(u8, choice, live_cava_style)) selected_idx = @intCast(i);
+    }
+    gtk.adw_combo_row_set_selected(row, selected_idx);
+    _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onCavaStyleChanged), null, null, 0);
+
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
 /// Sets the matrix fall speed (appearance.matrix_speed).
 fn onMatrixSpeedChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c) void {
     live_matrix_speed = @as(u32, @intCast(gtk.gtk_spin_button_get_value_as_int(spin)));
     saveAndSignal();
+}
+
+// Progress display choices (values must stay byte-for-byte in sync with
+// main.zig's MPRIS_PROGRESS_* — they are written straight into config.json).
+const MPRIS_PROGRESS_CHOICES = [_][]const u8{ "underline", "bar" };
+const MPRIS_PROGRESS_LABELS = [_][*:0]const u8{ "Underline", "Progress bar" };
+
+/// Picks the media progress display (appearance.mpris_progress_style).
+/// Applies on the next SIGUSR1 reload like every other config.json change.
+fn onMprisProgressChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx >= MPRIS_PROGRESS_CHOICES.len) return;
+    live_mpris_progress_style = MPRIS_PROGRESS_CHOICES[idx];
+    saveAndSignal();
+}
+
+fn buildMprisProgressRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Progress style");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "How playback position shows on the media module: an accent underline, or a subtle fill across the pill.");
+
+    var buf: [MPRIS_PROGRESS_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (MPRIS_PROGRESS_LABELS, 0..) |label, i| buf[i] = label;
+    buf[MPRIS_PROGRESS_LABELS.len] = null;
+    gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+
+    var selected_idx: c_uint = 0;
+    for (MPRIS_PROGRESS_CHOICES, 0..) |choice, i| {
+        if (std.mem.eql(u8, choice, live_mpris_progress_style)) selected_idx = @intCast(i);
+    }
+    gtk.adw_combo_row_set_selected(row, selected_idx);
+    _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onMprisProgressChanged), null, null, 0);
+
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
 }
 const BEZEL_EFFECT_LABELS = [_][*:0]const u8{ "Rotating", "Breathing", "Solid" };
 
@@ -2067,6 +2181,92 @@ fn buildFontRow(group: *gtk.AdwPreferencesGroup) void {
 }
 
 // ---------------------------------------------------------------------
+// Volume device selection — discovers PipeWire sinks via `pactl list sinks
+// short` (same runCaptured fork/exec/pipe-capture as monitors above) so the
+// module, mixer, wheel and OSD can follow a specific device (e.g. a USB DAC
+// whose knob drives it directly, bypassing the default sink). Blank means
+// the default output. Applies live — every poll/fetch/set reads it fresh,
+// unlike Monitor below.
+// ---------------------------------------------------------------------
+
+const MAX_SINK_NAME = 128;
+const MAX_SINK_ENTRIES = 8;
+
+const SinkEntry = struct {
+    name_buf: [MAX_SINK_NAME:0]u8 = undefined,
+    name_len: usize = 0,
+
+    fn name(self: *const SinkEntry) [:0]const u8 {
+        return self.name_buf[0..self.name_len :0];
+    }
+    fn setName(self: *SinkEntry, s: []const u8) void {
+        const n = @min(s.len, MAX_SINK_NAME);
+        @memcpy(self.name_buf[0..n], s[0..n]);
+        self.name_buf[n] = 0;
+        self.name_len = n;
+    }
+};
+
+var sink_entries: [MAX_SINK_ENTRIES]SinkEntry = undefined;
+var sink_entry_count: usize = 0;
+
+/// Missing pactl / no sinks / unparseable leaves sink_entry_count at 0 — the
+/// combo then offers only "Default output", which is also the correct
+/// fallback for an unmatched saved value.
+fn discoverVolumeSinks() void {
+    sink_entry_count = 0;
+    const output = runCaptured(&.{ "pactl", "list", "sinks", "short" }, 3000) orelse return;
+    defer gpa.free(output);
+    // `ID\tNAME\tDRIVER…` per line — the name is the second tab field.
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        const tab1 = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+        const rest = line[tab1 + 1 ..];
+        const tab2 = std.mem.indexOfScalar(u8, rest, '\t') orelse continue;
+        const name = rest[0..tab2];
+        if (name.len == 0 or sink_entry_count >= MAX_SINK_ENTRIES) continue;
+        sink_entries[sink_entry_count].setName(name);
+        sink_entry_count += 1;
+    }
+}
+
+fn onVolumeSinkChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx == 0) {
+        live_volume_sink = "";
+    } else {
+        const entry_idx = idx - 1;
+        if (entry_idx >= sink_entry_count) return;
+        live_volume_sink = sink_entries[entry_idx].name();
+    }
+    saveAndSignal();
+}
+
+fn buildVolumeSinkRow(group: *gtk.AdwPreferencesGroup) void {
+    discoverVolumeSinks();
+
+    const row = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Volume Device");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "Which output the module, mixer, wheel and OSD follow. Pick a USB DAC if its knob drives it directly. Applies live.");
+
+    var buf: [MAX_SINK_ENTRIES + 2]?[*:0]const u8 = undefined;
+    buf[0] = "Default output";
+    var selected_idx: c_uint = 0;
+    for (sink_entries[0..sink_entry_count], 0..) |*e, i| {
+        buf[i + 1] = e.name().ptr;
+        if (std.mem.eql(u8, e.name(), live_volume_sink)) selected_idx = @intCast(i + 1);
+    }
+    buf[sink_entry_count + 1] = null;
+    gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+    gtk.adw_combo_row_set_selected(row, selected_idx);
+    _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onVolumeSinkChanged), null, null, 0);
+
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+// ---------------------------------------------------------------------
 // Monitor selection — discovers connected outputs via the running
 // compositor's IPC (`hyprctl monitors -j` on Hyprland, `mmsg get
 // all-monitors` on MangoWM; the only live-system-query mechanism in this
@@ -2300,9 +2500,20 @@ fn buildAppearancePage() *gtk.GtkBox {
     gtk.adw_preferences_group_set_title(background_group, "Background Effect");
     gtk.adw_preferences_group_set_description(background_group, "What paints behind the modules: nothing, the audio visualizer wash (uses the Audio Visualizer color under Bar Colors), or cmatrix-style glyph rain (uses the Matrix Rain color). Effects need a visible background — at 0% opacity above there is nothing to paint on.");
     buildBgModeRow(background_group);
+    buildCavaStyleRow(background_group);
     addSpinRow(background_group, "Cava Strength (%)", 0, 100, @floatFromInt(live_cava_bg_strength), @ptrCast(&onCavaBgStrengthChanged));
     addSpinRow(background_group, "Matrix Speed", 1, 6, @floatFromInt(live_matrix_speed), @ptrCast(&onMatrixSpeedChanged));
     gtk.gtk_box_append(outer, @ptrCast(background_group));
+
+    const media_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(media_group, "Media");
+    buildMprisProgressRow(media_group);
+    gtk.gtk_box_append(outer, @ptrCast(media_group));
+
+    const sound_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(sound_group, "Sound");
+    buildVolumeSinkRow(sound_group);
+    gtk.gtk_box_append(outer, @ptrCast(sound_group));
 
     const font_group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(font_group, "Font");
@@ -2465,7 +2676,7 @@ fn onPinToBarClicked(_: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) voi
         logging.warn("shortcuts: this app is already pinned ({s}), not duplicating", .{ss.exec()});
         return;
     }
-    if (!live_launchers.append(ss.name(), ss.exec(), ss.icon(), 1)) {
+    if (!live_launchers.append(ss.name(), ss.exec(), ss.icon())) {
         logging.warn("shortcuts: launcher list is full ({d} max), not pinning", .{MAX_LAUNCHERS});
         return;
     }
@@ -2588,11 +2799,11 @@ fn fillInstalledApp(row: *SessionShortcut, entry: desktop_entries.DesktopEntry) 
 }
 
 /// One row of the Shortcuts tab's "Pinned Launchers" list: a live_launchers
-/// row mirrored in the GUI with an Unpin suffix button plus a per-launcher
-/// display-mode dropdown (Name / Name + icon / Icon). populatePinnedLaunchers()
-/// rebuilds the whole list after any pin/unpin, so a captured index would
-/// dangle — the Unpin button and dropdown's user_data are instead the row's
-/// own stable address inside the fixed live_launchers array.
+/// row mirrored in the GUI with an Unpin suffix button.
+/// populatePinnedLaunchers() rebuilds the whole list after any pin/unpin,
+/// so a captured index would dangle — the Unpin button's user_data is
+/// instead the row's own stable address inside the fixed live_launchers
+/// array.
 fn addPinnedLauncherRow(i: usize) void {
     const listbox = g_pinned_listbox orelse return;
     const row = gtk.adw_action_row_new();
@@ -2621,38 +2832,12 @@ fn addPinnedLauncherRow(i: usize) void {
         gtk.adw_action_row_add_prefix(row, @ptrCast(image));
     }
 
-    var labels: [DISPLAY_LABELS.len + 1]?[*:0]const u8 = undefined;
-    for (DISPLAY_LABELS, 0..) |label, li| labels[li] = label;
-    labels[DISPLAY_LABELS.len] = null;
-    const dd = gtk.gtk_drop_down_new_from_strings(&labels) orelse {
-        const unpin_button = gtk.gtk_button_new_with_label("Unpin");
-        gtk.gtk_widget_set_valign(@ptrCast(unpin_button), gtk.ALIGN_CENTER);
-        _ = gtk.g_signal_connect_data(@ptrCast(unpin_button), "clicked", @ptrCast(&onRemoveLauncherClicked), @ptrCast(lrow), null, 0);
-        gtk.adw_action_row_add_suffix(row, @ptrCast(unpin_button));
-        gtk.gtk_list_box_append(listbox, @ptrCast(row));
-        return;
-    };
-    gtk.gtk_drop_down_set_selected(dd, @intCast(lrow.display_idx));
-    gtk.gtk_widget_set_valign(@ptrCast(dd), gtk.ALIGN_CENTER);
-    _ = gtk.g_signal_connect_data(@ptrCast(dd), "notify::selected", @ptrCast(&onLauncherDisplayChanged), @ptrCast(lrow), null, 0);
-    gtk.adw_action_row_add_suffix(row, @ptrCast(dd));
-
     const unpin_button = gtk.gtk_button_new_with_label("Unpin");
     gtk.gtk_widget_set_valign(@ptrCast(unpin_button), gtk.ALIGN_CENTER);
     _ = gtk.g_signal_connect_data(@ptrCast(unpin_button), "clicked", @ptrCast(&onRemoveLauncherClicked), @ptrCast(lrow), null, 0);
     gtk.adw_action_row_add_suffix(row, @ptrCast(unpin_button));
 
     gtk.gtk_list_box_append(listbox, @ptrCast(row));
-}
-
-/// The per-launcher display-mode dropdown changed on a Pinned Launchers
-/// row. `user_data` is the row's stable address in the live_launchers array
-/// (same convention as onRemoveLauncherClicked); the selected index maps
-/// straight onto DISPLAY_CHOICES, so this just stores it and persists.
-fn onLauncherDisplayChanged(dd: *gtk.GtkDropDown, _: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
-    const lrow: *LauncherRow = @ptrCast(@alignCast(user_data.?));
-    lrow.setDisplay(gtk.gtk_drop_down_get_selected(dd));
-    saveAndSignal();
 }
 
 fn populatePinnedLaunchers() void {
@@ -3374,6 +3559,25 @@ pub fn main() void {
 
 fn realMain() !void {
     logging.step("starting up", .{});
+    // Headless config surgery for the bar's launcher drag-and-drop: no
+    // GTK, just load → move → write, exit code out. The bar runs this and
+    // reloads itself past it, so no SIGUSR1 is signaled here. Args come
+    // from /proc/self/cmdline (NUL-separated) — no std.process arg helpers
+    // in this Zig version.
+    const cmdline = readFileAlloc(gpa, "/proc/self/cmdline") catch "";
+    defer if (cmdline.len > 0) gpa.free(cmdline);
+    var parts: [4][]const u8 = undefined;
+    var nparts: usize = 0;
+    var sit = std.mem.splitScalar(u8, cmdline, 0);
+    while (sit.next()) |p| {
+        if (p.len == 0) continue;
+        if (nparts >= parts.len) break;
+        parts[nparts] = p;
+        nparts += 1;
+    }
+    if (nparts == 4 and std.mem.eql(u8, parts[1], "--move-launcher")) {
+        std.process.exit(moveLauncherCli(parts[2], parts[3]));
+    }
     const app = gtk.adw_application_new(APP_ID, 0);
     _ = gtk.g_signal_connect_data(@ptrCast(app), "activate", @ptrCast(&onAppActivate), null, null, 0);
     const code = gtk.g_application_run(@ptrCast(app), 0, null);
@@ -3459,5 +3663,26 @@ test "tombstoned kinds strip cleanly" {
     // Idempotent: nothing left to strip.
     stripRemovedKinds(&g);
     try t.expectEqual(@as(usize, 3), g.len);
+}
+
+test "launcher move reorders" {
+    const t = std.testing;
+    var g: LauncherGroup = .{};
+    try t.expect(!g.move(0, 0)); // empty: nothing to move
+    _ = g.append("a", "cmd-a", null);
+    _ = g.append("b", "cmd-b", null);
+    _ = g.append("c", "cmd-c", null);
+    _ = g.append("d", "cmd-d", null);
+    try t.expect(g.move(0, 2));
+    try t.expectEqualStrings("cmd-b", g.rows[0].command_buf[0..g.rows[0].command_len]);
+    try t.expectEqualStrings("cmd-c", g.rows[1].command_buf[0..g.rows[1].command_len]);
+    try t.expectEqualStrings("cmd-a", g.rows[2].command_buf[0..g.rows[2].command_len]);
+    try t.expectEqualStrings("cmd-d", g.rows[3].command_buf[0..g.rows[3].command_len]);
+    try t.expect(g.move(3, 0));
+    try t.expectEqualStrings("cmd-d", g.rows[0].command_buf[0..g.rows[0].command_len]);
+    try t.expect(g.move(1, 99)); // clamps to the end
+    try t.expectEqualStrings("cmd-b", g.rows[3].command_buf[0..g.rows[3].command_len]);
+    try t.expect(g.move(2, 2)); // no-op move still true
+    try t.expect(!g.move(9, 0));
 }
 

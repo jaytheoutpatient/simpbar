@@ -36,6 +36,11 @@ pub const DesktopEntry = struct {
     exec: []const u8,
     icon: []const u8,
     wm_class: []const u8,
+    /// File stem ("org.gnome.Boxes" for org.gnome.Boxes.desktop) — set by
+    /// the directory scan, empty for hand-parsed entries. Sandboxed apps
+    /// often Exec through flatpak (useless as a key) with no WMClass, so
+    /// the stem is the only stable handle on their icon.
+    id: []const u8 = "",
 };
 
 /// Reads all of `path` into `allocator` — same shape as main.zig's
@@ -155,7 +160,13 @@ fn scanApplicationsDir(
         const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir_path, name }) catch continue;
         const data = readFileAlloc(arena, path) catch continue;
         if (parseDesktop(data, arena)) |entry| {
-            out.append(arena, entry) catch continue;
+            var owned = entry;
+            // Stem key for sandboxed apps (see DesktopEntry.id).
+            if (std.mem.endsWith(u8, name, ".desktop")) {
+                const stem = name[0 .. name.len - ".desktop".len];
+                owned.id = arena.dupe(u8, stem) catch continue;
+            }
+            out.append(arena, owned) catch continue;
             seen.append(arena, arena.dupe(u8, name) catch continue) catch continue;
         }
     }

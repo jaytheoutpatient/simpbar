@@ -4,10 +4,12 @@
 //!
 //! This is a deliberately simplified version of the icon theme spec: it
 //! doesn't parse index.theme, doesn't follow theme Inherits chains, and
-//! doesn't detect which theme is actually configured — it just searches
+//! doesn't detect which theme is actually configured — it searches
 //! Flatpak's exported icon dirs (many sandboxed apps' icons only live
 //! there) and the hicolor theme (the spec-mandated universal fallback),
-//! then falls back to the flat /usr/share/pixmaps location older apps use.
+//! then the always-installed Adwaita sets (for legacy names only they
+//! ship), then the flat /usr/share/pixmaps location older apps use. A
+//! "-symbolic" name with no direct hit retries as its non-symbolic twin.
 //! That's enough to find real icons in practice without a full spec
 //! implementation.
 
@@ -32,6 +34,18 @@ fn tryPath(buf: []u8, comptime fmt: []const u8, args: anytype) ?[:0]const u8 {
 /// Finds an icon file for `name`, writing the path into `buf` and returning
 /// a slice of it, or null if nothing matched.
 pub fn resolveIconPath(name: []const u8, buf: []u8) ?[]const u8 {
+    if (searchIconPath(name, buf)) |p| return p;
+    // Standard fallback: a "-symbolic" icon with no direct hit retries as
+    // its non-symbolic twin (our config/welcome pins name the symbolic
+    // form while only the regular one is installed).
+    const suffix = "-symbolic";
+    if (name.len > suffix.len and std.mem.endsWith(u8, name, suffix)) {
+        if (searchIconPath(name[0 .. name.len - suffix.len], buf)) |p| return p;
+    }
+    return null;
+}
+
+fn searchIconPath(name: []const u8, buf: []u8) ?[]const u8 {
     var path_buf: [512]u8 = undefined;
 
     if (name.len > 0 and name[0] == '/') {
@@ -45,22 +59,29 @@ pub fn resolveIconPath(name: []const u8, buf: []u8) ?[]const u8 {
         return null;
     }
 
-    const roots = [_][]const u8{
-        "/var/lib/flatpak/exports/share/icons",
-        "/usr/share/icons",
+    // (root, theme dir, contexts): the two hicolor trees first in their
+    // historical order (Flatpak exports shadow system icons, as before),
+    // then the always-present Adwaita sets for names only they ship
+    // (legacy context included). Anything resolving before this change
+    // resolves to the same file after it; later roots only fill past
+    // misses.
+    const roots = [_]struct { root: []const u8, theme: []const u8, ctxs: []const []const u8 }{
+        .{ .root = "/var/lib/flatpak/exports/share/icons", .theme = "hicolor", .ctxs = &[_][]const u8{ "apps", "status", "actions" } },
+        .{ .root = "/usr/share/icons", .theme = "hicolor", .ctxs = &[_][]const u8{ "apps", "status", "actions" } },
+        .{ .root = "/usr/share/icons", .theme = "Adwaita", .ctxs = &[_][]const u8{ "apps", "status", "actions", "devices", "legacy" } },
+        .{ .root = "/usr/share/icons", .theme = "AdwaitaLegacy", .ctxs = &[_][]const u8{ "apps", "status", "actions", "devices", "legacy" } },
     };
     // "symbolic" and "scalable" aren't WxH names but are real, common
     // directory names in the spec (monochrome / vector icons); tried
     // first since they scale cleanly to our small render size.
     const sizes = [_][]const u8{ "scalable", "symbolic", "256x256", "128x128", "64x64", "48x48", "32x32", "24x24", "22x22", "16x16" };
-    const contexts = [_][]const u8{ "apps", "status" };
     const exts = [_][]const u8{ ".svg", ".png" };
 
-    for (roots) |root| {
+    for (roots) |r| {
         for (sizes) |size| {
-            for (contexts) |ctx| {
+            for (r.ctxs) |ctx| {
                 for (exts) |ext| {
-                    const p = tryPath(&path_buf, "{s}/hicolor/{s}/{s}/{s}{s}", .{ root, size, ctx, name, ext }) orelse continue;
+                    const p = tryPath(&path_buf, "{s}/{s}/{s}/{s}/{s}{s}", .{ r.root, r.theme, size, ctx, name, ext }) orelse continue;
                     if (fileExists(p)) {
                         const len = @min(p.len, buf.len);
                         @memcpy(buf[0..len], p[0..len]);

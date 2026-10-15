@@ -1946,7 +1946,7 @@ Type=Application
 Name=Simpbar Welcome
 Comment=Setup actions, keybindings, and links for the simpbar Hyprland setup
 Exec=simpbar-welcome
-Icon=preferences-desktop-display-symbolic
+Icon=help-about
 Terminal=false
 Categories=Settings;
 StartupNotify=true
@@ -1958,11 +1958,25 @@ Type=Application
 Name=Simpbar Config
 Comment=Configure simpbar's appearance, module layout, and desktop shortcuts
 Exec=simpbar-config
-Icon=preferences-desktop-display-symbolic
+Icon=simpbar-config
 Terminal=false
 Categories=Settings;
 StartupNotify=true
 CONFIGDESKTOPEOF
+
+# simpbar-config's bar icon (blue/purple cog): hicolor scalable, then
+# refresh the icon cache so the new icon resolves without a logout.
+if [ -f "/tmp/simpbar-temp/simpbar-main/assets/icons/simpbar-config.svg" ]; then
+    sudo install -Dm644 "/tmp/simpbar-temp/simpbar-main/assets/icons/simpbar-config.svg" /usr/share/icons/hicolor/scalable/apps/simpbar-config.svg \
+        && ok "simpbar-config icon installed to hicolor" \
+        || warn "could not install simpbar-config icon (bar pin falls back to text)"
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 \
+            || warn "icon cache refresh failed (log out and back in if the cog doesn't appear)"
+    fi
+else
+    warn "assets/icons/simpbar-config.svg missing from the repo checkout (bar pin falls back to text)"
+fi
 
 cat > ~/.config/systemd/user/simpbar-welcome.service <<EOF
 [Unit]
