@@ -128,6 +128,7 @@ CONFIG[extra_pass]=""
 CONFIG[extra_imaging]=""
 CONFIG[extra_music]=""
 CONFIG[extra_video]=""
+CONFIG[extra_gaming]=""
 CONFIG[wants_libreoffice]="no"
 CONFIG[lo_locale]=""
 CONFIG[lo_hunspell]=""
@@ -1506,8 +1507,14 @@ configure_extra_packages() {
         ["KeePassXC"]="keepassxc" ["Bitwarden"]="bitwarden" ["pass"]="pass"
         ["GIMP"]="gimp" ["Krita"]="krita" ["Inkscape"]="inkscape"
         ["MPV"]="mpv" ["Amarok"]="amarok" ["Spotify"]="spotify"
-        ["Tenacity"]="tenacity" ["JamesDSP"]="jamesdsp" ["EasyEffects"]="easyeffects"
+        ["Tenacity"]="tenacity" ["JamesDSP"]="jamesdsp"
+        # EasyEffects ships with its full plugin set (same set the Welcome
+        # app installs): the app alone is useless without effects to load.
+        # Multi-word values flow through fine — every downstream user
+        # word-splits (picker echo, wc -w counts, install loop).
+        ["EasyEffects"]="easyeffects calf lsp-plugins-lv2 mda.lv2 x42-plugins-lv2 zam-plugins-lv2"
         ["MakeMKV"]="makemkv" ["Kdenlive"]="kdenlive" ["Avidemux"]="avidemux-qt" ["MKVToolNix"]="mkvtoolnix-gui"
+        ["Steam"]="steam" ["Lutris"]="lutris" ["Heroic"]="heroic-games-launcher-bin"
     )
 
     # Checkbox picker for one category; echoes chosen package names. Header
@@ -1527,7 +1534,7 @@ configure_extra_packages() {
         echo "$out"
     }
 
-    local browser social dev pass imaging music video wants_lo=""
+    local browser social dev pass imaging music video gaming wants_lo=""
 
     browser=$(pick_category 6 "WEB BROWSERS" \
         "Floorp" "Firefox" "Brave" "LibreWolf" "Vivaldi" "Tor Browser" \
@@ -1551,6 +1558,9 @@ configure_extra_packages() {
     video=$(pick_category 2 "VIDEO EDITING" \
         "MakeMKV" "Kdenlive" "Avidemux" "MKVToolNix")
 
+    gaming=$(pick_category 2 "GAMING" \
+        "Steam" "Lutris" "Heroic")
+
     local office_sel=""
     office_sel=$(printf '%s\n' "LibreOffice" | gum choose --no-limit --height 3 \
         --header="-- OFFICE --" --header.foreground 6 \
@@ -1566,6 +1576,7 @@ configure_extra_packages() {
     CONFIG[extra_imaging]="$(echo $imaging)"
     CONFIG[extra_music]="$(echo $music)"
     CONFIG[extra_video]="$(echo $video)"
+    CONFIG[extra_gaming]="$(echo $gaming)"
     CONFIG[wants_libreoffice]="${wants_lo:-no}"
     CONFIG[lo_locale]=""
     CONFIG[lo_hunspell]=""
@@ -1624,8 +1635,9 @@ configure_extra_packages() {
     [[ -n "${CONFIG[extra_imaging]}" ]]  && echo -e "  Creative:    ${CYAN}${CONFIG[extra_imaging]}${NC}"
     [[ -n "${CONFIG[extra_music]}" ]]    && echo -e "  Music/Audio: ${CYAN}${CONFIG[extra_music]}${NC}"
     [[ -n "${CONFIG[extra_video]}" ]]    && echo -e "  Video:       ${CYAN}${CONFIG[extra_video]}${NC}"
+    [[ -n "${CONFIG[extra_gaming]}" ]]   && echo -e "  Gaming:      ${CYAN}${CONFIG[extra_gaming]}${NC}"
     [[ "${CONFIG[wants_libreoffice]}" == "yes" ]] && echo -e "  LibreOffice: ${CYAN}yes (${CONFIG[lo_locale]})${NC}"
-    if [[ -z "${CONFIG[extra_browser]}${CONFIG[extra_social]}${CONFIG[extra_dev]}${CONFIG[extra_pass]}${CONFIG[extra_imaging]}${CONFIG[extra_music]}${CONFIG[extra_video]}" && "${CONFIG[wants_libreoffice]}" != "yes" ]]; then
+    if [[ -z "${CONFIG[extra_browser]}${CONFIG[extra_social]}${CONFIG[extra_dev]}${CONFIG[extra_pass]}${CONFIG[extra_imaging]}${CONFIG[extra_music]}${CONFIG[extra_video]}${CONFIG[extra_gaming]}" && "${CONFIG[wants_libreoffice]}" != "yes" ]]; then
         echo -e "  ${YELLOW}(no extra packages selected)${NC}"
     fi
     echo -e "${PURPLE}═══════════════════════════════════════════════════════════════════════${NC}"
@@ -1733,7 +1745,7 @@ show_main_menu() {
         fi
 
         local extra_pkg_count=0
-        for _grp in extra_browser extra_social extra_dev extra_pass extra_imaging extra_music extra_video; do
+        for _grp in extra_browser extra_social extra_dev extra_pass extra_imaging extra_music extra_video extra_gaming; do
             [[ -n "${CONFIG[$_grp]}" ]] && (( extra_pkg_count += $(wc -w <<< "${CONFIG[$_grp]}") ))
         done
         [[ "${CONFIG[wants_libreoffice]}" == "yes" ]] && (( extra_pkg_count++ ))
@@ -1877,7 +1889,7 @@ show_summary() {
 
     local extra_pkg_summary="None"
     local _epc=0 _grp
-    for _grp in extra_browser extra_social extra_dev extra_pass extra_imaging extra_music extra_video; do
+    for _grp in extra_browser extra_social extra_dev extra_pass extra_imaging extra_music extra_video extra_gaming; do
         [[ -n "${CONFIG[$_grp]}" ]] && (( _epc += $(wc -w <<< "${CONFIG[$_grp]}") ))
     done
     [[ "${CONFIG[wants_libreoffice]}" == "yes" ]] && (( _epc++ ))
@@ -1976,7 +1988,7 @@ install_extra_kernels() {
 # the install — every package is best-effort with a warning.
 install_extra_software() {
     local pkgs="${CONFIG[extra_browser]} ${CONFIG[extra_social]} ${CONFIG[extra_dev]}"
-    pkgs+=" ${CONFIG[extra_pass]} ${CONFIG[extra_imaging]} ${CONFIG[extra_music]} ${CONFIG[extra_video]}"
+    pkgs+=" ${CONFIG[extra_pass]} ${CONFIG[extra_imaging]} ${CONFIG[extra_music]} ${CONFIG[extra_video]} ${CONFIG[extra_gaming]}"
     local aur_left=""
     local p
     # shellcheck disable=SC2086
@@ -2058,7 +2070,10 @@ install_simpbar_desktop() {
         lib32-vulkan-radeon vulkan-intel lib32-vulkan-intel vulkan-swrast
         lib32-vulkan-swrast matugen)
     if [[ "${CONFIG[desktop]}" == "mango" ]]; then
-        pkgs+=(mangowm xdg-desktop-portal-wlr xdg-desktop-portal-gtk easyeffects)
+        # easyeffects rides with its full plugin set (same bundle as the
+        # Extra Packages picker) — Mango autostarts it, so it must arrive
+        # usable, not empty.
+        pkgs+=(mangowm xdg-desktop-portal-wlr xdg-desktop-portal-gtk easyeffects calf lsp-plugins-lv2 mda.lv2 x42-plugins-lv2 zam-plugins-lv2)
     else
         pkgs+=(hyprland xdg-desktop-portal-hyprland)
     fi
@@ -2520,7 +2535,7 @@ perform_installation() {
     # otherwise this would flash a no-op line in the progress bar.
     {
         local _has_extra=0 _grp
-        for _grp in extra_browser extra_social extra_dev extra_pass extra_imaging extra_music extra_video; do
+        for _grp in extra_browser extra_social extra_dev extra_pass extra_imaging extra_music extra_video extra_gaming; do
             [[ -n "${CONFIG[$_grp]}" ]] && _has_extra=1
         done
         [[ "${CONFIG[wants_libreoffice]}" == "yes" ]] && _has_extra=1
