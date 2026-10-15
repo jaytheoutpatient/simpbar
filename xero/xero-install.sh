@@ -146,6 +146,14 @@ on_err() {
     # run_step_visual redirects each step's stdout/stderr to a logfile, so
     # without this an error here would vanish into it instead of the user.
     exec > /dev/tty 2>&1 || true
+    # Stop the progress redraw loop FIRST: it repaints via `tput cup` every
+    # 0.3s, so drawing the error box + prompt while it still runs garbles
+    # both into the shredded screen from the bug reports. Tracked globally
+    # by run_step_visual (empty outside a step — the :- keeps set -u happy).
+    kill "${DISPLAY_PID:-}" 2>/dev/null || true
+    wait "${DISPLAY_PID:-}" 2>/dev/null || true
+    DISPLAY_PID=""
+    clear 2>/dev/null || true
     tput cnorm 2>/dev/null || true
 
     if have_gum; then
@@ -450,16 +458,21 @@ run_step_visual() {
         # terminal resize otherwise leaves cup repositioning stale
         # coordinates and shreds overlapping frames across the screen.
         # A real size change clears and rebuilds; identical geometry
-        # keeps the flicker-free cup repositioning.
+        # keeps the flicker-free cup repositioning. Both dimensions are
+        # watched — columns alone missed height-only resizes, which stale
+        # top_row the same way.
         last_cols="$cols"
+        last_rows=$(term_lines)
         while true; do
             cols=$(term_cols)
-            if [[ "$cols" != "$last_cols" ]]; then
+            rows_now=$(term_lines)
+            if [[ "$cols" != "$last_cols" || "$rows_now" != "$last_rows" ]]; then
                 clear
                 content_height=8
                 [[ $cols -ge 58 ]] && content_height=$(( content_height + 6 ))
                 top_row=$(vpad_for "$content_height")
                 last_cols=$cols
+                last_rows=$rows_now
             else
                 tput cup "$top_row" 0
             fi
@@ -2184,8 +2197,16 @@ perform_installation() {
     if [[ -n "${CONFIG[extra_kernel]}" ]]; then
         step_labels+=("Installing additional kernels"); step_funcs+=("install_extra_kernels")
     fi
+    step_labels+=("Configuring system");            step_funcs+=("configure_system")
+    step_labels+=("Installing Limine bootloader");    step_funcs+=("install_bootloader")
+    step_labels+=("Configuring Btrfs snapshots");   step_funcs+=("setup_snapper")
+    step_labels+=("Creating user account");         step_funcs+=("create_user")
     # Extra software only gets a step when something was actually picked —
-    # otherwise this would flash a no-op line in the progress bar.
+    # otherwise this would flash a no-op line in the progress bar. Registered
+    # HERE (not up with the other optionals) because install_extra_software
+    # writes ~/AUR-EXTRAS.txt for AUR-only picks — the home directory must
+    # exist first, or the redirect fails and the ERR trap kills the install
+    # mid-step. (That ordering bug shredded the progress screen outright.)
     {
         local _has_extra=0 _grp
         for _grp in extra_browser extra_social extra_dev extra_pass extra_imaging extra_music extra_video extra_gaming; do
@@ -2196,10 +2217,6 @@ perform_installation() {
             step_labels+=("Installing extra software"); step_funcs+=("install_extra_software")
         fi
     }
-    step_labels+=("Configuring system");            step_funcs+=("configure_system")
-    step_labels+=("Installing Limine bootloader");    step_funcs+=("install_bootloader")
-    step_labels+=("Configuring Btrfs snapshots");   step_funcs+=("setup_snapper")
-    step_labels+=("Creating user account");         step_funcs+=("create_user")
     # First-boot staging needs the user + home to exist (choice file and
     # WM stubs land in the new user's home), so it runs right after
     # create_user. Base-only installs skip it entirely.
