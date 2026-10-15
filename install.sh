@@ -513,8 +513,9 @@ if [ -d /run/archiso ]; then
                 if bash /tmp/xero-install.sh < /dev/tty; then
                     rm -f /tmp/xero-install.sh
                     printf '\n  %sBase system installed — reboot into it now.%s\n' "$C_GREEN" "$C_RESET"
-                    printf '  Remove the installation media, reboot, log in as the user you just created,\n'
-                    printf '  and run the desktop setup there:\n'
+                    printf '  Remove the installation media, reboot, log in as the user you just created.\n'
+                    printf '  If you chose a first-boot WM, a terminal opens with the desktop setup running.\n'
+                    printf '  Otherwise (or if it never opens), run it yourself post-reboot:\n'
                     printf '  %scurl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash%s\n' "$C_BOLD" "$C_RESET"
                     printf '  (Running the steps below here would install into this live ISO as root —\n'
                     printf '  nothing would survive the reboot.)\n'
@@ -2044,6 +2045,15 @@ fi
 ok "swaync config in ~/.config/swaync"
 ok "LazyVim config in ~/.config/nvim (run 'nvim' to finish plugin install)"
 ok "fastfetch runs automatically in new terminal sessions (~/.bashrc)"
+
+# First-boot handoff: if this system was provisioned by the xero base
+# installer, an autostart stub may still call /usr/local/bin/simpbar-firstboot
+# on graphical logins. Record success so the next login retracts the stubs
+# instead of re-opening this installer — and remove the launcher itself,
+# whose job is done. Harmless no-ops on systems that never had phase 1.
+mkdir -p ~/.config/simpbar
+touch ~/.config/simpbar/.firstboot-done 2>/dev/null || true
+sudo rm -f /usr/local/bin/simpbar-firstboot 2>/dev/null || true
 
 printf '\n%s%s Setup complete!%s\n' "$C_GREEN$C_BOLD" "✔" "$C_RESET"
 printf '%sRestart your session, or run:%s\n' "$C_BOLD" "$C_RESET"

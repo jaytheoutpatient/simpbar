@@ -11,9 +11,10 @@
 # Author: XeroLinux Team
 # License: GPL-3.0
 #
-# Simpbar fork: no desktop environment (run the simpbar installer
-# after reboot), Limine bootloader instead of GRUB. Base-system flow
-# otherwise unchanged from upstream v2.0.0.
+# Simpbar fork: base system + first-boot WM staging (the full desktop
+# still comes from the simpbar installer, auto-opened on first login),
+# Limine bootloader instead of GRUB. Base-system flow otherwise unchanged
+# from upstream v2.0.0.
 
 set -Eeuo pipefail
 
@@ -103,6 +104,14 @@ CONFIG[gfx_driver]="mesa"
 CONFIG[parallel_downloads]="5"
 CONFIG[aur_helper]="paru"
 CONFIG[extra_kernel]=""
+# First-boot WM (Hyprland/MangoWM + terminal): chosen here, staged by
+# install_firstboot_wm after the user exists. Phase 1 installs ONLY the WM,
+# its portal and the terminal — the full desktop still comes from install.sh,
+# which phase 1 auto-opens in the terminal on first graphical login.
+# "none" keeps base-only behavior (no trigger files written at all).
+CONFIG[firstboot_wm]="none"
+CONFIG[firstboot_term]="alacritty"
+CONFIG[firstboot_term_e]="-e"
 CONFIG[uefi]="no"
 CONFIG[boot_part]=""
 CONFIG[root_part]=""
@@ -295,7 +304,7 @@ show_header() {
         --align center --width "$box_width" --margin "0 2" --padding "1 2" \
         "✨ $SCRIPT_NAME v$VERSION ✨" \
         "" \
-        "Installs a base Arch system (no desktop — simpbar setup after reboot)," \
+        "Installs a base Arch system (first-boot WM + installer auto-launch)," \
         "with more configuration options than the ISO installer." \
         "For experienced Arch/Linux users. NOT beginner-friendly."
 }
@@ -1331,6 +1340,95 @@ select_extra_kernel() {
     show_success "Extra kernels queued: ${CONFIG[extra_kernel]}"
     sleep 0.5
 }
+
+# ────────────────────────────────────────────────────────────────────────────────
+# FIRST-BOOT WM (choice staged in phase 1, desktop via install.sh)
+# ────────────────────────────────────────────────────────────────────────────────
+# Records which WM (and terminal) the installed system boots into the
+# first time. install_firstboot_wm (run in install order, after the user
+# exists) installs just the WM + portal + terminal and writes a one-shot
+# trigger; on first graphical login that trigger opens the terminal with
+# install.sh running inside it. The full bar/widgets/configs stay
+# install.sh's job — deliberately NOT built here (see the revert note in
+# git history: chroot-built desktops fail in ways a live user session
+# doesn't, and two scripts each running where their assumptions hold is
+# the safer design).
+
+select_firstboot() {
+    show_header
+    show_submenu_header "🖥️ First-boot Desktop"
+    echo ""
+
+    gum style --foreground 245 --margin "0 2" \
+        "Phase 1 installs only the window manager + a terminal." \
+        "On first login the terminal opens with the simpbar" \
+        "installer running — that is what builds the desktop."
+    echo ""
+
+    local options=(
+        "none      │ Base system only (no auto-launch — run install.sh yourself)"
+        "hyprland  │ Hyprland (terminal auto-opens the installer on login)"
+        "mango     │ MangoWM (terminal auto-opens the installer on login)"
+    )
+
+    local selection=""
+    selection=$(printf '%s\n' "${options[@]}" | gum choose --height 5 --header "Desktop:") || true
+
+    case "$selection" in
+        "hyprland"*)
+            CONFIG[firstboot_wm]="hyprland"
+            show_success "First-boot: Hyprland"
+            ;;
+        "mango"*)
+            CONFIG[firstboot_wm]="mango"
+            show_success "First-boot: MangoWM"
+            ;;
+        *)
+            CONFIG[firstboot_wm]="none"
+            show_success "First-boot: none (base system only)"
+            sleep 0.5
+            return
+            ;;
+    esac
+    echo ""
+
+    # Terminal to auto-open: same 7 install.sh offers, same default
+    # (Alacritty). install.sh later detects the installed one and skips
+    # its own question, so the picks stay consistent automatically.
+    local term_options=(
+        "kitty     │ Kitty"
+        "foot      │ Foot"
+        "ghostty   │ Ghostty"
+        "alacritty │ Alacritty"
+        "wezterm   │ WezTerm"
+        "konsole   │ Konsole"
+        "ptyxis    │ Ptyxis"
+    )
+    local term_sel=""
+    term_sel=$(printf '%s\n' "${term_options[@]}" | gum choose --height 9 --header "Terminal:") || true
+    # -e flag: kitty runs its command bare, the rest take -e (same mapping
+    # install.sh uses for its keybind viewer).
+    case "$term_sel" in
+        "kitty"*)   CONFIG[firstboot_term]="kitty";     CONFIG[firstboot_term_e]="" ;;
+        "foot"*)    CONFIG[firstboot_term]="foot";      CONFIG[firstboot_term_e]="-e" ;;
+        "ghostty"*) CONFIG[firstboot_term]="ghostty";   CONFIG[firstboot_term_e]="-e" ;;
+        "wezterm"*) CONFIG[firstboot_term]="wezterm";   CONFIG[firstboot_term_e]="-e" ;;
+        "konsole"*) CONFIG[firstboot_term]="konsole";   CONFIG[firstboot_term_e]="-e" ;;
+        "ptyxis"*)  CONFIG[firstboot_term]="ptyxis";    CONFIG[firstboot_term_e]="-e" ;;
+        *)          CONFIG[firstboot_term]="alacritty"; CONFIG[firstboot_term_e]="-e" ;;
+    esac
+    show_success "Terminal: ${CONFIG[firstboot_term]}"
+    sleep 0.5
+}
+
+# One-line summary label for the menu and the install summary.
+firstboot_label() {
+    case "${CONFIG[firstboot_wm]}" in
+        hyprland) echo "Hyprland + ${CONFIG[firstboot_term]}" ;;
+        mango)    echo "MangoWM + ${CONFIG[firstboot_term]}" ;;
+        *)        echo "none (base only)" ;;
+    esac
+}
 # ────────────────────────────────────────────────────────────────────────────────
 # EXTRA PACKAGES (desktop-phase optional apps, picked up front like every
 # other setting instead of deferring to a desktop phase — the actual `pacman -S` calls
@@ -1592,7 +1690,7 @@ show_main_menu() {
             --align center --width "$box_width" --margin "0 2" --padding "1 2" \
             "✨ $SCRIPT_NAME v$VERSION ✨" \
             "" \
-            "Installs a base Arch system (no desktop — simpbar setup after reboot)," \
+            "Installs a base Arch system (first-boot WM + installer auto-launch)," \
             "with more configuration options than the ISO installer." \
             "For experienced Arch/Linux users. NOT beginner-friendly."
 
@@ -1643,6 +1741,9 @@ show_main_menu() {
         local extra_pkg_label="None"
         [[ $extra_pkg_count -gt 0 ]] && extra_pkg_label="$extra_pkg_count selected"
 
+        local firstboot_item_label
+        firstboot_item_label=$(firstboot_label)
+
         local menu_items=(
             ""
             "1.  Installer Language    │ ${CONFIG[installer_lang]}"
@@ -1657,8 +1758,9 @@ show_main_menu() {
             "10. AUR Helper            │ ${CONFIG[aur_helper]}"
             "11. Additional Kernel     │ $kernel_label"
             "12. Extra Packages        │ $extra_pkg_label"
+            "13. First-boot Desktop    │ $firstboot_item_label"
             "──────────────────────────────────────────────"
-            "13. Start Installation"
+            "14. Start Installation"
             "0.  Exit"
         )
 
@@ -1694,7 +1796,8 @@ show_main_menu() {
             "10."*) select_aur_helper ;;
             "11."*) select_extra_kernel ;;
             "12."*) configure_extra_packages ;;
-            "13."*)
+            "13."*) select_firstboot ;;
+            "14."*)
                 if validate_config; then
                     show_summary
                     local confirm_msg=""
@@ -1781,6 +1884,14 @@ show_summary() {
     [[ "${CONFIG[wants_libreoffice]}" == "yes" ]] && (( _epc++ ))
     [[ $_epc -gt 0 ]] && extra_pkg_summary="$_epc selected"
 
+    local firstboot_summary
+    firstboot_summary=$(firstboot_label)
+    if [[ "${CONFIG[firstboot_wm]}" != "none" ]]; then
+        firstboot_summary+=" (installer auto-opens on login)"
+    else
+        firstboot_summary+=" — run install.sh yourself post-reboot"
+    fi
+
     if [[ "${CONFIG[partition_mode]}" == "manual" ]]; then
         local efi_note=""
         [[ "${CONFIG[reuse_efi]}" == "yes" ]] && efi_note=" (reused, not formatted)"
@@ -1802,7 +1913,7 @@ show_summary() {
             "Encryption:       $encrypt_status" \
             "Swap:             ${CONFIG[swap]}" \
             "" \
-            "Desktop:          none (simpbar setup after reboot)" \
+            "Desktop:          $firstboot_summary" \
             "AUR Helper:       ${CONFIG[aur_helper]}" \
             "Graphics:         ${CONFIG[gfx_driver]}" \
             "Boot Mode:        $boot_mode" \
@@ -1831,7 +1942,7 @@ show_summary() {
             "Encryption:       $encrypt_status" \
             "Swap:             ${CONFIG[swap]}" \
             "" \
-            "Desktop:          none (simpbar setup after reboot)" \
+            "Desktop:          $firstboot_summary" \
             "AUR Helper:       ${CONFIG[aur_helper]}" \
             "Graphics:         ${CONFIG[gfx_driver]}" \
             "Boot Mode:        $boot_mode" \
@@ -1909,6 +2020,154 @@ install_extra_software() {
         show_warning "AUR-only extras saved to ~/AUR-EXTRAS.txt — install after reboot"
     fi
 }
+# ────────────────────────────────────────────────────────────────────────────────
+# FIRST-BOOT WM STAGING (packages + auto-launch trigger, nothing built)
+# ────────────────────────────────────────────────────────────────────────────────
+# Installs the chosen WM, its portal and the terminal into the target,
+# then writes the trigger that opens install.sh on first graphical login:
+# a WM autostart stub calling /usr/local/bin/simpbar-firstboot.
+#
+# Exactly-once mechanics (install.sh merges configs, never deletes, so the
+# trigger must clean up after itself):
+#   * every stub file carries a `# simpbar-firstboot stub` marker;
+#   * the launcher fires the installer while no done-file exists;
+#   * the first run WITH the done-file present (written by install.sh on
+#     success — including a manual TTY run before any graphical login)
+#     removes every marker-bearing stub and exits silently.
+# A user who never wants the auto-launch just runs
+# `touch ~/.config/simpbar/.firstboot-done` once.
+#
+# Failure policy matches the rest of phase 1: warn, never abort.
+install_firstboot_wm() {
+    local tu="${CONFIG[username]}"
+    local th="$MOUNTPOINT/home/$tu"
+    [[ -d "$th" ]] || { show_warning "Home $th missing — skipping first-boot setup"; return 0; }
+
+    # ── 1. WM + portal + terminal (repo packages only) ──────────────
+    local pkgs=()
+    if [[ "${CONFIG[firstboot_wm]}" == "mango" ]]; then
+        pkgs+=(mangowm xdg-desktop-portal-wlr xdg-desktop-portal-gtk)
+    else
+        pkgs+=(hyprland xdg-desktop-portal-hyprland)
+    fi
+    pkgs+=("${CONFIG[firstboot_term]}")
+
+    arch-chroot "$MOUNTPOINT" pacman -Sy >/dev/null 2>&1 \
+        || show_warning "Database sync failed — package installs may fail below"
+    if ! arch-chroot "$MOUNTPOINT" pacman -S --noconfirm --needed "${pkgs[@]}" >/dev/null 2>&1; then
+        show_warning "First-boot batch install failed — retrying per package"
+        local p
+        for p in "${pkgs[@]}"; do
+            arch-chroot "$MOUNTPOINT" pacman -S --noconfirm --needed "$p" >/dev/null 2>&1 \
+                || show_warning "Could not install $p — install post-reboot: sudo pacman -S $p"
+        done
+    fi
+
+    # ── 2. ly session entries ────────────────────────────────────────
+    # ly offers whatever sits in wayland-sessions. Hyprland's package
+    # ships its entry; Mango's might not — without one there is no Mango
+    # login at all, so derive the binary and write a minimal entry.
+    if [[ "${CONFIG[firstboot_wm]}" == "mango" ]]; then
+        if ! ls "$MOUNTPOINT/usr/share/wayland-sessions/" 2>/dev/null | grep -qi mango; then
+            local mbin=""
+            mbin=$(ls "$MOUNTPOINT/usr/bin/" 2>/dev/null | grep -i "^mango" | head -n1)
+            if [[ -n "$mbin" ]]; then
+                cat > "$MOUNTPOINT/usr/share/wayland-sessions/mango.desktop" << MANGOSESSIONEOF
+[Desktop Entry]
+Name=Mango
+Comment=Mango Wayland compositor
+Exec=$mbin
+Type=Application
+DesktopNames=mango
+MANGOSESSIONEOF
+                show_success "Mango ly session written (Exec=$mbin)"
+            else
+                show_warning "No mango binary in /usr/bin and no session file — ly cannot offer Mango; check the mangowm install post-reboot"
+            fi
+        fi
+    else
+        if ! ls "$MOUNTPOINT/usr/share/wayland-sessions/" 2>/dev/null | grep -qi hyprland; then
+            show_warning "No Hyprland session file in wayland-sessions — ly may not offer Hyprland"
+        fi
+    fi
+
+    # ── 3. terminal choice + launcher ───────────────────────────────
+    # Choice file mirrors the browser-choice pattern (data, not code).
+    mkdir -p "$th/.config/simpbar"
+    printf '%s\n' "${CONFIG[firstboot_term]}" > "$th/.config/simpbar/terminal-choice" 2>/dev/null \
+        || show_warning "terminal-choice not recorded"
+
+    cat > "$MOUNTPOINT/usr/local/bin/simpbar-firstboot" << 'FIRSTBOOTEOF'
+#!/bin/sh
+# Featherlite first-boot: open the simpbar desktop installer in the user's
+# terminal. Fires on every graphical login UNTIL install.sh records success
+# (~/.config/simpbar/.firstboot-done); the first run past that point
+# removes the stub autostart files (marker-checked below, so real configs
+# are never touched) and exits silently. To opt out without installing:
+# touch ~/.config/simpbar/.firstboot-done
+set -u
+MARKER="simpbar-firstboot stub"
+DONE="$HOME/.config/simpbar/.firstboot-done"
+if [ -f "$DONE" ]; then
+    # Done: retract the stubs (only files still carrying our marker) and go
+    # quiet. The mango stub shares its path with the real config, which
+    # lacks the marker after install.sh overwrites it — grep keeps us honest.
+    if [ -f "$HOME/.config/hypr/hyprland.conf" ] && grep -q "$MARKER" "$HOME/.config/hypr/hyprland.conf" 2>/dev/null; then
+        rm -f "$HOME/.config/hypr/hyprland.conf"
+        rmdir "$HOME/.config/hypr" 2>/dev/null || true
+    fi
+    if [ -f "$HOME/.config/mango/cfg/autostart.conf" ] && grep -q "$MARKER" "$HOME/.config/mango/cfg/autostart.conf" 2>/dev/null; then
+        rm -f "$HOME/.config/mango/cfg/autostart.conf"
+        rmdir -p "$HOME/.config/mango/cfg" 2>/dev/null || true
+    fi
+    exit 0
+fi
+TERM_BIN="$(cat "$HOME/.config/simpbar/terminal-choice" 2>/dev/null)"
+[ -n "$TERM_BIN" ] || TERM_BIN="alacritty"
+if ! command -v "$TERM_BIN" >/dev/null 2>&1; then
+    exit 0
+fi
+INSTALL_CMD='curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash'
+if [ "$TERM_BIN" = "kitty" ]; then
+    exec "$TERM_BIN" bash -c "$INSTALL_CMD; exec bash"
+else
+    exec "$TERM_BIN" -e bash -c "$INSTALL_CMD; exec bash"
+fi
+FIRSTBOOTEOF
+    chmod 755 "$MOUNTPOINT/usr/local/bin/simpbar-firstboot" 2>/dev/null \
+        || show_warning "/usr/local/bin/simpbar-firstboot not installed"
+
+    # ── 4. WM autostart stubs (marker-bearing, retracted above) ─────
+    if [[ "${CONFIG[firstboot_wm]}" == "mango" ]]; then
+        # Mango reads cfg/autostart.conf for `exec_once = ...` lines. This
+        # stub shares its path with the real config, which overwrites it
+        # when install.sh runs (same filename merge).
+        mkdir -p "$th/.config/mango/cfg"
+        cat > "$th/.config/mango/cfg/autostart.conf" << 'MANGOSTUBEOF'
+# simpbar-firstboot stub — launches the desktop installer once, then
+# retracts itself (see /usr/local/bin/simpbar-firstboot). Overwritten by
+# the real config when install.sh runs.
+exec_once = simpbar-firstboot
+MANGOSTUBEOF
+    else
+        # Hyprland runs exec-once lines from hyprland.conf on startup. The
+        # repo ships no hyprland.conf (config lives in hyprland.lua), so
+        # nothing here collides — and the launcher retracts this file once
+        # install.sh records success.
+        mkdir -p "$th/.config/hypr"
+        cat > "$th/.config/hypr/hyprland.conf" << 'HYPRSTUBEOF'
+# simpbar-firstboot stub — launches the desktop installer once, then
+# retracts itself (see /usr/local/bin/simpbar-firstboot).
+exec-once = simpbar-firstboot
+HYPRSTUBEOF
+    fi
+
+    arch-chroot "$MOUNTPOINT" chown -R "$tu:$tu" "/home/$tu" 2>/dev/null \
+        || show_warning "Could not chown home dir — check ownership after reboot"
+    show_success "First-boot trigger staged — installer auto-opens on login"
+    return 0
+}
+
 perform_installation() {
     # Build the ordered step list dynamically based on config, so the
     # percent bar's total always matches what will actually run.
@@ -1941,6 +2200,14 @@ perform_installation() {
     step_labels+=("Installing Limine bootloader");    step_funcs+=("install_bootloader")
     step_labels+=("Configuring Btrfs snapshots");   step_funcs+=("setup_snapper")
     step_labels+=("Creating user account");         step_funcs+=("create_user")
+    # First-boot staging needs the user + home to exist (choice file and
+    # WM stubs land in the new user's home), so it runs right after
+    # create_user. Base-only installs skip it entirely.
+    if [[ "${CONFIG[firstboot_wm]}" != "none" ]]; then
+        local _fb_step="Hyprland"
+        [[ "${CONFIG[firstboot_wm]}" == "mango" ]] && _fb_step="MangoWM"
+        step_labels+=("Staging first-boot WM ($_fb_step)"); step_funcs+=("install_firstboot_wm")
+    fi
     step_labels+=("Installing graphics drivers");   step_funcs+=("install_graphics")
     step_labels+=("Configuring swap");              step_funcs+=("setup_swap_system")
 
@@ -1951,19 +2218,37 @@ perform_installation() {
     done
 
     # No desktop phase here by design (there is no Part 2 in this fork):
-    # the base system above is the whole job. After rebooting, fetch the
-    # simpbar desktop installer and run it for the Hyprland/MangoWM
-    # desktop, bar, widgets and theming.
+    # the base system above is the whole job, plus the first-boot trigger
+    # when a WM was chosen. After rebooting, install.sh builds the
+    # Hyprland/MangoWM desktop, bar, widgets and theming — opened
+    # automatically in the terminal on first login.
     show_header
-    gum style --foreground 82 --bold --border double --border-foreground 82 \
-        --align center --width 60 --margin "1 2" --padding "1 2" \
-        "✨ Base System Installed! ✨" \
-        "" \
-        "No desktop environment was installed — that is intentional." \
-        "" \
-        "Remove the installation media and reboot, then set up" \
-        "the simpbar desktop:" \
-        "  curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash"
+    if [[ "${CONFIG[firstboot_wm]}" != "none" ]]; then
+        local _fb_done="Hyprland"
+        [[ "${CONFIG[firstboot_wm]}" == "mango" ]] && _fb_done="MangoWM"
+        gum style --foreground 82 --bold --border double --border-foreground 82 \
+            --align center --width 60 --margin "1 2" --padding "1 2" \
+            "✨ Base System Installed! ✨" \
+            "" \
+            "$_fb_done + terminal staged for first boot." \
+            "" \
+            "Remove the installation media and reboot, log in" \
+            "via ly — a terminal opens with the simpbar" \
+            "desktop installer running." \
+            "" \
+            "If it doesn't open, run post-reboot:" \
+            "  curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash"
+    else
+        gum style --foreground 82 --bold --border double --border-foreground 82 \
+            --align center --width 60 --margin "1 2" --padding "1 2" \
+            "✨ Base System Installed! ✨" \
+            "" \
+            "No desktop environment was installed — that is intentional." \
+            "" \
+            "Remove the installation media and reboot, then set up" \
+            "the simpbar desktop:" \
+            "  curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash"
+    fi
     echo ""
 }
 
