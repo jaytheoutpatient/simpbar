@@ -1048,29 +1048,6 @@ case "$DISCORD_CHOICE" in
 esac
 [ "$DISCORD_DETECTED" = 1 ] && [ -n "$DISCORD_NAME" ] && detected_note "Discord client" "$DISCORD_NAME"
 
-printf '\n  %sfalcond%s is a gaming performance daemon: it watches for running games\n' "$C_BOLD" "$C_RESET"
-printf '  (including Proton/Wine) and automatically applies performance profiles —\n'
-printf '  CPU scheduler switching, AMD 3D V-Cache mode, performance mode — without\n'
-printf '  you having to flip settings manually. %sfalcond-gui%s is a GTK app to\n' "$C_BOLD" "$C_RESET"
-printf '  configure and monitor it.\n'
-if reuse_detected FALCOND_CHOICE '1:falcond'; then
-    FALCOND_DETECTED=1
-else
-    FALCOND_DETECTED=0
-    prompt_choice FALCOND_CHOICE 2 "Would you like to install falcond & falcond-gui?" "Yes" "No"
-fi
-INSTALL_FALCOND=0
-if [ "$FALCOND_CHOICE" = 1 ]; then
-    INSTALL_FALCOND=1
-    # falcond's scx_sched option switches between sched_ext schedulers —
-    # scx-scheds (official repo) provides the actual scheduler binaries.
-    # falcond-gui detects/manages them via scx_loader's D-Bus service,
-    # which ships in the separate scx-tools package — without it there's
-    # nothing for falcond-gui to query, so the scheduler list shows empty.
-    PACMAN_PKGS+=(scx-scheds scx-tools)
-fi
-[ "$FALCOND_DETECTED" = 1 ] && detected_note "falcond" "falcond + falcond-gui"
-
 printf '\n  %smatugen%s is the Material You colorscheme generator simpbar uses for\n' "$C_BOLD" "$C_RESET"
 printf '  auto-theming: pick a wallpaper and it recolors the bar to match it\n'
 printf '  (the bar has an %sAuto-theme with matugen%s toggle in simpbar-config). It\n' "$C_BOLD" "$C_RESET"
@@ -1204,7 +1181,6 @@ fi
 AUR_PKGS=(protonplus dracula-gtk-theme bibata-cursor-theme game-devices-udev zafiro-icon-theme)
 [ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
-[ "$INSTALL_FALCOND" -eq 1 ] && AUR_PKGS+=(falcond falcond-gui)
 [ "$INSTALL_MATUGEN" -eq 1 ] && AUR_PKGS+=(matugen)
 
 printf '  Installing %d packages (%s first, AUR helper only if needed):\n    %s\n' "${#AUR_PKGS[@]}" "$REPO_NAME" "${AUR_PKGS[*]}"
@@ -1226,26 +1202,6 @@ if pacman -Qq game-devices-udev >/dev/null 2>&1; then
     run_spinner "Reloading udev rules for game controllers" \
         sudo bash -c 'udevadm control --reload-rules && udevadm trigger' \
         || warn "Could not reload udev rules — replug your controller or reboot for the new rules to apply"
-fi
-
-if pacman -Qq falcond >/dev/null 2>&1; then
-    # falcond-gui needs the user in the 'falcond' group to talk to the
-    # daemon without root. The package creates the group; existing users
-    # aren't added to it automatically.
-    if getent group falcond >/dev/null 2>&1; then
-        run_spinner "Adding $USER to the falcond group" sudo usermod -aG falcond "$USER" \
-            || warn "Could not add $USER to the falcond group — run 'sudo usermod -aG falcond $USER' manually"
-    else
-        warn "falcond group not found — falcond-gui may need to be run as root, or check the package docs"
-    fi
-
-    run_spinner "Enabling falcond.service" sudo systemctl enable --now falcond.service \
-        || warn "Could not enable falcond.service — check 'systemctl status falcond' after reboot"
-
-    if pacman -Qq scx-tools >/dev/null 2>&1; then
-        run_spinner "Enabling scx_loader.service" sudo systemctl enable --now scx_loader.service \
-            || warn "Could not enable scx_loader.service — falcond-gui won't detect schedulers without it running"
-    fi
 fi
 
 # Download today's Bing wallpaper — through the wallpaper engine, not by
@@ -2018,15 +1974,6 @@ if pacman -Qq game-devices-udev >/dev/null 2>&1; then
 fi
 if [ -e ~/.config/systemd/user/simpbar-update-checker.timer ]; then
     ok "Update checker enabled — notifies on new Arch/AUR updates or new commits on the simpbar repo (checks every 6h)"
-fi
-if pacman -Qq falcond >/dev/null 2>&1; then
-    ok "falcond & falcond-gui installed (log out/in for group membership to apply)"
-fi
-if pacman -Qq scx-scheds >/dev/null 2>&1; then
-    ok "scx-scheds installed (provides the sched_ext schedulers falcond can switch between)"
-fi
-if pacman -Qq scx-tools >/dev/null 2>&1; then
-    ok "scx-tools installed and scx_loader.service enabled (lets falcond-gui detect schedulers)"
 fi
 if [ -e ~/.config/rofi/config.rasi ]; then
     ok "rofi configured with the Material theme"
