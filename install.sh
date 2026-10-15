@@ -710,14 +710,41 @@ if [ "$REPO_CHOICE" = 1 ]; then
         rm -rf /tmp/cachyos-repo
         ok "CachyOS repos enabled"
     fi
+    # A partial earlier run can leave [cachyos*] sections without working
+    # keys (the official script writes sections before fetching) — the skip
+    # above then sails past a broken setup and packages die later on PGP
+    # errors. Prove the keys exist now; on failure, populate locally
+    # (offline — no keyserver involved) and re-check. Fail-open throughout:
+    # a fuzzy match that misses only defers to the package step, it never
+    # aborts a healthy system.
+    if sudo pacman-key --list-keys 2>/dev/null | grep -qi cachy; then
+        ok "CachyOS keyring verified"
+    else
+        warn "CachyOS repo sections exist but no CachyOS key found (partial earlier run?) — repairing locally"
+        sudo pacman-key --populate archlinux cachyos 2>/dev/null || true
+        if sudo pacman-key --list-keys 2>/dev/null | grep -qi cachy; then
+            ok "CachyOS keyring repaired"
+        else
+            die "CachyOS repos are configured but their keys are missing. Try: sudo pacman-key --populate archlinux cachyos — then re-run this installer, which resumes past repo setup."
+        fi
+    fi
 else
     # ── Chaotic-AUR ─────────────────────────────────────────────────
     if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
         ok "Chaotic-AUR already configured"
     else
-        run_spinner "Importing Chaotic-AUR signing key" \
-            sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com \
-            || die "Failed to import the Chaotic-AUR signing key."
+        # Keyservers flake — retry a few times before giving up (recv-key
+        # is idempotent, so retries are safe).
+        _key_ok=0
+        for _try in 1 2 3; do
+            if run_spinner "Importing Chaotic-AUR signing key (attempt $_try/3)" \
+                sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com; then
+                _key_ok=1
+                break
+            fi
+            [ "$_try" -lt 3 ] && sleep 5
+        done
+        [ "$_key_ok" = 1 ] || die "Failed to import the Chaotic-AUR signing key."
 
         run_spinner "Trusting Chaotic-AUR signing key" \
             sudo pacman-key --lsign-key 3056513887B78AEB \
