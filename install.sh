@@ -341,7 +341,12 @@ prompt_choice() {
             warn "No interactive terminal available — defaulting to option $default"
             choice="$default"
         fi
-        [ -z "$choice" ] && choice="$default"
+        # Strip whitespace (including \r): pasted input and some VM consoles
+    # smuggle in carriage returns, which would otherwise fail numeric
+    # validation below and force a re-ask for a choice that was valid.
+    # Pure builtins — no fork, safe anywhere in the run.
+    choice="${choice//[[:space:]]/}"
+    [ -z "$choice" ] && choice="$default"
         if [ "$choice" -eq "$choice" ] 2>/dev/null && [ "$choice" -ge 1 ] && [ "$choice" -le "$opt_count" ]; then
             break
         fi
@@ -494,6 +499,10 @@ if [ -d /run/archiso ]; then
         else
             xero_confirm=""
         fi
+        # Same paste hygiene as prompt_choice: a smuggled \r must not turn
+        # an explicit YES into a silent skip (nor vice versa — the comparison
+        # below stays an exact match either way).
+        xero_confirm="${xero_confirm//[[:space:]]/}"
         if [ "$xero_confirm" = "YES" ]; then
             if curl -fsSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/xero/xero-install.sh -o /tmp/xero-install.sh; then
                 bash /tmp/xero-install.sh < /dev/tty \
@@ -521,7 +530,10 @@ fi
 # the review menu must stay reachable on every re-run, and prompt_choice
 # would replay a stale saved answer and hide it forever.
 force_ask=0
-if has_saved_answers; then
+# Only when a previous run got past the first real question (repo choice):
+# an answers file holding just XERO_CHOICE (aborted before Step 1) would
+# otherwise print a review of blank values for nothing that was configured.
+if has_saved_answers && [ -n "$(load_answer REPO_CHOICE)" ]; then
     printf '\n  %sExisting simpbar setup found%s — your previous answers will be\n' "$C_YELLOW" "$C_RESET"
     printf '  reused and the questions below will be skipped.\n'
     printf '  %s·%s repository     %s\n' "$C_GREEN" "$C_RESET" "$(load_answer REPO_CHOICE | sed 's/^1$/CachyOS/;s/^2$/Chaotic-AUR/')"
@@ -1033,42 +1045,10 @@ else
     fi
 fi
 
-if reuse_detected OBS_CHOICE '1:obs-studio'; then
-    OBS_DETECTED=1
-else
-    OBS_DETECTED=0
-    prompt_choice OBS_CHOICE 2 "Will you be using OBS Studio for recording/streaming?" "Yes" "No"
-fi
-[ "$OBS_CHOICE" = 1 ] && PACMAN_PKGS+=(obs-studio)
-[ "$OBS_DETECTED" = 1 ] && detected_note "OBS Studio" "obs-studio"
-
-# An installed editor answers both questions at once (want one? which?).
-# Otherwise the outer Yes/No replays/asks, and only a Yes reaches the inner
-# choice — same shape as before, just pre-empted by ground truth.
-if reuse_detected VIDEO_EDITOR_CHOICE '1:kdenlive' '2:shotcut' '3:flowblade'; then
-    VIDEO_EDITOR_YN=1
-    save_answer VIDEO_EDITOR_YN 1
-    VIDEO_EDITOR_DETECTED=1
-else
-    VIDEO_EDITOR_DETECTED=0
-    prompt_choice VIDEO_EDITOR_YN 2 "Would you like to install a video editor?" "Yes" "No"
-fi
-if [ "$VIDEO_EDITOR_YN" = 1 ] && [ "$VIDEO_EDITOR_DETECTED" = 0 ]; then
-    prompt_choice VIDEO_EDITOR_CHOICE 1 "Which video editor would you like to install?" \
-        "Kdenlive" "Shotcut" "Flowblade"
-fi
-if [ "$VIDEO_EDITOR_YN" = 1 ]; then
-    case "${VIDEO_EDITOR_CHOICE:-}" in
-        1) VIDEO_EDITOR_NAME="Kdenlive";  PACMAN_PKGS+=(kdenlive) ;;
-        2) VIDEO_EDITOR_NAME="Shotcut";   PACMAN_PKGS+=(shotcut) ;;
-        3) VIDEO_EDITOR_NAME="Flowblade"; PACMAN_PKGS+=(flowblade) ;;
-        *) VIDEO_EDITOR_NAME="" ;;
-    esac
-    [ "$VIDEO_EDITOR_DETECTED" = 1 ] && [ -n "$VIDEO_EDITOR_NAME" ] && detected_note "Video editor" "$VIDEO_EDITOR_NAME"
-else
-    VIDEO_EDITOR_NAME=""
-fi
-
+# NOTE: OBS Studio and video-editor prompts used to live here. They were
+# removed outright (not gated): neither is needed for the desktop to
+# function, and anyone who wants one installs it directly. Saved
+# OBS_CHOICE / VIDEO_EDITOR_* answers in install-answers are now inert.
 # Lutris and Heroic are independent packages, so "both installed" is its own
 # answer (choice 3) that detect_one's exactly-one rule can't express — check
 # it first, then fall back to the single-hit rule.
@@ -2017,14 +1997,6 @@ ok "$FILE_MANAGER_NAME installed and bound to SUPER + E"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 if pacman -Qq cliphist >/dev/null 2>&1; then
     ok "cliphist installed (bind a key to it yourself — e.g. SUPER+C in the config)"
-fi
-if pacman -Qq obs-studio >/dev/null 2>&1; then
-    ok "OBS Studio installed"
-fi
-if [ -n "$VIDEO_EDITOR_NAME" ]; then
-    ok "$VIDEO_EDITOR_NAME installed"
-else
-    ok "Video editor install skipped, as requested"
 fi
 if pacman -Qq lutris >/dev/null 2>&1; then
     ok "Lutris installed"

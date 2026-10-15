@@ -2184,7 +2184,9 @@ install_base_system() {
     critical+=" btrfs-progs dosfstools e2fsprogs xfsprogs gptfdisk"
 
     # Base utilities
-    critical+=" sudo nano vim git wget curl"
+    # Base utilities (ly rides here too: the TUI login manager that owns
+    # tty1 after install — sessions come later from the desktop setup).
+    critical+=" sudo nano vim git wget curl ly"
 
     # Network stack
     critical+=" networkmanager iw iwd ppp lftp ldns avahi samba netctl dhcpcd openssh"
@@ -2348,6 +2350,17 @@ EOF
 EOF
 
     arch-chroot "$MOUNTPOINT" systemctl enable NetworkManager
+
+    # ly owns tty1 after install: the package ships only the template
+    # ly@.service, so it is enabled as an instance (ly@tty1) — a plain
+    # "ly.service" does not exist and would fail. getty@tty1 stands down
+    # per the wiki (ly@ conflicts with it anyway; other ttys keep their
+    # gettys, so a broken ly can never lock out console access entirely).
+    # Sessions themselves (Hyprland/MangoWM entries) arrive later with
+    # the desktop setup.
+    arch-chroot "$MOUNTPOINT" systemctl enable ly@tty1 \
+        || show_warning "Could not enable ly@tty1 — enable it manually after reboot: systemctl enable ly@tty1"
+    arch-chroot "$MOUNTPOINT" systemctl disable getty@tty1.service 2>/dev/null || true
 
     # Force NetworkManager to use wpa_supplicant for WiFi (not iwd)
     mkdir -p "$MOUNTPOINT/etc/NetworkManager/conf.d"
