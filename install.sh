@@ -484,8 +484,13 @@ command -v pacman >/dev/null || die "This script is Arch-only (pacman not found)
 # behavior change. Fetched from this repo (versioned with it) rather than
 # Xero upstream, downloaded first so a failed fetch can't feed a half-pipe
 # to bash. stdin is forced to /dev/tty so its prompts work even when this
-# script itself runs as `curl | bash`. When it exits without rebooting,
-# this one simply continues.
+# script itself runs as `curl | bash`. A SUCCESSFUL base install ends this
+# run outright: the new system sits at /mnt and this live ISO (root, no
+# real user, nothing persists past reboot) is the wrong place for desktop
+# setup — every later step would pacman into the ISO and write configs to
+# root's home, then evaporate on reboot. So success prints the reboot
+# handoff and exits; only a failed/skipped base install falls through
+# below, where the operator owns the consequences.
 if [ -d /run/archiso ]; then
     printf '\n  %sArch ISO live environment detected.%s\n' "$C_YELLOW" "$C_RESET"
     prompt_choice XERO_CHOICE 2 "Provision this machine with the simpbar base-system installer first?" \
@@ -505,8 +510,18 @@ if [ -d /run/archiso ]; then
         xero_confirm="${xero_confirm//[[:space:]]/}"
         if [ "$xero_confirm" = "YES" ]; then
             if curl -fsSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/xero/xero-install.sh -o /tmp/xero-install.sh; then
-                bash /tmp/xero-install.sh < /dev/tty \
-                    || warn "Base installer exited early — continuing with simpbar setup"
+                if bash /tmp/xero-install.sh < /dev/tty; then
+                    rm -f /tmp/xero-install.sh
+                    printf '\n  %sBase system installed — reboot into it now.%s\n' "$C_GREEN" "$C_RESET"
+                    printf '  Remove the installation media, reboot, log in as the user you just created,\n'
+                    printf '  and run the desktop setup there:\n'
+                    printf '  %scurl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash%s\n' "$C_BOLD" "$C_RESET"
+                    printf '  (Running the steps below here would install into this live ISO as root —\n'
+                    printf '  nothing would survive the reboot.)\n'
+                    exit 0
+                else
+                    warn "Base installer exited early — continuing with simpbar setup"
+                fi
                 rm -f /tmp/xero-install.sh
                 ok "Continuing with simpbar setup"
             else
