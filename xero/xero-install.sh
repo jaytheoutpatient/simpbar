@@ -2133,6 +2133,10 @@ if [ -f "$DONE" ]; then
         rm -f "$HOME/.config/mango/cfg/autostart.conf"
         rmdir -p "$HOME/.config/mango/cfg" 2>/dev/null || true
     fi
+    if [ -f "$HOME/.config/mango/config.conf" ] && grep -q "$MARKER" "$HOME/.config/mango/config.conf" 2>/dev/null; then
+        rm -f "$HOME/.config/mango/config.conf"
+        rmdir -p "$HOME/.config/mango" 2>/dev/null || true
+    fi
     exit 0
 fi
 TERM_BIN="$(cat "$HOME/.config/simpbar/terminal-choice" 2>/dev/null)"
@@ -2152,10 +2156,19 @@ FIRSTBOOTEOF
 
     # ── 4. WM autostart stubs (marker-bearing, retracted above) ─────
     if [[ "${CONFIG[firstboot_wm]}" == "mango" ]]; then
-        # Mango reads cfg/autostart.conf for `exec_once = ...` lines. This
-        # stub shares its path with the real config, which overwrites it
-        # when install.sh runs (same filename merge).
+        # Mango reads ONLY ~/.config/mango/config.conf (else /etc/mango's),
+        # and sub-configs load solely via `source=` lines in it — a lone
+        # cfg/autostart.conf is never touched. So the stub is a minimal
+        # main config sourcing a stub autostart. Both share their paths
+        # with the real config, which overwrites them when install.sh runs
+        # (same filename merge).
         mkdir -p "$th/.config/mango/cfg"
+        cat > "$th/.config/mango/config.conf" << 'MANGOCONFSTUBEOF'
+# simpbar-firstboot stub — launches the desktop installer once, then
+# retracts itself (see /usr/local/bin/simpbar-firstboot). Overwritten by
+# the real config when install.sh runs.
+source=~/.config/mango/cfg/autostart.conf
+MANGOCONFSTUBEOF
         cat > "$th/.config/mango/cfg/autostart.conf" << 'MANGOSTUBEOF'
 # simpbar-firstboot stub — launches the desktop installer once, then
 # retracts itself (see /usr/local/bin/simpbar-firstboot). Overwritten by
