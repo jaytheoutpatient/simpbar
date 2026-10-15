@@ -224,7 +224,29 @@ ensure_dependencies() {
 
     if [[ ${#deps_needed[@]} -gt 0 ]]; then
         echo -e "${CYAN}Installing required dependencies...${NC}"
-        pacman -Sy --noconfirm "${deps_needed[@]}" &>/dev/null || true
+        # Fresh ISOs often have an uninitialized pacman keyring, which
+        # fails every install with signature errors. Initializing it here
+        # is a harmless no-op when already done and fixes the cold-boot
+        # case. `timeout` guards entropy-starved VMs where --init could
+        # otherwise sit forever waiting on randomness.
+        if ! pacman-key --list-keys &>/dev/null; then
+            if command -v timeout &>/dev/null; then
+                timeout 120 pacman-key --init &>/dev/null || true
+            else
+                pacman-key --init &>/dev/null || true
+            fi
+            pacman-key --populate archlinux &>/dev/null || true
+        fi
+        # Never swallow pacman's output: a failed dependency install used
+        # to die silently here, leaving only a confusing missing binary
+        # several steps later.
+        local dep_log
+        dep_log=$(mktemp)
+        if ! pacman -Sy --noconfirm "${deps_needed[@]}" >"$dep_log" 2>&1; then
+            echo -e "${RED}Dependency install failed — pacman's output:${NC}"
+            tail -n 12 "$dep_log"
+        fi
+        rm -f "$dep_log"
     fi
 }
 
