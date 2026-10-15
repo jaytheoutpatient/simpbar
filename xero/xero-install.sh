@@ -110,7 +110,7 @@ CONFIG[extra_kernel]=""
 # which phase 1 auto-opens in the terminal on first graphical login.
 # "none" keeps base-only behavior (no trigger files written at all).
 CONFIG[firstboot_wm]="none"
-CONFIG[firstboot_term]="alacritty"
+CONFIG[firstboot_term]="foot"
 CONFIG[firstboot_term_e]="-e"
 CONFIG[uefi]="no"
 CONFIG[boot_part]=""
@@ -2054,9 +2054,14 @@ install_extra_software() {
 install_firstboot_wm() {
     local tu="${CONFIG[username]}"
     local th="$MOUNTPOINT/home/$tu"
-    [[ -d "$th" ]] || { show_warning "Home $th missing — skipping first-boot setup"; return 0; }
+    [[ -d "$th" ]] || { show_warning "Home $th missing — skipping first-boot setup"; echo "WARN: home $th missing" >> "$th/firstboot-install.log" 2>/dev/null || true; return 0; }
 
     # ── 1. WM + portal + terminal (repo packages only) ──────────────
+    # Pacman output goes to firstboot-install.log in the new user's home
+    # (appended, never truncated), NOT /dev/null: this step runs inside
+    # run_step_visual, whose logfile swallows show_warning text, so a
+    # silent failure here used to mean a dead blank screen post-reboot
+    # with nothing to diagnose it. The final chown -R already covers it.
     local pkgs=()
     if [[ "${CONFIG[firstboot_wm]}" == "mango" ]]; then
         pkgs+=(mangowm xdg-desktop-portal-wlr xdg-desktop-portal-gtk)
@@ -2065,14 +2070,15 @@ install_firstboot_wm() {
     fi
     pkgs+=("${CONFIG[firstboot_term]}")
 
-    arch-chroot "$MOUNTPOINT" pacman -Sy >/dev/null 2>&1 \
-        || show_warning "Database sync failed — package installs may fail below"
-    if ! arch-chroot "$MOUNTPOINT" pacman -S --noconfirm --needed "${pkgs[@]}" >/dev/null 2>&1; then
+    arch-chroot "$MOUNTPOINT" pacman -Sy >>"$th/firstboot-install.log" 2>&1 \
+        || { show_warning "Database sync failed — package installs may fail below"; echo "WARN: database sync failed" >> "$th/firstboot-install.log"; }
+    if ! arch-chroot "$MOUNTPOINT" pacman -S --noconfirm --needed "${pkgs[@]}" >>"$th/firstboot-install.log" 2>&1; then
         show_warning "First-boot batch install failed — retrying per package"
+        echo "WARN: batch install failed, retrying per package: ${pkgs[*]}" >> "$th/firstboot-install.log"
         local p
         for p in "${pkgs[@]}"; do
-            arch-chroot "$MOUNTPOINT" pacman -S --noconfirm --needed "$p" >/dev/null 2>&1 \
-                || show_warning "Could not install $p — install post-reboot: sudo pacman -S $p"
+            arch-chroot "$MOUNTPOINT" pacman -S --noconfirm --needed "$p" >>"$th/firstboot-install.log" 2>&1 \
+                || { show_warning "Could not install $p — install post-reboot: sudo pacman -S $p"; echo "WARN: could not install $p" >> "$th/firstboot-install.log"; }
         done
     fi
 
@@ -2096,11 +2102,13 @@ MANGOSESSIONEOF
                 show_success "Mango ly session written (Exec=$mbin)"
             else
                 show_warning "No mango binary in /usr/bin and no session file — ly cannot offer Mango; check the mangowm install post-reboot"
+                echo "WARN: no mango binary and no session file" >> "$th/firstboot-install.log"
             fi
         fi
     else
         if ! ls "$MOUNTPOINT/usr/share/wayland-sessions/" 2>/dev/null | grep -qi hyprland; then
             show_warning "No Hyprland session file in wayland-sessions — ly may not offer Hyprland"
+            echo "WARN: no Hyprland session file" >> "$th/firstboot-install.log"
         fi
     fi
 
@@ -2108,7 +2116,7 @@ MANGOSESSIONEOF
     # Choice file mirrors the browser-choice pattern (data, not code).
     mkdir -p "$th/.config/simpbar"
     printf '%s\n' "${CONFIG[firstboot_term]}" > "$th/.config/simpbar/terminal-choice" 2>/dev/null \
-        || show_warning "terminal-choice not recorded"
+        || { show_warning "terminal-choice not recorded"; echo "WARN: terminal-choice not recorded" >> "$th/firstboot-install.log"; }
 
     cat > "$MOUNTPOINT/usr/local/bin/simpbar-firstboot" << 'FIRSTBOOTEOF'
 #!/bin/sh
@@ -2118,13 +2126,22 @@ MANGOSESSIONEOF
 # removes the stub autostart files (marker-checked below, so real configs
 # are never touched) and exits silently. To opt out without installing:
 # touch ~/.config/simpbar/.firstboot-done
+# Everything below logs to ~/.cache/simpbar-firstboot.log — autostart
+# failures are otherwise invisible (no terminal exists yet to show them).
 set -u
+mkdir -p "$HOME/.cache" 2>/dev/null || true
+exec >>"$HOME/.cache/simpbar-firstboot.log" 2>&1
 MARKER="simpbar-firstboot stub"
 DONE="$HOME/.config/simpbar/.firstboot-done"
 if [ -f "$DONE" ]; then
     # Done: retract the stubs (only files still carrying our marker) and go
-    # quiet. The mango stub shares its path with the real config, which
+    # quiet. The mango stubs share their paths with the real config, which
     # lacks the marker after install.sh overwrites it — grep keeps us honest.
+    # Same for hyprland.lua: install.sh deploys the real one over the stub.
+    if [ -f "$HOME/.config/hypr/hyprland.lua" ] && grep -q "$MARKER" "$HOME/.config/hypr/hyprland.lua" 2>/dev/null; then
+        rm -f "$HOME/.config/hypr/hyprland.lua"
+        rmdir "$HOME/.config/hypr" 2>/dev/null || true
+    fi
     if [ -f "$HOME/.config/hypr/hyprland.conf" ] && grep -q "$MARKER" "$HOME/.config/hypr/hyprland.conf" 2>/dev/null; then
         rm -f "$HOME/.config/hypr/hyprland.conf"
         rmdir "$HOME/.config/hypr" 2>/dev/null || true
@@ -2140,19 +2157,23 @@ if [ -f "$DONE" ]; then
     exit 0
 fi
 TERM_BIN="$(cat "$HOME/.config/simpbar/terminal-choice" 2>/dev/null)"
-[ -n "$TERM_BIN" ] || TERM_BIN="alacritty"
+[ -n "$TERM_BIN" ] || TERM_BIN="foot"
+echo "firstboot start $(date) term=$TERM_BIN"
 if ! command -v "$TERM_BIN" >/dev/null 2>&1; then
+    echo "terminal $TERM_BIN not found — cannot open installer"
     exit 0
 fi
 INSTALL_CMD='curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash'
 if [ "$TERM_BIN" = "kitty" ]; then
     exec "$TERM_BIN" bash -c "$INSTALL_CMD; exec bash"
+elif [ "$TERM_BIN" = "wezterm" ]; then
+    exec wezterm start -- bash -c "$INSTALL_CMD; exec bash"
 else
     exec "$TERM_BIN" -e bash -c "$INSTALL_CMD; exec bash"
 fi
 FIRSTBOOTEOF
     chmod 755 "$MOUNTPOINT/usr/local/bin/simpbar-firstboot" 2>/dev/null \
-        || show_warning "/usr/local/bin/simpbar-firstboot not installed"
+        || { show_warning "/usr/local/bin/simpbar-firstboot not installed"; echo "WARN: simpbar-firstboot not installed" >> "$th/firstboot-install.log"; }
 
     # ── 4. WM autostart stubs (marker-bearing, retracted above) ─────
     if [[ "${CONFIG[firstboot_wm]}" == "mango" ]]; then
@@ -2163,33 +2184,47 @@ FIRSTBOOTEOF
         # with the real config, which overwrites them when install.sh runs
         # (same filename merge).
         mkdir -p "$th/.config/mango/cfg"
-        cat > "$th/.config/mango/config.conf" << 'MANGOCONFSTUBEOF'
+        cat > "$th/.config/mango/config.conf" << MANGOCONFSTUBEOF
 # simpbar-firstboot stub — launches the desktop installer once, then
 # retracts itself (see /usr/local/bin/simpbar-firstboot). Overwritten by
 # the real config when install.sh runs.
 source=~/.config/mango/cfg/autostart.conf
+bind=SUPER,Return,spawn,${CONFIG[firstboot_term]}
 MANGOCONFSTUBEOF
         cat > "$th/.config/mango/cfg/autostart.conf" << 'MANGOSTUBEOF'
 # simpbar-firstboot stub — launches the desktop installer once, then
 # retracts itself (see /usr/local/bin/simpbar-firstboot). Overwritten by
 # the real config when install.sh runs.
-exec_once = simpbar-firstboot
+exec-once = /usr/local/bin/simpbar-firstboot
 MANGOSTUBEOF
     else
-        # Hyprland runs exec-once lines from hyprland.conf on startup. The
-        # repo ships no hyprland.conf (config lives in hyprland.lua), so
-        # nothing here collides — and the launcher retracts this file once
-        # install.sh records success.
+        # Hyprland 0.55+ loads hyprland.lua when present and otherwise falls
+        # back to the legacy hyprland.conf (which upstream is dropping), so
+        # the stub ships BOTH: the lua form carries the autostart + keybind,
+        # the conf covers pre-0.55. The repo ships neither filename, so
+        # nothing here collides — and the launcher retracts both files once
+        # install.sh records success (marker-gated; the real hyprland.lua
+        # that install.sh deploys has no marker and is left alone).
         mkdir -p "$th/.config/hypr"
-        cat > "$th/.config/hypr/hyprland.conf" << 'HYPRSTUBEOF'
+        cat > "$th/.config/hypr/hyprland.lua" << HYPRLUASTUBEOF
+-- simpbar-firstboot stub — launches the desktop installer once, then
+-- retracts itself (see /usr/local/bin/simpbar-firstboot). Overwritten by
+-- the real config when install.sh runs.
+hl.on("hyprland.start", function()
+    hl.exec_cmd("/usr/local/bin/simpbar-firstboot")
+end)
+hl.bind("SUPER + Return", hl.dsp.exec_cmd("${CONFIG[firstboot_term]}"))
+HYPRLUASTUBEOF
+        cat > "$th/.config/hypr/hyprland.conf" << HYPRCONFSTUBEOF
 # simpbar-firstboot stub — launches the desktop installer once, then
 # retracts itself (see /usr/local/bin/simpbar-firstboot).
-exec-once = simpbar-firstboot
-HYPRSTUBEOF
+exec-once = /usr/local/bin/simpbar-firstboot
+bind = SUPER, Return, exec, ${CONFIG[firstboot_term]}
+HYPRCONFSTUBEOF
     fi
 
     arch-chroot "$MOUNTPOINT" chown -R "$tu:$tu" "/home/$tu" 2>/dev/null \
-        || show_warning "Could not chown home dir — check ownership after reboot"
+        || { show_warning "Could not chown home dir — check ownership after reboot"; echo "WARN: chown home failed" >> "$th/firstboot-install.log"; }
     show_success "First-boot trigger staged — installer auto-opens on login"
     return 0
 }
