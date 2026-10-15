@@ -414,8 +414,23 @@ run_step_visual() {
     clear
     tput civis
     (
+        # Geometry is re-checked every frame, not pinned: a mid-step
+        # terminal resize otherwise leaves cup repositioning stale
+        # coordinates and shreds overlapping frames across the screen.
+        # A real size change clears and rebuilds; identical geometry
+        # keeps the flicker-free cup repositioning.
+        last_cols="$cols"
         while true; do
-            tput cup "$top_row" 0
+            cols=$(term_cols)
+            if [[ "$cols" != "$last_cols" ]]; then
+                clear
+                content_height=8
+                [[ $cols -ge 58 ]] && content_height=$(( content_height + 6 ))
+                top_row=$(vpad_for "$content_height")
+                last_cols=$cols
+            else
+                tput cup "$top_row" 0
+            fi
             local lines sub live_pct
             lines=$(wc -l < "$logfile" 2>/dev/null || echo 0)
             sub=$(( lines / 4 ))
