@@ -1526,6 +1526,120 @@ if pacman -Qq firefox >/dev/null 2>&1; then
     esac
 fi
 
+# ── Default bar pins ───────────────────────────────────────────────
+# Seed config.json's launchers from this run's choices so a fresh install
+# opens on working icon pins instead of the compiled fallbacks (which sit
+# in text mode until their apps exist). Only when the file lacks launchers
+# entirely — existing pins are never touched. Third-party pins probe what
+# actually landed (package names like zen-browser-bin aren't commands); our
+# own helpers always pin. Labels stay plain text (no nerd glyphs): with
+# icons resolving, the label only shows in the GUI list.
+probe_bin() {
+    local b
+    for b in "$@"; do
+        if command -v "$b" >/dev/null 2>&1; then
+            printf '%s' "$b"
+            return 0
+        fi
+    done
+    return 1
+}
+SEED_PINS=()
+if [ -n "$BROWSER_NAME" ]; then
+    case "$BROWSER_CHOICE" in
+        1) _cands="brave brave-browser" ;;
+        2) _cands="zen-browser zen zen-bin" ;;
+        3) _cands="vivaldi-stable vivaldi" ;;
+        4) _cands="microsoft-edge-stable microsoft-edge" ;;
+        5) _cands="librewolf" ;;
+        *) _cands="" ;;
+    esac
+    # Word-splitting intended: _cands is our own literal list above.
+    # shellcheck disable=SC2086
+    if [ -n "$_cands" ] && BROWSER_BIN="$(probe_bin $_cands)"; then
+        SEED_PINS+=("Browser|$BROWSER_BIN|$BROWSER_BIN")
+    fi
+fi
+if [ -n "$DISCORD_NAME" ]; then
+    case "$DISCORD_CHOICE" in
+        1) _dbin="discord" ;;
+        2) _dbin="vesktop" ;;
+        3) _dbin="equibop" ;;
+        *) _dbin="" ;;
+    esac
+    if [ -n "$_dbin" ] && command -v "$_dbin" >/dev/null 2>&1; then
+        SEED_PINS+=("Discord|$_dbin|$_dbin")
+    fi
+fi
+if command -v "$FILE_MANAGER_BIN" >/dev/null 2>&1; then
+    SEED_PINS+=("Files|$FILE_MANAGER_BIN|$FILE_MANAGER_BIN")
+fi
+if command -v "$TERMINAL_BIN" >/dev/null 2>&1; then
+    SEED_PINS+=("Term|$TERMINAL_BIN|$TERMINAL_BIN")
+fi
+if command -v steam >/dev/null 2>&1; then
+    SEED_PINS+=("Steam|steam|steam")
+fi
+SEED_PINS+=("Config|simpbar-config|simpbar-config")
+SEED_PINS+=("Welcome|simpbar-welcome|help-about")
+unset _cands _dbin
+mkdir -p ~/.config/simpbar
+if [ ! -f ~/.config/simpbar/config.json ]; then
+    SEED_HAVE_FILE=0
+else
+    SEED_HAVE_FILE=1
+fi
+if [ "$SEED_HAVE_FILE" = 1 ] && grep -q '"launchers"' ~/.config/simpbar/config.json 2>/dev/null; then
+    ok "config.json already has launchers — leaving your pins alone"
+elif ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 unavailable — skipping default pin seeding (bar falls back to built-in pins)"
+else
+    SEED_JSON="["
+    _first=1
+    for _pin in "${SEED_PINS[@]}"; do
+        _label="${_pin%%|*}"
+        _rest="${_pin#*|}"
+        _cmd="${_rest%%|*}"
+        _icon="${_rest#*|}"
+        # Values are our own literals and PATH-probed basenames — no JSON
+        # metacharacters possible, so plain interpolation is safe.
+        if [ "$_first" = 1 ]; then _first=0; else SEED_JSON="$SEED_JSON,"; fi
+        SEED_JSON="$SEED_JSON{\"label\":\"$_label\",\"command\":\"$_cmd\",\"icon\":\"$_icon\"}"
+    done
+    SEED_JSON="$SEED_JSON]"
+    unset _first _pin _label _rest _cmd _icon
+    if SEED_OUT="$(python3 - ~/.config/simpbar/config.json "$SEED_JSON" <<'PYEOF'
+import json, sys
+path, frag = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except FileNotFoundError:
+    cfg = {"appearance": {}}
+except Exception as e:
+    print("could not parse {0}: {1} — leaving it alone".format(path, e))
+    sys.exit(1)
+if not isinstance(cfg, dict):
+    print("config root is not an object — leaving it alone")
+    sys.exit(1)
+if "launchers" in cfg:
+    print("launchers already present")
+    sys.exit(0)
+cfg["launchers"] = json.loads(frag)
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+print("seeded {0} pins".format(len(cfg["launchers"])))
+PYEOF
+)"; then
+        ok "Default bar pins seeded ($SEED_OUT)"
+    else
+        warn "Default pin seeding failed ($SEED_OUT) — bar falls back to built-in pins"
+    fi
+    unset SEED_OUT
+fi
+unset SEED_PINS SEED_JSON SEED_HAVE_FILE
+
 # ── Step 8: LazyVim ─────────────────────────────────────────────────
 step "Setting up LazyVim"
 
