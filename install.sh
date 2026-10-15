@@ -479,7 +479,7 @@ command -v pacman >/dev/null || die "This script is Arch-only (pacman not found)
 # offer our Xero-based provisioning script first: it installs a whole base
 # system (partitioning, base, users, drivers, Limine bootloader — no
 # desktop environment) where this script only ever configures an
-# already-running one. Opt-in behind a typed YES (it can wipe disks);
+# already-running one. Opt-in behind a typed y (it can wipe disks);
 # declining, or running on an installed system, continues below with zero
 # behavior change. Fetched from this repo (versioned with it) rather than
 # Xero upstream, downloaded first so a failed fetch can't feed a half-pipe
@@ -498,17 +498,17 @@ if [ -d /run/archiso ]; then
     if [ "$XERO_CHOICE" = 1 ]; then
         printf '\n  %sWARNING: the base installer partitions disks and can%s\n' "$C_RED" "$C_RESET"
         printf '  %sDESTROY DATA. Only continue on a machine (or VM) you can wipe.%s\n' "$C_RED" "$C_RESET"
-        printf '  %sType YES in capitals to launch it, anything else skips:%s ' "$C_BOLD" "$C_RESET"
+        printf '  %sType y to launch it, anything else skips:%s ' "$C_BOLD" "$C_RESET"
         if [ -r /dev/tty ]; then
             IFS= read -r xero_confirm < /dev/tty || xero_confirm=""
         else
             xero_confirm=""
         fi
         # Same paste hygiene as prompt_choice: a smuggled \r must not turn
-        # an explicit YES into a silent skip (nor vice versa — the comparison
+        # an explicit y into a silent skip (nor vice versa — the comparison
         # below stays an exact match either way).
         xero_confirm="${xero_confirm//[[:space:]]/}"
-        if [ "$xero_confirm" = "YES" ]; then
+        if [ "$xero_confirm" = "y" ] || [ "$xero_confirm" = "Y" ]; then
             if curl -fsSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/xero/xero-install.sh -o /tmp/xero-install.sh; then
                 if bash /tmp/xero-install.sh < /dev/tty; then
                     rm -f /tmp/xero-install.sh
