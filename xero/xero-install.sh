@@ -3102,8 +3102,8 @@ write_limine_conf() {
                 continue
             fi
             entries=$((entries + 1))
-            title="Arch Linux"
-            [[ "$stem" != "linux" ]] && title="Arch Linux ($stem)"
+            title="Featherlite Linux"
+            [[ "$stem" != "linux" ]] && title="Featherlite Linux ($stem)"
             printf '%s\n' "/$title"
             echo "    protocol: linux"
             echo "    path: boot():/vmlinuz-$stem"
@@ -3168,11 +3168,12 @@ install_bootloader() {
     # limine-snapper-sync targets the OS entry by name: pin it to ours so
     # snapshot entries attach even if os-release ever says otherwise. The
     # ESP is auto-detected (/boot here), so no path config is needed.
+    # Must match the entry titles written by write_limine_conf above.
     if [[ -f "$MOUNTPOINT/etc/limine-snapper-sync.conf" ]]; then
         if grep -q '^#*TARGET_OS_NAME=' "$MOUNTPOINT/etc/limine-snapper-sync.conf"; then
-            sed -i 's/^#*TARGET_OS_NAME=.*/TARGET_OS_NAME="Arch Linux"/' "$MOUNTPOINT/etc/limine-snapper-sync.conf"
+            sed -i 's/^#*TARGET_OS_NAME=.*/TARGET_OS_NAME="Featherlite Linux"/' "$MOUNTPOINT/etc/limine-snapper-sync.conf"
         else
-            echo 'TARGET_OS_NAME="Arch Linux"' >> "$MOUNTPOINT/etc/limine-snapper-sync.conf"
+            echo 'TARGET_OS_NAME="Featherlite Linux"' >> "$MOUNTPOINT/etc/limine-snapper-sync.conf"
         fi
     fi
 }
