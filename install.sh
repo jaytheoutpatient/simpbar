@@ -727,6 +727,20 @@ for d in "${CONFIG_DIRS[@]}" simpbar; do
     fi
 done
 
+# First-boot stubs (written by xero-install.sh into ~/.config/hypr and
+# ~/.config/mango, all carrying a `simpbar-firstboot stub` marker) share
+# paths with the real configs and are MEANT to be overwritten by them —
+# but the no-clobber deploy below would preserve them forever, leaving a
+# fresh install stuck on stubs (no bar autostart, no wallpaper restore).
+# Remove marker-bearing files first; real user configs carry no marker and
+# are never touched by this.
+for _stubdir in ~/.config/hypr ~/.config/mango; do
+    [ -d "$_stubdir" ] || continue
+    grep -rIl "simpbar-firstboot stub" "$_stubdir" 2>/dev/null | while IFS= read -r _stub; do
+        rm -f "$_stub"
+    done
+done
+unset _stubdir _stub
 for d in "${CONFIG_DIRS[@]}"; do
     # No-clobber deploy: on a fresh install everything lands; on an update
     # re-run (Welcome -> "Update Simpbar" just re-runs this script) existing
