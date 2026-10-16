@@ -1327,8 +1327,9 @@ select_extra_kernel() {
 
     local options=(
         "None"
-        "linux-cachyos   │ CachyOS optimized kernel  (Chaotic-AUR)"
-        "linux-lts       │ Long Term Support kernel   (official repos)"
+        "linux-cachyos    │ CachyOS optimized kernel  (Chaotic-AUR)"
+        "linux-cachyos-rc │ CachyOS release-candidate kernel (Chaotic-AUR)"
+        "linux-lts        │ Long Term Support kernel   (official repos)"
     )
 
     local selections=""
@@ -1344,6 +1345,9 @@ select_extra_kernel() {
 
     while IFS= read -r line; do
         case "$line" in
+            # RC first: its label is also a prefix-match for the stable arm
+            # below, so order matters.
+            "linux-cachyos-rc"*) CONFIG[extra_kernel]+="linux-cachyos-rc linux-cachyos-rc-headers " ;;
             "linux-cachyos"*) CONFIG[extra_kernel]+="linux-cachyos linux-cachyos-headers " ;;
             "linux-lts"*)     CONFIG[extra_kernel]+="linux-lts linux-lts-headers " ;;
         esac
@@ -1738,12 +1742,22 @@ show_main_menu() {
         fi
 
         local kernel_label="None"
-        if [[ "${CONFIG[extra_kernel]}" == *"linux-cachyos"* && "${CONFIG[extra_kernel]}" == *"linux-lts"* ]]; then
-            kernel_label="CachyOS + LTS"
-        elif [[ "${CONFIG[extra_kernel]}" == *"linux-cachyos"* ]]; then
-            kernel_label="CachyOS"
-        elif [[ "${CONFIG[extra_kernel]}" == *"linux-lts"* ]]; then
-            kernel_label="LTS"
+        # Built from parts: a plain substring test for "linux-cachyos"
+        # would also match "linux-cachyos-rc", so test RC first and test
+        # stable against the string with RC removed.
+        local _kl_parts=()
+        if [[ "${CONFIG[extra_kernel]}" == *"linux-cachyos-rc"* ]]; then
+            _kl_parts+=("RC")
+        fi
+        if [[ "${CONFIG[extra_kernel]//linux-cachyos-rc/}" == *"linux-cachyos"* ]]; then
+            _kl_parts+=("CachyOS")
+        fi
+        if [[ "${CONFIG[extra_kernel]}" == *"linux-lts"* ]]; then
+            _kl_parts+=("LTS")
+        fi
+        if [[ ${#_kl_parts[@]} -gt 0 ]]; then
+            kernel_label="${_kl_parts[*]}"
+            kernel_label="${kernel_label// / + }"
         fi
 
         local extra_pkg_count=0

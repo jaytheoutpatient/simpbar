@@ -568,9 +568,10 @@ fi
 # ── XeroLinux-provisioned systems ────────────────────────────────────
 # Xero's own installer sets up [xerolinux] + [chaotic-aur], a paru default,
 # and Phase-2 browsers/social apps — so on its systems this script skips
-# the overlapping choices below (repos, browser, Discord, AUR helper)
-# instead of re-asking or fighting them. Everything else (WM, terminals,
-# theming, simpbar itself) still runs. Non-Xero systems never see this.
+# the overlapping choices below (repos, browser, Discord, AUR helper,
+# graphics-driver pins) instead of re-asking or fighting them. Everything
+# else (WM, terminals, theming, simpbar itself) still runs. Non-Xero
+# systems never see this.
 XERO_SYSTEM=0
 if grep -qE '^\[xerolinux\]' /etc/pacman.conf 2>/dev/null; then
     XERO_SYSTEM=1
@@ -972,7 +973,15 @@ PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-
 # Official Mesa Vulkan stack — see the Step 6 header: pinning these satisfies
 # steam's vulkan-driver / lib32-vulkan-driver depends directly, so pacman never
 # resolves them to the CachyOS repos' conflicting mesa-git / lib32-mesa-git.
-PACMAN_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon vulkan-intel lib32-vulkan-intel vulkan-swrast lib32-vulkan-swrast)
+# Skipped on XeroLinux-provisioned systems: Xero's own graphics-driver step
+# already set up mesa + the vendor stack (possibly custom bundles that
+# conflict with official mesa), and without CachyOS repos the mesa-git
+# conflict these pins guard against cannot occur there.
+if [ "$XERO_SYSTEM" = 1 ]; then
+    ok "Graphics drivers skipped (covered by the Xero install)"
+else
+    PACMAN_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon vulkan-intel lib32-vulkan-intel vulkan-swrast lib32-vulkan-swrast)
+fi
 
 # The compositor itself plus its desktop portal, chosen in Step 2. MangoWM
 # also needs the apps the shipped mango config starts/binds on login
