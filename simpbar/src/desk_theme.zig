@@ -1106,6 +1106,51 @@ test "parse wlr-randr text" {
     // disabled output skipped
 }
 
+test "parse wlr-randr virtual output" {
+    const sample =
+        \\Virtual-1 "Unknown Unknown (Virtual-1)"
+        \\  Physical size: 0x0 mm
+        \\  Enabled: yes
+        \\  Modes:
+        \\    1280x800 px, 60.000 Hz (preferred, current)
+        \\  Position: 0,0
+        \\  Transform: normal
+        \\  Scale: 1.000000
+    ;
+    try std.testing.expectEqual(@as(usize, 1), parseWlrRandr(sample));
+    const ds = detectedMonitors();
+    try std.testing.expectEqualStrings("Virtual-1", ds[0].name());
+    try std.testing.expectEqual(@as(u32, 1280), ds[0].width);
+    try std.testing.expectEqual(@as(u32, 800), ds[0].height);
+    try std.testing.expectEqual(@as(u32, 60), ds[0].refresh);
+}
+
+test "parse mmsg virtual output" {
+    const sample =
+        \\{"monitors":[{"name":"Virtual-1","active":true,"x":0,"y":0,"width":1280,"height":800,"scale":1,"tags":[]}]}
+    ;
+    try std.testing.expectEqual(@as(usize, 1), parseMonitorObjects(sample));
+    const ds = detectedMonitors();
+    try std.testing.expectEqualStrings("Virtual-1", ds[0].name());
+    try std.testing.expectEqual(@as(u32, 1280), ds[0].width);
+}
+
+test "parse hyprctl virtual output" {
+    const sample =
+        \\[{"id":0,"name":"Virtual-1","width":1280,"height":800,"refreshRate":60.0,"x":0,"y":0,"scale":1.0}]
+    ;
+    try std.testing.expectEqual(@as(usize, 1), parseMonitorObjects(sample));
+    const ds = detectedMonitors();
+    try std.testing.expectEqualStrings("Virtual-1", ds[0].name());
+    try std.testing.expectEqual(@as(u32, 60), ds[0].refresh);
+}
+
+test "compose mango rule virtual output" {
+    var out: [512]u8 = undefined;
+    const s = composeMangoRule("Virtual-1", 1280, 800, 60, 0, 0, null, true, &out);
+    try std.testing.expectEqualStrings("monitor_rule = name:Virtual-1, width:1280, height:800, refresh:60, x:0, y:0, rr:0, vrr:0", s);
+}
+
 test "parse wlr-randr at-variant mode line" {
     const sample =
         \\DP-1 "Test (DP-1)"
