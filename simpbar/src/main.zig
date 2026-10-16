@@ -3434,6 +3434,7 @@ fn openTrayContextMenu(bar: *Bar, tray_index: usize) void {
         .xdg_surface = ps.xdg_surface,
         .popup = ps.popup,
     };
+    pm.menu = menu;
     pm.dest_len = @min(item.busName().len, pm.dest_buf.len);
     @memcpy(pm.dest_buf[0..pm.dest_len], item.busName()[0..pm.dest_len]);
     pm.path_len = @min(menu_path.len, pm.path_buf.len);
