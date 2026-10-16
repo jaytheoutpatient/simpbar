@@ -728,7 +728,13 @@ for d in "${CONFIG_DIRS[@]}" simpbar; do
 done
 
 for d in "${CONFIG_DIRS[@]}"; do
-    cp -r "/tmp/simpbar-temp/simpbar-main/$d" ~/.config/
+    # No-clobber deploy: on a fresh install everything lands; on an update
+    # re-run (Welcome -> "Update Simpbar" just re-runs this script) existing
+    # files are left alone and only genuinely new files are added. A plain
+    # `cp -r` would overwrite the user's live configs every update —
+    # notably ~/.config/mango/cfg/monitors.conf and ~/.config/hypr/*.lua —
+    # wiping monitor settings back to shipped defaults.
+    cp -rn "/tmp/simpbar-temp/simpbar-main/$d" ~/.config/
 done
 # Fix matugen layout: templates in templates/ subdir, scripts in root
 if [ -d ~/.config/matugen ]; then
