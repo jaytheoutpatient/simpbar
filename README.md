@@ -2,7 +2,7 @@
 
 A native Zig/Wayland status bar for **Hyprland and MangoWM** — simple, clean, out of the way — plus an installer that sets up a ricing-friendly Arch desktop around it.
 
-Built for **Arch Linux** (EndeavourOS, CachyOS, Garuda, XeroLinux should work too). Pick your window manager (**Hyprland** or **MangoWM**) and repo setup (**CachyOS** or **Chaotic-AUR**) up front.
+Built for **Arch Linux** (EndeavourOS, CachyOS, Garuda, XeroLinux should work too). Pick your window manager (**Hyprland** or **MangoWM**) up front; **Chaotic-AUR** is configured for binary packages.
 
 ## Install
 

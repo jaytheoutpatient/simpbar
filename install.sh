@@ -110,7 +110,7 @@ install_paru() {
 
 # Bash-builtin sleep for spinner/keepalive/retry waits. /usr/bin/sleep is a
 # dynamically linked external that cannot even execute mid-libc-upgrade
-# (the CachyOS repo step swaps libc under us — every tick then faults with
+# (a repo sync can swap libc under us — every tick then faults with
 # "cannot execute" / bus errors), while this already-running shell and its
 # builtins keep working. The fd opens once up front (RDWR so the pipe never
 # sees EOF) and `read -t` does the waiting: no fork, no exec.
@@ -360,9 +360,8 @@ prompt_choice() {
 }
 
 # Try installing a "would-be-AUR" package from the enabled pacman repos
-# first (Chaotic-AUR in particular carries these as binary packages, and
-# CachyOS carries a good chunk too), falling back to an AUR helper only when
-# the repos don't have it.
+# first (Chaotic-AUR carries these as binary packages), falling back to an
+# AUR helper only when the repos don't have it.
 # install_aur_pkg <display name> <package>
 install_aur_pkg() {
     local name="$1" pkg="$2"
@@ -552,7 +551,7 @@ force_ask=0
 if has_saved_answers && [ -n "$(load_answer REPO_CHOICE)" ]; then
     printf '\n  %sExisting simpbar setup found%s — your previous answers will be\n' "$C_YELLOW" "$C_RESET"
     printf '  reused and the questions below will be skipped.\n'
-    printf '  %s·%s repository     %s\n' "$C_GREEN" "$C_RESET" "$(load_answer REPO_CHOICE | sed 's/^1$/CachyOS/;s/^2$/Chaotic-AUR/')"
+    printf '  %s·%s repository     %s\n' "$C_GREEN" "$C_RESET" "Chaotic-AUR"
     printf '  %s·%s window manager %s\n' "$C_GREEN" "$C_RESET" "$(load_answer WM_CHOICE | sed 's/^1$/Hyprland/;s/^2$/MangoWM/')"
     printf '\n  %sReview and change these answers? [y/N]: %s' "$C_BOLD" "$C_RESET"
     if [ -r /dev/tty ]; then
@@ -582,39 +581,26 @@ fi
 step "Choosing package repositories"
 
 if [ "$XERO_SYSTEM" = 1 ]; then
-    # Chaotic-AUR is already there via Xero (and CachyOS repos would fight
-    # the Xero stack), so take the Chaotic branch silently.
+    # Chaotic-AUR is already there via Xero, so take it silently.
     REPO_CHOICE=2; save_answer REPO_CHOICE 2; REPO_DETECTED=0
     REPO_NAME="Chaotic-AUR"; REPO_LABEL="Chaotic-AUR"
 else
 
-printf '\n  %sBoth options add a binary repo to pacman so most packages —\n' "$C_BOLD"
+printf '\n  %sChaotic-AUR%s adds a binary repo to pacman so most packages —\n' "$C_YELLOW" "$C_RESET"
 printf '  including things that are AUR-only on plain Arch — install through\n'
 printf '  %ssudo pacman -S%s instead of being compiled by an AUR helper (yay/\n' "$C_CYAN" "$C_RESET"
 printf '  paru only gets used for the few stragglers the repo does not carry).\n\n'
-printf '  %sCachyOS repos:%s performance-optimized, recompiled Arch packages.\n' "$C_YELLOW" "$C_RESET"
-printf '    Opinionated: it swaps in a tuned pacman and rebuilds core packages\n'
-printf '    for your CPU (x86-64-v3/v4 or AMD Zen).\n'
-printf '  %sChaotic-AUR:%s a binary mirror of AUR packages layered on plain\n' "$C_YELLOW" "$C_RESET"
-printf '    Arch — closest to what this installer used to do.\n'
 
-# When exactly one of the two repo setups is already configured, that's the
-# answer — no point asking which repos you want when pacman.conf shows it.
+# Chaotic-AUR already configured means nothing to ask — otherwise take it.
 REPO_DETECTED=0
-_have_cachyos=0; have_chaotic=0
-grep -qE '^\[cachyos' /etc/pacman.conf 2>/dev/null && _have_cachyos=1
+have_chaotic=0
 grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null && have_chaotic=1
-if [ "$_have_cachyos" = 1 ] && [ "$have_chaotic" = 0 ]; then
-    REPO_CHOICE=1; save_answer REPO_CHOICE 1; REPO_DETECTED=1
-elif [ "$_have_cachyos" = 0 ] && [ "$have_chaotic" = 1 ]; then
+if [ "$have_chaotic" = 1 ]; then
     REPO_CHOICE=2; save_answer REPO_CHOICE 2; REPO_DETECTED=1
 else
-    prompt_choice REPO_CHOICE 2 "Which repository setup would you like?" "CachyOS" "Chaotic-AUR"
+    REPO_CHOICE=2; save_answer REPO_CHOICE 2; REPO_DETECTED=0
 fi
-case "$REPO_CHOICE" in
-    1) REPO_NAME="CachyOS";    REPO_LABEL="CachyOS" ;;
-    *) REPO_NAME="Chaotic-AUR"; REPO_LABEL="Chaotic-AUR" ;;
-esac
+REPO_NAME="Chaotic-AUR"; REPO_LABEL="Chaotic-AUR"
 [ "$REPO_DETECTED" = 1 ] && detected_note "Repositories" "$REPO_NAME"
 ok "Selected ${REPO_NAME} repositories"
 fi
@@ -652,7 +638,7 @@ step "Checking prerequisites"
 # The script asks for the sudo password exactly once, up front, then serves
 # every later `sudo` from that stored copy through an askpass helper. A `sudo`
 # wrapper placed first on PATH means child processes (pacman, makepkg,
-# yay/paru, the CachyOS repo installer) inherit it too, so nothing re-prompts
+# yay/paru, pacman key imports) inherit it too, so nothing re-prompts
 # for the rest of the run.
 SUDO_PASS=""
 SUDO_KEEPALIVE_PID=""
@@ -836,93 +822,42 @@ cp /tmp/simpbar-temp/simpbar-main/appdrawer.desktop ~/.local/share/simpbar/appdr
 
 rm -rf /tmp/simpbar-temp
 
-# ── Step 5: set up the chosen repo ───────────────────────────────────
+# ── Step 5: set up Chaotic-AUR ─────────────────────────────────────
 step "Setting up ${REPO_NAME}"
 
-if [ "$REPO_CHOICE" = 1 ]; then
-    # ── CachyOS ─────────────────────────────────────────────────────
-    if grep -qE '^\[cachyos' /etc/pacman.conf 2>/dev/null; then
-        ok "CachyOS repos already configured"
-    else
-        run_spinner "Downloading the CachyOS repo installer" \
-            curl -fsSL -o /tmp/cachyos-repo.tar.xz https://mirror.cachyos.org/cachyos-repo.tar.xz \
-            || die "Could not download the CachyOS repo installer (check your network connection)."
-
-        run_spinner "Extracting the CachyOS repo installer" \
-            bash -c 'rm -rf /tmp/cachyos-repo && mkdir -p /tmp/cachyos-repo && tar xf /tmp/cachyos-repo.tar.xz -C /tmp/cachyos-repo --strip-components=1' \
-            || die "Could not extract the CachyOS repo installer."
-        rm -f /tmp/cachyos-repo.tar.xz
-
-        # The official script detects your CPU's ISA level, adds the matching
-        # [cachyos*] sections, installs the keyring/mirrorlists, swaps in its
-        # tuned pacman, and runs pacman -Syu. Its internal `pacman -U` and
-        # `pacman -Syu` carry no --noconfirm, so they prompt with "[Y/n]".
-        # When this installer runs as `curl ... | bash`, stdin is the still-open
-        # pipe feeding the rest of the script — an unanswered pacman would read
-        # the next lines of the script source as its answer and abort. Feed it
-        # a stream of "y" answers instead so the prompts are satisfied and the
-        # script source is never consumed. The sudo wrapper/askpass set up
-        # earlier handles the password (sudo -A reads it via askpass, not stdin,
-        # so the "y" lines pass straight through to the script).
-        run_spinner "Installing the CachyOS repos (tuned pacman + core packages)" \
-            bash -c 'cd /tmp/cachyos-repo && yes | sudo ./cachyos-repo.sh --install' \
-            || die "CachyOS repo setup failed (see output above)."
-        rm -rf /tmp/cachyos-repo
-        ok "CachyOS repos enabled"
-    fi
-    # A partial earlier run can leave [cachyos*] sections without working
-    # keys (the official script writes sections before fetching) — the skip
-    # above then sails past a broken setup and packages die later on PGP
-    # errors. Prove the keys exist now; on failure, populate locally
-    # (offline — no keyserver involved) and re-check. Fail-open throughout:
-    # a fuzzy match that misses only defers to the package step, it never
-    # aborts a healthy system.
-    if sudo pacman-key --list-keys 2>/dev/null | grep -qi cachy; then
-        ok "CachyOS keyring verified"
-    else
-        warn "CachyOS repo sections exist but no CachyOS key found (partial earlier run?) — repairing locally"
-        sudo pacman-key --populate archlinux cachyos 2>/dev/null || true
-        if sudo pacman-key --list-keys 2>/dev/null | grep -qi cachy; then
-            ok "CachyOS keyring repaired"
-        else
-            die "CachyOS repos are configured but their keys are missing. Try: sudo pacman-key --populate archlinux cachyos — then re-run this installer, which resumes past repo setup."
-        fi
-    fi
+# ── Chaotic-AUR ─────────────────────────────────────────────────
+if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
+    ok "Chaotic-AUR already configured"
 else
-    # ── Chaotic-AUR ─────────────────────────────────────────────────
-    if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
-        ok "Chaotic-AUR already configured"
-    else
-        # Keyservers flake — retry a few times before giving up (recv-key
-        # is idempotent, so retries are safe).
-        _key_ok=0
-        for _try in 1 2 3; do
-            if run_spinner "Importing Chaotic-AUR signing key (attempt $_try/3)" \
-                sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com; then
-                _key_ok=1
-                break
-            fi
-            [ "$_try" -lt 3 ] && spin_sleep 5
-        done
-        [ "$_key_ok" = 1 ] || die "Failed to import the Chaotic-AUR signing key."
+    # Keyservers flake — retry a few times before giving up (recv-key
+    # is idempotent, so retries are safe).
+    _key_ok=0
+    for _try in 1 2 3; do
+        if run_spinner "Importing Chaotic-AUR signing key (attempt $_try/3)" \
+            sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com; then
+            _key_ok=1
+            break
+        fi
+        [ "$_try" -lt 3 ] && spin_sleep 5
+    done
+    [ "$_key_ok" = 1 ] || die "Failed to import the Chaotic-AUR signing key."
 
-        run_spinner "Trusting Chaotic-AUR signing key" \
-            sudo pacman-key --lsign-key 3056513887B78AEB \
-            || die "Failed to locally sign the Chaotic-AUR key."
+    run_spinner "Trusting Chaotic-AUR signing key" \
+        sudo pacman-key --lsign-key 3056513887B78AEB \
+        || die "Failed to locally sign the Chaotic-AUR key."
 
-        run_spinner "Installing Chaotic-AUR keyring & mirrorlist" \
-            sudo pacman -U --noconfirm \
-                'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
-                'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
-            || die "Failed to install the Chaotic-AUR keyring/mirrorlist packages."
+    run_spinner "Installing Chaotic-AUR keyring & mirrorlist" \
+        sudo pacman -U --noconfirm \
+            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
+            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
+        || die "Failed to install the Chaotic-AUR keyring/mirrorlist packages."
 
-        printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
+    printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
 
-        run_spinner "Syncing package databases" sudo pacman -Sy \
-            || die "Failed to sync package databases after enabling Chaotic-AUR."
+    run_spinner "Syncing package databases" sudo pacman -Sy \
+        || die "Failed to sync package databases after enabling Chaotic-AUR."
 
-        ok "Chaotic-AUR enabled"
-    fi
+    ok "Chaotic-AUR enabled"
 fi
 
 # ── Step 6: install packages ─────────────────────────────────────────
@@ -930,13 +865,12 @@ fi
 # `PACMAN_PKGS+=` for the Vulkan ICDs). There is deliberately no GPU detection,
 # but the drivers cannot be left to `steam` either: steam hard-depends on the
 # vulkan-driver / lib32-vulkan-driver virtuals, and on a fresh system those are
-# unsatisfied, so pacman picks a provider by repo order. The CachyOS repos are
-# listed first in pacman.conf, so it selects their mesa-git / lib32-mesa-git —
-# which conflict with the installed official mesa and abort the whole
-# transaction ("Remove mesa? [Y/n]" answered N by --noconfirm). Pinning the
-# official ICDs satisfies steam's depends directly so mesa-git is never pulled;
-# radeon/intel cover real hardware and swrast covers GPU-less machines (test
-# VMs), so the same fixed set works everywhere.
+# unsatisfied, so pacman picks a provider — which can pull a conflicting
+# mesa-git / lib32-mesa-git that aborts the whole transaction ("Remove mesa?
+# [Y/n]" answered N by --noconfirm). Pinning the official ICDs satisfies
+# steam's depends directly so mesa-git is never pulled; radeon/intel cover
+# real hardware and swrast covers GPU-less machines (test VMs), so the same
+# fixed set works everywhere.
 step "Installing packages"
 
 # Steam lives in the multilib repo, which isn't enabled by default.
@@ -972,11 +906,10 @@ PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-
 
 # Official Mesa Vulkan stack — see the Step 6 header: pinning these satisfies
 # steam's vulkan-driver / lib32-vulkan-driver depends directly, so pacman never
-# resolves them to the CachyOS repos' conflicting mesa-git / lib32-mesa-git.
+# resolves them to a conflicting mesa-git / lib32-mesa-git.
 # Skipped on XeroLinux-provisioned systems: Xero's own graphics-driver step
 # already set up mesa + the vendor stack (possibly custom bundles that
-# conflict with official mesa), and without CachyOS repos the mesa-git
-# conflict these pins guard against cannot occur there.
+# conflict with official mesa).
 if [ "$XERO_SYSTEM" = 1 ]; then
     ok "Graphics drivers skipped (covered by the Xero install)"
 else
@@ -1119,7 +1052,7 @@ case "$DISCORD_CHOICE" in
        # Either installed twin satisfies the choice — installing the other
        # would conflict-abort the whole batch (pacman can't resolve [y/N]
        # under --noconfirm), so install nothing in that case. Otherwise
-       # prefer the repo package name (CachyOS ships `equibop`; bare
+       # prefer the repo package name (Chaotic-AUR ships `equibop`; bare
        # `-bin` only exists in the AUR) with the AUR name as fallback.
        if pacman -Qq equibop >/dev/null 2>&1 || pacman -Qq equibop-bin >/dev/null 2>&1; then DISCORD_AUR_PKG=""
        elif pacman -Si equibop >/dev/null 2>&1; then DISCORD_AUR_PKG="equibop"
@@ -1253,7 +1186,7 @@ fi
 
 
 # protonplus etc. used to mean an AUR helper — with Chaotic-AUR
-# (or CachyOS) enabled most of these are now binary packages, so they install
+# enabled most of these are now binary packages, so they install
 # through pacman from the chosen repo, and yay/paru are only reached for the
 # stragglers the repo doesn't carry. wlogout is deliberately gone: the app
 # drawer's Power menu (bar power button / SUPER+SHIFT+Q) replaces it.
@@ -2040,11 +1973,7 @@ elif [ "$XERO_SYSTEM" = 1 ]; then
 else
     ok "Browser install skipped, as requested"
 fi
-if [ "$REPO_CHOICE" = 1 ]; then
-    ok "CachyOS repos enabled"
-else
-    ok "Chaotic-AUR repo enabled"
-fi
+ok "Chaotic-AUR repo enabled"
 if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
     ok "Today's Bing wallpaper downloaded to ~/Pictures/Wallpaper"
 fi
