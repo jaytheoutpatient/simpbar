@@ -1370,6 +1370,16 @@ if [ "$INSTALL_MATUGEN" -eq 1 ]; then
 
         if [ -e ~/.config/matugen/config.toml ]; then
             warn "~/.config/matugen/config.toml already exists — leaving your existing matugen config alone"
+            # Migrate pre-fix Steam skin paths: older configs wrote to
+            # ~/.steam/steam/millennium/..., which creates ~/.steam/steam as a
+            # real directory on fresh installs and breaks Steam with
+            # "Couldn't set up Steam data" (bin_steam.sh needs it to be a
+            # symlink to ~/.local/share/Steam). New path works with or without
+            # the symlink.
+            if grep -q '\.steam/steam/millennium' ~/.config/matugen/config.toml 2>/dev/null; then
+                sed -i 's|~/.steam/steam/millennium|~/.local/share/Steam/millennium|g' ~/.config/matugen/config.toml 2>/dev/null || true
+                ok "migrated Steam skin paths in matugen config to ~/.local/share/Steam"
+            fi
         else
             warn "matugen config missing — copying from repo's full config"
             cp "/tmp/simpbar-temp/simpbar-main/matugen/config.toml" ~/.config/matugen/config.toml 2>/dev/null || true
@@ -1403,6 +1413,20 @@ if [ "$INSTALL_MATUGEN" -eq 1 ]; then
             # EOF error; the 45 s cap (a healthy run takes <1 s) guarantees
             # progress either way, and a failure prints matugen's captured
             # output so the real cause is visible.
+            # Pre-fix guard: remove a blocking ~/.steam/steam real directory
+            # (left by old configs) so the initial matugen run + later Steam
+            # launch can't hit "Couldn't set up Steam data". Real Steam data
+            # lives in ~/.local/share/Steam; this dir only ever held skins.
+            if [ -e "$HOME/.steam/steam" ] && [ ! -L "$HOME/.steam/steam" ]; then
+                [ -d "$HOME/.steam/steam/millennium" ] && {
+                    mkdir -p "$HOME/.local/share/Steam" 2>/dev/null || true
+                    cp -a "$HOME/.steam/steam/millennium/." "$HOME/.local/share/Steam/millennium/" 2>/dev/null || true
+                }
+                [ -L "$HOME/.steam/steam/Steam" ] && rm -f "$HOME/.steam/steam/Steam" 2>/dev/null || true
+                rm -rf "$HOME/.steam/steam" 2>/dev/null || true
+                warn "removed blocking ~/.steam/steam directory (Steam needs it to be a symlink)"
+            fi
+            [ ! -e "$HOME/.steam/steam" ] && [ -d "$HOME/.local/share/Steam" ] && ln -sfn "$HOME/.local/share/Steam" "$HOME/.steam/steam" 2>/dev/null || true
             run_spinner "Generating the initial matugen scheme from the Bing wallpaper" \
                 timeout 45 bash -c '"$0" "$@" </dev/null' /usr/bin/simpbar-matugen "$BING_FILE" \
                 || warn "Could not generate the initial matugen scheme — it'll apply on the next wallpaper change"

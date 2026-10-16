@@ -133,7 +133,7 @@ output_path = "~/.config/zen/1zf1flh5.Default (release)/chrome/userChrome.css"
 post_hook = "sh -c 'python3 \"$HOME/.config/matugen/zen-enable-pref.py\" \"$HOME/.config/zen/1zf1flh5.Default (release)/prefs.js\"'"
 
 # ═══════════════════════ Steam (Millennium) ═══════════════════════
-# Renders a complete Millennium skin to ~/.steam/steam/millennium/themes/
+# Renders a complete Millennium skin to ~/.local/share/Steam/millennium/themes/
 # matugen/ — the directory Millennium 3 watches. Select it once in
 # Settings → Themes and every wallpaper change recolors Steam.
 #   • steam-skin.json      → the skin manifest (Millennium looks for this)
@@ -142,41 +142,48 @@ post_hook = "sh -c 'python3 \"$HOME/.config/matugen/zen-enable-pref.py\" \"$HOME
 # No patcher beyond Millennium is needed; see skin.json for the window → css
 # mapping. If your install uses steamui/skins instead of millennium/themes,
 # only the output paths below change.
+# NOTE: outputs intentionally target ~/.local/share/Steam (the real Steam data
+# dir), NOT ~/.steam/steam. ~/.steam/steam must remain a symlink to
+# ~/.local/share/Steam — if matugen creates it as a real directory (e.g. on a
+# fresh install where Steam has never bootstrapped), Steam fails with
+# "Couldn't set up Steam data" because its launcher (bin_steam.sh) cannot
+# repair the link with `ln -fns`. Writing to the real dir works with or
+# without the symlink and shows up via the symlink once Steam runs.
 [templates.steam-skin-json]
 input_path = "~/.config/matugen/templates/steam-skin.json"
-output_path = "~/.steam/steam/millennium/themes/matugen/skin.json"
+output_path = "~/.local/share/Steam/millennium/themes/matugen/skin.json"
 
 [templates.steam-md3]
 input_path = "~/.config/matugen/templates/steam-md3.css"
-output_path = "~/.steam/steam/millennium/themes/matugen/steam-md3.css"
+output_path = "~/.local/share/Steam/millennium/themes/matugen/steam-md3.css"
 
 [templates.steam-libraryroot]
 input_path = "~/.config/matugen/templates/steam-libraryroot.css"
-output_path = "~/.steam/steam/millennium/themes/matugen/steam-libraryroot.css"
+output_path = "~/.local/share/Steam/millennium/themes/matugen/steam-libraryroot.css"
 
 [templates.steam-friends]
 input_path = "~/.config/matugen/templates/steam-friends.css"
-output_path = "~/.steam/steam/millennium/themes/matugen/steam-friends.css"
+output_path = "~/.local/share/Steam/millennium/themes/matugen/steam-friends.css"
 
 [templates.steam-overlay]
 input_path = "~/.config/matugen/templates/steam-overlay.css"
-output_path = "~/.steam/steam/millennium/themes/matugen/steam-overlay.css"
+output_path = "~/.local/share/Steam/millennium/themes/matugen/steam-overlay.css"
 
 [templates.steam-notifications]
 input_path = "~/.config/matugen/templates/steam-notifications.css"
-output_path = "~/.steam/steam/millennium/themes/matugen/steam-notifications.css"
+output_path = "~/.local/share/Steam/millennium/themes/matugen/steam-notifications.css"
 
 [templates.steam-bigpicture]
 input_path = "~/.config/matugen/templates/steam-bigpicture.css"
-output_path = "~/.steam/steam/millennium/themes/matugen/steam-bigpicture.css"
+output_path = "~/.local/share/Steam/millennium/themes/matugen/steam-bigpicture.css"
 
 [templates.steam-menu]
 input_path = "~/.config/matugen/templates/steam-menu.css"
-output_path = "~/.steam/steam/millennium/themes/matugen/steam-menu.css"
+output_path = "~/.local/share/Steam/millennium/themes/matugen/steam-menu.css"
 
 [templates.steam-webkit]
 input_path = "~/.config/matugen/templates/steam-webkit.css"
-output_path = "~/.steam/steam/millennium/themes/matugen/steam-webkit.css"
+output_path = "~/.local/share/Steam/millennium/themes/matugen/steam-webkit.css"
 
 # ═══════════════════════════ swaync ═══════════════════════════
 # Renders the notification center's whole style.css from the MD3 dark palette

@@ -155,4 +155,57 @@ case "$TYPE" in
     *) TYPE="scheme-tonal-spot" ;;
 esac
 
+# Steam data-link guard: ~/.steam/steam must stay a symlink to
+# ~/.local/share/Steam. Older simpbar matugen configs wrote the Millennium
+# skin to ~/.steam/steam/millennium/..., so on a machine where Steam had never
+# bootstrapped, matugen's mkdir -p created ~/.steam/steam as a REAL directory.
+# Steam's launcher (bin_steam.sh) repairs with `ln -fns`, which silently fails
+# on a real directory (it nests a `Steam` link inside instead) and then aborts
+# with "Couldn't set up Steam data". Current configs write to
+# ~/.local/share/Steam/... directly, but this guard repairs already-broken
+# installs and migrates old configs so one bad state can't wedge Steam again.
+# Never fails the theming run — wallpaper recolor must not depend on Steam.
+ensure_steam_data_link() {
+    local link="$HOME/.steam/steam"
+    local data="$HOME/.local/share/Steam"
+    local cfg="$HOME/.config/matugen/config.toml"
+
+    # Migrate old output paths (harmless when already migrated or missing).
+    if [ -f "$cfg" ] && grep -q '\.steam/steam/millennium' "$cfg" 2>/dev/null; then
+        sed -i 's|~/.steam/steam/millennium|~/.local/share/Steam/millennium|g' "$cfg" 2>/dev/null || true
+        echo "simpbar-matugen: migrated Steam skin paths in $cfg to ~/.local/share/Steam" >&2
+    fi
+
+    # Broken state: real directory where a symlink should be.
+    if [ -e "$link" ] && [ ! -L "$link" ]; then
+        # Preserve any Millennium skin generated while broken.
+        if [ -d "$link/millennium" ]; then
+            mkdir -p "$data" 2>/dev/null || true
+            if [ -d "$data" ]; then
+                cp -a "$link/millennium/." "$data/millennium/" 2>/dev/null || true
+            fi
+        fi
+        # Drop the nested link Steam's failed repair leaves behind.
+        [ -L "$link/Steam" ] && rm -f "$link/Steam" 2>/dev/null || true
+        # Remove the blocking directory (backup leftovers, never Steam data:
+        # real Steam data lives under $data, this dir only ever held skins).
+        if [ -d "$link/millennium" ] || [ -L "$link/Steam" ] || [ -z "$(ls -A "$link" 2>/dev/null)" ]; then
+            rm -rf "$link" 2>/dev/null || true
+        else
+            local backup="${XDG_STATE_HOME:-$HOME/.local/state}/simpbar/steam-broken-$(date +%s)"
+            mkdir -p "$(dirname "$backup")" 2>/dev/null || true
+            mv -f "$link" "$backup" 2>/dev/null || rm -rf "$link" 2>/dev/null || true
+            echo "simpbar-matugen: moved unexpected $link aside to $backup" >&2
+        fi
+        echo "simpbar-matugen: removed blocking $link directory (Steam needs it to be a symlink)" >&2
+    fi
+
+    # Recreate the expected symlink when the target exists and link is missing.
+    if [ ! -e "$link" ] && [ -d "$data" ]; then
+        ln -sfn "$data" "$link" 2>/dev/null || true
+    fi
+    return 0
+}
+ensure_steam_data_link || true
+
 exec "$MATUGEN_BIN" -t "$TYPE" image "$IMG"
