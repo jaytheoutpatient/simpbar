@@ -29,6 +29,7 @@ const hp = @import("hypr_pages.zig");
 const hypr = @import("hyprland.zig");
 const mango = @import("mango.zig");
 const desk = @import("desk_theme.zig");
+const mon = @import("monitors.zig");
 
 const gpa = std.heap.c_allocator;
 
@@ -649,7 +650,15 @@ fn openRuleDialog(parent: *anyopaque, rp: *const RulePage, line: usize) void {
 fn onRuleEdit(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
     const d = gtk.g_object_get_data(@ptrCast(button), "rp") orelse return;
     const rp: *const RulePage = @ptrCast(@alignCast(d));
-    openRuleDialog(@ptrCast(button), rp, @intFromPtr(user_data.?) - 1);
+    const line = @intFromPtr(user_data.?) - 1;
+    // Monitor rules get the capability-aware canvas dialog (resolution /
+    // refresh dropdowns from wlr-randr modes); everything else keeps the
+    // generic pair editor.
+    if (rp == &g_rp_monitors) {
+        openMangoMonitorDialog(@ptrCast(button), line);
+        return;
+    }
+    openRuleDialog(@ptrCast(button), rp, line);
 }
 
 fn onRuleRemove(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
@@ -659,6 +668,7 @@ fn onRuleRemove(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) voi
     _ = rp.doc.save();
     reload();
     rebuildRuleList(rp);
+    if (rp == &g_rp_monitors) queueMangoCanvasDraw();
 }
 
 fn onRuleAdd(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
@@ -669,6 +679,11 @@ fn onRuleAdd(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
     _ = rp.doc.save();
     reload();
     rebuildRuleList(rp);
+    queueMangoCanvasDraw();
+    if (rp == &g_rp_monitors) {
+        openMangoMonitorDialog(@ptrCast(button), rp.doc.lineCount() - 1);
+        return;
+    }
     openRuleDialog(@ptrCast(button), rp, rp.doc.lineCount() - 1);
 }
 
@@ -704,14 +719,45 @@ fn addRulePage(outer: *gtk.GtkBox, rp: *const RulePage) void {
 }
 
 // ---------------------------------------------------------------------
-// Monitor auto-detection (Monitors page). Reads live geometry from
-// wlr-randr (preferred — includes refresh) or `mmsg get all-monitors`
-// (name/resolution/position, no refresh), then rewrites each matching
-// monitor_rule in place: detected name/width/height/x/y plus refresh when
-// known (else the rule's old refresh, else omitted), preserving every
-// other pair (scale, rr, vrr, mirror). Displays without a rule get a fresh
-// one following the repo's rr:0/vrr:0 convention.
+// Monitors page — Event-Horizon-style editor for MangoWM.
+// monitor_rule lines keep their flat `key:value` format; the page adds:
+//   - a visual arrange canvas (click to select, drag to move, snap +
+//     normalize on drop),
+//   - capability-aware Resolution / Refresh dropdowns parsed from the FULL
+//     `wlr-randr` mode list (not just the current mode),
+//   - side-by-side / align-tops helpers,
+//   - and the original Auto-detect button (fills name/width/height/
+//     refresh/x/y from live outputs, preserving scale/rr/vrr/mirror).
 // ---------------------------------------------------------------------
+
+const MANGO_CANVAS_W: c_int = 620;
+const MANGO_CANVAS_H: c_int = 280;
+const MANGO_CANVAS_PAD: f64 = 0.1;
+
+var g_mango_canvas: ?*hg.GtkDrawingArea = null;
+var g_mango_selected: usize = 0; // index into monitor_rule lines list
+var g_mango_caps: [8]mon.WlrCapsEntry = undefined;
+var g_mango_caps_n: usize = 0;
+
+var g_mdrag_idx: isize = -1;
+var g_mdrag_anchor_x: i32 = 0;
+var g_mdrag_anchor_y: i32 = 0;
+var g_mdrag_fit_min_x: f64 = 0;
+var g_mdrag_fit_min_y: f64 = 0;
+var g_mdrag_fit_scale: f64 = 1;
+
+// Edit-dialog dropdown storage (one dialog at a time).
+var g_mdlg_res_bufs: [mon.MAX_RES][16:0]u8 = undefined;
+var g_mdlg_res_ptrs: [mon.MAX_RES][*:0]const u8 = undefined;
+var g_mdlg_hz_bufs: [mon.MAX_HZ][16:0]u8 = undefined;
+var g_mdlg_hz_ptrs: [mon.MAX_HZ][*:0]const u8 = undefined;
+// The doc line the open dialog edits (dropdown callbacks need it; the
+// generic DlgCtx is not used for monitor rules).
+var g_mdlg_line: usize = 0;
+
+fn queueMangoCanvasDraw() void {
+    if (g_mango_canvas) |c| hg.gtk_widget_queue_draw(@ptrCast(c));
+}
 
 fn findMonitorRuleLine(name: []const u8) ?usize {
     for (doc_monitors.lines.items, 0..) |l, i| {
@@ -734,6 +780,7 @@ fn findMonitorRuleLine(name: []const u8) ?usize {
 
 fn onMonitorsDetectClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     if (desk.detectMango() == 0) return;
+    refreshMangoCaps();
     for (desk.detectedMonitors()) |*d| {
         if (d.name().len == 0 or d.width == 0 or d.height == 0) continue;
         const li = findMonitorRuleLine(d.name());
@@ -748,6 +795,565 @@ fn onMonitorsDetectClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void 
     _ = doc_monitors.save();
     reload();
     rebuildRuleList(&g_rp_monitors);
+    queueMangoCanvasDraw();
+}
+
+// --- Caps (full wlr-randr mode list) ---
+
+fn refreshMangoCaps() void {
+    g_mango_caps_n = 0;
+    const out = hypr.captureOutput(&.{ "wlr-randr" }, 3000) orelse return;
+    defer gpa.free(out);
+    g_mango_caps_n = mon.parseWlrRandrCaps(out, &g_mango_caps);
+}
+
+fn mangoCapsFor(name: []const u8) ?*const mon.OutputCaps {
+    if (name.len == 0) return null;
+    var i: usize = 0;
+    while (i < g_mango_caps_n) : (i += 1) {
+        if (std.mem.eql(u8, g_mango_caps[i].name(), name)) return &g_mango_caps[i].caps;
+    }
+    return null;
+}
+
+// --- Rule value helpers ---
+
+fn ruleField(value: []const u8, key: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |raw| {
+        const p = std.mem.trim(u8, raw, " \t");
+        const c = std.mem.indexOfScalar(u8, p, ':') orelse continue;
+        if (std.mem.eql(u8, std.mem.trim(u8, p[0..c], " \t"), key)) {
+            return std.mem.trim(u8, p[c + 1 ..], " \t");
+        }
+    }
+    return "";
+}
+
+fn ruleInt(value: []const u8, key: []const u8, fallback: i32) i32 {
+    const s = ruleField(value, key);
+    if (s.len == 0) return fallback;
+    return std.fmt.parseInt(i32, s, 10) catch fallback;
+}
+
+/// Collects doc line indices for every monitor_rule. Returns count.
+fn mangoMonitorLines(out: []usize) usize {
+    var n: usize = 0;
+    for (doc_monitors.lines.items, 0..) |l, i| {
+        const kv = mango.parseKV(l) orelse continue;
+        if (!std.mem.eql(u8, kv.key, "monitor_rule")) continue;
+        if (n < out.len) {
+            out[n] = i;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn mangoRects(rects: []mon.ArrangeRect, line_idxs: []const usize) usize {
+    var n: usize = 0;
+    for (line_idxs, 0..) |li, k| {
+        if (k >= rects.len) break;
+        const kv = mango.parseKV(doc_monitors.line(li)) orelse continue;
+        const w = ruleInt(kv.value, "width", 1920);
+        const h = ruleInt(kv.value, "height", 1080);
+        const x = ruleInt(kv.value, "x", 0);
+        const y = ruleInt(kv.value, "y", 0);
+        const scale_s = ruleField(kv.value, "scale");
+        const ss: []const u8 = if (scale_s.len != 0) scale_s else "1";
+        var lw: i32 = 0;
+        var lh: i32 = 0;
+        mon.logicalExtents(w, h, ss, 0, &lw, &lh);
+        rects[k] = .{ .x = x, .y = y, .w = lw, .h = lh };
+        n += 1;
+    }
+    return n;
+}
+
+fn mangoRuleName(line_idx: usize, buf: []u8) []const u8 {
+    const kv = mango.parseKV(doc_monitors.line(line_idx)) orelse return "";
+    const nm = ruleField(kv.value, "name");
+    const n = @min(nm.len, buf.len);
+    @memcpy(buf[0..n], nm[0..n]);
+    return buf[0..n];
+}
+
+/// Rewrites x/y for each monitor_rule, preserving every other pair
+/// (width/height/refresh/scale/rr/vrr/mirror) via composeMangoRule.
+fn writeMangoPositions(rects: []const mon.ArrangeRect, line_idxs: []const usize) void {
+    for (rects, 0..) |r, k| {
+        if (k >= line_idxs.len) break;
+        const li = line_idxs[k];
+        const kv = mango.parseKV(doc_monitors.line(li)) orelse continue;
+        const nm = ruleField(kv.value, "name");
+        if (nm.len == 0) continue;
+        const w = ruleInt(kv.value, "width", 0);
+        const h = ruleInt(kv.value, "height", 0);
+        if (w == 0 or h == 0) continue;
+        const rf = ruleField(kv.value, "refresh");
+        const refresh: u32 = if (rf.len != 0) std.fmt.parseInt(u32, rf, 10) catch 0 else 0;
+        var vbuf: [mango.MAX_LINE]u8 = undefined;
+        const line = desk.composeMangoRule(nm, @intCast(w), @intCast(h), refresh, r.x, r.y, kv.value, false, &vbuf);
+        doc_monitors.setLine(li, line);
+    }
+    _ = doc_monitors.save();
+    reload();
+}
+
+/// Sets one key:value pair on a monitor_rule line, preserving the rest.
+fn setMangoRuleField(line_idx: usize, key: []const u8, value: []const u8) void {
+    const kv = mango.parseKV(doc_monitors.line(line_idx)) orelse return;
+    var out: [mango.MAX_LINE]u8 = undefined;
+    var n: usize = 0;
+    const W = struct {
+        fn s(buf: []u8, nn: *usize, t: []const u8) void {
+            if (nn.* >= buf.len) return;
+            const k = @min(t.len, buf.len - nn.*);
+            @memcpy(buf[nn.*..][0..k], t[0..k]);
+            nn.* += k;
+        }
+    };
+    W.s(&out, &n, "monitor_rule = ");
+    var first = true;
+    var saw = false;
+    var it = std.mem.splitScalar(u8, kv.value, ',');
+    while (it.next()) |raw| {
+        const p = std.mem.trim(u8, raw, " \t");
+        if (p.len == 0) continue;
+        const c = std.mem.indexOfScalar(u8, p, ':');
+        const pk: []const u8 = if (c) |cc| std.mem.trim(u8, p[0..cc], " \t") else p;
+        if (std.mem.eql(u8, pk, key)) {
+            saw = true;
+            if (value.len == 0) continue;
+            if (!first) W.s(&out, &n, ", ");
+            first = false;
+            W.s(&out, &n, key);
+            W.s(&out, &n, ":");
+            W.s(&out, &n, value);
+        } else {
+            if (!first) W.s(&out, &n, ", ");
+            first = false;
+            W.s(&out, &n, p);
+        }
+    }
+    if (!saw and value.len != 0) {
+        if (!first) W.s(&out, &n, ", ");
+        W.s(&out, &n, key);
+        W.s(&out, &n, ":");
+        W.s(&out, &n, value);
+    }
+    doc_monitors.setLine(line_idx, out[0..n]);
+    _ = doc_monitors.save();
+}
+
+// --- Canvas paint + interaction ---
+
+fn onMangoCanvasDraw(_: *hg.GtkDrawingArea, cr: *hg.CairoT, w: c_int, h: c_int, _: ?*anyopaque) callconv(.c) void {
+    var line_idxs: [8]usize = undefined;
+    const m = mangoMonitorLines(&line_idxs);
+    var rects: [8]mon.ArrangeRect = undefined;
+    const n = mangoRects(&rects, line_idxs[0..m]);
+    const cw: i32 = @intCast(w);
+    const ch: i32 = @intCast(h);
+    hg.cairo_set_source_rgb(cr, 0.11, 0.11, 0.14);
+    hg.cairo_rectangle(cr, 0, 0, @floatFromInt(@max(1, cw)), @floatFromInt(@max(1, ch)));
+    hg.cairo_fill(cr);
+    if (n == 0) {
+        hg.cairo_set_source_rgb(cr, 0.6, 0.6, 0.65);
+        hg.cairo_select_font_face(cr, "monospace", 0, 0);
+        hg.cairo_set_font_size(cr, 13);
+        hg.cairo_move_to(cr, 16, 24);
+        var msg: [128:0]u8 = undefined;
+        const s = std.fmt.bufPrintZ(&msg, "No monitor rules — Add one or hit Auto-detect.", .{}) catch "No monitors.";
+        hg.cairo_show_text(cr, s.ptr);
+        return;
+    }
+    const fit = mon.computeCanvasFit(rects[0..n], cw, ch, MANGO_CANVAS_PAD);
+    const sf = @max(fit.fit_scale, 1e-6);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const r = rects[i];
+        if (r.w <= 0 or r.h <= 0) continue;
+        const sx = (r.x - fit.min_x) * sf;
+        const sy = (r.y - fit.min_y) * sf;
+        const sw: f64 = @as(f64, @floatFromInt(r.w)) * sf;
+        const sh: f64 = @as(f64, @floatFromInt(r.h)) * sf;
+        if (i == g_mango_selected) {
+            hg.cairo_set_source_rgba(cr, 0.28, 0.55, 0.95, 0.45);
+        } else {
+            hg.cairo_set_source_rgba(cr, 0.35, 0.38, 0.48, 0.55);
+        }
+        hg.cairo_rectangle(cr, sx, sy, @max(4, sw), @max(4, sh));
+        hg.cairo_fill(cr);
+        if (i == g_mango_selected) {
+            hg.cairo_set_source_rgb(cr, 0.45, 0.7, 1.0);
+        } else {
+            hg.cairo_set_source_rgb(cr, 0.55, 0.58, 0.65);
+        }
+        hg.cairo_set_line_width(cr, if (i == g_mango_selected) 2.5 else 1.5);
+        hg.cairo_rectangle(cr, sx, sy, @max(4, sw), @max(4, sh));
+        hg.cairo_stroke(cr);
+        hg.cairo_set_source_rgb(cr, 0.92, 0.92, 0.95);
+        hg.cairo_select_font_face(cr, "monospace", 0, 0);
+        hg.cairo_set_font_size(cr, 12);
+        hg.cairo_move_to(cr, sx + 6, sy + 16);
+        var nbuf: [64]u8 = undefined;
+        const nm = mangoRuleName(line_idxs[i], &nbuf);
+        var lbuf: [72:0]u8 = undefined;
+        const zs = std.fmt.bufPrintZ(&lbuf, "{s}", .{if (nm.len != 0) nm else "???"}) catch "?";
+        hg.cairo_show_text(cr, zs.ptr);
+    }
+}
+
+fn mangoCanvasHit(px: f64, py: f64) isize {
+    var line_idxs: [8]usize = undefined;
+    const m = mangoMonitorLines(&line_idxs);
+    var rects: [8]mon.ArrangeRect = undefined;
+    const n = mangoRects(&rects, line_idxs[0..m]);
+    if (n == 0) return -1;
+    const fit = mon.computeCanvasFit(rects[0..n], MANGO_CANVAS_W, MANGO_CANVAS_H, MANGO_CANVAS_PAD);
+    const sf = @max(fit.fit_scale, 1e-6);
+    var i: isize = @intCast(n);
+    while (i > 0) {
+        i -= 1;
+        const idx: usize = @intCast(i);
+        const r = rects[idx];
+        if (r.w <= 0 or r.h <= 0) continue;
+        const sx = (r.x - fit.min_x) * sf;
+        const sy = (r.y - fit.min_y) * sf;
+        const sw: f64 = @as(f64, @floatFromInt(r.w)) * sf;
+        const sh: f64 = @as(f64, @floatFromInt(r.h)) * sf;
+        if (px >= sx and px < sx + sw and py >= sy and py < sy + sh) return i;
+    }
+    return -1;
+}
+
+fn onMangoCanvasPressed(_: *hg.GtkGestureClick, n_press: c_int, x: f64, y: f64, user_data: ?*anyopaque) callconv(.c) void {
+    const hit = mangoCanvasHit(x, y);
+    if (hit >= 0) {
+        g_mango_selected = @intCast(hit);
+        queueMangoCanvasDraw();
+        if (n_press >= 2) {
+            var line_idxs: [8]usize = undefined;
+            const m = mangoMonitorLines(&line_idxs);
+            if (@as(usize, @intCast(hit)) < m) {
+                if (user_data) |parent| openMangoMonitorDialog(parent, line_idxs[@intCast(hit)]);
+            }
+        }
+    }
+}
+
+fn onMangoDragBegin(_: *hg.GtkGestureDrag, x: f64, y: f64, _: ?*anyopaque) callconv(.c) void {
+    const hit = mangoCanvasHit(x, y);
+    g_mdrag_idx = hit;
+    if (hit < 0) return;
+    g_mango_selected = @intCast(hit);
+    var line_idxs: [8]usize = undefined;
+    const m = mangoMonitorLines(&line_idxs);
+    var rects: [8]mon.ArrangeRect = undefined;
+    const n = mangoRects(&rects, line_idxs[0..m]);
+    const fit = mon.computeCanvasFit(rects[0..n], MANGO_CANVAS_W, MANGO_CANVAS_H, MANGO_CANVAS_PAD);
+    g_mdrag_fit_min_x = fit.min_x;
+    g_mdrag_fit_min_y = fit.min_y;
+    g_mdrag_fit_scale = @max(fit.fit_scale, 1e-6);
+    const idx: usize = @intCast(hit);
+    if (idx < m) {
+        const kv = mango.parseKV(doc_monitors.line(line_idxs[idx])) orelse return;
+        g_mdrag_anchor_x = ruleInt(kv.value, "x", 0);
+        g_mdrag_anchor_y = ruleInt(kv.value, "y", 0);
+    }
+    queueMangoCanvasDraw();
+}
+
+fn setMangoRuleFieldNoSave(line_idx: usize, key: []const u8, value: []const u8) void {
+    const kv = mango.parseKV(doc_monitors.line(line_idx)) orelse return;
+    var out: [mango.MAX_LINE]u8 = undefined;
+    var n: usize = 0;
+    const W = struct {
+        fn s(buf: []u8, nn: *usize, t: []const u8) void {
+            if (nn.* >= buf.len) return;
+            const k = @min(t.len, buf.len - nn.*);
+            @memcpy(buf[nn.*..][0..k], t[0..k]);
+            nn.* += k;
+        }
+    };
+    W.s(&out, &n, "monitor_rule = ");
+    var first = true;
+    var saw = false;
+    var it = std.mem.splitScalar(u8, kv.value, ',');
+    while (it.next()) |raw| {
+        const p = std.mem.trim(u8, raw, " \t");
+        if (p.len == 0) continue;
+        const c = std.mem.indexOfScalar(u8, p, ':');
+        const pk: []const u8 = if (c) |cc| std.mem.trim(u8, p[0..cc], " \t") else p;
+        if (std.mem.eql(u8, pk, key)) {
+            saw = true;
+            if (!first) W.s(&out, &n, ", ");
+            first = false;
+            W.s(&out, &n, key);
+            W.s(&out, &n, ":");
+            W.s(&out, &n, value);
+        } else {
+            if (!first) W.s(&out, &n, ", ");
+            first = false;
+            W.s(&out, &n, p);
+        }
+    }
+    if (!saw) {
+        if (!first) W.s(&out, &n, ", ");
+        W.s(&out, &n, key);
+        W.s(&out, &n, ":");
+        W.s(&out, &n, value);
+    }
+    doc_monitors.setLine(line_idx, out[0..n]);
+}
+
+fn onMangoDragUpdate(gesture: *hg.GtkGestureDrag, _: f64, _: f64, _: ?*anyopaque) callconv(.c) void {
+    if (g_mdrag_idx < 0) return;
+    const idx: usize = @intCast(g_mdrag_idx);
+    var line_idxs: [8]usize = undefined;
+    const m = mangoMonitorLines(&line_idxs);
+    if (idx >= m) return;
+    var ox: f64 = 0;
+    var oy: f64 = 0;
+    hg.gtk_gesture_drag_get_offset(gesture, &ox, &oy);
+    const inv = 1.0 / @max(g_mdrag_fit_scale, 1e-9);
+    const nx: i32 = g_mdrag_anchor_x + @as(i32, @intFromFloat(@round(ox * inv)));
+    const ny: i32 = g_mdrag_anchor_y + @as(i32, @intFromFloat(@round(oy * inv)));
+    var xbuf: [16]u8 = undefined;
+    var ybuf: [16]u8 = undefined;
+    const xs = std.fmt.bufPrint(&xbuf, "{d}", .{nx}) catch return;
+    const ys = std.fmt.bufPrint(&ybuf, "{d}", .{ny}) catch return;
+    setMangoRuleFieldNoSave(line_idxs[idx], "x", xs);
+    setMangoRuleFieldNoSave(line_idxs[idx], "y", ys);
+    queueMangoCanvasDraw();
+}
+
+fn onMangoDragEnd(_: *hg.GtkGestureDrag, _: f64, _: f64, _: ?*anyopaque) callconv(.c) void {
+    if (g_mdrag_idx < 0) return;
+    const moved: usize = @intCast(g_mdrag_idx);
+    g_mdrag_idx = -1;
+    var line_idxs: [8]usize = undefined;
+    const m = mangoMonitorLines(&line_idxs);
+    var rects: [8]mon.ArrangeRect = undefined;
+    const n = mangoRects(&rects, line_idxs[0..m]);
+    const dis = [_]bool{false} ** 8;
+    mon.finalizeDrag(rects[0..n], dis[0..n], moved);
+    writeMangoPositions(rects[0..n], line_idxs[0..m]);
+    rebuildRuleList(&g_rp_monitors);
+    queueMangoCanvasDraw();
+}
+
+fn onMangoArrangeClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    var line_idxs: [8]usize = undefined;
+    const m = mangoMonitorLines(&line_idxs);
+    var rects: [8]mon.ArrangeRect = undefined;
+    const n = mangoRects(&rects, line_idxs[0..m]);
+    if (n == 0) return;
+    const dis = [_]bool{false} ** 8;
+    mon.arrangeSideBySide(rects[0..n], dis[0..n]);
+    writeMangoPositions(rects[0..n], line_idxs[0..m]);
+    rebuildRuleList(&g_rp_monitors);
+    queueMangoCanvasDraw();
+}
+
+fn onMangoAlignTopsClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    var line_idxs: [8]usize = undefined;
+    const m = mangoMonitorLines(&line_idxs);
+    var rects: [8]mon.ArrangeRect = undefined;
+    const n = mangoRects(&rects, line_idxs[0..m]);
+    if (n == 0) return;
+    const dis = [_]bool{false} ** 8;
+    mon.alignTops(rects[0..n], dis[0..n]);
+    var mn_y: i32 = std.math.maxInt(i32);
+    for (rects[0..n]) |r| mn_y = @min(mn_y, r.y);
+    if (mn_y != std.math.maxInt(i32)) {
+        for (rects[0..n]) |*r| r.y -= mn_y;
+    }
+    writeMangoPositions(rects[0..n], line_idxs[0..m]);
+    rebuildRuleList(&g_rp_monitors);
+    queueMangoCanvasDraw();
+}
+
+fn onMangoCapsRefreshClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    refreshMangoCaps();
+    queueMangoCanvasDraw();
+}
+
+// --- Capability-aware monitor_rule dialog ---
+
+fn onMangoResChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    const kv = mango.parseKV(doc_monitors.line(g_mdlg_line)) orelse return;
+    const nm = ruleField(kv.value, "name");
+    const caps = mangoCapsFor(nm) orelse return;
+    if (idx >= caps.n_res) return;
+    const res = caps.resolution(idx);
+    const x = std.mem.indexOfScalar(u8, res, 'x') orelse return;
+    const ws = res[0..x];
+    const hs = res[x + 1 ..];
+    const list = caps.hzList(idx);
+    if (list.len > 0) {
+        var rib: [16]u8 = undefined;
+        const ri = std.fmt.bufPrint(&rib, "{d}", .{@as(i32, @intFromFloat(@round(list[0])))}) catch return;
+        setMangoRuleField(g_mdlg_line, "width", ws);
+        setMangoRuleField(g_mdlg_line, "height", hs);
+        setMangoRuleField(g_mdlg_line, "refresh", ri);
+    } else {
+        setMangoRuleField(g_mdlg_line, "width", ws);
+        setMangoRuleField(g_mdlg_line, "height", hs);
+    }
+    reload();
+    rebuildRuleList(&g_rp_monitors);
+    queueMangoCanvasDraw();
+}
+
+fn onMangoHzChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx: usize = @intCast(gtk.adw_combo_row_get_selected(row));
+    const kv = mango.parseKV(doc_monitors.line(g_mdlg_line)) orelse return;
+    const nm = ruleField(kv.value, "name");
+    const ws = ruleField(kv.value, "width");
+    const hs = ruleField(kv.value, "height");
+    const caps = mangoCapsFor(nm) orelse return;
+    var ri: usize = 0;
+    var found = false;
+    var i: usize = 0;
+    while (i < caps.n_res) : (i += 1) {
+        const r = caps.resolution(i);
+        const x = std.mem.indexOfScalar(u8, r, 'x') orelse continue;
+        if (std.mem.eql(u8, r[0..x], ws) and std.mem.eql(u8, r[x + 1 ..], hs)) {
+            ri = i;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return;
+    const list = caps.hzList(ri);
+    if (idx >= list.len) return;
+    var rib: [16]u8 = undefined;
+    const ri_s = std.fmt.bufPrint(&rib, "{d}", .{@as(i32, @intFromFloat(@round(list[idx])))}) catch return;
+    setMangoRuleField(g_mdlg_line, "refresh", ri_s);
+    reload();
+    rebuildRuleList(&g_rp_monitors);
+    queueMangoCanvasDraw();
+}
+
+fn onMangoCtxDialogClosed(_: *hg.AdwDialog, _: ?*anyopaque) callconv(.c) void {
+    reload();
+    rebuildRuleList(&g_rp_monitors);
+    queueMangoCanvasDraw();
+}
+
+fn openMangoMonitorDialog(parent: *anyopaque, line: usize) void {
+    if (line >= doc_monitors.lineCount()) return;
+    const kv0 = mango.parseKV(doc_monitors.line(line)) orelse return;
+    if (!std.mem.eql(u8, kv0.key, "monitor_rule")) {
+        openRuleDialog(parent, &g_rp_monitors, line);
+        return;
+    }
+    g_mdlg_line = line;
+    const kv = mango.parseKV(doc_monitors.line(line)) orelse return;
+    const nm = ruleField(kv.value, "name");
+    const ws = ruleField(kv.value, "width");
+    const hs = ruleField(kv.value, "height");
+    const rf = ruleField(kv.value, "refresh");
+    const xs = ruleField(kv.value, "x");
+    const ys = ruleField(kv.value, "y");
+    const ss = ruleField(kv.value, "scale");
+    const rrs = ruleField(kv.value, "rr");
+    const vrs = ruleField(kv.value, "vrr");
+    const mir = ruleField(kv.value, "mirror");
+
+    const content = hp.newDialogBox();
+    const group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(group, "Monitor Rule");
+    {
+        const row = gtk.adw_action_row_new();
+        gtk.adw_preferences_row_set_title(@ptrCast(row), "Name");
+        const entry = gtk.gtk_entry_new();
+        gtk.gtk_widget_set_size_request(@ptrCast(entry), 180, -1);
+        gtk.gtk_widget_set_valign(@ptrCast(entry), gtk.ALIGN_CENTER);
+        hp.setEntryZ(gtk.gtk_entry_get_buffer(entry), nm);
+        _ = gtk.g_signal_connect_data(@ptrCast(gtk.gtk_entry_get_buffer(entry)), "notify::text", @ptrCast(&onMangoNameChanged), null, null, 0);
+        gtk.adw_action_row_add_suffix(row, @ptrCast(entry));
+        gtk.adw_preferences_group_add(group, @ptrCast(row));
+    }
+    const caps = mangoCapsFor(nm);
+    if (caps != null and caps.?.n_res > 0) {
+        const c = caps.?;
+        var cur_res_buf: [32]u8 = undefined;
+        const cur_res = std.fmt.bufPrint(&cur_res_buf, "{s}x{s}", .{ ws, hs }) catch "";
+        var ri = c.findResolution(cur_res) orelse 0;
+        if (ri >= c.n_res) ri = 0;
+        var rn: usize = 0;
+        while (rn < c.n_res and rn < mon.MAX_RES) : (rn += 1) {
+            const s = c.resolution(rn);
+            const n = @min(s.len, 15);
+            @memcpy(g_mdlg_res_bufs[rn][0..n], s[0..n]);
+            g_mdlg_res_bufs[rn][n] = 0;
+            g_mdlg_res_ptrs[rn] = g_mdlg_res_bufs[rn][0..n :0];
+        }
+        hp.addComboRow(group, "Resolution", g_mdlg_res_ptrs[0..rn], @intCast(ri), @ptrCast(&onMangoResChanged), null);
+        const list = c.hzList(ri);
+        var hn: usize = 0;
+        var sel: usize = 0;
+        for (list, 0..) |hz, hi| {
+            if (hn >= mon.MAX_HZ) break;
+            var hzb: [16]u8 = undefined;
+            const s = mon.formatHz(hz, &hzb);
+            const n = @min(s.len, 15);
+            @memcpy(g_mdlg_hz_bufs[hn][0..n], s[0..n]);
+            g_mdlg_hz_bufs[hn][n] = 0;
+            g_mdlg_hz_ptrs[hn] = g_mdlg_hz_bufs[hn][0..n :0];
+            const rounded: i32 = @intFromFloat(@round(hz));
+            var rib: [16]u8 = undefined;
+            const rs = std.fmt.bufPrint(&rib, "{d}", .{rounded}) catch "";
+            if (std.mem.eql(u8, rs, rf)) sel = hn;
+            hn += 1;
+            _ = hi;
+        }
+        if (hn > 0) {
+            hp.addComboRow(group, "Refresh Rate", g_mdlg_hz_ptrs[0..hn], @intCast(sel), @ptrCast(&onMangoHzChanged), null);
+        }
+    }
+    addMangoField(group, "Width", ws, "width", 100);
+    addMangoField(group, "Height", hs, "height", 100);
+    addMangoField(group, "Refresh", rf, "refresh", 100);
+    addMangoField(group, "X", xs, "x", 100);
+    addMangoField(group, "Y", ys, "y", 100);
+    addMangoField(group, "Scale", ss, "scale", 100);
+    addMangoField(group, "RR", rrs, "rr", 100);
+    addMangoField(group, "VRR", vrs, "vrr", 100);
+    addMangoField(group, "Mirror", mir, "mirror", 160);
+    gtk.gtk_box_append(content, @ptrCast(group));
+    const d = hg.adw_dialog_new();
+    hg.adw_dialog_set_title(d, "Edit Monitor Rule");
+    hg.adw_dialog_set_content_width(d, 600);
+    hg.adw_dialog_set_child(d, @ptrCast(content));
+    _ = gtk.g_signal_connect_data(@ptrCast(d), "closed", @ptrCast(&onMangoCtxDialogClosed), null, null, 0);
+    hp.addDialogFooter(content, d);
+    hg.adw_dialog_present(d, parent);
+}
+
+const MangoFieldCtx = struct { key: []const u8 };
+var g_mango_field_ctx: [16]MangoFieldCtx = undefined;
+var g_mango_field_n: usize = 0;
+
+fn onMangoFieldChanged(buffer: *gtk.GtkEntryBuffer, _: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
+    const ctx: *MangoFieldCtx = @ptrCast(@alignCast(user_data.?));
+    setMangoRuleField(g_mdlg_line, ctx.key, std.mem.span(gtk.gtk_entry_buffer_get_text(buffer)));
+}
+
+fn onMangoNameChanged(buffer: *gtk.GtkEntryBuffer, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    setMangoRuleField(g_mdlg_line, "name", std.mem.span(gtk.gtk_entry_buffer_get_text(buffer)));
+}
+
+fn addMangoField(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, initial: []const u8, key: []const u8, width: c_int) void {
+    if (g_mango_field_n >= g_mango_field_ctx.len) g_mango_field_n = 0;
+    const ctx = &g_mango_field_ctx[g_mango_field_n];
+    g_mango_field_n += 1;
+    ctx.* = .{ .key = key };
+    hp.addEntryRow(group, title, initial, width, @ptrCast(&onMangoFieldChanged), @ptrCast(ctx));
 }
 
 // ---------------------------------------------------------------------
@@ -1279,8 +1885,32 @@ fn buildLayoutPage() *gtk.GtkBox {
 
 fn buildMonitorsPage() *gtk.GtkBox {
     const outer = hp.pageBox();
+    // Update the description to mention the canvas + modes.
+    g_rp_monitors.desc = "One row per monitor_rule. Drag cards on the canvas to arrange; Auto-detect fills name, resolution, refresh and position from the connected displays (extras like scale/rr/vrr/mirror are preserved). Resolution choices come from wlr-randr's full mode list.";
     addRulePage(outer, &g_rp_monitors);
+
+    refreshMangoCaps();
+
+    g_mango_canvas = hg.gtk_drawing_area_new();
+    hg.gtk_drawing_area_set_content_width(g_mango_canvas.?, MANGO_CANVAS_W);
+    hg.gtk_drawing_area_set_content_height(g_mango_canvas.?, MANGO_CANVAS_H);
+    hg.gtk_drawing_area_set_draw_func(g_mango_canvas.?, &onMangoCanvasDraw, null, null);
+    gtk.gtk_box_append(outer, @ptrCast(g_mango_canvas.?));
+
+    const click = hg.gtk_gesture_click_new();
+    _ = gtk.g_signal_connect_data(@ptrCast(click), "pressed", @ptrCast(&onMangoCanvasPressed), g_mango_canvas.?, null, 0);
+    gtk.gtk_widget_add_controller(@ptrCast(g_mango_canvas.?), @ptrCast(click));
+
+    const drag = hg.gtk_gesture_drag_new();
+    _ = gtk.g_signal_connect_data(@ptrCast(drag), "drag-begin", @ptrCast(&onMangoDragBegin), null, null, 0);
+    _ = gtk.g_signal_connect_data(@ptrCast(drag), "drag-update", @ptrCast(&onMangoDragUpdate), null, null, 0);
+    _ = gtk.g_signal_connect_data(@ptrCast(drag), "drag-end", @ptrCast(&onMangoDragEnd), null, null, 0);
+    gtk.gtk_widget_add_controller(@ptrCast(g_mango_canvas.?), @ptrCast(drag));
+
     hp.appendActionButton(outer, "Auto-detect Monitors", @ptrCast(&onMonitorsDetectClicked), null);
+    hp.appendActionButton(outer, "Arrange Side-by-Side", @ptrCast(&onMangoArrangeClicked), null);
+    hp.appendActionButton(outer, "Align Tops", @ptrCast(&onMangoAlignTopsClicked), null);
+    hp.appendActionButton(outer, "Refresh Modes", @ptrCast(&onMangoCapsRefreshClicked), null);
     return outer;
 }
 

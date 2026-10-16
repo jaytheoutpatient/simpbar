@@ -289,6 +289,7 @@ pub const Monitor = struct {
     position: Text = .{},
     scale: Text = .{},
     vrr: i32 = -1,
+    transform: i32 = 0,
 };
 
 // ---------------------------------------------------------------------
@@ -648,6 +649,7 @@ fn buildStateJson() ![]u8 {
         try list.appendSlice(gpa, ",\"position\":"); try appendText(&list, m.position);
         try list.appendSlice(gpa, ",\"scale\":"); try appendText(&list, m.scale);
         try list.appendSlice(gpa, ",\"vrr\":"); try appendInt(&list, m.vrr);
+        try list.appendSlice(gpa, ",\"transform\":"); try appendInt(&list, m.transform);
         try list.append(gpa, '}');
     }
     try list.appendSlice(gpa, "],\"binds\":[");
@@ -781,7 +783,7 @@ fn parseLeaf(obj: std.json.ObjectMap, out: *Leaf) void {
 }
 
 fn parseMonitor(obj: std.json.ObjectMap, out: *Monitor) void {
-    out.* = .{ .enabled = optBool(obj, "enabled", true), .vrr = optInt(obj, "vrr", -1) };
+    out.* = .{ .enabled = optBool(obj, "enabled", true), .vrr = optInt(obj, "vrr", -1), .transform = optInt(obj, "transform", 0) };
     out.output.set(optStr(obj, "output"));
     out.mode.set(optStr(obj, "mode"));
     out.position.set(optStr(obj, "position"));
@@ -1345,6 +1347,12 @@ fn appendMonitors(list: *std.ArrayList(u8)) !void {
             try list.appendSlice(gpa, "\n\tvrr = ");
             var b: [8]u8 = undefined;
             try list.appendSlice(gpa, std.fmt.bufPrint(&b, "{d}", .{m.vrr}) catch unreachable);
+            try list.append(gpa, ',');
+        }
+        if (m.transform != 0) {
+            try list.appendSlice(gpa, "\n\ttransform = ");
+            var tb: [8]u8 = undefined;
+            try list.appendSlice(gpa, std.fmt.bufPrint(&tb, "{d}", .{m.transform}) catch unreachable);
         }
         try list.appendSlice(gpa, "\n})\n");
     }

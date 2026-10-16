@@ -41,3 +41,40 @@ pub extern "c" fn gtk_spin_button_get_value(self: *gtk.GtkSpinButton) f64;
 // Hyprland" action button to the content header bar.
 pub extern "c" fn gtk_header_bar_pack_start(self: *anyopaque, child: *anyopaque) void;
 pub extern "c" fn adw_header_bar_pack_end(self: *anyopaque, child: *anyopaque) void;
+
+// --- Monitor arrange canvas (Hyprland + Mango pages) -------------------
+// GtkDrawingArea + GtkGestureClick/Drag + cairo, verified via `nm -D`
+// against libgtk-4.so.1 / libcairo.so.2 on this machine.
+
+pub const GtkDrawingArea = opaque {};
+pub const GtkGestureClick = opaque {};
+pub const GtkGestureDrag = opaque {};
+pub const CairoT = opaque {};
+
+pub extern "c" fn gtk_drawing_area_new() *GtkDrawingArea;
+pub extern "c" fn gtk_drawing_area_set_content_width(self: *GtkDrawingArea, width: c_int) void;
+pub extern "c" fn gtk_drawing_area_set_content_height(self: *GtkDrawingArea, height: c_int) void;
+pub extern "c" fn gtk_drawing_area_set_draw_func(
+    self: *GtkDrawingArea,
+    draw_func: ?*const fn (*GtkDrawingArea, *CairoT, c_int, c_int, ?*anyopaque) callconv(.c) void,
+    user_data: ?*anyopaque,
+    destroy: ?*const fn (?*anyopaque) callconv(.c) void,
+) void;
+pub extern "c" fn gtk_widget_queue_draw(self: *anyopaque) void;
+
+pub extern "c" fn gtk_gesture_click_new() *GtkGestureClick;
+pub extern "c" fn gtk_gesture_drag_new() *GtkGestureDrag;
+pub extern "c" fn gtk_gesture_drag_get_offset(self: *GtkGestureDrag, x: ?*f64, y: ?*f64) void;
+pub extern "c" fn gtk_event_controller_get_widget(self: *anyopaque) ?*anyopaque;
+
+// cairo (libcairo.so.2)
+pub extern "c" fn cairo_set_source_rgb(cr: *CairoT, r: f64, g: f64, b: f64) void;
+pub extern "c" fn cairo_set_source_rgba(cr: *CairoT, r: f64, g: f64, b: f64, a: f64) void;
+pub extern "c" fn cairo_rectangle(cr: *CairoT, x: f64, y: f64, w: f64, h: f64) void;
+pub extern "c" fn cairo_fill(cr: *CairoT) void;
+pub extern "c" fn cairo_stroke(cr: *CairoT) void;
+pub extern "c" fn cairo_set_line_width(cr: *CairoT, w: f64) void;
+pub extern "c" fn cairo_move_to(cr: *CairoT, x: f64, y: f64) void;
+pub extern "c" fn cairo_show_text(cr: *CairoT, text: [*:0]const u8) void;
+pub extern "c" fn cairo_select_font_face(cr: *CairoT, family: [*:0]const u8, slant: c_int, weight: c_int) void;
+pub extern "c" fn cairo_set_font_size(cr: *CairoT, size: f64) void;

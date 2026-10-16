@@ -25,6 +25,7 @@ const gtk = @import("welcome_gtk.zig");
 const hg = @import("hypr_gtk.zig");
 const hypr = @import("hyprland.zig");
 const desk = @import("desk_theme.zig");
+const mon = @import("monitors.zig");
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -656,15 +657,49 @@ pub fn buildGeneralPage() *gtk.GtkBox {
 }
 
 // ---------------------------------------------------------------------
-// Monitors page
+// Monitors page — Event-Horizon-style editor: capability-aware
+// resolution/refresh dropdowns (from hyprctl availableModes), a visual
+// arrange canvas (click to select, drag to move, snap + normalize on
+// drop), side-by-side / align-tops helpers, and the original Auto-detect
+// button (fills name/mode/position/scale/transform from live outputs).
 // ---------------------------------------------------------------------
 
 var g_monitors_list: ?*gtk.GtkListBox = null;
+var g_mon_canvas: ?*hg.GtkDrawingArea = null;
+var g_mon_selected: usize = 0;
+
+// Capability cache: one OutputCaps per output name, refreshed from
+// `hyprctl monitors -j` (availableModes + current mode as fallback).
+var g_caps: [hypr.MAX_MONITORS]mon.OutputCaps = undefined;
+var g_caps_names: [hypr.MAX_MONITORS]MonitorName = undefined;
+var g_caps_n: usize = 0;
+
+// Edit-dialog dropdown storage (one dialog at a time; GtkStringList copies
+// what it is given, but the label pointers must stay alive while the
+// dialog lives, so they live here, not on the stack).
+var g_dlg_res_bufs: [mon.MAX_RES][16:0]u8 = undefined;
+var g_dlg_res_ptrs: [mon.MAX_RES][*:0]const u8 = undefined;
+var g_dlg_hz_bufs: [mon.MAX_HZ][16:0]u8 = undefined;
+var g_dlg_hz_ptrs: [mon.MAX_HZ][*:0]const u8 = undefined;
+
+const TRANSFORM_LABELS = [_][*:0]const u8{ "0° normal", "90°", "180°", "270°", "Flip", "Flip 90°", "Flip 180°", "Flip 270°" };
+
+const MON_CANVAS_W: c_int = 620;
+const MON_CANVAS_H: c_int = 280;
+const MON_CANVAS_PAD: f64 = 0.1;
+
+var g_drag_idx: isize = -1;
+var g_drag_anchor_x: i32 = 0;
+var g_drag_anchor_y: i32 = 0;
+var g_drag_fit_min_x: f64 = 0;
+var g_drag_fit_min_y: f64 = 0;
+var g_drag_fit_scale: f64 = 1;
 
 fn onMonitorEnableChanged(sw: *gtk.GtkSwitch, _: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
     const m: *hypr.Monitor = @ptrCast(@alignCast(user_data.?));
     m.enabled = gtk.gtk_switch_get_active(sw) != 0;
     _ = hypr.saveAll();
+    queueMonCanvasDraw();
 }
 
 fn onMonitorEditClicked(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
@@ -675,8 +710,348 @@ fn onMonitorEditClicked(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv
 fn onMonitorRemoveClicked(_: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
     const idx: usize = @intFromPtr(user_data.?);
     removeAt(hypr.Monitor, &hypr.state.monitors, &hypr.state.monitors_len, idx);
+    if (g_mon_selected >= hypr.state.monitors_len and hypr.state.monitors_len > 0) {
+        g_mon_selected = hypr.state.monitors_len - 1;
+    }
     _ = hypr.saveAll();
     rebuildMonitorsList();
+    queueMonCanvasDraw();
+}
+
+fn queueMonCanvasDraw() void {
+    if (g_mon_canvas) |c| hg.gtk_widget_queue_draw(@ptrCast(c));
+}
+
+/// Builds canvas rects from the model. Returns count; fills `rects` and
+/// `disabled` in parallel.
+fn hyprRects(rects: []mon.ArrangeRect, disabled: []bool) usize {
+    const n = @min(hypr.state.monitors_len, rects.len);
+    for (hypr.state.monitors[0..n], 0..) |*m, i| {
+        disabled[i] = !m.enabled;
+        const spec = mon.parseHyprModeString(m.mode.slice());
+        var px: i32 = 0;
+        var py: i32 = 0;
+        if (m.position.len != 0) {
+            _ = mon.parsePositionXy(m.position.slice(), &px, &py);
+        }
+        var lw: i32 = 0;
+        var lh: i32 = 0;
+        const scale_s: []const u8 = if (m.scale.len != 0) m.scale.slice() else "1";
+        mon.logicalExtents(spec.w, spec.h, scale_s, m.transform, &lw, &lh);
+        rects[i] = .{ .x = px, .y = py, .w = lw, .h = lh };
+    }
+    return n;
+}
+
+fn writeHyprPositions(rects: []const mon.ArrangeRect) void {
+    for (hypr.state.monitors[0..hypr.state.monitors_len], 0..) |*m, i| {
+        if (i >= rects.len) break;
+        if (!m.enabled) continue;
+        var buf: [32]u8 = undefined;
+        if (mon.formatPositionXy(rects[i].x, rects[i].y, &buf)) |s| {
+            m.position.set(s);
+        } else |_| {}
+    }
+}
+
+fn capsForOutput(output: []const u8) ?*mon.OutputCaps {
+    if (output.len == 0) return null;
+    var i: usize = 0;
+    while (i < g_caps_n) : (i += 1) {
+        if (std.mem.eql(u8, g_caps_names[i].slice(), output)) return &g_caps[i];
+    }
+    return null;
+}
+
+fn scanJsonFloat(obj: []const u8, key: []const u8) ?f64 {
+    var needle: [64]u8 = undefined;
+    const nk = std.fmt.bufPrint(&needle, "\"{s}\"", .{key}) catch return null;
+    const ki = std.mem.indexOf(u8, obj, nk) orelse return null;
+    var k = ki + nk.len;
+    while (k < obj.len and (obj[k] == ' ' or obj[k] == '\t')) k += 1;
+    if (k >= obj.len or obj[k] != ':') return null;
+    k += 1;
+    while (k < obj.len and (obj[k] == ' ' or obj[k] == '\t')) k += 1;
+    const start = k;
+    if (k < obj.len and (obj[k] == '-' or obj[k] == '+')) k += 1;
+    var digits = false;
+    while (k < obj.len and (std.ascii.isDigit(obj[k]) or obj[k] == '.')) : (k += 1) {
+        if (std.ascii.isDigit(obj[k])) digits = true;
+    }
+    if (!digits) return null;
+    return std.fmt.parseFloat(f64, obj[start..k]) catch null;
+}
+
+fn scanJsonString(obj: []const u8, key: []const u8) ?[]const u8 {
+    var needle: [64]u8 = undefined;
+    const nk = std.fmt.bufPrint(&needle, "\"{s}\"", .{key}) catch return null;
+    const ki = std.mem.indexOf(u8, obj, nk) orelse return null;
+    var k = ki + nk.len;
+    while (k < obj.len and (obj[k] == ' ' or obj[k] == '\t')) k += 1;
+    if (k >= obj.len or obj[k] != ':') return null;
+    k += 1;
+    while (k < obj.len and (obj[k] == ' ' or obj[k] == '\t')) k += 1;
+    if (k >= obj.len or obj[k] != '"') return null;
+    k += 1;
+    const start = k;
+    while (k < obj.len and obj[k] != '"') : (k += 1) {}
+    if (k >= obj.len) return null;
+    return obj[start..k];
+}
+
+/// Refreshes the caps cache from `hyprctl monitors -j` without touching
+/// the saved config. Called on page build and by the Refresh button.
+fn refreshHyprCaps() void {
+    g_caps_n = 0;
+    const output = hypr.captureOutput(&.{ "hyprctl", "monitors", "-j" }, 3000) orelse return;
+    defer std.heap.c_allocator.free(output);
+    // Split top-level objects (depth-1 members of the root array).
+    var depth: usize = 0;
+    var obj_start: ?usize = null;
+    var i: usize = 0;
+    while (i < output.len) : (i += 1) {
+        const c = output[i];
+        if (c == '"') {
+            i += 1;
+            while (i < output.len and output[i] != '"') : (i += 1) {
+                if (output[i] == '\\' and i + 1 < output.len) i += 1;
+            }
+            continue;
+        }
+        if (c == '{') {
+            if (depth == 1 and obj_start == null) obj_start = i;
+            depth += 1;
+            continue;
+        }
+        if (c == '}') {
+            if (depth > 0) depth -= 1;
+            if (depth == 1 and obj_start != null) {
+                const obj = output[obj_start.? .. i + 1];
+                obj_start = null;
+                const nm = scanJsonString(obj, "name") orelse continue;
+                if (nm.len == 0 or g_caps_n >= hypr.MAX_MONITORS) continue;
+                const idx = g_caps_n;
+                const nn = @min(nm.len, g_caps_names[idx].buf.len);
+                @memcpy(g_caps_names[idx].buf[0..nn], nm[0..nn]);
+                g_caps_names[idx].len = nn;
+                g_caps[idx] = .{};
+                mon.mergeHyprAvailableModes(obj, &g_caps[idx]);
+                // Current mode as fallback (covers compositors/versions
+                // without availableModes, and guarantees the configured
+                // mode is always selectable).
+                const w = scanJsonFloat(obj, "width");
+                const h = scanJsonFloat(obj, "height");
+                const hz = scanJsonFloat(obj, "refreshRate") orelse scanJsonFloat(obj, "refresh");
+                if (w != null and h != null) {
+                    g_caps[idx].addMode(@intFromFloat(@trunc(w.?)), @intFromFloat(@trunc(h.?)), hz orelse 0);
+                    g_caps[idx].sortModes();
+                }
+                g_caps_n += 1;
+            }
+            continue;
+        }
+        if (c == '[' and depth == 0) {
+            depth = 1;
+            continue;
+        }
+        if (c == ']' and depth == 1) {
+            depth = 0;
+            continue;
+        }
+    }
+}
+
+// --- Canvas paint + interaction ---
+
+fn onMonCanvasDraw(_: *hg.GtkDrawingArea, cr: *hg.CairoT, w: c_int, h: c_int, _: ?*anyopaque) callconv(.c) void {
+    var rects: [hypr.MAX_MONITORS]mon.ArrangeRect = undefined;
+    var disabled: [hypr.MAX_MONITORS]bool = undefined;
+    const n = hyprRects(&rects, &disabled);
+    const cw: i32 = @intCast(w);
+    const ch: i32 = @intCast(h);
+    // Background.
+    hg.cairo_set_source_rgb(cr, 0.11, 0.11, 0.14);
+    hg.cairo_rectangle(cr, 0, 0, @floatFromInt(@max(1, cw)), @floatFromInt(@max(1, ch)));
+    hg.cairo_fill(cr);
+    if (n == 0) {
+        hg.cairo_set_source_rgb(cr, 0.6, 0.6, 0.65);
+        hg.cairo_select_font_face(cr, "monospace", 0, 0);
+        hg.cairo_set_font_size(cr, 13);
+        hg.cairo_move_to(cr, 16, 24);
+        var msg: [128:0]u8 = undefined;
+        const s = std.fmt.bufPrintZ(&msg, "No monitors — Add one or hit Auto-detect.", .{}) catch "No monitors.";
+        hg.cairo_show_text(cr, s.ptr);
+        return;
+    }
+    const fit = mon.computeCanvasFit(rects[0..n], cw, ch, MON_CANVAS_PAD);
+    const sf = @max(fit.fit_scale, 1e-6);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const r = rects[i];
+        if (r.w <= 0 or r.h <= 0) continue;
+        const sx = (r.x - fit.min_x) * sf;
+        const sy = (r.y - fit.min_y) * sf;
+        const sw: f64 = @as(f64, @floatFromInt(r.w)) * sf;
+        const sh: f64 = @as(f64, @floatFromInt(r.h)) * sf;
+        const selected = (i == g_mon_selected);
+        const dis = disabled[i];
+        if (selected) {
+            hg.cairo_set_source_rgba(cr, 0.28, 0.55, 0.95, 0.45);
+        } else if (dis) {
+            hg.cairo_set_source_rgba(cr, 0.4, 0.4, 0.45, 0.35);
+        } else {
+            hg.cairo_set_source_rgba(cr, 0.35, 0.38, 0.48, 0.55);
+        }
+        hg.cairo_rectangle(cr, sx, sy, @max(4, sw), @max(4, sh));
+        hg.cairo_fill(cr);
+        if (selected) {
+            hg.cairo_set_source_rgb(cr, 0.45, 0.7, 1.0);
+        } else {
+            hg.cairo_set_source_rgb(cr, 0.55, 0.58, 0.65);
+        }
+        hg.cairo_set_line_width(cr, if (selected) 2.5 else 1.5);
+        hg.cairo_rectangle(cr, sx, sy, @max(4, sw), @max(4, sh));
+        hg.cairo_stroke(cr);
+        // Label: output name.
+        hg.cairo_set_source_rgb(cr, 0.92, 0.92, 0.95);
+        hg.cairo_select_font_face(cr, "monospace", 0, 0);
+        hg.cairo_set_font_size(cr, 12);
+        hg.cairo_move_to(cr, sx + 6, sy + 16);
+        var lbuf: [72:0]u8 = undefined;
+        const m = &hypr.state.monitors[i];
+        const lbl = if (m.output.len != 0) m.output.slice() else "???";
+        const zs = std.fmt.bufPrintZ(&lbuf, "{s}", .{lbl}) catch "?";
+        hg.cairo_show_text(cr, zs.ptr);
+    }
+}
+
+fn monCanvasHit(px: f64, py: f64) isize {
+    var rects: [hypr.MAX_MONITORS]mon.ArrangeRect = undefined;
+    var disabled: [hypr.MAX_MONITORS]bool = undefined;
+    const n = hyprRects(&rects, &disabled);
+    if (n == 0) return -1;
+    const fit = mon.computeCanvasFit(rects[0..n], MON_CANVAS_W, MON_CANVAS_H, MON_CANVAS_PAD);
+    const sf = @max(fit.fit_scale, 1e-6);
+    var i: isize = @intCast(n);
+    while (i > 0) {
+        i -= 1;
+        const idx: usize = @intCast(i);
+        const r = rects[idx];
+        if (r.w <= 0 or r.h <= 0) continue;
+        const sx = (r.x - fit.min_x) * sf;
+        const sy = (r.y - fit.min_y) * sf;
+        const sw: f64 = @as(f64, @floatFromInt(r.w)) * sf;
+        const sh: f64 = @as(f64, @floatFromInt(r.h)) * sf;
+        if (px >= sx and px < sx + sw and py >= sy and py < sy + sh) return i;
+    }
+    return -1;
+}
+
+fn onMonCanvasPressed(_: *hg.GtkGestureClick, n_press: c_int, x: f64, y: f64, user_data: ?*anyopaque) callconv(.c) void {
+    const hit = monCanvasHit(x, y);
+    if (hit >= 0) {
+        g_mon_selected = @intCast(hit);
+        queueMonCanvasDraw();
+        if (n_press >= 2) {
+            if (user_data) |parent| openMonitorDialog(parent, @intCast(hit));
+        }
+    }
+}
+
+fn onMonDragBegin(_: *hg.GtkGestureDrag, x: f64, y: f64, _: ?*anyopaque) callconv(.c) void {
+    const hit = monCanvasHit(x, y);
+    g_drag_idx = hit;
+    if (hit < 0) return;
+    const idx: usize = @intCast(hit);
+    if (idx < hypr.state.monitors_len) {
+        g_mon_selected = idx;
+    }
+    var rects: [hypr.MAX_MONITORS]mon.ArrangeRect = undefined;
+    var disabled: [hypr.MAX_MONITORS]bool = undefined;
+    const n = hyprRects(&rects, &disabled);
+    const fit = mon.computeCanvasFit(rects[0..n], MON_CANVAS_W, MON_CANVAS_H, MON_CANVAS_PAD);
+    g_drag_fit_min_x = fit.min_x;
+    g_drag_fit_min_y = fit.min_y;
+    g_drag_fit_scale = @max(fit.fit_scale, 1e-6);
+    const m = &hypr.state.monitors[idx];
+    var ax: i32 = 0;
+    var ay: i32 = 0;
+    if (m.position.len != 0) _ = mon.parsePositionXy(m.position.slice(), &ax, &ay);
+    g_drag_anchor_x = ax;
+    g_drag_anchor_y = ay;
+    queueMonCanvasDraw();
+}
+
+fn onMonDragUpdate(gesture: *hg.GtkGestureDrag, _: f64, _: f64, _: ?*anyopaque) callconv(.c) void {
+    if (g_drag_idx < 0) return;
+    const idx: usize = @intCast(g_drag_idx);
+    if (idx >= hypr.state.monitors_len) return;
+    var ox: f64 = 0;
+    var oy: f64 = 0;
+    hg.gtk_gesture_drag_get_offset(gesture, &ox, &oy);
+    const inv = 1.0 / @max(g_drag_fit_scale, 1e-9);
+    const nx: i32 = g_drag_anchor_x + @as(i32, @intFromFloat(@round(ox * inv)));
+    const ny: i32 = g_drag_anchor_y + @as(i32, @intFromFloat(@round(oy * inv)));
+    var buf: [32]u8 = undefined;
+    if (mon.formatPositionXy(nx, ny, &buf)) |s| {
+        hypr.state.monitors[idx].position.set(s);
+    } else |_| {}
+    queueMonCanvasDraw();
+}
+
+fn onMonDragEnd(_: *hg.GtkGestureDrag, _: f64, _: f64, _: ?*anyopaque) callconv(.c) void {
+    if (g_drag_idx < 0) return;
+    const moved: usize = @intCast(g_drag_idx);
+    g_drag_idx = -1;
+    var rects: [hypr.MAX_MONITORS]mon.ArrangeRect = undefined;
+    var disabled: [hypr.MAX_MONITORS]bool = undefined;
+    const n = hyprRects(&rects, &disabled);
+    mon.finalizeDrag(rects[0..n], disabled[0..n], moved);
+    writeHyprPositions(rects[0..n]);
+    _ = hypr.saveAll();
+    rebuildMonitorsList();
+    queueMonCanvasDraw();
+}
+
+fn onMonArrangeClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    var rects: [hypr.MAX_MONITORS]mon.ArrangeRect = undefined;
+    var disabled: [hypr.MAX_MONITORS]bool = undefined;
+    const n = hyprRects(&rects, &disabled);
+    if (n == 0) return;
+    mon.arrangeSideBySide(rects[0..n], disabled[0..n]);
+    writeHyprPositions(rects[0..n]);
+    _ = hypr.saveAll();
+    rebuildMonitorsList();
+    queueMonCanvasDraw();
+}
+
+fn onMonAlignTopsClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    var rects: [hypr.MAX_MONITORS]mon.ArrangeRect = undefined;
+    var disabled: [hypr.MAX_MONITORS]bool = undefined;
+    const n = hyprRects(&rects, &disabled);
+    if (n == 0) return;
+    mon.alignTops(rects[0..n], disabled[0..n]);
+    // Align keeps x, normalizes y only — reuse finalize's normalize by hand:
+    var mn_y: i32 = std.math.maxInt(i32);
+    for (rects[0..n], 0..) |r, i| {
+        if (disabled[i] or r.w <= 0) continue;
+        mn_y = @min(mn_y, r.y);
+    }
+    if (mn_y != std.math.maxInt(i32)) {
+        for (rects[0..n]) |*r| {
+            if (r.w <= 0) continue;
+            r.y -= mn_y;
+        }
+    }
+    writeHyprPositions(rects[0..n]);
+    _ = hypr.saveAll();
+    rebuildMonitorsList();
+    queueMonCanvasDraw();
+}
+
+fn onMonCapsRefreshClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    refreshHyprCaps();
+    queueMonCanvasDraw();
 }
 
 fn rebuildMonitorsList() void {
@@ -690,7 +1065,8 @@ fn rebuildMonitorsList() void {
         var sub: [MAX_ZBUF]u8 = undefined;
         const scale_txt = if (m.scale.len != 0) m.scale.slice() else "1";
         const vrr_txt: [:0]const u8 = if (m.vrr == 1) "on" else if (m.vrr == 2) "auto" else if (m.vrr == 0) "off" else "default";
-        gtk.adw_action_row_set_subtitle(row, fmtZ(&sub, "{s} @ {s} scale {s}  vrr {s}", .{ m.mode.slice(), m.position.slice(), scale_txt, vrr_txt }));
+        const sel_mark: [:0]const u8 = if (i == g_mon_selected) "● " else "";
+        gtk.adw_action_row_set_subtitle(row, fmtZ(&sub, "{s}{s} @ {s} scale {s}  vrr {s}  T{d}", .{ sel_mark, m.mode.slice(), m.position.slice(), scale_txt, vrr_txt, m.transform }));
 
         addRowSwitch(row, m.enabled, @ptrCast(&onMonitorEnableChanged), @ptrCast(m));
         addRowButton(row, "Edit", @ptrCast(&onMonitorEditClicked), @ptrFromInt(i));
@@ -701,17 +1077,112 @@ fn rebuildMonitorsList() void {
 
 fn onMonitorsDialogClosed(_: *hg.AdwDialog, _: ?*anyopaque) callconv(.c) void {
     rebuildMonitorsList();
+    queueMonCanvasDraw();
+}
+
+fn onResChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
+    const m: *hypr.Monitor = @ptrCast(@alignCast(user_data.?));
+    const idx = gtk.adw_combo_row_get_selected(row);
+    const caps = capsForOutput(m.output.slice()) orelse return;
+    if (idx >= caps.n_res) return;
+    const new_res = caps.resolution(idx);
+    var cur_res: []const u8 = "";
+    var cur_hz: []const u8 = "";
+    mon.splitHyprMode(m.mode.slice(), &cur_res, &cur_hz);
+    var hz_buf: [16]u8 = undefined;
+    var new_hz: []const u8 = "";
+    // Snap the refresh rate to the first rate the new resolution offers.
+    const list = caps.hzList(idx);
+    if (list.len > 0) {
+        new_hz = mon.formatHz(list[0], &hz_buf);
+    } else {
+        new_hz = cur_hz;
+    }
+    var mbuf: [40]u8 = undefined;
+    m.mode.set(mon.joinHyprMode(new_res, new_hz, &mbuf));
+    _ = hypr.saveAll();
+    queueMonCanvasDraw();
+}
+
+fn onHzChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
+    const m: *hypr.Monitor = @ptrCast(@alignCast(user_data.?));
+    const idx: usize = @intCast(gtk.adw_combo_row_get_selected(row));
+    const caps = capsForOutput(m.output.slice()) orelse return;
+    var cur_res: []const u8 = "";
+    var cur_hz: []const u8 = "";
+    mon.splitHyprMode(m.mode.slice(), &cur_res, &cur_hz);
+    const ri = caps.findResolution(cur_res) orelse 0;
+    const list = caps.hzList(ri);
+    if (idx >= list.len) return;
+    var hz_buf: [16]u8 = undefined;
+    const hz_s = mon.formatHz(list[idx], &hz_buf);
+    var mbuf: [40]u8 = undefined;
+    m.mode.set(mon.joinHyprMode(cur_res, hz_s, &mbuf));
+    _ = hypr.saveAll();
+    queueMonCanvasDraw();
+}
+
+fn onTransformChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
+    const m: *hypr.Monitor = @ptrCast(@alignCast(user_data.?));
+    const idx: i32 = @intCast(gtk.adw_combo_row_get_selected(row));
+    m.transform = std.math.clamp(idx, 0, 7);
+    _ = hypr.saveAll();
+    queueMonCanvasDraw();
 }
 
 fn openMonitorDialog(parent: *anyopaque, idx: usize) void {
     if (idx >= hypr.state.monitors_len) return;
     const m = &hypr.state.monitors[idx];
+    g_mon_selected = idx;
     const content = newDialogBox();
     const group = gtk.adw_preferences_group_new();
     addTextRow(group, "Output", &m.output, 180);
-    addTextRow(group, "Mode", &m.mode, 180);
+    const caps = capsForOutput(m.output.slice());
+    if (caps != null and caps.?.n_res > 0) {
+        const c = caps.?;
+        var cur_res: []const u8 = "";
+        var cur_hz: []const u8 = "";
+        mon.splitHyprMode(m.mode.slice(), &cur_res, &cur_hz);
+        var ri = c.findResolution(cur_res) orelse 0;
+        if (ri >= c.n_res) ri = 0;
+        // Resolution options.
+        var rn: usize = 0;
+        while (rn < c.n_res and rn < mon.MAX_RES) : (rn += 1) {
+            const s = c.resolution(rn);
+            const n = @min(s.len, 15);
+            @memcpy(g_dlg_res_bufs[rn][0..n], s[0..n]);
+            g_dlg_res_bufs[rn][n] = 0;
+            g_dlg_res_ptrs[rn] = g_dlg_res_bufs[rn][0..n :0];
+        }
+        addComboRow(group, "Resolution", g_dlg_res_ptrs[0..rn], @intCast(ri), @ptrCast(&onResChanged), @ptrCast(m));
+        // Refresh options for the current resolution.
+        const list = c.hzList(ri);
+        var hn: usize = 0;
+        var sel: usize = 0;
+        var hbufs: [mon.MAX_HZ][16]u8 = undefined;
+        for (list, 0..) |hz, i| {
+            if (hn >= mon.MAX_HZ) break;
+            const s = mon.formatHz(hz, &hbufs[hn]);
+            const n = @min(s.len, 15);
+            @memcpy(g_dlg_hz_bufs[hn][0..n], s[0..n]);
+            g_dlg_hz_bufs[hn][n] = 0;
+            g_dlg_hz_ptrs[hn] = g_dlg_hz_bufs[hn][0..n :0];
+            var cmp: [16]u8 = undefined;
+            if (std.mem.eql(u8, mon.formatHz(hz, &cmp), cur_hz)) sel = hn;
+            hn += 1;
+            _ = i;
+        }
+        if (hn > 0) {
+            addComboRow(group, "Refresh Rate", g_dlg_hz_ptrs[0..hn], @intCast(sel), @ptrCast(&onHzChanged), @ptrCast(m));
+        } else {
+            addTextRow(group, "Mode", &m.mode, 180);
+        }
+    } else {
+        addTextRow(group, "Mode", &m.mode, 180);
+    }
     addTextRow(group, "Position", &m.position, 180);
     addTextRow(group, "Scale", &m.scale, 80);
+    addComboRow(group, "Transform", &TRANSFORM_LABELS, @intCast(std.math.clamp(m.transform, 0, 7)), @ptrCast(&onTransformChanged), @ptrCast(m));
     addComboRow(group, "VRR", &VRR_LABELS, vrrIndex(m.vrr), @ptrCast(&onVrrChanged), @ptrCast(&m.vrr));
     addSwitchRow(group, "Enabled", "Write this monitor to the config.", m.enabled, @ptrCast(&onBoolChanged), @ptrCast(&m.enabled));
     gtk.gtk_box_append(content, @ptrCast(group));
@@ -725,16 +1196,20 @@ fn onMonitorAddClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     if (m) |mm| {
         if (monitor_name_count > 0) mm.output.set(monitor_names[0].slice());
         _ = hypr.saveAll();
+        g_mon_selected = hypr.state.monitors_len - 1;
         rebuildMonitorsList();
+        queueMonCanvasDraw();
     }
 }
 
 /// Fills one monitor entry per connected display (name, mode, position,
-/// scale) from `hyprctl monitors -j`: existing entries match by output
-/// name and are updated in place, new displays are appended. No-op when
-/// hyprctl answers nothing.
+/// scale, transform) from `hyprctl monitors -j`: existing entries match by
+/// output name and are updated in place, new displays are appended. No-op
+/// when hyprctl answers nothing. Caps are refreshed too so the new modes
+/// are immediately selectable.
 fn onMonitorsDetectClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     if (desk.detectHyprland() == 0) return;
+    refreshHyprCaps();
     for (desk.detectedMonitors()) |*d| {
         if (d.name().len == 0 or d.width == 0 or d.height == 0) continue;
         var target: ?*hypr.Monitor = null;
@@ -766,21 +1241,45 @@ fn onMonitorsDetectClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void 
     }
     _ = hypr.saveAll();
     rebuildMonitorsList();
+    queueMonCanvasDraw();
 }
 
 pub fn buildMonitorsPage() *gtk.GtkBox {
     const outer = pageBox();
     const group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(group, "Monitors");
-    gtk.adw_preferences_group_set_description(group, "Written via hl.monitor(). Auto-detect fills name, mode, position and scale from the connected displays; reload Hyprland (or let its config auto-reload) to apply.");
+    gtk.adw_preferences_group_set_description(group, "Written via hl.monitor(). Drag cards on the canvas to arrange; Auto-detect fills name, mode, position, scale and transform from the connected displays. Resolution choices come from each display's availableModes.");
     gtk.gtk_box_append(outer, @ptrCast(group));
+
+    refreshHyprCaps();
+
+    // Arrange canvas.
+    g_mon_canvas = hg.gtk_drawing_area_new();
+    hg.gtk_drawing_area_set_content_width(g_mon_canvas.?, MON_CANVAS_W);
+    hg.gtk_drawing_area_set_content_height(g_mon_canvas.?, MON_CANVAS_H);
+    hg.gtk_drawing_area_set_draw_func(g_mon_canvas.?, &onMonCanvasDraw, null, null);
+    gtk.gtk_box_append(outer, @ptrCast(g_mon_canvas.?));
+
+    const click = hg.gtk_gesture_click_new();
+    _ = gtk.g_signal_connect_data(@ptrCast(click), "pressed", @ptrCast(&onMonCanvasPressed), g_mon_canvas.? , null, 0);
+    gtk.gtk_widget_add_controller(@ptrCast(g_mon_canvas.?), @ptrCast(click));
+
+    const drag = hg.gtk_gesture_drag_new();
+    _ = gtk.g_signal_connect_data(@ptrCast(drag), "drag-begin", @ptrCast(&onMonDragBegin), null, null, 0);
+    _ = gtk.g_signal_connect_data(@ptrCast(drag), "drag-update", @ptrCast(&onMonDragUpdate), null, null, 0);
+    _ = gtk.g_signal_connect_data(@ptrCast(drag), "drag-end", @ptrCast(&onMonDragEnd), null, null, 0);
+    gtk.gtk_widget_add_controller(@ptrCast(g_mon_canvas.?), @ptrCast(drag));
 
     g_monitors_list = newListBox();
     gtk.gtk_box_append(outer, @ptrCast(g_monitors_list.?));
+    if (g_mon_selected >= hypr.state.monitors_len and hypr.state.monitors_len > 0) g_mon_selected = 0;
     rebuildMonitorsList();
 
     appendActionButton(outer, "Add Monitor", @ptrCast(&onMonitorAddClicked), null);
     appendActionButton(outer, "Auto-detect Monitors", @ptrCast(&onMonitorsDetectClicked), null);
+    appendActionButton(outer, "Arrange Side-by-Side", @ptrCast(&onMonArrangeClicked), null);
+    appendActionButton(outer, "Align Tops", @ptrCast(&onMonAlignTopsClicked), null);
+    appendActionButton(outer, "Refresh Modes", @ptrCast(&onMonCapsRefreshClicked), null);
     return outer;
 }
 
