@@ -796,6 +796,13 @@ if cp /tmp/simpbar-temp/simpbar-main/assets/icons/simpbar-config.svg ~/.local/sh
 else
     warn "simpbar-config.svg missing from the repo checkout (bar pin falls back to text)"
 fi
+# Same deal for the welcome-pin icon (bird logo SVG, traced from the
+# pasted PNG master — vectors scale to any size, so it lives in scalable/).
+if cp /tmp/simpbar-temp/simpbar-main/assets/icons/simpbar-welcome.svg ~/.local/share/simpbar/assets/icons/ 2>/dev/null; then
+    ok "simpbar-welcome icon staged"
+else
+    warn "simpbar-welcome.svg missing from the repo checkout (welcome pin falls back to theme icon)"
+fi
 
 # simpbar-matugen (the wallpaper→Material You recolor helper, tracked at the
 # repo root alongside the source) is staged beside the source now while the
@@ -1615,7 +1622,7 @@ if command -v steam >/dev/null 2>&1; then
     SEED_PINS+=("Steam|steam|steam")
 fi
 SEED_PINS+=("Config|simpbar-config|simpbar-config")
-SEED_PINS+=("Welcome|simpbar-welcome|help-about")
+SEED_PINS+=("Welcome|simpbar-welcome|simpbar-welcome")
 unset _cands _dbin
 mkdir -p ~/.config/simpbar
 if [ ! -f ~/.config/simpbar/config.json ]; then
@@ -1865,7 +1872,7 @@ Type=Application
 Name=Simpbar Welcome
 Comment=Setup actions, keybindings, and links for the simpbar Hyprland setup
 Exec=simpbar-welcome
-Icon=help-about
+Icon=simpbar-welcome
 Terminal=false
 Categories=Settings;
 StartupNotify=true
@@ -1890,9 +1897,47 @@ if [ -f ~/.local/share/simpbar/assets/icons/simpbar-config.svg ]; then
     sudo install -Dm644 ~/.local/share/simpbar/assets/icons/simpbar-config.svg /usr/share/icons/hicolor/scalable/apps/simpbar-config.svg \
         && ok "simpbar-config icon installed to hicolor" \
         || warn "could not install simpbar-config icon (bar pin falls back to text)"
-    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-        sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 \
-            || warn "icon cache refresh failed (log out and back in if the cog doesn't appear)"
+fi
+# simpbar-welcome's bar icon (bird logo SVG): hicolor scalable, same as
+# above. The cache refresh below covers both icons.
+if [ -f ~/.local/share/simpbar/assets/icons/simpbar-welcome.svg ]; then
+    sudo install -Dm644 ~/.local/share/simpbar/assets/icons/simpbar-welcome.svg /usr/share/icons/hicolor/scalable/apps/simpbar-welcome.svg \
+        && ok "simpbar-welcome icon installed to hicolor" \
+        || warn "could not install simpbar-welcome icon (welcome pin falls back to theme icon)"
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 \
+        || warn "icon cache refresh failed (log out and back in if an icon doesn't appear)"
+fi
+
+# Existing installs pinned the welcome launcher with the old help-about
+# icon — point just that pin at the bird logo, leaving everything else
+# in the user's config alone.
+if command -v python3 >/dev/null 2>&1 && [ -f ~/.config/simpbar/config.json ]; then
+    if python3 - ~/.config/simpbar/config.json <<'PYEOF' 2>/dev/null; then
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(1)
+launchers = cfg.get("launchers")
+if not isinstance(launchers, list):
+    sys.exit(1)
+changed = False
+for entry in launchers:
+    if isinstance(entry, dict) and entry.get("command") == "simpbar-welcome" and entry.get("icon") == "help-about":
+        entry["icon"] = "simpbar-welcome"
+        changed = True
+if not changed:
+    sys.exit(1)
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+print("welcome pin now uses the simpbar-welcome icon")
+PYEOF
+        ok "Welcome pin migrated to the simpbar-welcome icon"
     fi
 fi
 

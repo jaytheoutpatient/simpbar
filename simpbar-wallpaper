@@ -1180,7 +1180,7 @@ print("\t".join(str(best.get(k) or "") for k in ("id", "path", "file_type", "cat
 # ---------------------------------------------------------------------------
 
 # With no arguments, open a picker. The drawer's Wallpapers tab is the real one;
-# the fallbacks are for a machine without quickshell (e.g. Debian by default).
+# the fallbacks are for a minimal setup without quickshell.
 open_picker() {
     if command -v appdrawer >/dev/null 2>&1; then
         exec appdrawer wallpapers

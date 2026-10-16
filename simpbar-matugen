@@ -131,8 +131,8 @@ if [ ! -f "$IMG" ]; then
     exit 1
 fi
 
-# matugen may live in ~/.cargo/bin (e.g. the Debian installer's `cargo
-# install matugen`) where a systemd user service's restricted PATH won't
+# matugen may live in ~/.cargo/bin (e.g. from a `cargo install matugen`)
+# where a systemd user service's restricted PATH won't
 # find it — try the cargo bin dir explicitly before giving up.
 if command -v matugen >/dev/null 2>&1; then
     MATUGEN_BIN="$(command -v matugen)"

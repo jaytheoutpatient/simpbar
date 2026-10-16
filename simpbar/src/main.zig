@@ -612,8 +612,7 @@ fn ensureLauncherIcons() void {
 // getenv is enough here; no need for std.process's env-map machinery.
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
-// Used to detect which package manager this machine runs (checkupdates →
-// Arch, apt-get → Debian-family), mirroring icontheme.zig's own extern.
+// Used to probe for binaries (mirroring icontheme.zig's own extern).
 extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
 
 // std.c doesn't expose socket()/connect() publicly in this Zig version
@@ -6449,33 +6448,16 @@ fn startWeatherFetch(cmd: *PolledCommand) void {
     cmd.startFetch("/usr/bin/env", &argv);
 }
 
-/// True if `path` is a runnable file — the module's executable check for
-/// picking the distro's package-update tool. F_OK (access mode 0) is all
-/// that's needed for /usr/bin binaries (X_OK on a root-owned world-executable
-/// binary is the same result, and 0 avoids any ACL edge cases).
-fn binExists(path: [*:0]const u8) bool {
-    return access(path, 0) == 0;
-}
-
-/// The shell one-liner that counts available package updates for this
-/// machine's distro: checkupdates (pacman-contrib, Arch) when present, else
-/// apt (Debian-family). Writes into `buf` and returns a null-terminated view
-/// of it. apt's header ("Listing...") and "N:" note lines never contain the
-/// "[upgradable from: ...]" marker, so counting marker lines counts exactly
-/// the upgradable packages.
+/// The shell one-liner that counts available package updates
+/// (pacman-contrib's checkupdates, Arch Linux). Writes into `buf` and
+/// returns a null-terminated view of it.
 fn systemUpdateCountShell(buf: []u8) [:0]const u8 {
-    if (binExists("/usr/bin/checkupdates")) {
-        return std.fmt.bufPrintZ(buf, "checkupdates | wc -l", .{}) catch "checkupdates | wc -l";
-    }
-    // The awk counters' braces are literal shell syntax — doubled up here so
-    // fmt doesn't read them as format placeholders ("{c}" would be a char arg).
-    return std.fmt.bufPrintZ(buf, "apt list --upgradable 2>/dev/null | awk '/upgradable from:/{{c++}} END{{print c+0}}'", .{}) catch "apt list --upgradable 2>/dev/null | awk '/upgradable from:/{{c++}} END{{print c+0}}'";
+    return std.fmt.bufPrintZ(buf, "checkupdates | wc -l", .{}) catch "checkupdates | wc -l";
 }
 
 fn startPacmanFetch(cmd: *PolledCommand) void {
     // Needs a real shell for the pipe (checkupdates | wc -l). The module is
-    // still called "pacman" in config.json for backwards compat — it's the
-    // "how many system updates are available" counter either way.
+    // still called "pacman" in config.json for backwards compat.
     var shell_buf: [128]u8 = undefined;
     const shell_cmd = systemUpdateCountShell(&shell_buf);
     var argv = [_:null]?[*:0]const u8{ "sh", "-c", shell_cmd.ptr, null };

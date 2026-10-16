@@ -20,15 +20,15 @@
 
 [config]
 version_check = false
-# Keep `matugen image` fully non-interactive — the wallpaper-picker hook
-# (waypaper/azote) runs it in the background with no terminal, and without an
+# Keep `matugen image` fully non-interactive — the wallpaper hook
+# (simpbar-wallpaper) runs it in the background with no terminal, and without an
 # explicit fallback + preference matugen stops to ask which source color to
 # use. closest-to-fallback keeps the picked color near the neutral teal
 # fallback below; change both to taste.
 fallback_color = "#80CBC4"
 prefer = "closest-to-fallback"
 
-# The wallpaper itself is owned by waypaper (Arch) / azote (Debian) + swaybg
+# The wallpaper itself is owned by simpbar-wallpaper + swaybg
 # on this setup — matugen only recolors things, it must never set the
 # wallpaper. set = false + a no-op command keeps it that way (matugen 4.x
 # requires the command field to parse even when set is false).
