@@ -573,6 +573,422 @@ pub fn refreshHyprCursor(theme: []const u8, size: u32) void {
 }
 
 // ---------------------------------------------------------------------
+// Monitor auto-detection (for the Monitors pages).
+//
+// Sources, in order: `hyprctl monitors -j` on Hyprland (name, resolution,
+// refresh, position, scale); `wlr-randr` on Mango (same set, parsed from
+// its text output); `mmsg get all-monitors` as the Mango fallback (name,
+// resolution, position, scale — no refresh rate there, so refresh stays 0
+// meaning unknown and callers preserve whatever was configured).
+// ---------------------------------------------------------------------
+
+pub const DetectedMonitor = struct {
+    name_buf: [64]u8 = undefined,
+    name_len: usize = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    refresh: u32 = 0, // rounded Hz; 0 = unknown
+    x: i32 = 0,
+    y: i32 = 0,
+    scale: f32 = 1.0,
+    has_scale: bool = false,
+    enabled: bool = true,
+
+    pub fn name(self: *const DetectedMonitor) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
+    fn setName(self: *DetectedMonitor, s: []const u8) void {
+        const n = @min(s.len, self.name_buf.len);
+        @memcpy(self.name_buf[0..n], s[0..n]);
+        self.name_len = n;
+    }
+};
+
+pub const MAX_DETECTED = 8;
+
+var detected: [MAX_DETECTED]DetectedMonitor = undefined;
+var detected_n: usize = 0;
+
+pub fn detectedMonitors() []DetectedMonitor {
+    return detected[0..detected_n];
+}
+
+/// Formats a scale factor the way compositor configs spell it ("1",
+/// "1.5" — never "1.00").
+pub fn formatScale(scale: f32, buf: []u8) []const u8 {
+    const s = std.fmt.bufPrint(buf, "{d:.2}", .{scale}) catch return "1";
+    var end = s.len;
+    while (end > 0 and s[end - 1] == '0') end -= 1;
+    if (end > 0 and s[end - 1] == '.') end -= 1;
+    if (end == 0) return "1";
+    return s[0..end];
+}
+
+fn skipBlank(s: []const u8, i: *usize) void {
+    while (i.* < s.len and (s[i.*] == ' ' or s[i.*] == '\t')) : (i.* += 1) {}
+}
+
+/// At s[i] == '"': the raw string body (escapes kept verbatim — monitor
+/// names never contain quotes), advancing past the closing quote.
+fn parseJsonString(s: []const u8, i: *usize) ?[]const u8 {
+    if (i.* >= s.len or s[i.*] != '"') return null;
+    i.* += 1;
+    const start = i.*;
+    while (i.* < s.len and s[i.*] != '"') : (i.* += 1) {
+        if (s[i.*] == '\\' and i.* + 1 < s.len) i.* += 1;
+    }
+    if (i.* >= s.len) return null;
+    const out = s[start..i.*];
+    i.* += 1;
+    return out;
+}
+
+/// A JSON number (int or float) at i, advancing past it.
+fn parseJsonNumber(s: []const u8, i: *usize) ?f64 {
+    const start = i.*;
+    if (i.* < s.len and (s[i.*] == '-' or s[i.*] == '+')) i.* += 1;
+    var digits = false;
+    while (i.* < s.len and ((s[i.*] >= '0' and s[i.*] <= '9') or s[i.*] == '.')) : (i.* += 1) {
+        if (s[i.*] >= '0' and s[i.*] <= '9') digits = true;
+    }
+    if (!digits) return null;
+    return std.fmt.parseFloat(f64, s[start..i.*]) catch null;
+}
+
+fn clampU32(v: f64) u32 {
+    if (v < 0 or v > 16384) return 0;
+    return @intFromFloat(@round(v));
+}
+
+/// Locates the monitors array region: mmsg's `"monitors": [...]` member,
+/// else a top-level `[...]` (hyprctl). Returns the bracket contents.
+/// Strings are skipped while bracket-matching so a `]` inside a quoted
+/// description can't end the scan early.
+fn monitorsRegion(text: []const u8) ?[]const u8 {
+    var start: usize = 0;
+    if (std.mem.indexOf(u8, text, "\"monitors\"")) |ki| {
+        var k = ki + "\"monitors\"".len;
+        while (k < text.len and (text[k] == ' ' or text[k] == '\t')) k += 1;
+        if (k < text.len and text[k] == ':') {
+            k += 1;
+            while (k < text.len and (text[k] == ' ' or text[k] == '\t')) k += 1;
+            if (k < text.len and text[k] == '[') start = k + 1;
+        }
+    } else {
+        var k: usize = 0;
+        while (k < text.len and (text[k] == ' ' or text[k] == '\t' or text[k] == '\r' or text[k] == '\n')) k += 1;
+        if (k < text.len and text[k] == '[') start = k + 1;
+    }
+    if (start == 0) return null;
+    var depth: usize = 1; // inside the array bracket
+    var i = start;
+    while (i < text.len) {
+        if (text[i] == '"') {
+            i += 1;
+            while (i < text.len and text[i] != '"') : (i += 1) {
+                if (text[i] == '\\' and i + 1 < text.len) i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if (text[i] == '[') depth += 1;
+        if (text[i] == ']') {
+            depth -= 1;
+            if (depth == 0) return text[start..i];
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// Monitor objects of the monitors region: its depth-1 members. Nested
+/// objects (tags, workspaces, clients) sit deeper and are skipped; only
+/// name/width/height/refreshRate/x/y/scale are captured. An object counts
+/// when it has a name plus dimensions.
+fn parseMonitorObjects(text: []const u8) usize {
+    detected_n = 0;
+    const region = monitorsRegion(text) orelse return 0;
+    var depth: usize = 0;
+    var cur: ?usize = null;
+    var i: usize = 0;
+    while (i < region.len) {
+        const c = region[i];
+        if (c == '{') {
+            depth += 1;
+            if (depth == 1) {
+                if (detected_n < MAX_DETECTED) {
+                    cur = detected_n;
+                    detected[detected_n] = .{};
+                } else {
+                    cur = null;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if (c == '}') {
+            if (depth == 1) {
+                if (cur) |ci| {
+                    if (detected[ci].name_len != 0 and detected[ci].width != 0 and detected[ci].height != 0) {
+                        detected_n += 1;
+                    }
+                }
+                cur = null;
+            }
+            if (depth > 0) depth -= 1;
+            i += 1;
+            continue;
+        }
+        if (depth != 1 or cur == null or c != '"') {
+            i += 1;
+            continue;
+        }
+        const ci = cur.?;
+        var j = i;
+        const key = parseJsonString(region, &j) orelse {
+            i += 1;
+            continue;
+        };
+        var k = j;
+        skipBlank(region, &k);
+        if (k >= region.len or region[k] != ':') {
+            i += 1;
+            continue;
+        }
+        k += 1;
+        skipBlank(region, &k);
+        if (std.mem.eql(u8, key, "name")) {
+            if (parseJsonString(region, &k)) |v| detected[ci].setName(v);
+            i = k;
+            continue;
+        }
+        if (parseJsonNumber(region, &k)) |v| {
+            if (std.mem.eql(u8, key, "width")) detected[ci].width = clampU32(v);
+            if (std.mem.eql(u8, key, "height")) detected[ci].height = clampU32(v);
+            if (std.mem.eql(u8, key, "x")) detected[ci].x = @intFromFloat(@round(std.math.clamp(v, -16384, 16384)));
+            if (std.mem.eql(u8, key, "y")) detected[ci].y = @intFromFloat(@round(std.math.clamp(v, -16384, 16384)));
+            if (std.mem.eql(u8, key, "scale")) {
+                detected[ci].scale = @floatCast(std.math.clamp(v, 0.5, 4.0));
+                detected[ci].has_scale = true;
+            }
+            if (std.mem.eql(u8, key, "refreshRate")) detected[ci].refresh = clampU32(v);
+        }
+        i = k;
+    }
+    return detected_n;
+}
+
+fn isDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+
+/// First `digits x digits` run on the line (the mode), e.g. 1920x1080.
+fn scanWxH(line: []const u8) ?struct { w: u32, h: u32 } {
+    var p: usize = 0;
+    while (p < line.len) {
+        if (!isDigit(line[p])) {
+            p += 1;
+            continue;
+        }
+        var j = p;
+        while (j < line.len and isDigit(line[j])) j += 1;
+        if (j < line.len and line[j] == 'x') {
+            var k = j + 1;
+            while (k < line.len and isDigit(line[k])) k += 1;
+            if (k > j + 1) {
+                const w = std.fmt.parseInt(u32, line[p..j], 10) catch null;
+                const h = std.fmt.parseInt(u32, line[j + 1 .. k], 10) catch null;
+                if (w != null and h != null and w.? != 0 and h.? != 0) return .{ .w = w.?, .h = h.? };
+                p = k;
+                continue;
+            }
+        }
+        p = j;
+    }
+    return null;
+}
+
+/// Refresh from a current-mode line: the number right before "Hz"
+/// (covers both "1920x1080 px, 60.000 Hz" and "1920x1080 @ 60 Hz").
+fn scanHz(line: []const u8) u32 {
+    const hz = std.mem.indexOf(u8, line, "Hz") orelse return 0;
+    var e = hz;
+    while (e > 0 and (line[e - 1] == ' ' or line[e - 1] == '\t')) e -= 1;
+    var b = e;
+    while (b > 0 and (isDigit(line[b - 1]) or line[b - 1] == '.')) b -= 1;
+    if (b >= e) return 0;
+    const v = std.fmt.parseFloat(f64, line[b..e]) catch return 0;
+    return clampU32(v);
+}
+
+fn parseWlrModeLine(line: []const u8, d: *DetectedMonitor) void {
+    if (scanWxH(line)) |m| {
+        d.width = m.w;
+        d.height = m.h;
+    }
+    d.refresh = scanHz(line);
+}
+
+/// wlr-randr text: `NAME "desc..."` headers, then indented details —
+/// `Enabled:`, a `Modes:` line with one `(current)` entry, `Position:`,
+/// `Scale:`. Disabled outputs are collected but flagged off.
+fn parseWlrRandr(text: []const u8) usize {
+    detected_n = 0;
+    var filled: usize = 0;
+    var cur: ?usize = null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, "\r");
+        if (line.len == 0) continue;
+        if (line[0] != ' ' and line[0] != '\t') {
+            cur = null;
+            const sp = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
+            if (sp == 0 or filled >= MAX_DETECTED) continue;
+            cur = filled;
+            detected[filled] = .{};
+            detected[filled].setName(line[0..sp]);
+            filled += 1;
+            continue;
+        }
+        const ci = cur orelse continue;
+        const t = std.mem.trim(u8, line, " \t");
+        if (std.mem.startsWith(u8, t, "Enabled:")) {
+            const rest = std.mem.trim(u8, t["Enabled:".len..], " \t");
+            detected[ci].enabled = std.ascii.eqlIgnoreCase(rest, "yes");
+        } else if (std.mem.indexOf(u8, t, "current") != null and std.mem.indexOf(u8, t, "Hz") != null) {
+            parseWlrModeLine(t, &detected[ci]);
+        } else if (std.mem.startsWith(u8, t, "Position:")) {
+            const rest = std.mem.trim(u8, t["Position:".len..], " \t");
+            const comma = std.mem.indexOfScalar(u8, rest, ',') orelse continue;
+            const px = std.fmt.parseInt(i32, std.mem.trim(u8, rest[0..comma], " \t"), 10) catch continue;
+            const py = std.fmt.parseInt(i32, std.mem.trim(u8, rest[comma + 1 ..], " \t"), 10) catch continue;
+            detected[ci].x = std.math.clamp(px, -16384, 16384);
+            detected[ci].y = std.math.clamp(py, -16384, 16384);
+        } else if (std.mem.startsWith(u8, t, "Scale:")) {
+            const rest = std.mem.trim(u8, t["Scale:".len..], " \t");
+            var e: usize = 0;
+            while (e < rest.len and (isDigit(rest[e]) or rest[e] == '.')) e += 1;
+            if (e == 0) continue;
+            const v = std.fmt.parseFloat(f64, rest[0..e]) catch continue;
+            detected[ci].scale = @floatCast(std.math.clamp(v, 0.5, 4.0));
+            detected[ci].has_scale = true;
+        }
+    }
+    // Keep enabled outputs with a detected mode, in order.
+    var kept: usize = 0;
+    for (detected[0..filled]) |*d| {
+        if (d.enabled and d.width != 0 and d.height != 0) {
+            detected[kept] = d.*;
+            kept += 1;
+        }
+    }
+    detected_n = kept;
+    return detected_n;
+}
+
+/// Mango monitor_rule composer (pure, tested): detected geometry plus
+/// refresh when known (else the old rule's refresh, else omitted),
+/// preserving every non-geometry pair (scale, rr, vrr, mirror, ...) from
+/// the old rule value. Fresh rules get the repo's rr:0/vrr:0 convention.
+pub fn composeMangoRule(name: []const u8, width: u32, height: u32, refresh: u32, x: i32, y: i32, old_value: ?[]const u8, is_new: bool, out: []u8) []const u8 {
+    const W = struct {
+        buf: []u8,
+        n: usize = 0,
+        fn s(self: *@This(), t: []const u8) void {
+            if (self.n >= self.buf.len) return;
+            const k = @min(t.len, self.buf.len - self.n);
+            @memcpy(self.buf[self.n..][0..k], t[0..k]);
+            self.n += k;
+        }
+        fn d(self: *@This(), v: anytype) void {
+            var tmp: [16]u8 = undefined;
+            const t = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch return;
+            self.s(t);
+        }
+    };
+    var w = W{ .buf = out };
+    var old_refresh: ?[]const u8 = null;
+    var extras: [32][]const u8 = undefined;
+    var en: usize = 0;
+    if (old_value) |ov| {
+        var it = std.mem.splitScalar(u8, ov, ',');
+        while (it.next()) |raw| {
+            const p = std.mem.trim(u8, raw, " \t");
+            if (p.len == 0) continue;
+            const c = std.mem.indexOfScalar(u8, p, ':') orelse {
+                if (en < extras.len) {
+                    extras[en] = p;
+                    en += 1;
+                }
+                continue;
+            };
+            const pk = std.mem.trim(u8, p[0..c], " \t");
+            const pv = std.mem.trim(u8, p[c + 1 ..], " \t");
+            if (std.mem.eql(u8, pk, "refresh")) {
+                if (refresh == 0 and pv.len != 0) old_refresh = pv;
+                continue;
+            }
+            var core = false;
+            for ([_][]const u8{ "name", "width", "height", "x", "y" }) |k| {
+                if (std.mem.eql(u8, pk, k)) {
+                    core = true;
+                    break;
+                }
+            }
+            if (core) continue;
+            if (en < extras.len) {
+                extras[en] = p;
+                en += 1;
+            }
+        }
+    }
+    w.s("monitor_rule = name:");
+    w.s(name);
+    w.s(", width:");
+    w.d(width);
+    w.s(", height:");
+    w.d(height);
+    if (refresh != 0) {
+        w.s(", refresh:");
+        w.d(refresh);
+    } else if (old_refresh) |r| {
+        w.s(", refresh:");
+        w.s(r);
+    }
+    w.s(", x:");
+    w.d(x);
+    w.s(", y:");
+    w.d(y);
+    for (extras[0..en]) |e| {
+        w.s(", ");
+        w.s(e);
+    }
+    if (is_new) w.s(", rr:0, vrr:0");
+    return out[0..w.n];
+}
+
+/// Hyprland live data. Empty (0) when hyprctl is missing or fails.
+pub fn detectHyprland() usize {
+    const out = captureOneLine(&.{ "hyprctl", "monitors", "-j" }) orelse return 0;
+    defer gpa.free(out);
+    return parseMonitorObjects(out);
+}
+
+/// Mango live data: wlr-randr first (has refresh), mmsg fallback (no
+/// refresh — refresh stays 0/unknown). Empty (0) when neither answers.
+pub fn detectMango() usize {
+    if (captureOneLine(&.{"wlr-randr"})) |out| {
+        defer gpa.free(out);
+        const n = parseWlrRandr(out);
+        if (n != 0) return n;
+    }
+    const out = captureOneLine(&.{ "mmsg", "get", "all-monitors" }) orelse return 0;
+    defer gpa.free(out);
+    return parseMonitorObjects(out);
+}
+
+// ---------------------------------------------------------------------
 // Unit tests (pure helpers only — no filesystem / process touch)
 // ---------------------------------------------------------------------
 
@@ -623,4 +1039,110 @@ test "theme list dedupes and sorts" {
     l.ensure("Capitaine");
     try std.testing.expectEqual(@as(usize, 4), l.count);
     try std.testing.expectEqualStrings("Capitaine", l.values[2]);
+}
+
+test "formatScale trims" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("1", formatScale(1.0, &buf));
+    try std.testing.expectEqualStrings("1.5", formatScale(1.5, &buf));
+    try std.testing.expectEqualStrings("2", formatScale(2.0, &buf));
+}
+
+test "parse hyprctl monitors json" {
+    const sample =
+        \\[{"id":0,"name":"DP-2","description":"Microstep cyclical (DP-2)","make":"Microstep","model":"cyclical","serial":"","width":1920,"height":1080,"refreshRate":239.963,"x":0,"y":0,"activeWorkspace":{"id":2,"name":"2"},"specialWorkspace":{"id":0,"name":""},"reserved":[0,0,0,0],"scale":1.0,"transform":0,"focused":true,"dpmsStatus":true,"vrr":false,"solitary":"1","activelyTearing":false,"directScanoutTo":""},{"id":1,"name":"HDMI-A-1","width":2560,"height":1440,"refreshRate":59.951,"x":1920,"y":-200,"scale":1.5,"transform":0,"focused":false,"dpmsStatus":true,"vrr":false}]
+    ;
+    try std.testing.expectEqual(@as(usize, 2), parseMonitorObjects(sample));
+    const ds = detectedMonitors();
+    try std.testing.expectEqualStrings("DP-2", ds[0].name());
+    try std.testing.expectEqual(@as(u32, 1920), ds[0].width);
+    try std.testing.expectEqual(@as(u32, 1080), ds[0].height);
+    try std.testing.expectEqual(@as(u32, 240), ds[0].refresh);
+    try std.testing.expectEqual(@as(u32, 2560), ds[1].width);
+    try std.testing.expectEqual(@as(u32, 1440), ds[1].height);
+    try std.testing.expectEqual(@as(u32, 60), ds[1].refresh);
+    try std.testing.expectEqual(@as(i32, 1920), ds[1].x);
+    try std.testing.expectEqual(@as(i32, -200), ds[1].y);
+    try std.testing.expect(ds[1].has_scale);
+}
+
+test "parse mmsg all-monitors json" {
+    const sample =
+        \\{"monitors":[{"name":"DP-2","active":true,"x":0,"y":0,"width":1920,"height":1080,"scale":1,"tags":[{"index":1,"is_active":false}]},{"name":"HDMI-A-1","active":true,"x":1920,"y":0,"width":2560,"height":1440,"scale":2,"tags":[]}]}
+    ;
+    try std.testing.expectEqual(@as(usize, 2), parseMonitorObjects(sample));
+    const ds = detectedMonitors();
+    try std.testing.expectEqualStrings("DP-2", ds[0].name());
+    try std.testing.expectEqual(@as(u32, 0), ds[0].refresh); // mmsg has no refresh
+    try std.testing.expectEqualStrings("HDMI-A-1", ds[1].name());
+    try std.testing.expectEqual(@as(u32, 2560), ds[1].width);
+    try std.testing.expectEqual(@as(i32, 1920), ds[1].x);
+}
+
+test "parse wlr-randr text" {
+    const sample =
+        \\DP-2 "Unknown Unknown (DP-2)"
+        \\  Physical size: 0x0 mm
+        \\  Enabled: yes
+        \\  Modes:
+        \\    1920x1080 px, 239.963 Hz (preferred, current)
+        \\    1920x1080 px, 60.000 Hz
+        \\  Position: 0,0
+        \\  Transform: normal
+        \\  Scale: 1.000000
+        \\HDMI-A-1 "Unknown Unknown (HDMI-A-1)"
+        \\  Enabled: no
+        \\  Modes:
+        \\    2560x1440 px, 59.951 Hz (current)
+        \\  Position: 1920,0
+        \\  Scale: 1.500000
+    ;
+    try std.testing.expectEqual(@as(usize, 1), parseWlrRandr(sample));
+    const ds = detectedMonitors();
+    try std.testing.expectEqualStrings("DP-2", ds[0].name());
+    try std.testing.expectEqual(@as(u32, 1920), ds[0].width);
+    try std.testing.expectEqual(@as(u32, 1080), ds[0].height);
+    try std.testing.expectEqual(@as(u32, 240), ds[0].refresh);
+    // disabled output skipped
+}
+
+test "parse wlr-randr at-variant mode line" {
+    const sample =
+        \\DP-1 "Test (DP-1)"
+        \\  Enabled: yes
+        \\  Modes:
+        \\    3840x2160 @ 60.000 Hz (current)
+        \\  Position: 0,0
+    ;
+    try std.testing.expectEqual(@as(usize, 1), parseWlrRandr(sample));
+    const ds = detectedMonitors();
+    try std.testing.expectEqual(@as(u32, 3840), ds[0].width);
+    try std.testing.expectEqual(@as(u32, 2160), ds[0].height);
+    try std.testing.expectEqual(@as(u32, 60), ds[0].refresh);
+}
+
+test "compose mango rule fresh with refresh" {
+    var out: [512]u8 = undefined;
+    const s = composeMangoRule("DP-2", 1920, 1080, 240, 0, 0, null, true, &out);
+    try std.testing.expectEqualStrings("monitor_rule = name:DP-2, width:1920, height:1080, refresh:240, x:0, y:0, rr:0, vrr:0", s);
+}
+
+test "compose mango rule preserves extras, keeps old refresh" {
+    var out: [512]u8 = undefined;
+    const old = "name:DP-2, width:1, height:1, refresh:240, x:9, y:9, scale:2, vrr:1, mirror:HDMI-1";
+    const s = composeMangoRule("DP-2", 1920, 1080, 0, 0, 0, old, false, &out);
+    try std.testing.expectEqualStrings("monitor_rule = name:DP-2, width:1920, height:1080, refresh:240, x:0, y:0, scale:2, vrr:1, mirror:HDMI-1", s);
+}
+
+test "compose mango rule detected refresh wins, no extras lost" {
+    var out: [512]u8 = undefined;
+    const old = "name:DP-2, width:1920, height:1080, refresh:60, x:0, y:0, rr:1";
+    const s = composeMangoRule("DP-2", 2560, 1440, 165, 1920, 0, old, false, &out);
+    try std.testing.expectEqualStrings("monitor_rule = name:DP-2, width:2560, height:1440, refresh:165, x:1920, y:0, rr:1", s);
+}
+
+test "compose mango rule omits unknown refresh on fresh" {
+    var out: [512]u8 = undefined;
+    const s = composeMangoRule("DP-2", 1920, 1080, 0, 0, 0, null, true, &out);
+    try std.testing.expectEqualStrings("monitor_rule = name:DP-2, width:1920, height:1080, x:0, y:0, rr:0, vrr:0", s);
 }

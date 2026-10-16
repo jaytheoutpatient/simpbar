@@ -729,11 +729,50 @@ fn onMonitorAddClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     }
 }
 
+/// Fills one monitor entry per connected display (name, mode, position,
+/// scale) from `hyprctl monitors -j`: existing entries match by output
+/// name and are updated in place, new displays are appended. No-op when
+/// hyprctl answers nothing.
+fn onMonitorsDetectClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (desk.detectHyprland() == 0) return;
+    for (desk.detectedMonitors()) |*d| {
+        if (d.name().len == 0 or d.width == 0 or d.height == 0) continue;
+        var target: ?*hypr.Monitor = null;
+        for (hypr.state.monitors[0..hypr.state.monitors_len]) |*m| {
+            if (std.mem.eql(u8, m.output.slice(), d.name())) {
+                target = m;
+                break;
+            }
+        }
+        if (target == null) {
+            if (hypr.state.monitors_len >= hypr.MAX_MONITORS) continue;
+            const m = pushAt(hypr.Monitor, &hypr.state.monitors, hypr.MAX_MONITORS, &hypr.state.monitors_len, .{ .enabled = true });
+            if (m) |mm| {
+                mm.output.set(d.name());
+                target = mm;
+            } else continue;
+        }
+        const t = target.?;
+        var mbuf: [32]u8 = undefined;
+        if (d.refresh != 0) {
+            if (std.fmt.bufPrint(&mbuf, "{d}x{d}@{d}", .{ d.width, d.height, d.refresh }) catch null) |s| t.mode.set(s);
+        } else if (std.fmt.bufPrint(&mbuf, "{d}x{d}", .{ d.width, d.height }) catch null) |s| {
+            t.mode.set(s);
+        }
+        var pbuf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&pbuf, "{d}x{d}", .{ d.x, d.y }) catch null) |s| t.position.set(s);
+        var sbuf: [16]u8 = undefined;
+        t.scale.set(desk.formatScale(d.scale, &sbuf));
+    }
+    _ = hypr.saveAll();
+    rebuildMonitorsList();
+}
+
 pub fn buildMonitorsPage() *gtk.GtkBox {
     const outer = pageBox();
     const group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(group, "Monitors");
-    gtk.adw_preferences_group_set_description(group, "Written via hl.monitor(). Reload Hyprland (or let its config auto-reload) to apply.");
+    gtk.adw_preferences_group_set_description(group, "Written via hl.monitor(). Auto-detect fills name, mode, position and scale from the connected displays; reload Hyprland (or let its config auto-reload) to apply.");
     gtk.gtk_box_append(outer, @ptrCast(group));
 
     g_monitors_list = newListBox();
@@ -741,6 +780,7 @@ pub fn buildMonitorsPage() *gtk.GtkBox {
     rebuildMonitorsList();
 
     appendActionButton(outer, "Add Monitor", @ptrCast(&onMonitorAddClicked), null);
+    appendActionButton(outer, "Auto-detect Monitors", @ptrCast(&onMonitorsDetectClicked), null);
     return outer;
 }
 

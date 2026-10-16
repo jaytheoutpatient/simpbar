@@ -550,7 +550,7 @@ var g_rp_monitors: RulePage = .{
     .spec = &MON_SPEC,
     .list = &g_monitors_list,
     .title = "Monitors",
-    .desc = "One row per monitor_rule. Values are comma-separated key:value pairs (name, width, height, refresh, x, y, scale, rr, vrr, mirror).",
+    .desc = "One row per monitor_rule. Values are comma-separated key:value pairs (name, width, height, refresh, x, y, scale, rr, vrr, mirror). Auto-detect fills them from the connected displays.",
     .add_label = "Add Monitor Rule",
     .add_value = "name:DP-1, width:1920, height:1080, refresh:60, x:0, y:0, rr:0, vrr:0",
     .dlg_title = "Edit Monitor Rule",
@@ -701,6 +701,53 @@ fn addRulePage(outer: *gtk.GtkBox, rp: *const RulePage) void {
     gtk.gtk_box_append(outer, @ptrCast(lb));
     rebuildRuleList(rp);
     hp.appendActionButton(outer, rp.add_label, @ptrCast(&onRuleAdd), @ptrCast(@constCast(rp)));
+}
+
+// ---------------------------------------------------------------------
+// Monitor auto-detection (Monitors page). Reads live geometry from
+// wlr-randr (preferred — includes refresh) or `mmsg get all-monitors`
+// (name/resolution/position, no refresh), then rewrites each matching
+// monitor_rule in place: detected name/width/height/x/y plus refresh when
+// known (else the rule's old refresh, else omitted), preserving every
+// other pair (scale, rr, vrr, mirror). Displays without a rule get a fresh
+// one following the repo's rr:0/vrr:0 convention.
+// ---------------------------------------------------------------------
+
+fn findMonitorRuleLine(name: []const u8) ?usize {
+    for (doc_monitors.lines.items, 0..) |l, i| {
+        const kv = mango.parseKV(l) orelse continue;
+        if (!std.mem.eql(u8, kv.key, "monitor_rule")) continue;
+        var it = std.mem.splitScalar(u8, kv.value, ',');
+        while (it.next()) |raw| {
+            const p = std.mem.trim(u8, raw, " \t");
+            const c = std.mem.indexOfScalar(u8, p, ':') orelse continue;
+            if (std.mem.eql(u8, std.mem.trim(u8, p[0..c], " \t"), "name") and
+                std.mem.eql(u8, std.mem.trim(u8, p[c + 1 ..], " \t"), name)) return i;
+        }
+    }
+    return null;
+}
+
+/// Geometry keys rewritten from detection (see desk.composeMangoRule).
+/// Everything else on the line is preserved verbatim — except refresh,
+/// kept from the old line only when detection has nothing newer to say.
+
+fn onMonitorsDetectClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (desk.detectMango() == 0) return;
+    for (desk.detectedMonitors()) |*d| {
+        if (d.name().len == 0 or d.width == 0 or d.height == 0) continue;
+        const li = findMonitorRuleLine(d.name());
+        var old: ?[]const u8 = null;
+        if (li) |idx| {
+            if (mango.parseKV(doc_monitors.line(idx))) |kv| old = kv.value;
+        }
+        var vbuf: [mango.MAX_LINE]u8 = undefined;
+        const line = desk.composeMangoRule(d.name(), d.width, d.height, d.refresh, d.x, d.y, old, li == null, &vbuf);
+        if (li) |idx| doc_monitors.setLine(idx, line) else doc_monitors.appendLine(line);
+    }
+    _ = doc_monitors.save();
+    reload();
+    rebuildRuleList(&g_rp_monitors);
 }
 
 // ---------------------------------------------------------------------
@@ -1233,6 +1280,7 @@ fn buildLayoutPage() *gtk.GtkBox {
 fn buildMonitorsPage() *gtk.GtkBox {
     const outer = hp.pageBox();
     addRulePage(outer, &g_rp_monitors);
+    hp.appendActionButton(outer, "Auto-detect Monitors", @ptrCast(&onMonitorsDetectClicked), null);
     return outer;
 }
 
