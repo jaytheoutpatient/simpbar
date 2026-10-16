@@ -2329,6 +2329,24 @@ perform_installation() {
             "  curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash"
     fi
     echo ""
+    # Auto-reboot: the base install is complete and the ISO environment is
+    # done — unmount, sync, and reboot so first boot lands in the new system
+    # (ly → first-boot WM staging, which opens the simpbar desktop
+    # installer). Countdown is cancellable with Ctrl+C.
+    echo "Rebooting in 10 seconds (press Ctrl+C to cancel)..."
+    for _rb in 10 9 8 7 6 5 4 3 2 1; do
+        printf '\r  Rebooting in %ss... ' "$_rb"
+        sleep 1
+    done
+    printf '\n'
+    sync
+    umount -R "$MOUNTPOINT" 2>/dev/null || true
+    swapoff -a 2>/dev/null || true
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl reboot
+    else
+        reboot
+    fi
 }
 
 # ────────────────────────────────────────────────────────────────────────────────
