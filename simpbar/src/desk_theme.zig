@@ -975,17 +975,136 @@ pub fn detectHyprland() usize {
     return parseMonitorObjects(out);
 }
 
-/// Mango live data: wlr-randr first (has refresh), mmsg fallback (no
-/// refresh — refresh stays 0/unknown). Empty (0) when neither answers.
+/// Mango live data: wlr-randr first (native, has refresh), xrandr second
+/// (needs a running XWayland; XWAYLAND* mirror names are skipped), mmsg
+/// fallback (always present with correct names, but no refresh — refresh
+/// stays 0/unknown). Empty (0) when none of them answer.
 pub fn detectMango() usize {
     if (captureOneLine(&.{"wlr-randr"})) |out| {
         defer gpa.free(out);
         const n = parseWlrRandr(out);
         if (n != 0) return n;
     }
+    if (captureOneLine(&.{"xrandr"})) |out| {
+        defer gpa.free(out);
+        const n = parseXRandr(out);
+        if (n != 0) return n;
+    }
     const out = captureOneLine(&.{ "mmsg", "get", "all-monitors" }) orelse return 0;
     defer gpa.free(out);
     return parseMonitorObjects(out);
+}
+
+/// Parses one signed integer at s[i..], advancing past it.
+fn parseSigned(s: []const u8, i: *usize) ?i32 {
+    const start = i.*;
+    if (i.* < s.len and (s[i.*] == '-' or s[i.*] == '+')) i.* += 1;
+    const ds = i.*;
+    while (i.* < s.len and isDigit(s[i.*])) i.* += 1;
+    if (ds == i.*) {
+        i.* = start;
+        return null;
+    }
+    return std.fmt.parseInt(i32, s[start..i.*], 10) catch null;
+}
+
+/// xrandr text (XWayland mirror): `NAME connected [primary] WxH+X+Y ...`
+/// headers plus indented mode lines, the current one marked `*`:
+/// `   1920x1080    239.88*+`. Disconnected outputs are skipped, as are
+/// XWAYLAND* mirror names (not compositor outputs — writing one into a
+/// monitor_rule would address nothing).
+fn parseXRandr(text: []const u8) usize {
+    detected_n = 0;
+    var filled: usize = 0;
+    var cur: ?usize = null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, "\r");
+        if (line.len == 0) continue;
+        if (line[0] != ' ' and line[0] != '\t') {
+            cur = null;
+            const sp = std.mem.indexOfAny(u8, line, " \t") orelse continue;
+            if (sp == 0) continue;
+            const nm = line[0..sp];
+            if (std.mem.startsWith(u8, nm, "XWAYLAND")) continue;
+            if (std.mem.indexOf(u8, line, " disconnected") != null) continue;
+            if (std.mem.indexOf(u8, line, " connected") == null) continue;
+            if (filled >= MAX_DETECTED) continue;
+            cur = filled;
+            detected[filled] = .{};
+            detected[filled].setName(nm);
+            filled += 1;
+            // Geometry rides on the header: 1920x1080+0+0.
+            if (scanWxH(line)) |m| {
+                detected[filled - 1].width = m.w;
+                detected[filled - 1].height = m.h;
+            }
+            // Position: signed pair right after the WxH run (+-1920+0 —
+            // the first '+' is the separator, the number carries its own).
+            if (scanWxHEnd(line)) |e| {
+                var p = e;
+                if (p < line.len and line[p] == '+') p += 1;
+                const px = parseSigned(line, &p) orelse continue;
+                const py = parseSigned(line, &p) orelse continue;
+                detected[filled - 1].x = std.math.clamp(px, -16384, 16384);
+                detected[filled - 1].y = std.math.clamp(py, -16384, 16384);
+            }
+            continue;
+        }
+        const ci = cur orelse continue;
+        if (std.mem.indexOfScalar(u8, line, '*') == null) continue;
+        const t = std.mem.trim(u8, line, " \t");
+        const mode_end = scanWxHEnd(t);
+        if (mode_end) |e| {
+            if (scanWxH(t[0..e])) |m| {
+                detected[ci].width = m.w;
+                detected[ci].height = m.h;
+            }
+        }
+        // Refresh: first float AFTER the WxH run (the width itself would
+        // otherwise win).
+        const rfrom = mode_end orelse 0;
+        var q: usize = rfrom;
+        while (q < t.len) : (q += 1) {
+            if (!isDigit(t[q])) continue;
+            var e = q;
+            while (e < t.len and (isDigit(t[e]) or t[e] == '.')) e += 1;
+            if (std.fmt.parseFloat(f64, t[q..e]) catch null) |v| {
+                detected[ci].refresh = clampU32(v);
+                break;
+            }
+        }
+    }
+    // Keep outputs with a detected mode, in order.
+    var kept: usize = 0;
+    for (detected[0..filled]) |*d| {
+        if (d.width != 0 and d.height != 0) {
+            detected[kept] = d.*;
+            kept += 1;
+        }
+    }
+    detected_n = kept;
+    return detected_n;
+}
+
+/// End offset (exclusive) of the first `digits x digits` run, or null.
+fn scanWxHEnd(line: []const u8) ?usize {
+    var p: usize = 0;
+    while (p < line.len) {
+        if (!isDigit(line[p])) {
+            p += 1;
+            continue;
+        }
+        var j = p;
+        while (j < line.len and isDigit(line[j])) j += 1;
+        if (j < line.len and line[j] == 'x') {
+            var k = j + 1;
+            while (k < line.len and isDigit(line[k])) k += 1;
+            if (k > j + 1) return k;
+        }
+        p = j;
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------
@@ -1143,6 +1262,40 @@ test "parse hyprctl virtual output" {
     const ds = detectedMonitors();
     try std.testing.expectEqualStrings("Virtual-1", ds[0].name());
     try std.testing.expectEqual(@as(u32, 60), ds[0].refresh);
+}
+
+test "parse xrandr connected output" {
+    const sample =
+        \\Screen 0: minimum 16 x 16, current 1920 x 1080, maximum 32767 x 32767
+        \\DP-2 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 700mm x 390mm
+        \\   1920x1080    239.88*+
+        \\   1440x1080    239.87
+        \\   800x600      239.81
+        \\HDMI-1 disconnected (normal left inverted right x axis y axis)
+    ;
+    try std.testing.expectEqual(@as(usize, 1), parseXRandr(sample));
+    const ds = detectedMonitors();
+    try std.testing.expectEqualStrings("DP-2", ds[0].name());
+    try std.testing.expectEqual(@as(u32, 1920), ds[0].width);
+    try std.testing.expectEqual(@as(u32, 1080), ds[0].height);
+    try std.testing.expectEqual(@as(u32, 240), ds[0].refresh);
+    try std.testing.expectEqual(@as(i32, 0), ds[0].x);
+    try std.testing.expectEqual(@as(i32, 0), ds[0].y);
+}
+
+test "parse xrandr skips xwayland mirrors and negative offsets" {
+    const sample =
+        \\Screen 0: minimum 16 x 16, current 3200 x 1080, maximum 32767 x 32767
+        \\XWAYLAND0 connected 1920x1080+0+0 0mm x 0mm
+        \\   1920x1080    60.00*+
+        \\DP-2 connected 1280x800+-1920+0 (normal left inverted right x axis y axis) 700mm x 390mm
+        \\   1280x800     60.00*+
+    ;
+    try std.testing.expectEqual(@as(usize, 1), parseXRandr(sample));
+    const ds = detectedMonitors();
+    try std.testing.expectEqualStrings("DP-2", ds[0].name());
+    try std.testing.expectEqual(@as(u32, 1280), ds[0].width);
+    try std.testing.expectEqual(@as(i32, -1920), ds[0].x);
 }
 
 test "compose mango rule virtual output" {
