@@ -24,6 +24,7 @@ const std = @import("std");
 const gtk = @import("welcome_gtk.zig");
 const hg = @import("hypr_gtk.zig");
 const hypr = @import("hyprland.zig");
+const desk = @import("desk_theme.zig");
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -465,6 +466,108 @@ fn discoverMonitorsExternal() void {
 }
 
 // ---------------------------------------------------------------------
+// Cursor + GTK theme (General page). Cursor theme/size live in the
+// XCURSOR_THEME / XCURSOR_SIZE env vars (written to hyprland-simpbar.lua
+// like every other env) and are pushed desktop-wide through gsettings plus
+// `hyprctl setcursor` for immediate effect. The dropdowns list real
+// directories: ~/.cursors (then ~/.icons, XDG/system icon dirs) for
+// cursors, ~/.themes (then XDG/system theme dirs) for GTK themes.
+// ---------------------------------------------------------------------
+
+fn hyprCursorTheme() []const u8 {
+    if (hypr.getEnv("XCURSOR_THEME")) |v| {
+        if (v.len != 0) return v;
+    }
+    return "Bibata-Modern-Ice";
+}
+
+fn hyprCursorSize() u32 {
+    if (hypr.getEnv("XCURSOR_SIZE")) |v| {
+        const n = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \t"), 10) catch null;
+        if (n) |s| return std.math.clamp(s, 8, 128);
+    }
+    return desk.currentCursorSize();
+}
+
+fn onCursorThemeChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    const vals = desk.cursorValues();
+    if (idx >= vals.len) return;
+    const name = vals[idx];
+    hypr.setEnv("XCURSOR_THEME", name);
+    _ = hypr.saveAll();
+    desk.applyCursorTheme(name);
+    desk.refreshHyprCursor(name, hyprCursorSize());
+}
+
+fn onCursorSizeChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c) void {
+    const size: u32 = @intCast(gtk.gtk_spin_button_get_value_as_int(spin));
+    var nbuf: [16]u8 = undefined;
+    const n = std.fmt.bufPrint(&nbuf, "{d}", .{size}) catch return;
+    hypr.setEnv("XCURSOR_SIZE", n);
+    _ = hypr.saveAll();
+    desk.applyCursorSize(size);
+    desk.refreshHyprCursor(hyprCursorTheme(), size);
+}
+
+fn onGtkThemeChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    const vals = desk.gtkValues();
+    if (idx >= vals.len) return;
+    desk.applyGtkTheme(vals[idx]);
+}
+
+fn cursorIndexOf(current: []const u8) c_uint {
+    const vals = desk.cursorValues();
+    for (vals, 0..) |v, i| {
+        if (std.mem.eql(u8, current, v)) return @intCast(i);
+    }
+    return 0;
+}
+
+fn gtkIndexOf(current: []const u8) c_uint {
+    const vals = desk.gtkValues();
+    for (vals, 0..) |v, i| {
+        if (std.mem.eql(u8, current, v)) return @intCast(i);
+    }
+    return 0;
+}
+
+fn buildCursorGroup(outer: *gtk.GtkBox) void {
+    desk.discoverCursors();
+    const cur = hyprCursorTheme();
+    desk.ensureCursorPresent(cur);
+    const cursor_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(cursor_group, "Cursor");
+    gtk.adw_preferences_group_set_description(cursor_group, "Cursor theme and size (XCURSOR_THEME / XCURSOR_SIZE). Drop themes into ~/.cursors to list them here.");
+    const vals = desk.cursorValues();
+    if (vals.len == 0) {
+        gtk.gtk_box_append(outer, @ptrCast(cursor_group));
+        return;
+    }
+    addComboRow(cursor_group, "Cursor Theme", desk.cursorLabels(), cursorIndexOf(cur), @ptrCast(&onCursorThemeChanged), null);
+    addSpinRow(cursor_group, "Cursor Size (px)", 8, 128, 1, @floatFromInt(hyprCursorSize()), @ptrCast(&onCursorSizeChanged), null);
+    gtk.gtk_box_append(outer, @ptrCast(cursor_group));
+}
+
+fn buildGtkThemeGroup(outer: *gtk.GtkBox) void {
+    desk.discoverGtkThemes();
+    var cbuf: [desk.MAX_NAME]u8 = undefined;
+    const cur = desk.currentGtkThemeBuf(&cbuf);
+    desk.ensureGtkPresent(cur);
+    const vals = desk.gtkValues();
+    const gtk_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(gtk_group, "GTK Theme");
+    gtk.adw_preferences_group_set_description(gtk_group, "Theme for GTK apps (gsettings + settings.ini). Drop themes into ~/.themes to list them here.");
+    if (vals.len == 0) {
+        gtk.gtk_box_append(outer, @ptrCast(gtk_group));
+        return;
+    }
+    addComboRow(gtk_group, "GTK Theme", desk.gtkLabels(), gtkIndexOf(cur), @ptrCast(&onGtkThemeChanged), null);
+    gtk.gtk_box_append(outer, @ptrCast(gtk_group));
+}
+
+// ---------------------------------------------------------------------
 // General page
 // ---------------------------------------------------------------------
 
@@ -545,6 +648,9 @@ pub fn buildGeneralPage() *gtk.GtkBox {
     addSpinRow(input_group, "Mouse Sensitivity", -1, 1, 0.05, hypr.state.input.sensitivity, @ptrCast(&onFloatChanged), @ptrCast(&hypr.state.input.sensitivity));
     addSwitchRow(input_group, "Natural Scrolling", "Invert the touchpad scroll direction.", hypr.state.input.natural_scroll, @ptrCast(&onBoolChanged), @ptrCast(&hypr.state.input.natural_scroll));
     gtk.gtk_box_append(outer, @ptrCast(input_group));
+
+    buildCursorGroup(outer);
+    buildGtkThemeGroup(outer);
 
     return outer;
 }

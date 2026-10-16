@@ -28,6 +28,7 @@ const hg = @import("hypr_gtk.zig");
 const hp = @import("hypr_pages.zig");
 const hypr = @import("hyprland.zig");
 const mango = @import("mango.zig");
+const desk = @import("desk_theme.zig");
 
 const gpa = std.heap.c_allocator;
 
@@ -198,8 +199,12 @@ fn addEntryField(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, doc: *man
 }
 
 fn addSpinField(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, min: f64, max: f64, step: f64, doc: *mango.Doc, key: []const u8, default: f64, is_float: bool) void {
+    addSpinFieldCb(group, title, min, max, step, doc, key, default, is_float, @ptrCast(&onFieldSpin));
+}
+
+fn addSpinFieldCb(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, min: f64, max: f64, step: f64, doc: *mango.Doc, key: []const u8, default: f64, is_float: bool, cb: gtk.GCallback) void {
     const initial = if (is_float) doc.getFloat(key, default) else @as(f64, @floatFromInt(doc.getInt(key, @intFromFloat(default))));
-    hp.addSpinRow(group, title, min, max, step, initial, @ptrCast(&onFieldSpin), @ptrCast(fieldFor(doc, key, is_float, null)));
+    hp.addSpinRow(group, title, min, max, step, initial, cb, @ptrCast(fieldFor(doc, key, is_float, null)));
 }
 
 fn addSwitchField(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, doc: *mango.Doc, key: []const u8, default: bool) void {
@@ -207,6 +212,10 @@ fn addSwitchField(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, doc: *ma
 }
 
 fn addComboField(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, labels: []const [*:0]const u8, values: []const []const u8, doc: *mango.Doc, key: []const u8, default: []const u8) void {
+    addComboFieldCb(group, title, labels, values, doc, key, default, @ptrCast(&onFieldCombo));
+}
+
+fn addComboFieldCb(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, labels: []const [*:0]const u8, values: []const []const u8, doc: *mango.Doc, key: []const u8, default: []const u8, cb: gtk.GCallback) void {
     const cur = doc.value(key) orelse default;
     var sel: c_uint = 0;
     for (values, 0..) |v, i| {
@@ -215,7 +224,7 @@ fn addComboField(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, labels: [
             break;
         }
     }
-    hp.addComboRow(group, title, labels, sel, @ptrCast(&onFieldCombo), @ptrCast(fieldFor(doc, key, false, values)));
+    hp.addComboRow(group, title, labels, sel, cb, @ptrCast(fieldFor(doc, key, false, values)));
 }
 
 // ---------------------------------------------------------------------
@@ -989,6 +998,74 @@ fn buildEnvPage() *gtk.GtkBox {
 }
 
 // ---------------------------------------------------------------------
+// Cursor + GTK theme (General page). Cursor theme comes from a dropdown of
+// real cursor directories (~/.cursors first, then ~/.icons and the XDG /
+// system icon dirs) instead of free text; the size spin additionally pushes
+// the size through gsettings. GTK theme is desktop-global (gsettings +
+// settings.ini) with no appearance.conf key, so it gets a plain combo row.
+// ---------------------------------------------------------------------
+
+fn onMangoCursorThemeChanged(row: *gtk.AdwComboRow, pspec: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
+    onFieldCombo(row, pspec, user_data);
+    const idx = gtk.adw_combo_row_get_selected(row);
+    const vals = desk.cursorValues();
+    if (idx >= vals.len) return;
+    desk.applyCursorTheme(vals[idx]);
+}
+
+fn onMangoCursorSizeChanged(spin: *gtk.GtkSpinButton, user_data: ?*anyopaque) callconv(.c) void {
+    onFieldSpin(spin, user_data);
+    desk.applyCursorSize(@intCast(gtk.gtk_spin_button_get_value_as_int(spin)));
+}
+
+fn onMangoGtkThemeChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    const vals = desk.gtkValues();
+    if (idx >= vals.len) return;
+    desk.applyGtkTheme(vals[idx]);
+}
+
+fn buildCursorGroup(outer: *gtk.GtkBox) void {
+    desk.discoverCursors();
+    const cur = doc_appearance.value("cursor_theme") orelse "";
+    desk.ensureCursorPresent(cur);
+    const cursor = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(cursor, "Cursor");
+    gtk.adw_preferences_group_set_description(cursor, "Cursor theme and size (appearance.conf). Drop themes into ~/.cursors to list them here.");
+    if (desk.cursorValues().len == 0) {
+        addEntryField(cursor, "Cursor Theme", &doc_appearance, "cursor_theme", "", 160);
+    } else {
+        addComboFieldCb(cursor, "Cursor Theme", desk.cursorLabels(), desk.cursorValues(), &doc_appearance, "cursor_theme", cur, @ptrCast(&onMangoCursorThemeChanged));
+    }
+    addSpinFieldCb(cursor, "Cursor Size (px)", 8, 128, 1, &doc_appearance, "cursor_size", 24, false, @ptrCast(&onMangoCursorSizeChanged));
+    gtk.gtk_box_append(outer, @ptrCast(cursor));
+}
+
+fn buildMangoGtkThemeGroup(outer: *gtk.GtkBox) void {
+    desk.discoverGtkThemes();
+    var cbuf: [desk.MAX_NAME]u8 = undefined;
+    const cur = desk.currentGtkThemeBuf(&cbuf);
+    desk.ensureGtkPresent(cur);
+    const group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(group, "GTK Theme");
+    gtk.adw_preferences_group_set_description(group, "Theme for GTK apps (gsettings + settings.ini). Drop themes into ~/.themes to list them here.");
+    const vals = desk.gtkValues();
+    if (vals.len == 0) {
+        gtk.gtk_box_append(outer, @ptrCast(group));
+        return;
+    }
+    var sel: c_uint = 0;
+    for (vals, 0..) |v, i| {
+        if (std.mem.eql(u8, cur, v)) {
+            sel = @intCast(i);
+            break;
+        }
+    }
+    hp.addComboRow(group, "GTK Theme", desk.gtkLabels(), sel, @ptrCast(&onMangoGtkThemeChanged), null);
+    gtk.gtk_box_append(outer, @ptrCast(group));
+}
+
+// ---------------------------------------------------------------------
 // General page (appearance.conf visuals + input.conf)
 // ---------------------------------------------------------------------
 
@@ -1037,11 +1114,8 @@ fn buildGeneralPage() *gtk.GtkBox {
     addColorField(colors, "Overlay", &doc_appearance, "overlay_color", "0x14a57cff");
     gtk.gtk_box_append(outer, @ptrCast(colors));
 
-    const cursor = gtk.adw_preferences_group_new();
-    gtk.adw_preferences_group_set_title(cursor, "Cursor");
-    addEntryField(cursor, "Cursor Theme", &doc_appearance, "cursor_theme", "", 160);
-    addSpinField(cursor, "Cursor Size (px)", 8, 128, 1, &doc_appearance, "cursor_size", 24, false);
-    gtk.gtk_box_append(outer, @ptrCast(cursor));
+    buildCursorGroup(outer);
+    buildMangoGtkThemeGroup(outer);
 
     const input = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(input, "Input (input.conf)");

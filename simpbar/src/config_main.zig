@@ -26,6 +26,7 @@ const hg = @import("hypr_gtk.zig");
 const hypr = @import("hyprland.zig");
 const hypr_pages = @import("hypr_pages.zig");
 const mango_pages = @import("mango_pages.zig");
+const desk = @import("desk_theme.zig");
 const logging = @import("logging.zig");
 const desktop_entries = @import("desktop_entries.zig");
 
@@ -2210,6 +2211,60 @@ fn buildFontRow(group: *gtk.AdwPreferencesGroup) void {
 }
 
 // ---------------------------------------------------------------------
+// Icon theme selection — discovers real icon themes (~/.icons first,
+// then the XDG / system icon dirs) so the bar's tray/launcher icons and
+// GTK apps follow one choice. Applies desktop-wide (gsettings +
+// settings.ini, which the bar's resolver reads) and reloads the bar.
+// ---------------------------------------------------------------------
+
+fn onIconChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    const vals = desk.iconValues();
+    if (idx >= vals.len) return;
+    desk.applyIconTheme(vals[idx]);
+    saveAndSignal();
+}
+
+fn buildIconRow(group: *gtk.AdwPreferencesGroup) void {
+    desk.discoverIcons();
+    var cbuf: [desk.MAX_NAME]u8 = undefined;
+    const cur = desk.currentIconThemeBuf(&cbuf);
+    desk.ensureIconPresent(cur);
+    const vals = desk.iconValues();
+
+    const row = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Icon Theme");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "Icons for the bar's tray/launcher pins and GTK apps. Drop themes into ~/.icons to list them here.");
+
+    if (vals.len == 0) {
+        // Nothing scannable — still show a functional (if single-choice)
+        // row naming whatever's currently configured.
+        var buf: [2]?[*:0]const u8 = .{ null, null };
+        var name_buf: [desk.MAX_NAME:0]u8 = undefined;
+        const n = @min(cur.len, desk.MAX_NAME);
+        @memcpy(name_buf[0..n], cur[0..n]);
+        name_buf[n] = 0;
+        buf[0] = name_buf[0..n :0].ptr;
+        gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+        gtk.adw_preferences_group_add(group, @ptrCast(row));
+        return;
+    }
+
+    var buf: [desk.MAX_NAMES + 1]?[*:0]const u8 = undefined;
+    var selected_idx: c_uint = 0;
+    for (vals, 0..) |v, i| {
+        buf[i] = desk.iconLabels()[i];
+        if (std.mem.eql(u8, v, cur)) selected_idx = @intCast(i);
+    }
+    buf[vals.len] = null;
+    gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+    gtk.adw_combo_row_set_selected(row, selected_idx);
+    _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onIconChanged), null, null, 0);
+
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+// ---------------------------------------------------------------------
 // Volume device selection — discovers PipeWire sinks via `pactl list sinks
 // short` (same runCaptured fork/exec/pipe-capture as monitors above) so the
 // module, mixer, wheel and OSD can follow a specific device (e.g. a USB DAC
@@ -2551,6 +2606,11 @@ fn buildAppearancePage() *gtk.GtkBox {
     gtk.adw_preferences_group_set_description(font_group, "Only Nerd Font variants are listed \u{2014} the bar's icons need Nerd Font glyph coverage.");
     buildFontRow(font_group);
     gtk.gtk_box_append(outer, @ptrCast(font_group));
+
+    const icon_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(icon_group, "Icons");
+    buildIconRow(icon_group);
+    gtk.gtk_box_append(outer, @ptrCast(icon_group));
 
     return outer;
 }

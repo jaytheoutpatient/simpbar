@@ -1363,6 +1363,11 @@ else
     warn "gsettings not found — select the Bibata cursor theme manually in nwg-look"
 fi
 
+# User drop-in dirs for simpbar-config's theme pickers: cursor themes land
+# in ~/.cursors, GTK themes in ~/.themes (both scanned first, ahead of the
+# XDG/system locations). Empty by default — just a discoverable place.
+mkdir -p ~/.cursors ~/.themes 2>/dev/null || true
+
 # qt6ct is the Qt6 settings app; QT_QPA_PLATFORMTHEME=qt6ct (set in the chosen
 # WM's env — hyprland.lua or the mango env.conf) is what makes Qt6 apps read
 # its config instead of falling back to their own default style. breeze ships

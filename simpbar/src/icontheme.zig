@@ -20,9 +20,62 @@ const c = @cImport({
 });
 
 extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+extern "c" fn close(fd: c_int) c_int;
+extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 
 fn fileExists(path: [:0]const u8) bool {
     return access(path.ptr, 0) == 0; // F_OK is always 0 on POSIX
+}
+
+/// Icon theme simpbar-config's icon picker applied (via gsettings +
+/// ~/.config/gtk-3.0/settings.ini, which GTK itself also reads). Empty
+/// until refreshConfiguredTheme() runs — the hardcoded hicolor/Adwaita
+/// search below then behaves exactly as before.
+var theme_name_buf: [128]u8 = undefined;
+var theme_name_len: usize = 0;
+
+pub fn configuredTheme() []const u8 {
+    return theme_name_buf[0..theme_name_len];
+}
+
+/// Re-reads gtk-icon-theme-name from ~/.config/gtk-3.0/settings.ini.
+/// Call at startup and on every config reload; never fails.
+pub fn refreshConfiguredTheme() void {
+    theme_name_len = 0;
+    const home: []const u8 = if (getenv("HOME")) |h| std.mem.span(h) else "/root";
+    var pbuf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "{s}/.config/gtk-3.0/settings.ini", .{home}) catch return;
+    var zpath: [528]u8 = undefined;
+    if (path.len + 1 > zpath.len) return;
+    @memcpy(zpath[0..path.len], path);
+    zpath[path.len] = 0;
+    const fd = open(zpath[0..path.len :0], 0, 0);
+    if (fd < 0) return;
+    defer _ = close(fd);
+    var data: [32768]u8 = undefined;
+    var n_total: usize = 0;
+    while (n_total < data.len) {
+        const n = read(fd, data[n_total..].ptr, data.len - n_total);
+        if (n <= 0) break;
+        n_total += @intCast(n);
+    }
+    var lines = std.mem.splitScalar(u8, data[0..n_total], '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#' or line[0] == ';' or line[0] == '[') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, line[0..eq], " \t"), "gtk-icon-theme-name")) continue;
+        const v = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        if (v.len == 0 or v.len >= theme_name_buf.len) return;
+        for (v) |ch| {
+            if (ch == '/' or ch == 0 or ch == '\n' or ch == '\r') return;
+        }
+        @memcpy(theme_name_buf[0..v.len], v);
+        theme_name_len = v.len;
+        return;
+    }
 }
 
 fn tryPath(buf: []u8, comptime fmt: []const u8, args: anytype) ?[:0]const u8 {
@@ -57,6 +110,46 @@ fn searchIconPath(name: []const u8, buf: []u8) ?[]const u8 {
             }
         }
         return null;
+    }
+
+    // The user-picked theme first (simpbar-config's icon picker): user
+    // dirs, then system icons. Skipped when no theme is configured — then
+    // this resolves exactly as before.
+    const picked = configuredTheme();
+    if (picked.len != 0) {
+        const home: []const u8 = if (getenv("HOME")) |h| std.mem.span(h) else "/root";
+        const picked_sizes = [_][]const u8{ "scalable", "symbolic", "256x256", "128x128", "64x64", "48x48", "32x32", "24x24", "22x22", "16x16" };
+        const picked_ctxs = [_][]const u8{ "apps", "status", "actions", "devices" };
+        const picked_exts = [_][]const u8{ ".svg", ".png" };
+        var hbuf: [512]u8 = undefined;
+        const user_rels = [_][]const u8{ ".icons", ".local/share/icons" };
+        for (user_rels) |rel| {
+            const root = std.fmt.bufPrint(&hbuf, "{s}/{s}", .{ home, rel }) catch continue;
+            for (picked_sizes) |size| {
+                for (picked_ctxs) |ctx| {
+                    for (picked_exts) |ext| {
+                        const p = tryPath(&path_buf, "{s}/{s}/{s}/{s}/{s}{s}", .{ root, picked, size, ctx, name, ext }) orelse continue;
+                        if (fileExists(p)) {
+                            const len = @min(p.len, buf.len);
+                            @memcpy(buf[0..len], p[0..len]);
+                            return buf[0..len];
+                        }
+                    }
+                }
+            }
+        }
+        for (picked_sizes) |size| {
+            for (picked_ctxs) |ctx| {
+                for (picked_exts) |ext| {
+                    const p = tryPath(&path_buf, "/usr/share/icons/{s}/{s}/{s}/{s}{s}", .{ picked, size, ctx, name, ext }) orelse continue;
+                    if (fileExists(p)) {
+                        const len = @min(p.len, buf.len);
+                        @memcpy(buf[0..len], p[0..len]);
+                        return buf[0..len];
+                    }
+                }
+            }
+        }
     }
 
     // (root, theme dir, contexts): the two hicolor trees first in their

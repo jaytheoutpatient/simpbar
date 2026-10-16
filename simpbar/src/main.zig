@@ -4646,6 +4646,7 @@ fn realMain() !void {
     resetLauncherViewOrder();
     writePidfile();
     logging.step("config loaded from {s}", .{config_json_path});
+    icontheme.refreshConfiguredTheme();
 
     var gpa_state = std.heap.DebugAllocator(.{}){};
     defer _ = gpa_state.deinit();
@@ -5484,6 +5485,11 @@ fn realMain() !void {
                         logging.warn("font: path too long, keeping current font", .{});
                     }
                 }
+
+                // Icon theme follows settings.ini (written by simpbar-config's
+                // icon picker); re-read it so a picked theme applies on this
+                // same reload instead of waiting for a bar restart.
+                icontheme.refreshConfiguredTheme();
 
                 // Custom-script commands/intervals live in stable buffers
                 // separate from current_config (see initCustomScripts' doc

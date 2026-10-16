@@ -417,6 +417,29 @@ pub const EnvVar = struct {
     value: Text = .{},
 };
 
+/// Reads an hl.env() variable from the model, or null when absent.
+pub fn getEnv(key: []const u8) ?[]const u8 {
+    for (state.envs[0..state.envs_len]) |*e| {
+        if (std.mem.eql(u8, e.key.slice(), key)) return e.value.slice();
+    }
+    return null;
+}
+
+/// Sets an hl.env() variable, appending it when missing (no-op when the
+/// table is full). Values truncate at Text capacity like every other row.
+pub fn setEnv(key: []const u8, value: []const u8) void {
+    for (state.envs[0..state.envs_len]) |*e| {
+        if (std.mem.eql(u8, e.key.slice(), key)) {
+            e.value.set(value);
+            return;
+        }
+    }
+    if (state.envs_len >= MAX_ENV) return;
+    state.envs[state.envs_len].key.set(key);
+    state.envs[state.envs_len].value.set(value);
+    state.envs_len += 1;
+}
+
 // ---------------------------------------------------------------------
 // Full state
 // ---------------------------------------------------------------------
