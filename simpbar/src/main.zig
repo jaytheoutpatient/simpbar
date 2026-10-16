@@ -2117,6 +2117,15 @@ const Appearance = struct {
     lava_size: u8,
     /// Matrix fall speed, pixels per 60ms tick (1-6).
     matrix_speed: u32,
+    /// Matrix rain charset: "katakana" (default) is classic cmatrix-style
+    /// katakana + digits; "distros" rains Nerd Font linux-distro logos
+    /// instead. Unrecognized values fall back to "katakana".
+    matrix_style: []const u8,
+    /// Which logos the "distros" matrix style rains: "all" (default) mixes
+    /// every known distro logo; a distro ID ("arch", "debian", "fedora",
+    /// ...) or "tux" rains that one logo everywhere. Unrecognized values
+    /// fall back to "all". Ignored unless matrix_style is "distros".
+    matrix_distro: []const u8,
     /// Media progress display: "underline" (default) draws the accent dash
     /// under the track text; "bar" fills the pill behind it, subtly.
     /// Unrecognized values fall back to "underline".
@@ -2257,6 +2266,8 @@ fn defaultConfig() Config {
             .cava_style = CAVA_STYLE_BARS,
             .matrix_color = 0xFF00FF41, // classic phosphor green
             .matrix_speed = 2,
+            .matrix_style = MATRIX_STYLE_KATAKANA,
+            .matrix_distro = MATRIX_DISTRO_ALL,
             .lava_color = 0xFFFF6A2A, // lava-lamp mid orange
             .lava_speed = 3,
             .lava_size = 100,
@@ -2422,6 +2433,8 @@ const JsonAppearance = struct {
     cava_style: []const u8 = "bars",
     matrix_color: []const u8 = "#00FF41",
     matrix_speed: u32 = 2,
+    matrix_style: []const u8 = "katakana",
+    matrix_distro: []const u8 = "all",
     lava_color: []const u8 = "#FF6A2A",
     lava_speed: u32 = 3,
     lava_size: u8 = 100,
@@ -2626,6 +2639,8 @@ fn parseAppearance(j: JsonAppearance) ?Appearance {
         .cava_style = cavaStyleOrDefault(j.cava_style),
         .matrix_color = parseHexColor(j.matrix_color) catch return null,
         .matrix_speed = std.math.clamp(j.matrix_speed, 1, 6),
+        .matrix_style = if (std.mem.eql(u8, j.matrix_style, MATRIX_STYLE_DISTROS)) MATRIX_STYLE_DISTROS else MATRIX_STYLE_KATAKANA,
+        .matrix_distro = j.matrix_distro,
         .lava_color = parseHexColor(j.lava_color) catch return null,
         .lava_speed = std.math.clamp(j.lava_speed, 1, 6),
         .lava_size = @min(j.lava_size, 200),
@@ -4484,10 +4499,11 @@ const Bar = struct {
     /// current width.
     matrix_heads: [512]i16 = [_]i16{0} ** 512,
     matrix_ncols: usize = 0,
-    /// One-time-resolved rain charset for this bar's font (katakana where
-    /// the font has it, else full blocks — an unresolved miss every frame
-    /// would flicker and burn a FreeType load each time).
-    matrix_chars: [16]u32 = [_]u32{0} ** 16,
+    /// One-time-resolved rain charset for this bar's font (Nerd Font
+    /// linux-distro logos where the font has them, else full blocks — an
+    /// unresolved miss every frame would flicker and burn a FreeType load
+    /// each time).
+    matrix_chars: [48]u32 = [_]u32{0} ** 48,
     matrix_chars_len: usize = 0,
     matrix_charset_done: bool = false,
     /// Drawer island span: min/max x of last frame's drawn in-drawer cells.
@@ -5416,6 +5432,10 @@ fn realMain() !void {
             if (loadConfigFromFile()) |cfg| {
                 const old_font_path = current_config.appearance.font_path;
                 const font_changed = !std.mem.eql(u8, old_font_path, cfg.appearance.font_path);
+                const old_matrix_style = current_config.appearance.matrix_style;
+                const matrix_style_changed = !std.mem.eql(u8, old_matrix_style, cfg.appearance.matrix_style);
+                const old_matrix_distro = current_config.appearance.matrix_distro;
+                const matrix_distro_changed = !std.mem.eql(u8, old_matrix_distro, cfg.appearance.matrix_distro);
                 const old_position = current_config.appearance.position;
                 const old_bar_height = current_config.appearance.bar_height;
                 const old_bar_mode = current_config.appearance.bar_mode;
@@ -5490,6 +5510,18 @@ fn realMain() !void {
                 // icon picker); re-read it so a picked theme applies on this
                 // same reload instead of waiting for a bar restart.
                 icontheme.refreshConfiguredTheme();
+
+                // The rain charset is resolved once per font+style+distro: a
+                // new font may lack glyphs the old one had (or vice versa),
+                // and a style/distro switch swaps the whole candidate set.
+                // Reset so the next paint re-resolves instead of raining
+                // stale (or missing) glyphs.
+                if (font_changed or matrix_style_changed or matrix_distro_changed) {
+                    for (bars[0..bar_count]) |*b| {
+                        b.matrix_charset_done = false;
+                        b.matrix_chars_len = 0;
+                    }
+                }
 
                 // Custom-script commands/intervals live in stable buffers
                 // separate from current_config (see initCustomScripts' doc
@@ -8011,6 +8043,24 @@ const BG_MODE_CAVA = "cava";
 const BG_MODE_MATRIX = "matrix";
 const BG_MODE_LAVA = "lava";
 
+/// appearance.matrix_style values: which glyph set the matrix rain uses.
+const MATRIX_STYLE_KATAKANA = "katakana";
+const MATRIX_STYLE_DISTROS = "distros";
+
+/// appearance.matrix_distro values: which logos the "distros" style rains.
+/// "all" mixes every known logo; anything else names one DISTRO_GLYPHS id
+/// ("arch", "debian", ...) or "tux" for the generic glyph. Unrecognized
+/// values fall back to "all".
+const MATRIX_DISTRO_ALL = "all";
+const MATRIX_DISTRO_TUX = "tux";
+
+/// Logo codepoint for one matrix_distro value, or null when the value
+/// names nothing (caller falls back to the full set).
+fn matrixDistroGlyph(id: []const u8) ?u32 {
+    if (std.mem.eql(u8, id, MATRIX_DISTRO_TUX)) return DISTRO_FALLBACK_GLYPH;
+    return DISTRO_GLYPHS.get(id);
+}
+
 /// Cava background shapes (appearance.cava_style values): "bars" rises
 /// each column from the bottom edge, "wave" mirrors around the vertical
 /// center, "curve" smooths the tops into a filled wave with a bright
@@ -8511,17 +8561,74 @@ fn updateMatrixHeads(bar: *Bar) void {
     }
 }
 
-/// Resolves the rain charset against this bar's font exactly once: katakana
-/// where the face has it, digits, always ending in FULL BLOCK so the list
-/// can never come back empty (blocks ship in practically every monospace).
+/// Unique Nerd Font linux-logo codepoints for the matrix rain, derived
+/// from DISTRO_GLYPHS (deduped — several IDs share one logo) plus the
+/// generic Tux fallback. Comptime, so the rain charset stays in sync with
+/// the distro table automatically.
+const MATRIX_DISTRO_CANDIDATES = blk: {
+    var uniq: [64]u32 = undefined;
+    var n: usize = 0;
+    for (DISTRO_GLYPHS.values()) |cp| {
+        var seen = false;
+        for (uniq[0..n]) |u| {
+            if (u == cp) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            uniq[n] = cp;
+            n += 1;
+        }
+    }
+    var fallback_seen = false;
+    for (uniq[0..n]) |u| {
+        if (u == DISTRO_FALLBACK_GLYPH) {
+            fallback_seen = true;
+            break;
+        }
+    }
+    if (!fallback_seen) {
+        uniq[n] = DISTRO_FALLBACK_GLYPH;
+        n += 1;
+    }
+    break :blk uniq[0..n].*;
+};
+
+/// Classic cmatrix charset: katakana + digits (what the rain used before
+/// the distro-logos style existed). Tried in order against the loaded
+/// font; FULL BLOCK below is the backstop.
+const MATRIX_KATAKANA_CANDIDATES = [_]u32{
+    0x30A2, 0x30A4, 0x30A6, 0x30A8, 0x30AA, 0x30AB, 0x30AD, 0x30AF, 0x30B2,
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    0x2588,
+};
+
+/// Resolves the rain charset against this bar's font exactly once, per
+/// appearance.matrix_style/matrix_distro: distro logos (all of them, or
+/// one picked logo) or classic katakana, kept only where the face has
+/// them, always ending in FULL BLOCK so the list can never come back
+/// empty (blocks ship in practically every monospace).
 fn resolveMatrixCharset(bar: *Bar) void {
     if (bar.matrix_charset_done) return;
     bar.matrix_charset_done = true;
-    const candidates = [_]u32{
-        0x30A2, 0x30A4, 0x30A6, 0x30A8, 0x30AA, 0x30AB, 0x30AD, 0x30AF, 0x30B2,
-        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-        0x2588,
-    };
+    if (std.mem.eql(u8, current_config.appearance.matrix_style, MATRIX_STYLE_DISTROS) and
+        !std.mem.eql(u8, current_config.appearance.matrix_distro, MATRIX_DISTRO_ALL))
+    {
+        // One picked logo everywhere. A font missing just that glyph still
+        // gets the full set below rather than a block-only rain.
+        if (matrixDistroGlyph(current_config.appearance.matrix_distro)) |cp| {
+            if (bar.font.glyph(cp)) |_| {
+                bar.matrix_chars[0] = cp;
+                bar.matrix_chars_len = 1;
+                return;
+            } else |_| {}
+        }
+    }
+    const candidates: []const u32 = if (std.mem.eql(u8, current_config.appearance.matrix_style, MATRIX_STYLE_DISTROS))
+        &MATRIX_DISTRO_CANDIDATES
+    else
+        &MATRIX_KATAKANA_CANDIDATES;
     for (candidates) |cp| {
         if (bar.matrix_chars_len >= bar.matrix_chars.len) break;
         _ = bar.font.glyph(cp) catch continue;
@@ -10321,6 +10428,34 @@ test "matrix falloff" {
     try t.expect(matrixFalloff(MATRIX_TAIL_PX) == 0.0);
     try t.expect(matrixFalloff(MATRIX_TAIL_PX + 40) == 0.0);
     try t.expect(matrixFalloff(-5) == 0.0);
+}
+
+test "matrix distro candidates" {
+    const t = std.testing;
+    // Non-empty, unique, carries the Tux fallback, and fits the per-bar
+    // charset buffer with room to spare.
+    try t.expect(MATRIX_DISTRO_CANDIDATES.len > 10);
+    try t.expect(MATRIX_DISTRO_CANDIDATES.len < 48);
+    var seen_fallback = false;
+    var i: usize = 0;
+    while (i < MATRIX_DISTRO_CANDIDATES.len) : (i += 1) {
+        if (MATRIX_DISTRO_CANDIDATES[i] == DISTRO_FALLBACK_GLYPH) seen_fallback = true;
+        var j: usize = i + 1;
+        while (j < MATRIX_DISTRO_CANDIDATES.len) : (j += 1) {
+            try t.expect(MATRIX_DISTRO_CANDIDATES[i] != MATRIX_DISTRO_CANDIDATES[j]);
+        }
+    }
+    try t.expect(seen_fallback);
+}
+
+test "matrix distro glyph lookup" {
+    const t = std.testing;
+    try t.expectEqual(@as(?u32, 0xF303), matrixDistroGlyph("arch"));
+    try t.expectEqual(@as(?u32, 0xF306), matrixDistroGlyph("debian"));
+    try t.expectEqual(@as(?u32, 0xF30A), matrixDistroGlyph("fedora"));
+    try t.expectEqual(@as(?u32, DISTRO_FALLBACK_GLYPH), matrixDistroGlyph("tux"));
+    try t.expect(matrixDistroGlyph("no-such-distro") == null);
+    try t.expect(matrixDistroGlyph("all") == null); // "all" is not one logo
 }
 
 test "weather tint and split" {

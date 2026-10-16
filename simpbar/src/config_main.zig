@@ -220,6 +220,12 @@ const JsonAppearance = struct {
     cava_style: []const u8 = "bars",
     // Matrix fall speed. Matches main.zig exactly.
     matrix_speed: u32 = 2,
+    // "katakana" (default) or "distros" — the matrix rain charset.
+    // Matches main.zig's JsonAppearance.matrix_style exactly.
+    matrix_style: []const u8 = "katakana",
+    // "all" (default), a distro ID ("arch", "debian", ...) or "tux" — which
+    // logos the "distros" matrix style rains. Matches main.zig exactly.
+    matrix_distro: []const u8 = "all",
     // Lava-lamp accent. Matches main.zig exactly.
     lava_color: []const u8 = "#FF6A2A",
     // Lava tempo 1-6 and blob size percent. Match main.zig exactly.
@@ -573,6 +579,10 @@ var live_lava_size: u8 = 100;
 var live_cava_style: []const u8 = "bars";
 // Matrix fall speed, pixels per tick.
 var live_matrix_speed: u32 = 2;
+// Matrix rain charset, one of MATRIX_STYLE_CHOICES below (static literals).
+var live_matrix_style: []const u8 = "katakana";
+// Matrix distro logos, one of MATRIX_DISTRO_CHOICES below (static literals).
+var live_matrix_distro: []const u8 = "all";
 // Media progress display, one of MPRIS_PROGRESS_CHOICES below (static literals).
 var live_mpris_progress_style: []const u8 = "underline";
 // Volume device name, or "" for the default output. Arena-backed from
@@ -960,6 +970,8 @@ fn loadConfigFromDisk() void {
     live_lava_size = @min(j.lava_size, 200);
     live_cava_style = if (std.mem.eql(u8, j.cava_style, "wave")) "wave" else if (std.mem.eql(u8, j.cava_style, "curve")) "curve" else "bars";
     live_matrix_speed = std.math.clamp(j.matrix_speed, 1, 6);
+    live_matrix_style = if (std.mem.eql(u8, j.matrix_style, "distros")) "distros" else "katakana";
+    live_matrix_distro = j.matrix_distro;
     live_mpris_progress_style = if (std.mem.eql(u8, j.mpris_progress_style, "bar")) "bar" else "underline";
     live_volume_sink = j.volume_sink;
     live_module_pill_opacity = @min(j.module_pill_opacity, 100);
@@ -1183,6 +1195,10 @@ fn buildConfigJson() ![]u8 {
     try appendJsonString(&list, live_cava_style);
     try list.appendSlice(gpa, ",\"matrix_speed\":");
     try appendJsonInt(&list, u32, live_matrix_speed);
+    try list.appendSlice(gpa, ",\"matrix_style\":");
+    try appendJsonString(&list, live_matrix_style);
+    try list.appendSlice(gpa, ",\"matrix_distro\":");
+    try appendJsonString(&list, live_matrix_distro);
     try list.appendSlice(gpa, ",\"lava_speed\":");
     try appendJsonInt(&list, u32, live_lava_speed);
     try list.appendSlice(gpa, ",\"lava_size\":");
@@ -1669,6 +1685,86 @@ fn buildCavaStyleRow(group: *gtk.AdwPreferencesGroup) void {
 fn onMatrixSpeedChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c) void {
     live_matrix_speed = @as(u32, @intCast(gtk.gtk_spin_button_get_value_as_int(spin)));
     saveAndSignal();
+}
+
+// Matrix rain charset choices (values must stay byte-for-byte in sync with
+// main.zig's MATRIX_STYLE_* — they are written straight into config.json).
+const MATRIX_STYLE_CHOICES = [_][]const u8{ "katakana", "distros" };
+const MATRIX_STYLE_LABELS = [_][*:0]const u8{ "Classic cmatrix", "Distro logos" };
+
+/// Picks the matrix rain charset (appearance.matrix_style). Applies on the
+/// next SIGUSR1 reload like every other config.json change.
+fn onMatrixStyleChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx >= MATRIX_STYLE_CHOICES.len) return;
+    live_matrix_style = MATRIX_STYLE_CHOICES[idx];
+    saveAndSignal();
+}
+
+fn buildMatrixStyleRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Matrix style");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "What rains down: classic cmatrix katakana and digits, or Linux distribution logos.");
+
+    var buf: [MATRIX_STYLE_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (MATRIX_STYLE_LABELS, 0..) |label, i| buf[i] = label;
+    buf[MATRIX_STYLE_LABELS.len] = null;
+    gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+
+    var selected_idx: c_uint = 0;
+    for (MATRIX_STYLE_CHOICES, 0..) |choice, i| {
+        if (std.mem.eql(u8, choice, live_matrix_style)) selected_idx = @intCast(i);
+    }
+    gtk.adw_combo_row_set_selected(row, selected_idx);
+    _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onMatrixStyleChanged), null, null, 0);
+
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+/// Picks which distro logos the matrix rain uses (appearance.matrix_distro).
+/// Only takes effect with the Distro logos style above; "All distros" mixes
+/// every known logo. Applies on the next SIGUSR1 reload like everything else.
+fn onMatrixDistroChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx >= MATRIX_DISTRO_CHOICES.len) return;
+    live_matrix_distro = MATRIX_DISTRO_CHOICES[idx];
+    saveAndSignal();
+}
+
+// Matrix distro choices. Values are DISTRO_GLYPHS ids in main.zig (plus
+// "all"/"tux", which the bar resolves itself) — they are written straight
+// into config.json, so they must stay byte-for-byte in sync.
+const MATRIX_DISTRO_CHOICES = [_][]const u8{
+    "all",       "arch",   "cachyos", "endeavouros", "garuda",
+    "manjaro",   "artix",  "xerolinux", "debian",    "ubuntu",
+    "pop_os",    "linuxmint", "fedora", "nixos",     "opensuse",
+    "gentoo",    "void",   "alpine",  "tux",
+};
+const MATRIX_DISTRO_LABELS = [_][*:0]const u8{
+    "All distros", "Arch Linux", "CachyOS",   "EndeavourOS", "Garuda",
+    "Manjaro",     "Artix",      "XeroLinux", "Debian",      "Ubuntu",
+    "Pop!_OS",     "Linux Mint", "Fedora",    "NixOS",       "openSUSE",
+    "Gentoo",      "Void",       "Alpine",    "Tux (generic)",
+};
+
+fn buildMatrixDistroRow(group: *gtk.AdwPreferencesGroup) void {
+    const row = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), "Matrix distro");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "Which logos rain with the Distro logos style: everything mixed, or one picked logo everywhere.");
+
+    var buf: [MATRIX_DISTRO_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (MATRIX_DISTRO_LABELS, 0..) |label, i| buf[i] = label;
+    buf[MATRIX_DISTRO_LABELS.len] = null;
+    gtk.adw_combo_row_set_model(row, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&buf))));
+
+    var selected_idx: c_uint = 0;
+    for (MATRIX_DISTRO_CHOICES, 0..) |choice, i| {
+        if (std.mem.eql(u8, choice, live_matrix_distro)) selected_idx = @intCast(i);
+    }
+    gtk.adw_combo_row_set_selected(row, selected_idx);
+    _ = gtk.g_signal_connect_data(@ptrCast(row), "notify::selected", @ptrCast(&onMatrixDistroChanged), null, null, 0);
+
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
 }
 
 /// Sets the lava tempo (appearance.lava_speed, 1-6).
@@ -2589,6 +2685,8 @@ fn buildAppearancePage() *gtk.GtkBox {
     addSpinRow(background_group, "Lava Speed", 1, 6, @floatFromInt(live_lava_speed), @ptrCast(&onLavaSpeedChanged));
     addSpinRow(background_group, "Lava Size (%)", 50, 200, @floatFromInt(live_lava_size), @ptrCast(&onLavaSizeChanged));
     addSpinRow(background_group, "Matrix Speed", 1, 6, @floatFromInt(live_matrix_speed), @ptrCast(&onMatrixSpeedChanged));
+    buildMatrixStyleRow(background_group);
+    buildMatrixDistroRow(background_group);
     gtk.gtk_box_append(outer, @ptrCast(background_group));
 
     const media_group = gtk.adw_preferences_group_new();
