@@ -862,20 +862,17 @@ fi
 
 # ── Step 6: install packages ─────────────────────────────────────────
 # Graphics: the official Mesa Vulkan stack is pinned explicitly below (see the
-# `PACMAN_PKGS+=` for the Vulkan ICDs). There is deliberately no GPU detection,
-# but the drivers cannot be left to `steam` either: steam hard-depends on the
-# vulkan-driver / lib32-vulkan-driver virtuals, and on a fresh system those are
-# unsatisfied, so pacman picks a provider — which can pull a conflicting
-# mesa-git / lib32-mesa-git that aborts the whole transaction ("Remove mesa?
-# [Y/n]" answered N by --noconfirm). Pinning the official ICDs satisfies
-# steam's depends directly so mesa-git is never pulled; radeon/intel cover
-# real hardware and swrast covers GPU-less machines (test VMs), so the same
-# fixed set works everywhere.
+# `PACMAN_PKGS+=` for the Vulkan ICDs). There is deliberately no GPU detection:
+# pinning the official ICDs keeps pacman from pulling a conflicting mesa-git /
+# lib32-mesa-git that aborts the whole transaction ("Remove mesa? [Y/n]"
+# answered N by --noconfirm); radeon/intel cover real hardware and swrast
+# covers GPU-less machines (test VMs), so the same fixed set works everywhere.
 step "Installing packages"
 
-# Steam lives in the multilib repo, which isn't enabled by default.
+# The lib32 graphics stack below lives in the multilib repo, which isn't
+# enabled by default.
 if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
-    warn "multilib repo not enabled — enabling it for Steam"
+    warn "multilib repo not enabled — enabling it for the lib32 graphics stack"
     sudo sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /etc/pacman.conf
     if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
@@ -902,11 +899,10 @@ fi
 # make a layer-shell surface at all. See the "App drawer" section below for
 # what actually gets deployed.
 # brightnessctl backs both WMs' XF86MonBrightness* binds.
-PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji fastfetch neovim steam swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility polkit-gnome grim slurp cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
+PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji fastfetch neovim swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility polkit-gnome grim slurp cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
 
-# Official Mesa Vulkan stack — see the Step 6 header: pinning these satisfies
-# steam's vulkan-driver / lib32-vulkan-driver depends directly, so pacman never
-# resolves them to a conflicting mesa-git / lib32-mesa-git.
+# Official Mesa Vulkan stack — see the Step 6 header: pinning these keeps
+# pacman from resolving the vulkan-driver virtuals to a conflicting mesa-git.
 # Skipped on XeroLinux-provisioned systems: Xero's own graphics-driver step
 # already set up mesa + the vendor stack (possibly custom bundles that
 # conflict with official mesa).
@@ -1007,27 +1003,10 @@ fi
 # removed outright (not gated): neither is needed for the desktop to
 # function, and anyone who wants one installs it directly. Saved
 # OBS_CHOICE / VIDEO_EDITOR_* answers in install-answers are now inert.
-# Lutris and Heroic are independent packages, so "both installed" is its own
-# answer (choice 3) that detect_one's exactly-one rule can't express — check
-# it first, then fall back to the single-hit rule.
-LAUNCHER_DETECTED=0
-if pkg_installed lutris && pkg_installed heroic-bin; then
-    LAUNCHER_CHOICE=3; save_answer LAUNCHER_CHOICE 3; LAUNCHER_DETECTED=1
-elif reuse_detected LAUNCHER_CHOICE '1:lutris' '2:heroic-bin'; then
-    LAUNCHER_DETECTED=1
-else
-    prompt_choice LAUNCHER_CHOICE 4 "Would you like to install any game launchers?" \
-        "Lutris" "Heroic" "Both" "Neither"
-fi
-
-INSTALL_HEROIC=0
-case "$LAUNCHER_CHOICE" in
-    1) LAUNCHER_NAME="Lutris"; PACMAN_PKGS+=(lutris) ;;
-    2) LAUNCHER_NAME="Heroic"; INSTALL_HEROIC=1 ;;
-    3) LAUNCHER_NAME="Lutris + Heroic"; PACMAN_PKGS+=(lutris); INSTALL_HEROIC=1 ;;
-    *) LAUNCHER_NAME="" ;;
-esac
-[ "$LAUNCHER_DETECTED" = 1 ] && [ -n "$LAUNCHER_NAME" ] && detected_note "Game launchers" "$LAUNCHER_NAME"
+# NOTE: the Lutris/Heroic game-launcher prompt used to live here. It was
+# removed outright (not gated): gaming launchers (Steam, Lutris, Heroic) are
+# picked in the Xero installer's GAMING category, so asking again here would
+# fight it. Saved LAUNCHER_CHOICE answers in install-answers are now inert.
 
 if [ "$XERO_SYSTEM" = 1 ]; then
     # Xero's Phase 2 covers Discord clients — skip the question and the
@@ -1194,7 +1173,6 @@ fi
 # picking now (see the Wallpaper Button tombstone in the bar source). Users
 # who already have waypaper keep it working — nothing here uninstalls it.
 AUR_PKGS=(protonplus bibata-cursor-theme game-devices-udev)
-[ "$INSTALL_HEROIC" -eq 1 ] && AUR_PKGS+=(heroic-games-launcher-bin)
 [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
 [ "$INSTALL_MATUGEN" -eq 1 ] && AUR_PKGS+=(matugen)
 
@@ -1921,7 +1899,7 @@ run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfir
 # ── Step 9: done ────────────────────────────────────────────────────
 step "Done"
 ok "Full system updated (pacman -Syu)"
-ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, ${TERMINAL_PKG}, fastfetch, neovim, steam, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, cava, pipewire, gnome-disk-utility, nwg-drawer, kdeconnect, brightnessctl installed (pacman)"
+ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, ${TERMINAL_PKG}, fastfetch, neovim, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, cava, pipewire, gnome-disk-utility, nwg-drawer, kdeconnect, brightnessctl installed (pacman)"
 if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
     ok "Hyprland + xdg-desktop-portal-hyprland installed (pacman)"
 else
@@ -1931,12 +1909,6 @@ ok "$FILE_MANAGER_NAME installed and bound to SUPER + E"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 if pacman -Qq cliphist >/dev/null 2>&1; then
     ok "cliphist installed (bind a key to it yourself — e.g. SUPER+C in the config)"
-fi
-if pacman -Qq lutris >/dev/null 2>&1; then
-    ok "Lutris installed"
-fi
-if pacman -Qq heroic-games-launcher-bin >/dev/null 2>&1; then
-    ok "Heroic Games Launcher installed (from ${REPO_NAME} or AUR helper)"
 fi
 if [ -n "$DISCORD_NAME" ]; then
     ok "$DISCORD_NAME installed"
