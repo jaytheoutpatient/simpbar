@@ -1328,7 +1328,7 @@ select_extra_kernel() {
     local options=(
         "None"
         "linux-cachyos    │ CachyOS optimized kernel  (Chaotic-AUR)"
-        "linux-cachyos-rc │ CachyOS release-candidate kernel (Chaotic-AUR)"
+        "linux-cachyos-rc │ CachyOS RC kernel — testing, may break GPU/boot (Chaotic-AUR)"
         "linux-lts        │ Long Term Support kernel   (official repos)"
     )
 
