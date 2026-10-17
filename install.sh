@@ -887,6 +887,20 @@ else
     ok "Chaotic-AUR enabled"
 fi
 
+# ── AUR-helper safety net ───────────────────────────────────────
+# The base installer is supposed to leave an AUR helper in place (paru/yay
+# from Chaotic-AUR). If that step was skipped — e.g. a transient Chaotic
+# CDN/keyserver outage during provisioning — grab paru from the repo now,
+# so nothing downstream unexpectedly lands on the build-from-AUR path.
+if [ "$XERO_SYSTEM" = 1 ] && ! command -v yay >/dev/null 2>&1 && ! command -v paru >/dev/null 2>&1; then
+    if run_spinner "AUR helper: paru (from Chaotic-AUR)" \
+        bash -c "sudo pacman -Sy --noconfirm >/dev/null 2>&1; sudo pacman -S --noconfirm --needed paru"; then
+        ok "AUR helper: paru"
+    else
+        warn "Could not install paru from Chaotic-AUR — it will be built on demand if AUR packages are needed"
+    fi
+fi
+
 # ── Step 6: install packages ─────────────────────────────────────────
 # Graphics: the official Mesa Vulkan stack is pinned explicitly below (see the
 # `PACMAN_PKGS+=` for the Vulkan ICDs). There is deliberately no GPU detection:
