@@ -3588,6 +3588,12 @@ const limine_conf_path: [:0]const u8 = "/boot/limine.conf";
 const limine_stage_path: [:0]const u8 = "/tmp/featherlite-limine.conf";
 const limine_stage_path_s: []const u8 = "/tmp/featherlite-limine.conf";
 
+// Where pkexec's own stderr is captured so a failed polkit auth can be
+// quoted back into the status label (a GUI process's stderr goes to the tty
+// it was launched from — invisible once that shell is gone).
+const limine_pkexec_err_path: [:0]const u8 = "/tmp/featherlite-pkexec.err";
+const limine_pkexec_err_path_s: []const u8 = "/tmp/featherlite-pkexec.err";
+
 // Fixed scratch buffer holding the current value plus its length. Empty
 // length means "unset" — the conf builder only writes keys for set values,
 // so an unset one simply falls back to Limine's own defaults.
@@ -3730,6 +3736,14 @@ fn resetLimineState() void {
     limine_branding_v.set("Featherlite");
 }
 
+/// Limine color keys want bare hex ("RRGGBB"), but color pickers hand us
+/// CSS-flavored "#RRGGBB" and hand-edited configs may too — Limine would
+/// never parse a leading '#' in these keys, so strip it on the way in.
+fn limineBareHex(v: []const u8) []const u8 {
+    if (v.len > 0 and v[0] == '#') return v[1..];
+    return v;
+}
+
 fn parseLimineConf(text: []const u8) void {
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line0| {
@@ -3742,9 +3756,11 @@ fn parseLimineConf(text: []const u8) void {
         if (std.ascii.eqlIgnoreCase(key, "timeout")) {
             limine_timeout = std.fmt.parseInt(i64, val, 10) catch limine_timeout;
         } else if (std.ascii.eqlIgnoreCase(key, "term_background")) {
-            limine_bg_v.set(if (val.len > 8) val[0..8] else val);
+            const bare = limineBareHex(val);
+            limine_bg_v.set(if (bare.len > 8) bare[0..8] else bare);
         } else if (std.ascii.eqlIgnoreCase(key, "term_foreground")) {
-            limine_fg_v.set(if (val.len > 8) val[0..8] else val);
+            const bare = limineBareHex(val);
+            limine_fg_v.set(if (bare.len > 8) bare[0..8] else bare);
         } else if (std.ascii.eqlIgnoreCase(key, "term_palette")) {
             limine_palette_v.set(val);
         } else if (std.ascii.eqlIgnoreCase(key, "term_palette_bright")) {
@@ -3752,7 +3768,7 @@ fn parseLimineConf(text: []const u8) void {
         } else if (std.ascii.eqlIgnoreCase(key, "interface_branding")) {
             limine_branding_v.set(val);
         } else if (std.ascii.eqlIgnoreCase(key, "interface_branding_colour")) {
-            limine_accent_v.set(val);
+            limine_accent_v.set(limineBareHex(val));
         } else if (std.ascii.eqlIgnoreCase(key, "wallpaper")) {
             if (std.mem.indexOf(u8, val, "/limine-wallpaper.") != null) {
                 // A wallpaper we wrote: keep it managed. The source for a
@@ -3981,6 +3997,28 @@ fn appendShellQuoted(out: *std.ArrayList(u8), s: []const u8) !void {
     try out.append(gpa, '\'');
 }
 
+/// Wraps the pkexec line for a detached spawn: sh routes stderr into the
+/// capture file (a GUI process inherits the tty it was started from, where
+/// pkexec's failure text would be invisible). The two quoting layers
+/// compose: cmd is already a full shell command, appendShellQuoted re-quotes
+/// it for the outer sh, and bash receives the original text byte-for-byte.
+fn buildShCapture(out_err: []const u8, program: []const u8, cmd: []const u8) ?[:0]u8 {
+    var s: std.ArrayList(u8) = .empty;
+    errdefer s.deinit(gpa);
+    s.appendSlice(gpa, "exec 2>") catch return null;
+    s.appendSlice(gpa, out_err) catch return null;
+    s.appendSlice(gpa, "; exec ") catch return null;
+    s.appendSlice(gpa, program) catch return null;
+    s.appendSlice(gpa, " ") catch return null;
+    appendShellQuoted(&s, cmd) catch return null;
+    s.append(gpa, 0) catch return null;
+    return s.items[0 .. s.items.len - 1 :0];
+}
+
+fn buildPkexecWrapper(cmd: []const u8) ?[:0]u8 {
+    return buildShCapture(limine_pkexec_err_path_s, "pkexec /usr/bin/bash -c", cmd);
+}
+
 /// The single pkexec shell line: wallpaper file shuffle (when one is
 /// active), the staged conf into /boot, the ESP fallback copy, and a+r so
 /// later direct reads never need a password. Ends in `true` so a missing
@@ -4052,7 +4090,16 @@ fn doLimineApply() void {
         return;
     };
     defer gpa.free(cmd);
-    launchDetached(&.{ "pkexec", "/usr/bin/bash", "-c", cmd });
+    // Fresh capture slot: the redirected stderr below truncates the file on
+    // spawn, and an empty file here stops a later note from quoting a
+    // previous attempt if the spawn itself never happens.
+    _ = writeFileAll(limine_pkexec_err_path, "");
+    if (buildPkexecWrapper(cmd)) |w| {
+        defer gpa.free(w);
+        launchDetached(&.{ "/bin/sh", "-c", w });
+    } else {
+        launchDetached(&.{ "pkexec", "/usr/bin/bash", "-c", cmd });
+    }
 
     // Kick off the verification poll (authorized vs cancelled detection).
     if (g_limine_poll_target) |t| gpa.free(t);
@@ -4063,6 +4110,29 @@ fn doLimineApply() void {
         limineStatus("Waiting for the polkit password prompt…", .{});
         _ = gtk.g_timeout_add(1600, liminePollTick, null);
     }
+}
+
+/// First non-empty line of pkexec's captured stderr, swept of '<' and '&'
+/// (cheap Pango safety) and capped at 100 chars so it always fits the status
+/// label. An empty result means "no capture" and the caller keeps its
+/// generic message.
+fn liminePkexecErrNote(buf: []u8) []const u8 {
+    const txt = readFileAll(limine_pkexec_err_path) orelse return "";
+    defer gpa.free(txt);
+    var it = std.mem.splitScalar(u8, txt, '\n');
+    while (it.next()) |row| {
+        const line = std.mem.trim(u8, row, " \t\r");
+        if (line.len == 0) continue;
+        var n: usize = 0;
+        for (line) |c| {
+            if (n >= buf.len or n >= 100) break;
+            if (c == '<' or c == '&') continue;
+            buf[n] = c;
+            n += 1;
+        }
+        return buf[0..n];
+    }
+    return "";
 }
 
 /// Authorized when the on-disk conf comes to equal the staged bytes.
@@ -4084,16 +4154,34 @@ fn liminePollTick(_: ?*anyopaque) callconv(.c) c_int {
     if (g_limine_poll_ticks >= 20) {
         gpa.free(g_limine_poll_target.?);
         g_limine_poll_target = null;
-        limineStatus("Apply cancelled — polkit prompt dismissed or timed out.", .{});
+        var note_buf: [200]u8 = undefined;
+        const note = liminePkexecErrNote(&note_buf);
+        if (note.len > 0) {
+            limineStatus("Apply did not complete — pkexec says: {s}", .{note});
+        } else {
+            limineStatus("Apply cancelled — polkit prompt dismissed or timed out.", .{});
+        }
         return 0;
     }
     return 1;
 }
 
+/// Reduces a stored hex value (bare, "#RRGGBB", or with alpha) to the 6-char
+/// core hexToRgba needs, or null when it isn't a usable color granularly.
+fn liminePickerCore(hex: []const u8) ?[]const u8 {
+    var core = limineBareHex(hex);
+    if (core.len >= 8) core = core[0..6]; // RRGGBBAA → drop alpha for the swatch
+    if (core.len != 6) return null;
+    return core[0..6];
+}
+
 fn limineSetPicker(idx: usize, hex: []const u8) void {
     const btn = g_limine_color_btns[idx] orelse return;
-    const picked = if (hex.len >= 8) hex[0..6] else hex; // RRGGBBAA → drop alpha for the swatch
-    const rgba = hexToRgba(picked) orelse return;
+    const core = liminePickerCore(hex) orelse return;
+    var norm: [7]u8 = undefined;
+    norm[0] = '#';
+    @memcpy(norm[1..7], core);
+    const rgba = hexToRgba(&norm) orelse return;
     gtk.gtk_color_dialog_button_set_rgba(btn, &rgba);
 }
 
@@ -4157,11 +4245,12 @@ fn onLimineColorChanged(button: *gtk.GtkColorDialogButton, _: *gtk.GParamSpec, u
     if (idx >= g_limine_color_btns.len) return;
     const rgba = gtk.gtk_color_dialog_button_get_rgba(button);
     var hex: [8]u8 = undefined;
-    const owned = rgbaToHex(rgba.*, &hex);
+    // rgbaToHex is CSS-flavored ("#RRGGBB"); the Limine state wants bare hex.
+    const bare = limineBareHex(rgbaToHex(rgba.*, &hex));
     switch (idx) {
-        0 => limine_bg_v.set(owned),
-        1 => limine_fg_v.set(owned),
-        else => limine_accent_v.set(owned),
+        0 => limine_bg_v.set(bare),
+        1 => limine_fg_v.set(bare),
+        else => limine_accent_v.set(bare),
     }
 }
 
