@@ -3707,14 +3707,23 @@ var g_limine_file_dialog: ?*gtk.GtkFileDialog = null;
 
 // Post-apply verification polling — compare the on-disk conf against the
 // staged bytes until they match (authorized) or the window expires.
-var g_limine_poll_target: ?[]u8 = null;
-var g_limine_poll_ticks: i32 = 0;
+/// The shared apply-poll context: staged bytes to compare against the
+/// on-disk config, the pkexec child pid, and the page-specific bits (which
+/// config, which capture file, which status label, what to do on success).
+/// One slot — a new apply (either page) replaces the context wholesale.
+const PollCtx = struct {
+    conf_path: [:0]const u8 = limine_conf_path,
+    err_path: [:0]const u8 = limine_pkexec_err_path,
+    applied_msg: [:0]const u8 = "Applied.",
+    status_label: ?*gtk.GtkLabel = null,
+    on_applied: ?*const fn ([]const u8) void = null,
+    target: ?[]u8 = null,
+    ticks: i32 = 0,
+    child_pid: c_int = -1,
+    reap_ticks: i32 = 0,
+};
 
-/// Live pid of the pkexec child spawned by the Boot page's Apply (single
-/// fork — pkexec refuses orphaned starts). The GUI never blocks on it; the
-/// poll and reaper timers waitpid(WNOHANG)-reap the pid instead.
-var g_limine_pkexec_pid: c_int = -1;
-var g_limine_reap_ticks: i32 = 0;
+var g_poll = PollCtx{};
 
 // The managed wallpaper's boot() URI — resolved away from a static
 // comptime string because the format suffix follows the picked file.
@@ -3993,6 +4002,578 @@ fn limineStatus(comptime fmt: []const u8, args: anytype) void {
     gtk.gtk_label_set_text(label, buf[0..msg.len :0]);
 }
 
+// ---------------------------------------------------------------------
+// Login (Ly) — "Login" tab. Styles Ly's TUI greeter by editing managed keys
+// in /etc/ly/config.ini: the background/foreground/border colors (Ly colors
+// are 0xSSRRGGBB — a zero styling byte plus 24-bit RGB), the pre-login
+// animation, and the big clock. Every other line — the fully commented
+// documentation the stock config ships with, hand-tuned binds, session
+// paths — passes through byte-for-byte; only known keys are replaced in
+// place (appended at the end when absent). Colors that arrive with a
+// styling byte (bold/dim/hi-black) or that don't parse as plain hex are
+// treated as foreign and left untouched rather than silently flattened.
+//
+// Root writes: /etc/ly/config.ini is root-owned, so Apply stages the new
+// file in /tmp and copies it with ONE pkexec through the same shared poll
+// machinery the Boot page uses (graphical polkit prompt, then verified by
+// re-reading). Changes show the next time the greeter starts — log out or
+// reboot.
+// ---------------------------------------------------------------------
+
+const ly_conf_path: [:0]const u8 = "/etc/ly/config.ini";
+const ly_stage_path: [:0]const u8 = "/tmp/featherlite-ly.ini";
+const ly_stage_path_s: []const u8 = "/tmp/featherlite-ly.ini";
+
+const LY_ANIMATIONS = [_][:0]const u8{ "none", "doom", "matrix", "colormix", "gameoflife" };
+const LY_BIGCLOCKS = [_][:0]const u8{ "none", "big", "chrono" };
+
+var ly_hex_storage: [3][20]u8 = undefined; // bg, fg, border (worst value: 8 hex chars)
+var ly_word_storage: [2][16]u8 = undefined; // animation, bigclock words
+var ly_bg_v = LimineVal{ .data = &ly_hex_storage[0] };
+var ly_fg_v = LimineVal{ .data = &ly_hex_storage[1] };
+var ly_border_v = LimineVal{ .data = &ly_hex_storage[2] };
+var ly_anim_v = LimineVal{ .data = &ly_word_storage[0] };
+var ly_clock_v = LimineVal{ .data = &ly_word_storage[1] };
+var ly_seconds_set = false; // bigclock_seconds known (parsed or toggled)
+var ly_seconds_on = false;
+
+var ly_found = false; // read succeeded at least once
+var ly_missing = false; // /etc/ly/config.ini absent — not a Ly system
+var ly_locked = false; // present but unreadable without root
+var ly_inited = false; // lazy load done on first Login-tab visit
+var g_ly_base: []u8 = ""; // current config text the edits re-apply on top of
+
+const LyPreset = struct {
+    label: [:0]const u8,
+    bg: []const u8,
+    fg: []const u8,
+    border: []const u8,
+};
+
+const LY_PRESETS = [_]LyPreset{
+    .{ .label = "Catppuccin Mocha", .bg = "1e1e2e", .fg = "cdd6f4", .border = "89b4fa" },
+    .{ .label = "Tokyo Night", .bg = "1a1b26", .fg = "c0caf5", .border = "7aa2f7" },
+    .{ .label = "Nord", .bg = "2e3440", .fg = "eceff4", .border = "88c0d0" },
+    .{ .label = "Rose Pine", .bg = "191724", .fg = "e0def4", .border = "c4a7e7" },
+    .{ .label = "Dracula", .bg = "21222c", .fg = "f8f8f2", .border = "bd93f9" },
+};
+
+const LY_PRESET_LABELS = [_][*:0]const u8{ "Keep current colors", "Catppuccin Mocha", "Tokyo Night", "Nord", "Rose Pine", "Dracula" };
+
+fn setLyBase(text: []const u8) void {
+    if (g_ly_base.len > 0) gpa.free(g_ly_base);
+    g_ly_base = gpa.dupe(u8, text) catch "";
+}
+
+fn lyStatus(comptime fmt: []const u8, args: anytype) void {
+    const label = g_ly_status_label orelse return;
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
+    buf[msg.len] = 0; // bufPrint already guarded the overflow case
+    gtk.gtk_label_set_text(label, buf[0..msg.len :0]);
+}
+
+/// Ly colors arrive as 0xSSRRGGBB. A zero styling byte parses to bare hex
+/// for the pickers; tokens carrying styling (bold, dim, hi-black…) or that
+/// aren't plain hex count as foreign — their lines stay untouched and the
+/// pickers show nothing for them.
+fn normalizeLyColor(val: []const u8) ?[]const u8 {
+    var v = val;
+    if (v.len >= 2 and v[0] == '0' and (v[1] == 'x' or v[1] == 'X')) {
+        v = v[2..];
+        if (v.len == 8) { // out of 0xSSRRGGBB: SS first
+            const style = std.fmt.parseInt(u32, v[0..2], 16) catch return null;
+            if (style != 0) return null;
+            v = v[2..];
+        }
+    }
+    if (v.len != 6) return null;
+    for (v) |c| {
+        if (!std.ascii.isHex(c)) return null;
+    }
+    return v;
+}
+
+fn lyListIndex(list: []const []const u8, val: []const u8) ?usize {
+    for (list, 0..) |entry, i| {
+        if (std.ascii.eqlIgnoreCase(entry, val)) return i;
+    }
+    return null;
+}
+
+fn resetLyState() void {
+    ly_found = false;
+    ly_missing = false;
+    ly_locked = false;
+    ly_bg_v.clear();
+    ly_fg_v.clear();
+    ly_border_v.clear();
+    ly_anim_v.clear();
+    ly_clock_v.clear();
+    ly_seconds_set = false;
+    ly_seconds_on = false;
+}
+
+/// Loads the state from disk. `allow_pkexec` permits one privileged read
+/// via polkit if the file is root-locked down — only ever from a direct
+/// user action (opening the Login tab or its reload button), never at
+/// application startup.
+fn loadLyState(allow_pkexec: bool) void {
+    resetLyState();
+    const probe = open(ly_conf_path, 0, 0);
+    if (probe < 0) {
+        const e = std.posix.errno(probe);
+        if (e == .ACCES or e == .PERM) {
+            ly_locked = true;
+            if (allow_pkexec) {
+                const out = runCaptured(&.{ "pkexec", "/usr/bin/cat", ly_conf_path }, 20000) orelse return;
+                defer gpa.free(out);
+                setLyBase(out);
+                parseLyConf(out);
+                ly_locked = false;
+                ly_found = true;
+            }
+        } else {
+            ly_missing = true;
+        }
+        return;
+    }
+    _ = close(probe);
+    const stored = readFileAll(ly_conf_path) orelse {
+        ly_locked = true;
+        return;
+    };
+    defer gpa.free(stored);
+    setLyBase(stored);
+    parseLyConf(stored);
+    ly_found = true;
+}
+
+fn parseLyConf(text: []const u8) void {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line0| {
+        const line = std.mem.trim(u8, line0, " \t\r");
+        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        const val = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(key, "bg")) {
+            if (normalizeLyColor(val)) |bare| ly_bg_v.set(bare);
+        } else if (std.ascii.eqlIgnoreCase(key, "fg")) {
+            if (normalizeLyColor(val)) |bare| ly_fg_v.set(bare);
+        } else if (std.ascii.eqlIgnoreCase(key, "border_fg")) {
+            if (normalizeLyColor(val)) |bare| ly_border_v.set(bare);
+        } else if (std.ascii.eqlIgnoreCase(key, "animation")) {
+            ly_anim_v.set(val); // stored raw — identical values rewrite identically
+        } else if (std.ascii.eqlIgnoreCase(key, "bigclock")) {
+            ly_clock_v.set(val);
+        } else if (std.ascii.eqlIgnoreCase(key, "bigclock_seconds")) {
+            if (std.ascii.eqlIgnoreCase(val, "true")) {
+                ly_seconds_on = true;
+                ly_seconds_set = true;
+            } else if (std.ascii.eqlIgnoreCase(val, "false")) {
+                ly_seconds_on = false;
+                ly_seconds_set = true;
+            }
+        }
+    }
+}
+
+const LyPending = struct {
+    bg: ?[]const u8 = null, // pre-formatted "0x00RRGGBB"
+    fg: ?[]const u8 = null,
+    border: ?[]const u8 = null,
+    anim: ?[]const u8 = null, // word
+    clock: ?[]const u8 = null, // word
+    seconds: ?bool = null,
+};
+
+/// Renders the bare hex state value as Ly's "0x00RRGGBB" token, or null
+/// when the value isn't a usable six-char color.
+fn lyKeyHex(buf: []u8, bare: []const u8) ?[]const u8 {
+    if (bare.len != 6) return null;
+    for (bare) |c| {
+        if (!std.ascii.isHex(c)) return null;
+    }
+    return std.fmt.bufPrint(buf, "0x00{s}", .{bare}) catch null;
+}
+
+fn writeLyKey(out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
+    try out.appendSlice(gpa, key);
+    try out.appendSlice(gpa, " = ");
+    try out.appendSlice(gpa, value);
+    try out.appendSlice(gpa, "\n");
+}
+
+fn appendVerbatim(out: *std.ArrayList(u8), raw: []const u8) !void {
+    try out.appendSlice(gpa, raw);
+    try out.appendSlice(gpa, "\n");
+}
+
+/// Rebuilds the config: replaces managed key lines with the current state
+/// values (unknown values included — idempotent), leaves every other line
+/// verbatim, and appends managed keys missing from the file at its end.
+fn lyApplyInto(base: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    var pending = LyPending{};
+    var fb: [3][12]u8 = undefined;
+    if (ly_bg_v.isSet()) pending.bg = lyKeyHex(&fb[0], ly_bg_v.text());
+    if (ly_fg_v.isSet()) pending.fg = lyKeyHex(&fb[1], ly_fg_v.text());
+    if (ly_border_v.isSet()) pending.border = lyKeyHex(&fb[2], ly_border_v.text());
+    if (ly_anim_v.isSet()) pending.anim = ly_anim_v.text();
+    if (ly_clock_v.isSet()) pending.clock = ly_clock_v.text();
+    if (ly_seconds_set) pending.seconds = ly_seconds_on;
+
+    var sb: [8]u8 = undefined;
+    var it = std.mem.splitScalar(u8, base, '\n');
+    while (it.next()) |raw| {
+        if (it.peek() == null and raw.len == 0) break; // trailing newline artifact
+        const line = std.mem.trim(u8, raw, " \t\r");
+        const eq = std.mem.indexOfScalar(u8, line, '=');
+        if (line.len == 0 or line[0] == '#' or line[0] == ';' or eq == null) {
+            try out.appendSlice(gpa, raw);
+            try out.appendSlice(gpa, "\n");
+            continue;
+        }
+        const key = std.mem.trim(u8, line[0..eq.?], " \t");
+        if (std.ascii.eqlIgnoreCase(key, "bg")) {
+            if (pending.bg) |v| try writeLyKey(&out, key, v) else try appendVerbatim(&out, raw);
+            pending.bg = null;
+        } else if (std.ascii.eqlIgnoreCase(key, "fg")) {
+            if (pending.fg) |v| try writeLyKey(&out, key, v) else try appendVerbatim(&out, raw);
+            pending.fg = null;
+        } else if (std.ascii.eqlIgnoreCase(key, "border_fg")) {
+            if (pending.border) |v| try writeLyKey(&out, key, v) else try appendVerbatim(&out, raw);
+            pending.border = null;
+        } else if (std.ascii.eqlIgnoreCase(key, "animation")) {
+            if (pending.anim) |v| try writeLyKey(&out, key, v) else try appendVerbatim(&out, raw);
+            pending.anim = null;
+        } else if (std.ascii.eqlIgnoreCase(key, "bigclock")) {
+            if (pending.clock) |v| try writeLyKey(&out, key, v) else try appendVerbatim(&out, raw);
+            pending.clock = null;
+        } else if (std.ascii.eqlIgnoreCase(key, "bigclock_seconds")) {
+            if (pending.seconds) |on| {
+                try writeLyKey(&out, key, if (on) "true" else "false");
+            } else try appendVerbatim(&out, raw);
+            pending.seconds = null;
+        } else {
+            try out.appendSlice(gpa, raw);
+            try out.appendSlice(gpa, "\n");
+        }
+    }
+    // Managed keys absent from the file land at the end.
+    if (pending.bg) |v| try writeLyKey(&out, "bg", v);
+    if (pending.fg) |v| try writeLyKey(&out, "fg", v);
+    if (pending.border) |v| try writeLyKey(&out, "border_fg", v);
+    if (pending.anim) |v| try writeLyKey(&out, "animation", v);
+    if (pending.clock) |v| try writeLyKey(&out, "bigclock", v);
+    if (pending.seconds) |on| {
+        try writeLyKey(&out, "bigclock_seconds", if (on) std.fmt.bufPrint(&sb, "true", .{}) catch "true" else "false");
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn doLyApply() void {
+    if (!ly_found) return;
+    if (g_ly_base.len == 0) {
+        lyStatus("No config loaded — reload first.", .{});
+        return;
+    }
+    // Fresh base: picks up edits made outside this app since the last load.
+    if (readFileAll(ly_conf_path)) |fresh| {
+        defer gpa.free(fresh);
+        setLyBase(fresh);
+    }
+    const newconf = lyApplyInto(g_ly_base) catch {
+        lyStatus("Failed to build the new login config.", .{});
+        return;
+    };
+    if (!writeFileAll(ly_stage_path, newconf)) {
+        gpa.free(newconf);
+        lyStatus("Failed to stage {s}.", .{ly_stage_path_s});
+        return;
+    }
+
+    defer gpa.free(newconf);
+    var cmd: std.ArrayList(u8) = .empty;
+    defer cmd.deinit(gpa);
+    cmd.appendSlice(gpa, "cp ") catch return;
+    appendShellQuoted(&cmd, ly_stage_path_s) catch return;
+    cmd.appendSlice(gpa, " /etc/ly/config.ini && chmod 644 /etc/ly/config.ini; true") catch return;
+
+    // Fresh capture slot for pkexec's own stderr (see the Boot page).
+    _ = writeFileAll(limine_pkexec_err_path, "");
+    if (buildShCapture(limine_pkexec_err_path_s, "pkexec /usr/bin/bash -c", cmd.items)) |w| {
+        defer gpa.free(w);
+        _ = launchApplyChild(&.{ "/bin/sh", "-c", w });
+    } else {
+        lyStatus("Out of memory building the apply command.", .{});
+        return;
+    }
+
+    if (!startApplyPoll(ly_conf_path, limine_pkexec_err_path, newconf, "Applied. Visible the next time the login screen starts.", lyPollApplied, g_ly_status_label)) {
+        lyStatus("Out of memory recording the staged config.", .{});
+        return;
+    }
+    lyStatus("Waiting for the polkit password prompt…", .{});
+}
+
+fn lyPollApplied(data: []const u8) void {
+    setLyBase(data);
+}
+
+// Widget handles the callbacks poke (built once; loads just refresh).
+var g_ly_page_stack: ?*gtk.GtkStack = null;
+var g_ly_color_btns: [3]?*gtk.GtkColorDialogButton = .{ null, null, null }; // bg, fg, border
+var g_ly_anim_combo: ?*gtk.AdwComboRow = null;
+var g_ly_clock_combo: ?*gtk.AdwComboRow = null;
+var g_ly_secs_switch: ?*gtk.GtkSwitch = null;
+var g_ly_status_label: ?*gtk.GtkLabel = null;
+
+fn lySetPicker(idx: usize, hex: []const u8) void {
+    const btn = g_ly_color_btns[idx] orelse return;
+    const core = liminePickerCore(hex) orelse return;
+    var norm: [7]u8 = undefined;
+    norm[0] = '#';
+    @memcpy(norm[1..7], core);
+    const rgba = hexToRgba(&norm) orelse return;
+    gtk.gtk_color_dialog_button_set_rgba(btn, &rgba);
+}
+
+fn lyUpdateStack() void {
+    const st = g_ly_page_stack orelse return;
+    const name: [*:0]const u8 = if (ly_found) "full" else if (ly_locked) "locked" else "missing";
+    gtk.gtk_stack_set_visible_child_name(st, name);
+}
+
+/// Refreshes the widgets from state. Combos with a value outside their
+/// known list stay where they are — the line passes through untouched —
+/// and only the switch/pickers repaint (their own callbacks write back the
+/// same values, so the refresh round-trips harmlessly).
+fn lyUpdateWidgets() void {
+    lyUpdateStack();
+    if (!ly_found) return;
+    lySetPicker(0, ly_bg_v.text());
+    lySetPicker(1, ly_fg_v.text());
+    lySetPicker(2, ly_border_v.text());
+    if (g_ly_anim_combo) |combo| {
+        if (lyListIndex(&LY_ANIMATIONS, ly_anim_v.text())) |idx| {
+            gtk.adw_combo_row_set_selected(combo, @intCast(idx));
+        }
+    }
+    if (g_ly_clock_combo) |combo| {
+        if (lyListIndex(&LY_BIGCLOCKS, ly_clock_v.text())) |idx| {
+            gtk.adw_combo_row_set_selected(combo, @intCast(idx));
+        }
+    }
+    if (g_ly_secs_switch) |sw| {
+        gtk.gtk_switch_set_active(sw, if (ly_seconds_set and ly_seconds_on) 1 else 0);
+    }
+}
+
+fn onLyPresetChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx == 0 or idx > LY_PRESETS.len) return; // 0 = keep current
+    const preset = LY_PRESETS[idx - 1];
+    ly_bg_v.set(preset.bg);
+    ly_fg_v.set(preset.fg);
+    ly_border_v.set(preset.border);
+    lySetPicker(0, ly_bg_v.text());
+    lySetPicker(1, ly_fg_v.text());
+    lySetPicker(2, ly_border_v.text());
+}
+
+fn onLyColorChanged(button: *gtk.GtkColorDialogButton, _: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
+    if (user_data == null) return;
+    const idx = @as(usize, @intFromPtr(user_data));
+    if (idx >= g_ly_color_btns.len) return;
+    const rgba = gtk.gtk_color_dialog_button_get_rgba(button);
+    var hex: [8]u8 = undefined;
+    // rgbaToHex is CSS-flavored ("#RRGGBB"); the Ly state wants bare hex.
+    const bare = limineBareHex(rgbaToHex(rgba.*, &hex));
+    switch (idx) {
+        0 => ly_bg_v.set(bare),
+        1 => ly_fg_v.set(bare),
+        else => ly_border_v.set(bare),
+    }
+}
+
+fn onLyAnimChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx >= LY_ANIMATIONS.len) return;
+    ly_anim_v.set(LY_ANIMATIONS[idx]);
+}
+
+fn onLyClockChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx >= LY_BIGCLOCKS.len) return;
+    ly_clock_v.set(LY_BIGCLOCKS[idx]);
+}
+
+fn onLySecsChanged(sw: *gtk.GtkSwitch, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    ly_seconds_on = gtk.gtk_switch_get_active(sw) != 0;
+    ly_seconds_set = true;
+}
+
+fn onLyReloadClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    loadLyState(true);
+    lyUpdateWidgets();
+}
+
+fn onLyApplyClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    doLyApply();
+}
+
+fn addLyColorRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, subtitle: [:0]const u8, idx: usize) void {
+    const row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), title);
+    gtk.adw_action_row_set_subtitle(row, subtitle);
+    const dlg = gtk.gtk_color_dialog_new();
+    const btn = gtk.gtk_color_dialog_button_new(dlg);
+    gtk.gtk_widget_set_valign(@ptrCast(btn), gtk.ALIGN_CENTER);
+    g_ly_color_btns[idx] = btn;
+    _ = gtk.g_signal_connect_data(@ptrCast(btn), "notify::rgba", @ptrCast(&onLyColorChanged), @as(?*anyopaque, @ptrFromInt(idx)), null, 0);
+    gtk.adw_action_row_add_suffix(row, @ptrCast(btn));
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+fn buildLyFullPage(stack: *gtk.GtkStack) void {
+    const page = gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 18);
+    _ = gtk.gtk_stack_add_named(stack, @ptrCast(page), "full");
+
+    const conf_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(conf_group, "Ly Greeter");
+    gtk.adw_preferences_group_set_description(conf_group, "The login screen Ly shows before a session. Only the keys below are touched — comments and every other setting pass through Apply untouched.");
+
+    const status_row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(status_row), "/etc/ly/config.ini");
+    gtk.adw_action_row_set_subtitle(status_row, "Colors, animation and clock live here.");
+    const reload_btn = gtk.gtk_button_new_from_icon_name("view-refresh-symbolic");
+    gtk.gtk_widget_set_valign(@ptrCast(reload_btn), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(reload_btn), "clicked", @ptrCast(&onLyReloadClicked), null, null, 0);
+    gtk.adw_action_row_add_suffix(status_row, @ptrCast(reload_btn));
+    gtk.adw_preferences_group_add(conf_group, @ptrCast(status_row));
+    gtk.gtk_box_append(page, @ptrCast(conf_group));
+
+    const color_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(color_group, "Greeter Colors");
+    gtk.adw_preferences_group_set_description(color_group, "A preset fills background, text and border instantly; Apply writes /etc/ly/config.ini.");
+    const combo = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(combo), "Color preset");
+    gtk.adw_action_row_set_subtitle(@ptrCast(combo), "Pick a palette for the greeter, or keep whatever is already in the config.");
+    var preset_buf: [LY_PRESET_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (LY_PRESET_LABELS, 0..) |label, i| preset_buf[i] = label;
+    preset_buf[LY_PRESET_LABELS.len] = null;
+    gtk.adw_combo_row_set_model(combo, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&preset_buf))));
+    gtk.adw_combo_row_set_selected(combo, 0);
+    _ = gtk.g_signal_connect_data(@ptrCast(combo), "notify::selected", @ptrCast(&onLyPresetChanged), null, null, 0);
+    gtk.adw_preferences_group_add(color_group, @ptrCast(combo));
+    addLyColorRow(color_group, "Background", "Screen behind the login box (bg).", 0);
+    addLyColorRow(color_group, "Text", "Prompt and input text color (fg).", 1);
+    addLyColorRow(color_group, "Border", "Frame color around the login box (border_fg).", 2);
+    gtk.gtk_box_append(page, @ptrCast(color_group));
+
+    const greet_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(greet_group, "Animation and Clock");
+    gtk.adw_preferences_group_set_description(greet_group, "The pre-login entertainment and the big clock. Their per-animation color keys are not managed — whatever is on disk stays.");
+    const anim = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(anim), "Animation");
+    gtk.adw_action_row_set_subtitle(@ptrCast(anim), "What plays behind the prompt: none, DOOM fire, CMatrix, colormix, Game of Life.");
+    var anim_buf: [LY_ANIMATIONS.len + 1]?[*:0]const u8 = undefined;
+    for (LY_ANIMATIONS, 0..) |a, i| anim_buf[i] = a;
+    anim_buf[LY_ANIMATIONS.len] = null;
+    gtk.adw_combo_row_set_model(anim, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&anim_buf))));
+    g_ly_anim_combo = anim;
+    _ = gtk.g_signal_connect_data(@ptrCast(anim), "notify::selected", @ptrCast(&onLyAnimChanged), null, null, 0);
+    gtk.adw_preferences_group_add(greet_group, @ptrCast(anim));
+
+    const clock = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(clock), "Big clock");
+    gtk.adw_action_row_set_subtitle(@ptrCast(clock), "none, big, or chrono.");
+    var clock_buf: [LY_BIGCLOCKS.len + 1]?[*:0]const u8 = undefined;
+    for (LY_BIGCLOCKS, 0..) |c, i| clock_buf[i] = c;
+    clock_buf[LY_BIGCLOCKS.len] = null;
+    gtk.adw_combo_row_set_model(clock, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&clock_buf))));
+    g_ly_clock_combo = clock;
+    _ = gtk.g_signal_connect_data(@ptrCast(clock), "notify::selected", @ptrCast(&onLyClockChanged), null, null, 0);
+    gtk.adw_preferences_group_add(greet_group, @ptrCast(clock));
+
+    const secs_row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(secs_row), "Seconds on the big clock");
+    gtk.adw_action_row_set_subtitle(secs_row, "Shows the ticking seconds under the clock digits.");
+    const secs = gtk.gtk_switch_new();
+    gtk.gtk_widget_set_valign(@ptrCast(secs), gtk.ALIGN_CENTER);
+    g_ly_secs_switch = secs;
+    _ = gtk.g_signal_connect_data(@ptrCast(secs), "notify::active", @ptrCast(&onLySecsChanged), null, null, 0);
+    gtk.adw_action_row_add_suffix(secs_row, @ptrCast(secs));
+    gtk.adw_preferences_group_add(greet_group, @ptrCast(secs_row));
+    gtk.gtk_box_append(page, @ptrCast(greet_group));
+
+    const apply_group = gtk.adw_preferences_group_new();
+    const apply_row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(apply_row), "Write the new login screen");
+    gtk.adw_action_row_set_subtitle(apply_row, "Staging and copying runs under one pkexec password prompt, then the result is verified by re-reading the config. Applies when the greeter next starts.");
+    const apply_btn = gtk.gtk_button_new_with_label("Apply");
+    gtk.gtk_widget_add_css_class(@ptrCast(apply_btn), "suggested-action");
+    gtk.gtk_widget_set_valign(@ptrCast(apply_btn), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(apply_btn), "clicked", @ptrCast(&onLyApplyClicked), null, null, 0);
+    gtk.adw_action_row_add_suffix(apply_row, @ptrCast(apply_btn));
+    gtk.adw_preferences_group_add(apply_group, @ptrCast(apply_row));
+    gtk.gtk_box_append(page, @ptrCast(apply_group));
+
+    const status_lbl = gtk.gtk_label_new(" ");
+    gtk.gtk_label_set_xalign(status_lbl, 0);
+    gtk.gtk_widget_add_css_class(@ptrCast(status_lbl), "dim-label");
+    g_ly_status_label = status_lbl;
+    gtk.gtk_box_append(page, @ptrCast(status_lbl));
+
+    lyUpdateWidgets();
+}
+
+fn buildLoginPage() *gtk.GtkBox {
+    loadLyState(false); // silent direct read — polkit only on user action
+    ly_inited = ly_found or ly_missing;
+
+    const outer = gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 18);
+    gtk.gtk_widget_set_margin_top(@ptrCast(outer), 24);
+    gtk.gtk_widget_set_margin_bottom(@ptrCast(outer), 24);
+    gtk.gtk_widget_set_margin_start(@ptrCast(outer), 24);
+    gtk.gtk_widget_set_margin_end(@ptrCast(outer), 24);
+
+    const inner = gtk.gtk_stack_new();
+    g_ly_page_stack = inner;
+    gtk.gtk_box_append(outer, @ptrCast(inner));
+
+    // Not-a-Ly-system card. Hooks in via the sidebar's lazy load.
+    const missing_box = gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 12);
+    const missing_lbl = gtk.gtk_label_new("No /etc/ly/config.ini on this machine — it doesn't use Ly, so there is no login screen to style here.");
+    gtk.gtk_label_set_wrap(missing_lbl, 1);
+    gtk.gtk_label_set_justify(missing_lbl, gtk.JUSTIFY_CENTER);
+    gtk.gtk_box_append(missing_box, @ptrCast(missing_lbl));
+    _ = gtk.gtk_stack_add_named(inner, @ptrCast(missing_box), "missing");
+
+    // Locked card — the config is unreadable without root. One polkit
+    // prompt through the ordinary approval flow reads it and swaps to the
+    // full editor.
+    const locked_box = gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 12);
+    const locked_lbl = gtk.gtk_label_new("The Ly config is unreadable without root. Approve a password prompt to read /etc/ly/config.ini, then it can be restyled.");
+    gtk.gtk_label_set_wrap(locked_lbl, 1);
+    gtk.gtk_label_set_justify(locked_lbl, gtk.JUSTIFY_CENTER);
+    gtk.gtk_box_append(locked_box, @ptrCast(locked_lbl));
+    const unlock_btn = gtk.gtk_button_new_with_label("Load with password");
+    _ = gtk.g_signal_connect_data(@ptrCast(unlock_btn), "clicked", @ptrCast(&onLyReloadClicked), null, null, 0);
+    gtk.gtk_widget_set_halign(@ptrCast(unlock_btn), gtk.ALIGN_CENTER);
+    gtk.gtk_box_append(locked_box, @ptrCast(unlock_btn));
+    _ = gtk.gtk_stack_add_named(inner, @ptrCast(locked_box), "locked");
+
+    buildLyFullPage(inner);
+
+    lyUpdateStack();
+    return outer;
+}
+
 fn appendShellQuoted(out: *std.ArrayList(u8), s: []const u8) !void {
     try out.append(gpa, '\'');
     for (s) |ch| {
@@ -4033,7 +4614,7 @@ fn buildPkexecWrapper(cmd: []const u8) ?[:0]u8 {
 /// parent is alive for the whole auth dance while the GUI stays responsive;
 /// if the GUI quits mid-auth, the already-past-the-check pkexec carries on
 /// and init reaps it. Poll/reaper timers waitpid(WNOHANG) the tracked pid.
-fn launchPkexecInSession(argv: []const [:0]const u8) c_int {
+fn launchApplyChild(argv: []const [:0]const u8) c_int {
     if (argv.len == 0 or argv.len > 14) return -1;
     const pid = libc_proc.fork();
     if (pid < 0) return -1;
@@ -4044,16 +4625,16 @@ fn launchPkexecInSession(argv: []const [:0]const u8) c_int {
         _ = std.c.execve(argv[0].ptr, @ptrCast(&buf), std.c.environ);
         std.c._exit(127);
     }
-    g_limine_pkexec_pid = pid;
+    g_poll.child_pid = pid;
     return pid;
 }
 
 /// One WNOHANG reap attempt of the tracked pkexec pid; true when reaped.
-fn reapPkexecChild() bool {
-    if (g_limine_pkexec_pid < 0) return false;
+fn reapPendingPid() bool {
+    if (g_poll.child_pid < 0) return false;
     var st: c_int = undefined;
-    if (std.c.waitpid(g_limine_pkexec_pid, &st, 1) == g_limine_pkexec_pid) {
-        g_limine_pkexec_pid = -1;
+    if (std.c.waitpid(g_poll.child_pid, &st, 1) == g_poll.child_pid) {
+        g_poll.child_pid = -1;
         return true;
     }
     return false;
@@ -4061,21 +4642,30 @@ fn reapPkexecChild() bool {
 
 /// After the auth poll ends, keep reaping a still-running pkexec (slow
 /// typist) for up to 5 minutes so it never lingers as a zombie child.
-fn limineReapTick(_: ?*anyopaque) callconv(.c) c_int {
-    _ = reapPkexecChild();
-    g_limine_reap_ticks += 1;
-    if (g_limine_pkexec_pid < 0 or g_limine_reap_ticks >= 150) {
-        g_limine_reap_ticks = 0;
+fn reapTick(_: ?*anyopaque) callconv(.c) c_int {
+    _ = reapPendingPid();
+    g_poll.reap_ticks += 1;
+    if (g_poll.child_pid < 0 or g_poll.reap_ticks >= 150) {
+        g_poll.reap_ticks = 0;
         return 0;
     }
     return 1;
 }
 
-fn limineStartReaperIfPending() void {
-    if (g_limine_pkexec_pid >= 0) {
-        g_limine_reap_ticks = 0;
-        _ = gtk.g_timeout_add(2000, limineReapTick, null);
+fn startReaperIfPending() void {
+    if (g_poll.child_pid >= 0) {
+        g_poll.reap_ticks = 0;
+        _ = gtk.g_timeout_add(2000, reapTick, null);
     }
+}
+
+/// Status text for the page whose apply is in flight.
+fn pollStatus(comptime fmt: []const u8, args: anytype) void {
+    const label = g_poll.status_label orelse return;
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
+    buf[msg.len] = 0; // bufPrint already guarded the overflow case
+    gtk.gtk_label_set_text(label, buf[0..msg.len :0]);
 }
 
 /// The single pkexec shell line: wallpaper file shuffle (when one is
@@ -4155,28 +4745,31 @@ fn doLimineApply() void {
     _ = writeFileAll(limine_pkexec_err_path, "");
     if (buildPkexecWrapper(cmd)) |w| {
         defer gpa.free(w);
-        _ = launchPkexecInSession(&.{ "/bin/sh", "-c", w });
+        _ = launchApplyChild(&.{ "/bin/sh", "-c", w });
     } else {
-        _ = launchPkexecInSession(&.{ "pkexec", "/usr/bin/bash", "-c", cmd });
+        _ = launchApplyChild(&.{ "pkexec", "/usr/bin/bash", "-c", cmd });
     }
 
     // Kick off the verification poll (authorized vs cancelled detection).
-    if (g_limine_poll_target) |t| gpa.free(t);
-    g_limine_poll_target = gpa.dupe(u8, newconf) catch null;
-    g_limine_poll_ticks = 0;
-    gpa.free(newconf);
-    if (g_limine_poll_target != null) {
-        limineStatus("Waiting for the polkit password prompt…", .{});
-        _ = gtk.g_timeout_add(1600, liminePollTick, null);
+    if (!startApplyPoll(limine_conf_path, limine_pkexec_err_path, newconf, "Applied. Reboot to see the new boot menu.", liminePollApplied, g_limine_status_label)) {
+        gpa.free(newconf);
+        limineStatus("Out of memory recording the staged config.", .{});
+        return;
     }
+    gpa.free(newconf);
+    limineStatus("Waiting for the polkit password prompt…", .{});
 }
 
-/// First non-empty line of pkexec's captured stderr, swept of '<' and '&'
-/// (cheap Pango safety) and capped at 100 chars so it always fits the status
-/// label. An empty result means "no capture" and the caller keeps its
-/// generic message.
-fn liminePkexecErrNote(buf: []u8) []const u8 {
-    const txt = readFileAll(limine_pkexec_err_path) orelse return "";
+fn liminePollApplied(data: []const u8) void {
+    setLimineBase(data);
+}
+
+/// First non-empty line of the captured pkexec stderr for `err_path`, swept
+/// of '<' and '&' (cheap Pango safety) and capped at 100 chars so it always
+/// fits the status label. An empty result means "no capture" and the caller
+/// keeps its generic message.
+fn pkexecErrNote(err_path: [:0]const u8, buf: []u8) []const u8 {
+    const txt = readFileAll(err_path) orelse return "";
     defer gpa.free(txt);
     var it = std.mem.splitScalar(u8, txt, '\n');
     while (it.next()) |row| {
@@ -4194,48 +4787,73 @@ fn liminePkexecErrNote(buf: []u8) []const u8 {
     return "";
 }
 
+/// Settings a poll up for one apply: records the comparison target (the
+/// staged bytes), wires the page's conf/capture paths, success hook and
+/// status label, and starts the 1.6 s tick. Returns false only when the
+/// target could not be recorded (out of memory).
+fn startApplyPoll(
+    conf_path: [:0]const u8,
+    err_path: [:0]const u8,
+    staged: []const u8,
+    applied_msg: [:0]const u8,
+    on_applied: *const fn ([]const u8) void,
+    lbl: ?*gtk.GtkLabel,
+) bool {
+    if (g_poll.target) |t| gpa.free(t);
+    g_poll.conf_path = conf_path;
+    g_poll.err_path = err_path;
+    g_poll.applied_msg = applied_msg;
+    g_poll.on_applied = on_applied;
+    g_poll.status_label = lbl;
+    g_poll.target = gpa.dupe(u8, staged) catch null;
+    g_poll.ticks = 0;
+    if (g_poll.target == null) return false;
+    _ = gtk.g_timeout_add(1600, applyPollTick, null);
+    return true;
+}
+
 /// Authorized when the on-disk conf comes to equal the staged bytes. The
 /// pkexec child is waitpid(WNOHANG)-reaped every tick; if it died without
 /// producing the conf, its captured stderr is surfaced immediately rather
 /// than polling out the full window against a dead process.
-fn liminePollTick(_: ?*anyopaque) callconv(.c) c_int {
-    const target = g_limine_poll_target orelse return 0;
-    g_limine_poll_ticks += 1;
-    const child_dead = reapPkexecChild();
+fn applyPollTick(_: ?*anyopaque) callconv(.c) c_int {
+    const target = g_poll.target orelse return 0;
+    g_poll.ticks += 1;
+    const child_dead = reapPendingPid();
 
     var applied = false;
-    if (readFileAll(limine_conf_path)) |data| {
+    if (readFileAll(g_poll.conf_path)) |data| {
         defer gpa.free(data);
         if (std.mem.eql(u8, data, target)) {
-            setLimineBase(data);
+            if (g_poll.on_applied) |hook| hook(data);
             applied = true;
         }
     }
     if (applied) {
-        gpa.free(g_limine_poll_target.?);
-        g_limine_poll_target = null;
-        limineStatus("Applied. Reboot to see the new boot menu.", .{});
-        limineStartReaperIfPending();
+        gpa.free(g_poll.target.?);
+        g_poll.target = null;
+        pollStatus("{s}", .{g_poll.applied_msg});
+        startReaperIfPending();
         return 0;
     }
     if (child_dead) {
-        gpa.free(g_limine_poll_target.?);
-        g_limine_poll_target = null;
+        gpa.free(g_poll.target.?);
+        g_poll.target = null;
         var note_buf: [200]u8 = undefined;
-        const note = liminePkexecErrNote(&note_buf);
+        const note = pkexecErrNote(g_poll.err_path, &note_buf);
         if (note.len > 0) {
-            limineStatus("Apply did not complete — pkexec says: {s}", .{note});
+            pollStatus("Apply did not complete — pkexec says: {s}", .{note});
         } else {
-            limineStatus("Apply cancelled — polkit prompt dismissed or timed out.", .{});
+            pollStatus("Apply cancelled — polkit prompt dismissed or timed out.", .{});
         }
         return 0;
     }
-    if (g_limine_poll_ticks >= 75) {
+    if (g_poll.ticks >= 75) {
         // ~2 minutes with the prompt still open and unanswered.
-        gpa.free(g_limine_poll_target.?);
-        g_limine_poll_target = null;
-        limineStatus("Polkit prompt never answered — apply timed out.", .{});
-        limineStartReaperIfPending();
+        gpa.free(g_poll.target.?);
+        g_poll.target = null;
+        pollStatus("Polkit prompt never answered — apply timed out.", .{});
+        startReaperIfPending();
         return 0;
     }
     return 1;
@@ -4539,14 +5157,15 @@ const PAGE_NAMES = [_][:0]const u8{ "Appearance", "Modules", "Shortcuts" };
 const PAGE_ICONS = [_][:0]const u8{ "applications-graphics-symbolic", "view-list-symbolic", "user-bookmarks-symbolic" };
 const BAR_COUNT = PAGE_NAMES.len;
 
-// "Bar" pages + compositor pages + the System deck's Boot page, in sidebar
-// order. The compositor section is Hyprland on Hyprland and Mango on
-// MangoWM; both decks have the same number of pages (9), so only the
+// "Bar" pages + compositor pages + the System deck's Boot and Login pages,
+// in sidebar order. The compositor section is Hyprland on Hyprland and
+// Mango on MangoWM; both decks have the same number of pages (9), so only the
 // names/icons and the section header change at runtime. Section header
 // rows ("Bar" / "Hyprland"|"Mango" / "System") are inserted between the
 // groups at build time.
-const BOOT_PAGE_INDEX = BAR_COUNT + hypr_pages.pages.names.len; // first (only) page of the System deck
-const SB_COUNT = BOOT_PAGE_INDEX + 1;
+const BOOT_PAGE_INDEX = BAR_COUNT + hypr_pages.pages.names.len; // first page of the System deck
+const LY_PAGE_INDEX = BOOT_PAGE_INDEX + 1; // second page of the System deck
+const SB_COUNT = LY_PAGE_INDEX + 1;
 var g_sb_names: [SB_COUNT][:0]const u8 = undefined;
 var g_sb_icons: [SB_COUNT][:0]const u8 = undefined;
 
@@ -4561,6 +5180,8 @@ fn setupSidebarNames() void {
     for (icons.*, 0..) |ic, i| g_sb_icons[BAR_COUNT + i] = ic;
     g_sb_names[BOOT_PAGE_INDEX] = "Boot";
     g_sb_icons[BOOT_PAGE_INDEX] = "system-reboot-symbolic";
+    g_sb_names[LY_PAGE_INDEX] = "Login";
+    g_sb_icons[LY_PAGE_INDEX] = "system-switch-user-symbolic";
 }
 
 var g_sidebar_rows: [SB_COUNT]*gtk.GtkListBoxRow = undefined;
@@ -4571,12 +5192,18 @@ fn onSidebarRowSelected(_: *gtk.GtkListBox, row: ?*gtk.GtkListBoxRow, _: ?*anyop
     const r = row orelse return;
     for (g_sidebar_rows, 0..) |sr, i| {
         if (sr == r) {
-            // The Boot tab takes its one privileged read (polkit) lazily,
-            // on the first actual visit — never at application startup.
+            // The system-deck tabs take their setup lazily, on the first
+            // actual visit — never at application startup. The Boot tab's
+            // polkit read is only permitted on this user action.
             if (i == BOOT_PAGE_INDEX and !limine_inited) {
                 limine_inited = true;
                 loadLimineState(true);
                 limineUpdateWidgets();
+            }
+            if (i == LY_PAGE_INDEX and !ly_inited) {
+                ly_inited = true;
+                loadLyState(true);
+                lyUpdateWidgets();
             }
             gtk.gtk_stack_set_visible_child_name(g_content_stack.?, g_sb_names[i]);
             return;
@@ -4657,12 +5284,14 @@ fn buildWindow(app: *anyopaque) *gtk.AdwApplicationWindow {
     }
     addSidebarRow(sidebar_list, "System", "", false, SB_COUNT);
     addSidebarRow(sidebar_list, g_sb_names[BOOT_PAGE_INDEX], g_sb_icons[BOOT_PAGE_INDEX], true, BOOT_PAGE_INDEX);
+    addSidebarRow(sidebar_list, g_sb_names[LY_PAGE_INDEX], g_sb_icons[LY_PAGE_INDEX], true, LY_PAGE_INDEX);
 
     const sec_widgets = if (hypr_pages.g_mango) mango_pages.pages.widgets() else hypr_pages.pages.widgets();
     var page_widgets: [SB_COUNT]*gtk.GtkBox = undefined;
     for (bar_pages, 0..) |p, i| page_widgets[i] = p;
     for (sec_widgets, 0..) |p, i| page_widgets[BAR_COUNT + i] = p;
     page_widgets[BOOT_PAGE_INDEX] = buildBootPage();
+    page_widgets[LY_PAGE_INDEX] = buildLoginPage();
 
     for (g_sb_names, 0..) |name, i| {
         const scrolled = gtk.gtk_scrolled_window_new();
