@@ -128,6 +128,11 @@ CONFIG[extra_imaging]=""
 CONFIG[extra_music]=""
 CONFIG[extra_video]=""
 CONFIG[extra_gaming]=""
+# Featherlite gaming extras (CachyOS-style): the Proton/lib32 runtime +
+# overlay stack, and the sched-ext scx_lavd scheduler. Picked in the main
+# menu; applied by setup_gaming_tuning.
+CONFIG[wants_gaming_stack]="no"
+CONFIG[wants_scx]="no"
 CONFIG[wants_libreoffice]="no"
 CONFIG[lo_locale]=""
 CONFIG[lo_hunspell]=""
@@ -1567,6 +1572,16 @@ configure_extra_packages() {
     gaming=$(pick_category 2 "GAMING" \
         "Steam" "Lutris" "Heroic")
 
+    local gaming_extras=""
+    gaming_extras=$(printf '%s\n' "Proton runtime + overlays" "scx_lavd scheduler" \
+        | gum choose --no-limit --height 2 \
+            --header="-- GAMING EXTRAS (Featherlite) --" --header.foreground 6 \
+            --selected-prefix "[x] " --unselected-prefix "[ ] " \
+            --selected.foreground "198") || true
+    echo ""
+    [[ "$gaming_extras" == *"Proton runtime"* ]] && CONFIG[wants_gaming_stack]="yes"
+    [[ "$gaming_extras" == *"scx_lavd"* ]]       && CONFIG[wants_scx]="yes"
+
     local office_sel=""
     office_sel=$(printf '%s\n' "LibreOffice" | gum choose --no-limit --height 3 \
         --header="-- OFFICE --" --header.foreground 6 \
@@ -1642,8 +1657,10 @@ configure_extra_packages() {
     [[ -n "${CONFIG[extra_music]}" ]]    && echo -e "  Music/Audio: ${CYAN}${CONFIG[extra_music]}${NC}"
     [[ -n "${CONFIG[extra_video]}" ]]    && echo -e "  Video:       ${CYAN}${CONFIG[extra_video]}${NC}"
     [[ -n "${CONFIG[extra_gaming]}" ]]   && echo -e "  Gaming:      ${CYAN}${CONFIG[extra_gaming]}${NC}"
+    [[ "${CONFIG[wants_gaming_stack]}" == "yes" ]] && echo -e "  Gaming:      ${CYAN}+ Proton runtime & overlays${NC}"
+    [[ "${CONFIG[wants_scx]}" == "yes" ]]           && echo -e "  Gaming:      ${CYAN}+ scx_lavd scheduler${NC}"
     [[ "${CONFIG[wants_libreoffice]}" == "yes" ]] && echo -e "  LibreOffice: ${CYAN}yes (${CONFIG[lo_locale]})${NC}"
-    if [[ -z "${CONFIG[extra_browser]}${CONFIG[extra_social]}${CONFIG[extra_dev]}${CONFIG[extra_pass]}${CONFIG[extra_imaging]}${CONFIG[extra_music]}${CONFIG[extra_video]}${CONFIG[extra_gaming]}" && "${CONFIG[wants_libreoffice]}" != "yes" ]]; then
+    if [[ -z "${CONFIG[extra_browser]}${CONFIG[extra_social]}${CONFIG[extra_dev]}${CONFIG[extra_pass]}${CONFIG[extra_imaging]}${CONFIG[extra_music]}${CONFIG[extra_video]}${CONFIG[extra_gaming]}" && "${CONFIG[wants_libreoffice]}" != "yes" && "${CONFIG[wants_gaming_stack]}" != "yes" && "${CONFIG[wants_scx]}" != "yes" ]]; then
         echo -e "  ${YELLOW}(no extra packages selected)${NC}"
     fi
     echo -e "${PURPLE}═══════════════════════════════════════════════════════════════════════${NC}"
@@ -2007,6 +2024,14 @@ install_extra_kernels() {
 install_extra_software() {
     local pkgs="${CONFIG[extra_browser]} ${CONFIG[extra_social]} ${CONFIG[extra_dev]}"
     pkgs+=" ${CONFIG[extra_pass]} ${CONFIG[extra_imaging]} ${CONFIG[extra_music]} ${CONFIG[extra_video]} ${CONFIG[extra_gaming]}"
+    # Featherlite gaming extras (CachyOS-inspired). The lib32 half is what
+    # actually makes Windows/Proton titles launch — the 64-bit soup alone
+    # is not enough. Repo names install directly; anything missing falls
+    # through to ~/AUR-EXTRAS.txt via the loop below (protontricks usually).
+    [[ "${CONFIG[wants_gaming_stack]}" == "yes" ]] && pkgs+=" gamemode lib32-gamemode mangohud lib32-mangohud goverlay gamescope power-profiles-daemon alsa-plugins lib32-alsa-plugins giflib lib32-giflib glfw gst-plugins-base-libs lib32-gst-plugins-base-libs lib32-gtk3 libjpeg-turbo lib32-libjpeg-turbo libva lib32-libva libxslt mpg123 lib32-mpg123 openal lib32-openal ocl-icd lib32-ocl-icd vulkan-tools ttf-liberation umu-launcher protontricks winetricks"
+    # The scheduler package rides the same best-effort loop; its config and
+    # service land in setup_gaming_tuning.
+    [[ "${CONFIG[wants_scx]}" == "yes" ]] && pkgs+=" scx-scheds"
     local aur_left=""
     local p
     # shellcheck disable=SC2086
@@ -2275,6 +2300,8 @@ perform_installation() {
             [[ -n "${CONFIG[$_grp]}" ]] && _has_extra=1
         done
         [[ "${CONFIG[wants_libreoffice]}" == "yes" ]] && _has_extra=1
+        [[ "${CONFIG[wants_gaming_stack]}" == "yes" ]] && _has_extra=1
+        [[ "${CONFIG[wants_scx]}" == "yes" ]] && _has_extra=1
         if [[ "$_has_extra" == "1" ]]; then
             step_labels+=("Installing extra software"); step_funcs+=("install_extra_software")
         fi
@@ -2289,6 +2316,11 @@ perform_installation() {
     fi
     step_labels+=("Installing graphics drivers");   step_funcs+=("install_graphics")
     step_labels+=("Configuring swap");              step_funcs+=("setup_swap_system")
+    # Gaming tuning needs the swap choice (zram branch) and the packages
+    # from install_extra_software, so it runs last of the system steps.
+    if [[ "${CONFIG[wants_gaming_stack]}" == "yes" || "${CONFIG[wants_scx]}" == "yes" ]]; then
+        step_labels+=("Applying gaming tuning");    step_funcs+=("setup_gaming_tuning")
+    fi
 
     local total=${#step_labels[@]}
     local i
@@ -3130,6 +3162,125 @@ install_graphics() {
         # (install_bootloader already ran earlier in the step order).
         echo "nvidia_drm.modeset=1 nvidia_drm.fbdev=1" > "$MOUNTPOINT/etc/limine-cmdline-extra"
         write_limine_conf || show_warning "Could not refresh limine.conf with NVIDIA parameters"
+    fi
+}
+
+# Featherlite gaming tuning — tier 1–2 of the CachyOS playbook, no distro
+# infra required. Runs only when something was picked under GAMING EXTRAS:
+#   - "Proton runtime + overlays": the packages went through
+#     install_extra_software; this writes the system half — the
+#     game-performance wrapper, gaming sysctls, the NOFILE limits CachyOS
+#     ships, and (when zram was selected) a zswap-off oneshot so zram is
+#     the only compression layer.
+#   - "scx_lavd scheduler": scx_loader config defaulting to CachyOS's
+#     gaming scheduler (scx_lavd, Auto mode → --performance flags),
+#     enabled only when the unit exists, with a condition drop-in so it
+#     no-ops safely on kernels built without sched-ext.
+# Everything is best-effort — nothing here aborts the install.
+setup_gaming_tuning() {
+    if [[ "${CONFIG[wants_gaming_stack]}" != "yes" && "${CONFIG[wants_scx]}" != "yes" ]]; then
+        return 0
+    fi
+    if [[ "${CONFIG[wants_gaming_stack]}" == "yes" ]]; then
+        # game-performance wrapper (CachyOS's, trimmed): holds the CPU on
+        # the "performance" power profile while the game runs, restores the
+        # previous profile on exit. Steam launch option:
+        #   game-performance %command%
+        mkdir -p "$MOUNTPOINT/usr/local/bin"
+        cat > "$MOUNTPOINT/usr/local/bin/game-performance" << 'EOF'
+#!/usr/bin/env bash
+# game-performance — Featherlite port of CachyOS's wrapper: pin the CPU
+# power profile to "performance" while a game runs, restore afterwards.
+# Needs power-profiles-daemon; without it, just runs the game as-is.
+set -euo pipefail
+if ! command -v powerprofilesctl >/dev/null 2>&1; then
+    exec "$@"
+fi
+prev="$(powerprofilesctl get 2>/dev/null || true)"
+if ! powerprofilesctl set performance 2>/dev/null; then
+    exec "$@"
+fi
+restore() { powerprofilesctl set "${prev:-balanced}" 2>/dev/null || true; }
+trap restore EXIT
+"$@"
+EOF
+        chmod 755 "$MOUNTPOINT/usr/local/bin/game-performance"
+        # Latency sysctls (values from CachyOS-Settings; swappiness follows
+        # the swap choice — 150 with zram like CachyOS's rule, 60 otherwise).
+        local swappiness=60
+        [[ "${CONFIG[swap]}" == "zram" ]] && swappiness=150
+        cat > "$MOUNTPOINT/etc/sysctl.d/99-featherlite-gaming.conf" << EOF
+# Featherlite gaming/latency tuning (from CachyOS-Settings)
+vm.swappiness = ${swappiness}
+vm.page-cluster = 0
+vm.vfs_cache_pressure = 50
+vm.dirty_writeback_centisecs = 1500
+kernel.nmi_watchdog = 0
+kernel.split_lock_mitigate = 0
+EOF
+        # CachyOS-size NOFILE limits (game servers, emulators, modpacks).
+        mkdir -p "$MOUNTPOINT/etc/systemd/system.conf.d" "$MOUNTPOINT/etc/systemd/user.conf.d"
+        printf '[Manager]\nDefaultLimitNOFILE=2048:2097152\n' \
+            > "$MOUNTPOINT/etc/systemd/system.conf.d/90-featherlite-limits.conf"
+        printf '[Manager]\nDefaultLimitNOFILE=1024:1048576\n' \
+            > "$MOUNTPOINT/etc/systemd/user.conf.d/90-featherlite-limits.conf"
+        # With zram: stop zswap from double-compressing zram pages.
+        if [[ "${CONFIG[swap]}" == "zram" ]]; then
+            cat > "$MOUNTPOINT/etc/systemd/system/featherlite-zswap-off.service" << 'EOF'
+[Unit]
+Description=Disable zswap (zram already compresses)
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target
+ConditionPathExists=/sys/module/zswap
+ConditionPathExists=/sys/devices/virtual/block/zram0
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo N > /sys/module/zswap/parameters/enabled'
+
+[Install]
+WantedBy=sysinit.target
+EOF
+            arch-chroot "$MOUNTPOINT" systemctl enable featherlite-zswap-off.service 2>/dev/null \
+                || show_warning "Could not enable featherlite-zswap-off.service"
+        fi
+        # game-performance is useless unless power-profiles-daemon runs.
+        if [[ -f "$MOUNTPOINT/usr/lib/systemd/system/power-profiles-daemon.service" ]]; then
+            arch-chroot "$MOUNTPOINT" systemctl enable power-profiles-daemon.service 2>/dev/null \
+                || show_warning "Could not enable power-profiles-daemon.service"
+        fi
+    fi
+    if [[ "${CONFIG[wants_scx]}" == "yes" ]]; then
+        mkdir -p "$MOUNTPOINT/etc/scx_loader"
+        cat > "$MOUNTPOINT/etc/scx_loader/config.toml" << 'EOF'
+# Featherlite: CachyOS-style sched-ext defaults — scx_lavd in Auto mode.
+default_sched = "scx_lavd"
+default_mode = "Auto"
+
+[scheds.scx_lavd]
+auto_mode = ["--performance"]
+EOF
+        mkdir -p "$MOUNTPOINT/etc/systemd/system/scx_loader.service.d"
+        cat > "$MOUNTPOINT/etc/systemd/system/scx_loader.service.d/featherlite-guard.conf" << 'EOF'
+[Unit]
+ConditionPathIsDirectory=/sys/kernel/sched_ext
+EOF
+        # Enable whichever loader unit scx-scheds shipped (the packaging
+        # moved between scx_loader.service and the older scx.service).
+        if [[ -f "$MOUNTPOINT/usr/lib/systemd/system/scx_loader.service" ]]; then
+            arch-chroot "$MOUNTPOINT" systemctl enable scx_loader.service 2>/dev/null \
+                || show_warning "Could not enable scx_loader.service"
+        elif [[ -f "$MOUNTPOINT/usr/lib/systemd/system/scx.service" ]]; then
+            mkdir -p "$MOUNTPOINT/etc/systemd/system/scx.service.d"
+            cp "$MOUNTPOINT/etc/systemd/system/scx_loader.service.d/featherlite-guard.conf" \
+               "$MOUNTPOINT/etc/systemd/system/scx.service.d/featherlite-guard.conf"
+            printf 'SCX_SCHEDULER=scx_lavd\nSCX_FLAGS=--performance\n' > "$MOUNTPOINT/etc/default/scx"
+            arch-chroot "$MOUNTPOINT" systemctl enable scx.service 2>/dev/null \
+                || show_warning "Could not enable scx.service"
+        else
+            show_warning "scx-scheds installed no loader unit — skipping scx enable"
+        fi
     fi
 }
 
