@@ -4024,8 +4024,14 @@ const ly_conf_path: [:0]const u8 = "/etc/ly/config.ini";
 const ly_stage_path: [:0]const u8 = "/tmp/featherlite-ly.ini";
 const ly_stage_path_s: []const u8 = "/tmp/featherlite-ly.ini";
 
-const LY_ANIMATIONS = [_][:0]const u8{ "none", "doom", "matrix", "colormix", "gameoflife" };
-const LY_BIGCLOCKS = [_][:0]const u8{ "none", "big", "chrono" };
+const LY_ANIMATIONS = [_][:0]const u8{ "none", "doom", "matrix", "colormix", "gameoflife", "dur_file" };
+// Ly 1.4+ bigclock is a numerals-language selector, NOT a size — "big" and
+// "chrono" are invalid there. This matters more than it looks: ly treats
+// the whole config as unparsable when ANY key's value fails to convert and
+// silently runs on built-in defaults, so a wrong entry here bricks every
+// setting on disk, hand-edits included.
+const LY_BIGCLOCKS = [_][:0]const u8{ "none", "en", "fa" };
+const LY_BIGCLOCK_LABELS = [_][*:0]const u8{ "None", "English numerals", "Persian numerals" };
 
 var ly_hex_storage: [3][20]u8 = undefined; // bg, fg, border (worst value: 8 hex chars)
 var ly_word_storage: [2][16]u8 = undefined; // animation, bigclock words
@@ -4164,9 +4170,22 @@ fn parseLyConf(text: []const u8) void {
         } else if (std.ascii.eqlIgnoreCase(key, "border_fg")) {
             if (normalizeLyColor(val)) |bare| ly_border_v.set(bare);
         } else if (std.ascii.eqlIgnoreCase(key, "animation")) {
-            ly_anim_v.set(val); // stored raw — identical values rewrite identically
+            // Only words this Ly accepts may be stored. When any key's value
+            // doesn't convert, ly discards the whole config and runs on
+            // defaults — so an invalid word must not be re-written verbatim
+            // by Apply: it heals to the safe default instead, repairing
+            // hand-edited poison on the next pass.
+            if (lyListIndex(&LY_ANIMATIONS, val) != null) {
+                ly_anim_v.set(val);
+            } else {
+                ly_anim_v.set("none");
+            }
         } else if (std.ascii.eqlIgnoreCase(key, "bigclock")) {
-            ly_clock_v.set(val);
+            if (lyListIndex(&LY_BIGCLOCKS, val) != null) {
+                ly_clock_v.set(val);
+            } else {
+                ly_clock_v.set("none");
+            }
         } else if (std.ascii.eqlIgnoreCase(key, "bigclock_seconds")) {
             if (std.ascii.eqlIgnoreCase(val, "true")) {
                 ly_seconds_on = true;
@@ -4480,7 +4499,7 @@ fn buildLyFullPage(stack: *gtk.GtkStack) void {
     gtk.adw_preferences_group_set_description(greet_group, "The pre-login entertainment and the big clock. Their per-animation color keys are not managed — whatever is on disk stays.");
     const anim = gtk.adw_combo_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(anim), "Animation");
-    gtk.adw_action_row_set_subtitle(@ptrCast(anim), "What plays behind the prompt: none, DOOM fire, CMatrix, colormix, Game of Life.");
+    gtk.adw_action_row_set_subtitle(@ptrCast(anim), "What plays behind the prompt: none, DOOM fire, CMatrix, colormix, Game of Life, or a .dur file.");
     var anim_buf: [LY_ANIMATIONS.len + 1]?[*:0]const u8 = undefined;
     for (LY_ANIMATIONS, 0..) |a, i| anim_buf[i] = a;
     anim_buf[LY_ANIMATIONS.len] = null;
@@ -4491,10 +4510,10 @@ fn buildLyFullPage(stack: *gtk.GtkStack) void {
 
     const clock = gtk.adw_combo_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(clock), "Big clock");
-    gtk.adw_action_row_set_subtitle(@ptrCast(clock), "none, big, or chrono.");
-    var clock_buf: [LY_BIGCLOCKS.len + 1]?[*:0]const u8 = undefined;
-    for (LY_BIGCLOCKS, 0..) |c, i| clock_buf[i] = c;
-    clock_buf[LY_BIGCLOCKS.len] = null;
+    gtk.adw_action_row_set_subtitle(@ptrCast(clock), "A large clock in the greeter; the numerals follow English or Persian.");
+    var clock_buf: [LY_BIGCLOCK_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (LY_BIGCLOCK_LABELS, 0..) |c, i| clock_buf[i] = c;
+    clock_buf[LY_BIGCLOCK_LABELS.len] = null;
     gtk.adw_combo_row_set_model(clock, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&clock_buf))));
     g_ly_clock_combo = clock;
     _ = gtk.g_signal_connect_data(@ptrCast(clock), "notify::selected", @ptrCast(&onLyClockChanged), null, null, 0);
