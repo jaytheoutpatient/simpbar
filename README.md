@@ -1,16 +1,13 @@
 # Simpbar
 
-A native Zig/Wayland status bar for **Hyprland and MangoWM** — simple, clean, out of the way — plus an installer that sets up a ricing-friendly desktop around it.
+A native Zig/Wayland status bar for **Hyprland and MangoWM** — simple, clean, out of the way — plus an installer that sets up a ricing-friendly Arch desktop around it.
 
-Built for **Arch & derivatives** (EndeavourOS, CachyOS, Garuda, XeroLinux), **Fedora & derivatives** (Nobara, Ultramarine), and **Debian & derivatives** (Ubuntu, Mint, Pop). Pick your window manager (**Hyprland** or **MangoWM**) up front; on Arch **Chaotic-AUR** is configured for binary packages.
+Built for **Arch Linux** (EndeavourOS, CachyOS, Garuda, XeroLinux should work too). Pick your window manager (**Hyprland** or **MangoWM**) up front; **Chaotic-AUR** is configured for binary packages.
 
 ## Install
 
-Download the script first, then run it — piping curl straight into bash can hand bash a truncated/Git-mangled copy and die with a confusing mid-file syntax error:
-
 ```
-curl -fsSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh -o /tmp/simpbar-install.sh
-bash /tmp/simpbar-install.sh
+curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/install.sh | bash
 ```
 
 Interactive — answers a few questions, asks for sudo **once**, then installs everything. Reboot when done (`systemctl reboot`).
