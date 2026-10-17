@@ -6867,6 +6867,7 @@ fn wttrIconFor(cp: u32) ?u32 {
         0x2600 => 0xE30D, // ☀ sunny/clear
         0x26C5 => 0xE302, // ⛅ partly cloudy
         0x2601 => 0xE335, // ☁ cloudy
+        0x1F324 => 0xE302, // 🌥 sun behind small cloud (wttr's current "partly cloudy day" emoji)
         0x1F326 => 0xE304, // 🌦 partly cloudy w/ rain
         0x1F327 => 0xE319, // 🌧 rain
         0x26C8 => 0xE31D, // ⛈ thunderstorm
