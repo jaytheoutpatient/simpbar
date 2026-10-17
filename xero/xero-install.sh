@@ -2,19 +2,19 @@
 #
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
-# ║                     ✨ Xero Arch Installer v2.0.0 ✨                          ║
+# ║                   ✨ Featherlite Installer v2.0.0 ✨                          ║
 # ║                                                                               ║
-# ║          A beautiful, streamlined Arch Linux installer for XeroLinux         ║
+# ║    A beautiful, streamlined Arch Linux installer for Featherlite Linux       ║
 # ║                                                                               ║
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
 #
 # Author: XeroLinux Team
 # License: GPL-3.0
 #
-# Simpbar fork: base system + first-boot WM staging (the full desktop
-# still comes from the simpbar installer, auto-opened on first login),
-# Limine bootloader instead of GRUB. Base-system flow otherwise unchanged
-# from upstream v2.0.0.
+# Featherlite system installer (maintained inside the simpbar repo): base
+# system + first-boot WM staging (the full desktop still comes from the
+# simpbar installer, auto-opened on first login), Limine bootloader instead
+# of GRUB. Base-system flow otherwise unchanged from upstream v2.0.0.
 
 set -Eeuo pipefail
 
@@ -23,7 +23,7 @@ set -Eeuo pipefail
 # ────────────────────────────────────────────────────────────────────────────────
 
 VERSION="2.0.0"
-SCRIPT_NAME="Xero Arch Installer"
+SCRIPT_NAME="Featherlite Installer"
 PART_LABEL="Part 1 - Pacstrap"
 
 # Mountpoint for installation
@@ -89,7 +89,7 @@ CONFIG[installer_lang]="English"
 CONFIG[locale]="en_US.UTF-8"
 CONFIG[keyboard]="us"
 CONFIG[timezone]="UTC"
-CONFIG[hostname]="xerolinux"
+CONFIG[hostname]="featherlite"
 CONFIG[username]=""
 CONFIG[user_password]=""
 CONFIG[root_password]=""
@@ -280,7 +280,7 @@ show_splash() {
     # blank (1) + version (1) = 8 lines.
     print_vpad "$(vpad_for 8)"
     gum style --foreground 198 --bold --align center --width "$cols" --padding "2 0" \
-        "X E R O L I N U X"
+        "F E A T H E R L I T E"
     gum style --foreground 45 --align center --width "$cols" \
         "A R C H   I N S T A L L E R"
     echo ""
@@ -312,7 +312,7 @@ show_header() {
         --align center --width "$box_width" --margin "0 2" --padding "1 2" \
         "✨ $SCRIPT_NAME v$VERSION ✨" \
         "" \
-        "Installs a base Arch system (first-boot WM + installer auto-launch)," \
+        "Installs a base Featherlite system (first-boot WM + installer auto-launch)," \
         "with more configuration options than the ISO installer." \
         "For experienced Arch/Linux users. NOT beginner-friendly."
 }
@@ -368,16 +368,16 @@ confirm_action() {
     fi
 }
 
-# Big block-letter "XEROLINUX" wordmark, 53 cols wide — drawn with the same
+# Big block-letter "FEATHERLITE" wordmark, 54 cols wide — drawn with the same
 # U+2588 FULL BLOCK used by the progress bar itself, so it's exactly as
 # console-safe as the bar already proven to render correctly here. Skipped
 # entirely on a narrow terminal (see draw_progress_bar) rather than wrapped.
-XEROLOGO=(
-    "█   █ █████ ████   ███  █     █████ █   █ █   █ █   █"
-    " █ █  █     █   █ █   █ █       █   ██  █ █   █  █ █ "
-    "  █   ████  ████  █   █ █       █   █ █ █ █   █   █  "
-    " █ █  █     █  █  █   █ █       █   █  ██ █   █  █ █ "
-    "█   █ █████ █   █  ███  █████ █████ █   █  ███  █   █"
+FEATHERLITELOGO=(
+    "████ ████ ████ █  █ ████ ████ █    ████ ████ ████ ████"
+    "█    █    █  █  █   █  █ █    █  █ █     █    █   █   "
+    "███  ███  ████  █   ████ ███  ███  █     █    █   ███ "
+    "█    █    █  █  █   █  █ █    █ █  █     █    █   █   "
+    "█    ████ █  █  █   █  █ ████ █  █ ████ ████  █   ████"
 )
 
 # Pure bash/tput/printf, no gum — redrawn many times a second from
@@ -403,7 +403,7 @@ draw_progress_bar() {
     # has to support — skipped below that width rather than wrapped/clipped.
     if [[ $cols -ge 58 ]]; then
         local logo_line
-        for logo_line in "${XEROLOGO[@]}"; do
+        for logo_line in "${FEATHERLITELOGO[@]}"; do
             printf '\033[38;5;198m\033[1m%s\033[0m\033[K\n' "$(center_pad "$logo_line" "$cols")"
         done
         printf '\033[K\n'
@@ -1045,14 +1045,14 @@ configure_hostname() {
     echo ""
 
     local hostname=""
-    hostname=$(gum input --placeholder "xerolinux" --value "${CONFIG[hostname]}" --width 40 --header "Hostname:") || true
+    hostname=$(gum input --placeholder "featherlite" --value "${CONFIG[hostname]}" --width 40 --header "Hostname:") || true
 
     if [[ "$hostname" =~ ^[a-z][a-z0-9-]*$ && ${#hostname} -le 63 ]]; then
         CONFIG[hostname]="$hostname"
         show_success "Hostname: ${CONFIG[hostname]}"
     else
-        show_warning "Invalid hostname, using default: xerolinux"
-        CONFIG[hostname]="xerolinux"
+        show_warning "Invalid hostname, using default: featherlite"
+        CONFIG[hostname]="featherlite"
     fi
 
     sleep 0.5
@@ -1707,7 +1707,7 @@ show_main_menu() {
             --align center --width "$box_width" --margin "0 2" --padding "1 2" \
             "✨ $SCRIPT_NAME v$VERSION ✨" \
             "" \
-            "Installs a base Arch system (first-boot WM + installer auto-launch)," \
+            "Installs a base Featherlite system (first-boot WM + installer auto-launch)," \
             "with more configuration options than the ISO installer." \
             "For experienced Arch/Linux users. NOT beginner-friendly."
 
@@ -2635,7 +2635,7 @@ install_base_system() {
         show_info "Installing Btrfs snapshot support..."
         # snap-pac omitted here — its pacman hooks would fire on every package install
         # during the chroot setup phase, creating unwanted snapshots before first login.
-        # It gets installed by xero-snapper-init on first boot instead.
+        # It gets installed by featherlite-snapper-init on first boot instead.
         stdbuf -oL -eL pacstrap -K "$MOUNTPOINT" --noconfirm snapper limine-snapper-sync 2>/dev/null || \
             show_warning "Some Btrfs snapshot packages failed — continuing"
     fi
@@ -2910,7 +2910,7 @@ install_bootloader() {
         local esp_part="${CONFIG[boot_part]#${CONFIG[disk]}}"
         esp_part="${esp_part#p}"
         [[ "$esp_part" =~ ^[0-9]+$ ]] || esp_part=1
-        arch-chroot "$MOUNTPOINT" efibootmgr --create             --disk "${CONFIG[disk]}" --part "$esp_part"             --label "XeroLinux"             --loader /EFI/BOOT/BOOTX64.EFI 2>/dev/null             || show_warning "NVRAM boot entry failed — the fallback EFI path still boots on most firmware"
+        arch-chroot "$MOUNTPOINT" efibootmgr --create             --disk "${CONFIG[disk]}" --part "$esp_part"             --label "Featherlite"             --loader /EFI/BOOT/BOOTX64.EFI 2>/dev/null             || show_warning "NVRAM boot entry failed — the fallback EFI path still boots on most firmware"
     else
         # BIOS: stage onto the ext4 /boot partition + MBR of the disk.
         # Runs in chroot so the target's limine version deploys itself.
@@ -3001,7 +3001,7 @@ SNAPCFG
     # via a oneshot service. Enabling them here (in a bare chroot) causes
     # them to fire before the user's filesystem is fully settled.
     mkdir -p "$MOUNTPOINT/usr/local/bin"
-    cat > "$MOUNTPOINT/usr/local/bin/xero-snapper-init" << 'SNAPINIT'
+    cat > "$MOUNTPOINT/usr/local/bin/featherlite-snapper-init" << 'SNAPINIT'
 #!/bin/bash
 # Install snap-pac now — its pacman hooks will fire on the NEXT package operation,
 # which is the first real user-initiated install, not during system setup.
@@ -3012,27 +3012,27 @@ systemctl enable --now snapper-cleanup.timer
 # entries in limine.conf boot fine with or without it).
 systemctl enable --now limine-snapper-sync.service \
     || echo "WARNING: could not enable limine-snapper-sync.service"
-touch /var/lib/xero-snapper-initialized
-systemctl disable xero-snapper-init.service
+touch /var/lib/featherlite-snapper-initialized
+systemctl disable featherlite-snapper-init.service
 SNAPINIT
-    chmod +x "$MOUNTPOINT/usr/local/bin/xero-snapper-init"
+    chmod +x "$MOUNTPOINT/usr/local/bin/featherlite-snapper-init"
 
-    cat > "$MOUNTPOINT/etc/systemd/system/xero-snapper-init.service" << 'SVCEOF'
+    cat > "$MOUNTPOINT/etc/systemd/system/featherlite-snapper-init.service" << 'SVCEOF'
 [Unit]
-Description=Initialize Snapper timers on first boot (XeroLinux)
-ConditionPathExists=!/var/lib/xero-snapper-initialized
+Description=Initialize Snapper timers on first boot (Featherlite Linux)
+ConditionPathExists=!/var/lib/featherlite-snapper-initialized
 After=sysinit.target local-fs.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/xero-snapper-init
+ExecStart=/usr/local/bin/featherlite-snapper-init
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
-    arch-chroot "$MOUNTPOINT" systemctl enable xero-snapper-init.service 2>/dev/null || true
+    arch-chroot "$MOUNTPOINT" systemctl enable featherlite-snapper-init.service 2>/dev/null || true
 
     show_success "Snapper configured — timers activate on first boot."
 }
