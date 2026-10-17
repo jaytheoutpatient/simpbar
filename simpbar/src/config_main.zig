@@ -3710,6 +3710,12 @@ var g_limine_file_dialog: ?*gtk.GtkFileDialog = null;
 var g_limine_poll_target: ?[]u8 = null;
 var g_limine_poll_ticks: i32 = 0;
 
+/// Live pid of the pkexec child spawned by the Boot page's Apply (single
+/// fork — pkexec refuses orphaned starts). The GUI never blocks on it; the
+/// poll and reaper timers waitpid(WNOHANG)-reap the pid instead.
+var g_limine_pkexec_pid: c_int = -1;
+var g_limine_reap_ticks: i32 = 0;
+
 // The managed wallpaper's boot() URI — resolved away from a static
 // comptime string because the format suffix follows the picked file.
 var limine_wall_key_buf: [32]u8 = undefined;
@@ -4019,6 +4025,59 @@ fn buildPkexecWrapper(cmd: []const u8) ?[:0]u8 {
     return buildShCapture(limine_pkexec_err_path_s, "pkexec /usr/bin/bash -c", cmd);
 }
 
+/// Spawns the pkexec wrapper as a direct child of the GUI: one fork, no
+/// setsid, no exiting intermediate. pkexec refuses to run when it has been
+/// orphaned before it starts — "Refusing to render service to dead parents"
+/// (its startup check fails once getppid() turns 1), which is exactly what
+/// launchDetached's double-fork shape produces. Kept as the GUI's child, the
+/// parent is alive for the whole auth dance while the GUI stays responsive;
+/// if the GUI quits mid-auth, the already-past-the-check pkexec carries on
+/// and init reaps it. Poll/reaper timers waitpid(WNOHANG) the tracked pid.
+fn launchPkexecInSession(argv: []const [:0]const u8) c_int {
+    if (argv.len == 0 or argv.len > 14) return -1;
+    const pid = libc_proc.fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        var buf: [16]?[*:0]const u8 = undefined;
+        for (argv, 0..) |a, i| buf[i] = a;
+        buf[argv.len] = null;
+        _ = std.c.execve(argv[0].ptr, @ptrCast(&buf), std.c.environ);
+        std.c._exit(127);
+    }
+    g_limine_pkexec_pid = pid;
+    return pid;
+}
+
+/// One WNOHANG reap attempt of the tracked pkexec pid; true when reaped.
+fn reapPkexecChild() bool {
+    if (g_limine_pkexec_pid < 0) return false;
+    var st: c_int = undefined;
+    if (std.c.waitpid(g_limine_pkexec_pid, &st, 1) == g_limine_pkexec_pid) {
+        g_limine_pkexec_pid = -1;
+        return true;
+    }
+    return false;
+}
+
+/// After the auth poll ends, keep reaping a still-running pkexec (slow
+/// typist) for up to 5 minutes so it never lingers as a zombie child.
+fn limineReapTick(_: ?*anyopaque) callconv(.c) c_int {
+    _ = reapPkexecChild();
+    g_limine_reap_ticks += 1;
+    if (g_limine_pkexec_pid < 0 or g_limine_reap_ticks >= 150) {
+        g_limine_reap_ticks = 0;
+        return 0;
+    }
+    return 1;
+}
+
+fn limineStartReaperIfPending() void {
+    if (g_limine_pkexec_pid >= 0) {
+        g_limine_reap_ticks = 0;
+        _ = gtk.g_timeout_add(2000, limineReapTick, null);
+    }
+}
+
 /// The single pkexec shell line: wallpaper file shuffle (when one is
 /// active), the staged conf into /boot, the ESP fallback copy, and a+r so
 /// later direct reads never need a password. Ends in `true` so a missing
@@ -4096,9 +4155,9 @@ fn doLimineApply() void {
     _ = writeFileAll(limine_pkexec_err_path, "");
     if (buildPkexecWrapper(cmd)) |w| {
         defer gpa.free(w);
-        launchDetached(&.{ "/bin/sh", "-c", w });
+        _ = launchPkexecInSession(&.{ "/bin/sh", "-c", w });
     } else {
-        launchDetached(&.{ "pkexec", "/usr/bin/bash", "-c", cmd });
+        _ = launchPkexecInSession(&.{ "pkexec", "/usr/bin/bash", "-c", cmd });
     }
 
     // Kick off the verification poll (authorized vs cancelled detection).
@@ -4135,23 +4194,31 @@ fn liminePkexecErrNote(buf: []u8) []const u8 {
     return "";
 }
 
-/// Authorized when the on-disk conf comes to equal the staged bytes.
+/// Authorized when the on-disk conf comes to equal the staged bytes. The
+/// pkexec child is waitpid(WNOHANG)-reaped every tick; if it died without
+/// producing the conf, its captured stderr is surfaced immediately rather
+/// than polling out the full window against a dead process.
 fn liminePollTick(_: ?*anyopaque) callconv(.c) c_int {
     const target = g_limine_poll_target orelse return 0;
     g_limine_poll_ticks += 1;
-    const now = readFileAll(limine_conf_path);
-    if (now == null and g_limine_poll_ticks < 20) return 1;
-    if (now) |data| {
+    const child_dead = reapPkexecChild();
+
+    var applied = false;
+    if (readFileAll(limine_conf_path)) |data| {
         defer gpa.free(data);
         if (std.mem.eql(u8, data, target)) {
             setLimineBase(data);
-            gpa.free(g_limine_poll_target.?);
-            g_limine_poll_target = null;
-            limineStatus("Applied. Reboot to see the new boot menu.", .{});
-            return 0;
+            applied = true;
         }
     }
-    if (g_limine_poll_ticks >= 20) {
+    if (applied) {
+        gpa.free(g_limine_poll_target.?);
+        g_limine_poll_target = null;
+        limineStatus("Applied. Reboot to see the new boot menu.", .{});
+        limineStartReaperIfPending();
+        return 0;
+    }
+    if (child_dead) {
         gpa.free(g_limine_poll_target.?);
         g_limine_poll_target = null;
         var note_buf: [200]u8 = undefined;
@@ -4161,6 +4228,14 @@ fn liminePollTick(_: ?*anyopaque) callconv(.c) c_int {
         } else {
             limineStatus("Apply cancelled — polkit prompt dismissed or timed out.", .{});
         }
+        return 0;
+    }
+    if (g_limine_poll_ticks >= 75) {
+        // ~2 minutes with the prompt still open and unanswered.
+        gpa.free(g_limine_poll_target.?);
+        g_limine_poll_target = null;
+        limineStatus("Polkit prompt never answered — apply timed out.", .{});
+        limineStartReaperIfPending();
         return 0;
     }
     return 1;
