@@ -2068,7 +2068,7 @@ install_extra_software() {
     aur_left="$(echo "$aur_left")"
     if [[ -n "$aur_left" ]]; then
         local user_home="$MOUNTPOINT/home/${CONFIG[username]}"
-        echo "paru -S --needed$aur_left" > "$user_home/AUR-EXTRAS.txt"
+        echo "${CONFIG[aur_helper]:-paru} -S --needed$aur_left" > "$user_home/AUR-EXTRAS.txt"
         show_warning "AUR-only extras saved to ~/AUR-EXTRAS.txt — install after reboot"
     fi
 }
@@ -2725,6 +2725,18 @@ add_repos() {
     apply_parallel_downloads "$MOUNTPOINT/etc/pacman.conf"
     configure_pacman_options "$MOUNTPOINT/etc/pacman.conf"
     arch-chroot "$MOUNTPOINT" pacman -Sy || show_warning "pacman -Sy had errors — continuing"
+
+    # The AUR helper chosen in the menu ("to install with the base
+    # system") — upstream installed it in the post-reboot Part 2, which
+    # this fork dropped, so it never actually landed. Chaotic-AUR ships
+    # prebuilt paru and yay, so it's one chroot pacman away; failure is
+    # non-fatal (repo could have been skipped above).
+    local helper="${CONFIG[aur_helper]}"
+    if [[ -n "$helper" ]] && ! arch-chroot "$MOUNTPOINT" pacman -Q "$helper" &>/dev/null; then
+        show_info "Installing AUR helper: $helper (from Chaotic-AUR)"
+        arch-chroot "$MOUNTPOINT" pacman -S --needed --noconfirm "$helper" 2>/dev/null \
+            || show_warning "$helper not installed — after reboot run: sudo pacman -S $helper"
+    fi
 }
 
 configure_system() {
@@ -3279,7 +3291,26 @@ EOF
             arch-chroot "$MOUNTPOINT" systemctl enable scx.service 2>/dev/null \
                 || show_warning "Could not enable scx.service"
         else
-            show_warning "scx-scheds installed no loader unit — skipping scx enable"
+            # Plain Arch's scx-scheds ships only the scheduler binaries —
+            # no loader units (verified against scx-scheds 1.1.3-2). Ship
+            # our own minimal one instead: scx_lavd, gaming-tuned. The
+            # condition keeps it a no-op on kernels without sched-ext.
+            cat > "$MOUNTPOINT/etc/systemd/system/featherlite-scx.service" << 'EOF'
+[Unit]
+Description=Featherlite sched-ext scheduler (scx_lavd)
+ConditionPathIsDirectory=/sys/kernel/sched_ext
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/scx_lavd --performance
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            arch-chroot "$MOUNTPOINT" systemctl enable featherlite-scx.service 2>/dev/null \
+                || show_warning "Could not enable featherlite-scx.service"
         fi
     fi
 }
