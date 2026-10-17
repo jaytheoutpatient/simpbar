@@ -4023,6 +4023,14 @@ fn limineStatus(comptime fmt: []const u8, args: anytype) void {
 const ly_conf_path: [:0]const u8 = "/etc/ly/config.ini";
 const ly_stage_path: [:0]const u8 = "/tmp/featherlite-ly.ini";
 const ly_stage_path_s: []const u8 = "/tmp/featherlite-ly.ini";
+// The greeter's own startup hook — Ly runs it BEFORE taking over the TTY,
+// the only moment the console's 16 palette entries can be redefined so the
+// theme's colors survive. Applied alongside config.ini in one pkexec when
+// a preset (and therefore a palette) is active.
+const ly_startup_path: [:0]const u8 = "/etc/ly/startup.sh";
+const ly_startup_path_s: []const u8 = "/etc/ly/startup.sh";
+const ly_startup_stage_path: [:0]const u8 = "/tmp/featherlite-ly-startup.sh";
+const ly_startup_stage_path_s: []const u8 = "/tmp/featherlite-ly-startup.sh";
 
 const LY_ANIMATIONS = [_][:0]const u8{ "none", "doom", "matrix", "colormix", "gameoflife", "dur_file" };
 // Ly 1.4+ bigclock is a numerals-language selector, NOT a size — "big" and
@@ -4042,6 +4050,7 @@ var ly_anim_v = LimineVal{ .data = &ly_word_storage[0] };
 var ly_clock_v = LimineVal{ .data = &ly_word_storage[1] };
 var ly_seconds_set = false; // bigclock_seconds known (parsed or toggled)
 var ly_seconds_on = false;
+var ly_vt_palette: ?[]const u8 = null; // preset palette; set only via the preset picker
 
 var ly_found = false; // read succeeded at least once
 var ly_missing = false; // /etc/ly/config.ini absent — not a Ly system
@@ -4054,14 +4063,51 @@ const LyPreset = struct {
     bg: []const u8,
     fg: []const u8,
     border: []const u8,
+    /// 16 console palette entries (normal run then bright run), matching
+    /// the Boot page's palette data. Needed because the kernel console
+    /// clamps ly's 24-bit colors to its 16-entry palette — bg/fg/border
+    /// quantize to near-default lookalikes unless these entries are
+    /// redefined to the theme. Each preset's bg/fg/border land EXACTLY on
+    /// slots 0/7(15)/4-or-5 of its palette.
+    vt: []const u8,
 };
 
 const LY_PRESETS = [_]LyPreset{
-    .{ .label = "Catppuccin Mocha", .bg = "1e1e2e", .fg = "cdd6f4", .border = "89b4fa" },
-    .{ .label = "Tokyo Night", .bg = "1a1b26", .fg = "c0caf5", .border = "7aa2f7" },
-    .{ .label = "Nord", .bg = "2e3440", .fg = "eceff4", .border = "88c0d0" },
-    .{ .label = "Rose Pine", .bg = "191724", .fg = "e0def4", .border = "c4a7e7" },
-    .{ .label = "Dracula", .bg = "21222c", .fg = "f8f8f2", .border = "bd93f9" },
+    .{
+        .label = "Catppuccin Mocha",
+        .bg = "1e1e2e",
+        .fg = "cdd6f4",
+        .border = "89b4fa",
+        .vt = "1e1e2e f38ba8 a6e3a1 f9e2af 89b4fa f5c2e7 94e2d5 cdd6f4 585b70 f38ba8 a6e3a1 f9e2af 89b4fa f5c2e7 94e2d5 cdd6f4",
+    },
+    .{
+        .label = "Tokyo Night",
+        .bg = "1a1b26",
+        .fg = "c0caf5",
+        .border = "7aa2f7",
+        .vt = "1a1b26 f7768e 9ece6a e0af68 7aa2f7 bb9af7 7dcfff a9b1d6 414868 ff7a93 b9f27c ff9e64 7da6ff bb9af7 0db9d7 c0caf5",
+    },
+    .{
+        .label = "Nord",
+        .bg = "2e3440",
+        .fg = "eceff4",
+        .border = "88c0d0",
+        .vt = "2e3440 bf616a a3be8c ebcb8b 81a1c1 b48ead 88c0d0 d8dee9 3b4252 bf616a a3be8c ebcb8b 81a1c1 b48ead 8fbcbb eceff4",
+    },
+    .{
+        .label = "Rose Pine",
+        .bg = "191724",
+        .fg = "e0def4",
+        .border = "c4a7e7",
+        .vt = "191724 eb6f92 31748f f6c177 3e8fb0 c4a7e7 9ccfd8 e0def4 26233a eb6f92 31748f f6c177 3e8fb0 c4a7e7 9ccfd8 e0def4",
+    },
+    .{
+        .label = "Dracula",
+        .bg = "21222c",
+        .fg = "f8f8f2",
+        .border = "bd93f9",
+        .vt = "21222c ff5555 50fa7b f1fa8c bd93f9 ff79c6 8be9fd f8f8f2 6272a4 ff6e6e 69ff94 ffffa5 d6acff ff92df a4ffff ffffff",
+    },
 };
 
 const LY_PRESET_LABELS = [_][*:0]const u8{ "Keep current colors", "Catppuccin Mocha", "Tokyo Night", "Nord", "Rose Pine", "Dracula" };
@@ -4111,6 +4157,7 @@ fn resetLyState() void {
     ly_found = false;
     ly_missing = false;
     ly_locked = false;
+    ly_vt_palette = null;
     ly_bg_v.clear();
     ly_fg_v.clear();
     ly_border_v.clear();
@@ -4294,6 +4341,54 @@ fn lyApplyInto(base: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+const LY_PALETTE_BLOCK_START = "# ---- Featherlite greeter palette (auto-written by simpbar-config); edit via the Login page ----";
+const LY_PALETTE_BLOCK_END = "# ---- end Featherlite greeter palette ----";
+
+/// Rebuilds the greeter's startup script so a `palette` (16 space-separated
+/// hex entries) takes effect at greeter start. The Linux console clamps
+/// ly's 24-bit colors to its 16-slot palette, so without this the theme
+/// quantizes to near-default lookalikes — redefining the slots with the
+/// theme's own values is the only remedy, and Ly runs this script before it
+/// takes over the TTY, which is exactly when the slots are settable. Our
+/// marker block is replaced in place; the shipped commented example and any
+/// user tweaks pass through untouched.
+fn lyStartupInto(base: []const u8, palette: []const u8) ![]u8 {
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    try block.appendSlice(gpa, LY_PALETTE_BLOCK_START ++ "\n");
+    try block.appendSlice(gpa, "if [ \"$TERM\" = \"linux\" ]; then\n\ti=0\n");
+    try block.appendSlice(gpa, "\tfor c in ");
+    try block.appendSlice(gpa, palette);
+    try block.appendSlice(gpa, "; do\n");
+    try block.appendSlice(gpa, "\t\tprintf '\\033]P%x%s' \"$i\" \"$c\"\n");
+    try block.appendSlice(gpa, "\t\ti=$(( i + 1 ))\n\tdone\n");
+    try block.appendSlice(gpa, "\tclear # repaint after the palette change\nfi\n");
+    try block.appendSlice(gpa, LY_PALETTE_BLOCK_END ++ "\n");
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const start = std.mem.indexOf(u8, base, LY_PALETTE_BLOCK_START);
+    var replaced = false;
+    if (start) |s| {
+        if (std.mem.indexOfPos(u8, base, s, LY_PALETTE_BLOCK_END)) |e| {
+            try out.appendSlice(gpa, base[0..s]);
+            try out.appendSlice(gpa, block.items);
+            // The block ends with a newline; drop one from the tail when
+            // the original spacing puts a blank line right after the marker.
+            const tail = base[e + LY_PALETTE_BLOCK_END.len ..];
+            try out.appendSlice(gpa, if (tail.len > 0 and tail[0] == '\n') tail[1..] else tail);
+            replaced = true;
+        }
+    }
+    if (!replaced) {
+        try out.appendSlice(gpa, base);
+        if (base.len > 0 and base[base.len - 1] != '\n') try out.append(gpa, '\n');
+        try out.appendSlice(gpa, "\n");
+        try out.appendSlice(gpa, block.items);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 fn doLyApply() void {
     if (!ly_found) return;
     if (g_ly_base.len == 0) {
@@ -4320,7 +4415,35 @@ fn doLyApply() void {
     defer cmd.deinit(gpa);
     cmd.appendSlice(gpa, "cp ") catch return;
     appendShellQuoted(&cmd, ly_stage_path_s) catch return;
-    cmd.appendSlice(gpa, " /etc/ly/config.ini && chmod 644 /etc/ly/config.ini; true") catch return;
+    cmd.appendSlice(gpa, " /etc/ly/config.ini && chmod 644 /etc/ly/config.ini") catch return;
+
+    // Active preset palette: rewrite the greeter's startup palette block in
+    // the same pkexec pass (see lyStartupInto — the console clamps ly's
+    // colors to its 16 palette entries, so the colors only survive when the
+    // entries match the theme).
+    if (ly_vt_palette) |pal| {
+        var startup_new: ?[]u8 = null;
+        if (readFileAll(ly_startup_path)) |curblk| {
+            defer gpa.free(curblk);
+            startup_new = lyStartupInto(curblk, pal) catch null;
+        } else {
+            startup_new = lyStartupInto("", pal) catch null;
+        }
+        if (startup_new == null) {
+            lyStatus("Failed to build the console palette script.", .{});
+            return;
+        }
+        if (!writeFileAll(ly_startup_stage_path, startup_new.?)) {
+            gpa.free(startup_new.?);
+            lyStatus("Failed to stage {s}.", .{ly_startup_stage_path_s});
+            return;
+        }
+        gpa.free(startup_new.?);
+        cmd.appendSlice(gpa, " && cp ") catch return;
+        appendShellQuoted(&cmd, ly_startup_stage_path_s) catch return;
+        cmd.appendSlice(gpa, " /etc/ly/startup.sh && chmod 755 /etc/ly/startup.sh") catch return;
+    }
+    cmd.appendSlice(gpa, "; true") catch return;
 
     // Fresh capture slot for pkexec's own stderr (see the Boot page).
     _ = writeFileAll(limine_pkexec_err_path, "");
@@ -4399,6 +4522,7 @@ fn onLyPresetChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) 
     ly_bg_v.set(preset.bg);
     ly_fg_v.set(preset.fg);
     ly_border_v.set(preset.border);
+    ly_vt_palette = preset.vt; // also re-tune the console's palette slots.on Apply
     lySetPicker(0, ly_bg_v.text());
     lySetPicker(1, ly_fg_v.text());
     lySetPicker(2, ly_border_v.text());
@@ -4481,7 +4605,7 @@ fn buildLyFullPage(stack: *gtk.GtkStack) void {
     gtk.adw_preferences_group_set_description(color_group, "A preset fills background, text and border instantly; Apply writes /etc/ly/config.ini.");
     const combo = gtk.adw_combo_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(combo), "Color preset");
-    gtk.adw_action_row_set_subtitle(@ptrCast(combo), "Pick a palette for the greeter, or keep whatever is already in the config.");
+    gtk.adw_action_row_set_subtitle(@ptrCast(combo), "Pick a palette: it writes the colors and re-tunes the console's 16-color palette so they actually show up on the login screen.");
     var preset_buf: [LY_PRESET_LABELS.len + 1]?[*:0]const u8 = undefined;
     for (LY_PRESET_LABELS, 0..) |label, i| preset_buf[i] = label;
     preset_buf[LY_PRESET_LABELS.len] = null;
