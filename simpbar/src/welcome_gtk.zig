@@ -119,6 +119,7 @@ pub extern "c" fn gtk_switch_get_active(self: *GtkSwitch) c_int;
 
 // GtkButton
 pub extern "c" fn gtk_button_new_with_label(label: [*:0]const u8) *GtkButton;
+pub extern "c" fn gtk_button_new_from_icon_name(icon_name: [*:0]const u8) *GtkButton;
 
 // GtkSpinner
 pub extern "c" fn gtk_spinner_new() *GtkSpinner;
@@ -240,6 +241,17 @@ pub extern "c" fn gtk_entry_new() *GtkEntry;
 pub extern "c" fn gtk_entry_get_buffer(self: *GtkEntry) *GtkEntryBuffer;
 pub extern "c" fn gtk_entry_buffer_get_text(self: *GtkEntryBuffer) [*:0]const u8;
 pub extern "c" fn gtk_entry_buffer_set_text(self: *GtkEntryBuffer, text: [*:0]const u8, len: c_int) void;
+pub extern "c" fn gtk_entry_set_placeholder_text(self: *GtkEntry, text: ?[*:0]const u8) void;
+
+// GtkSearchEntry — a search box with icon and clear button (Packages tab's
+// search field). GTK 4.10+ builds it on GtkWidget directly (it does NOT
+// extend GtkEntry), so text goes through the GtkEditable interface's
+// gtk_editable_get_text — that's what the classic gtk_search_entry_get_text
+// macro expands to in C.
+pub const GtkSearchEntry = opaque {};
+pub extern "c" fn gtk_search_entry_new() *GtkSearchEntry;
+pub extern "c" fn gtk_search_entry_set_placeholder_text(self: *GtkSearchEntry, text: ?[*:0]const u8) void;
+pub extern "c" fn gtk_editable_get_text(editable: *anyopaque) [*:0]const u8;
 
 // --- Drag-and-drop (Modules tab row reordering, config_main.zig) ----------
 //

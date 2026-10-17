@@ -1005,6 +1005,14 @@ esac
 PACMAN_PKGS+=("$TERMINAL_PKG")
 [ "$TERMINAL_DETECTED" = 1 ] && detected_note "Terminal emulator" "$TERMINAL_NAME"
 
+# Persist the pick for the GTK apps: every terminal-bound action in
+# simpbar-welcome (script launches, package installs) runs in whichever
+# terminal this file names rather than assuming foot. Format: one line,
+# "<binary>[ <exec-flag>]" — the flag separates the terminal's own options
+# from the command ("foot -e", "kitty" takes it bare).
+mkdir -p ~/.config/simpbar
+printf '%s\n' "$TERMINAL_BIN${TERMINAL_E:+ $TERMINAL_E}" > ~/.config/simpbar/terminal
+
 # Point whichever config the chosen WM ships at the picked terminal.
 if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
     # hyprland.lua (copied to ~/.config/hypr in Step 4) hardcodes its
