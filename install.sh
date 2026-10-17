@@ -1,7 +1,13 @@
 #!/bin/bash
 # Simpbar Installer
-# Arch Linux only
-# ligma
+# Distro support: Arch & derivatives (pacman + Chaotic-AUR + AUR),
+# Fedora & derivatives (dnf + the Terra rolling repo), Debian &
+# derivatives (apt). Package names were checked against
+#   https://archlinux.org/packages/  https://aur.chaotic.cx/packages
+#   https://packages.fedoraproject.org/  https://github.com/terrapkg/packages
+#   https://packages.debian.org/
+# Anything no repo carries degrades to a printed "install manually" hint
+# instead of aborting, so one unsupported straggler never kills the run.
 
 set -e
 
@@ -28,18 +34,17 @@ banner() {
     /   ,,   \
    /   |  |  -\
   /_-''    ''-_\
-
 LOGO
 )
     art_text=$(cat <<'ART'
    _____ _                 _
   / ____(_)               | |
  | (___  _ _ __ ___  _ __ | |__   __ _ _ __
-  \___ \| | '_ ` _ \| '_ \| '_ \ / _` | '__|
-  ____) | | | | | | | |_) | |_) | (_| | |
- |_____/|_|_| |_| |_| .__/|_.__/ \__,_|_|
-                     | |
-                     |_|          installer
+   \___ \| | '_ ` _ \| '_ \| '_ \ / _` | '__|
+   ____) | | | | | | |_) | |_) | (_| | |
+  |_____/|_|_| |_| .__/|_.__/ \__,_|_|
+                  | |
+                  |_|          installer
 ART
 )
     mapfile -t logo_lines <<< "$logo_text"
@@ -72,7 +77,7 @@ die() {
 }
 
 # Build & install yay-bin from the AUR. Returns 1 on failure without dying,
-# so callers can fall back to a manual-install warning.
+# so callers can fall back to a manual-install warning. (Arch only.)
 install_yay() {
     local build_dir
     build_dir=$(mktemp -d)
@@ -90,7 +95,7 @@ install_yay() {
     return 0
 }
 
-# Build & install paru from the AUR. Same contract as install_yay.
+# Build & install paru from the AUR. Same contract as install_yay. (Arch only.)
 install_paru() {
     local build_dir
     build_dir=$(mktemp -d)
@@ -212,12 +217,6 @@ load_answer() {
 # them all (see the review block after Step 0).
 has_saved_answers() {
     [ -r "$ANSWERS_FILE" ] && [ -s "$ANSWERS_FILE" ]
-}
-
-# True when pacman knows the package (official repos or a foreign/AUR build
-# already installed — `pacman -Q` covers both).
-pkg_installed() {
-    pacman -Qq "$1" >/dev/null 2>&1
 }
 
 # Map installed packages to a prompt choice. Each argument is
@@ -363,6 +362,317 @@ prompt_choice() {
 # first (Chaotic-AUR carries these as binary packages), falling back to an
 # AUR helper only when the repos don't have it.
 # install_aur_pkg <display name> <package>
+# ── Distro-aware package helpers ───────────────────────────────────────
+# PKG holds the package manager ("pacman" | "dnf" | "apt") and DISTRO_KIND
+# the distro family ("arch" | "fedora" | "debian"), both set by the
+# detection block that runs right after the banner. Everything that used to
+# hardcode pacman goes through these wrappers.
+#
+# pkg_installed also understands a "flatpak:<appid>" name (used by the
+# non-Arch browser/Discord detection specs) and checks both the system and
+# user installations.
+pkg_installed() {
+    local p="$1"
+    case "$p" in
+        flatpak:*)
+            command -v flatpak >/dev/null 2>&1 || return 1
+            local app="${p#flatpak:}"
+            flatpak info "$app" >/dev/null 2>&1 && return 0
+            flatpak info --user "$app" >/dev/null 2>&1 && return 0
+            return 1 ;;
+    esac
+    case "$PKG" in
+        pacman) pacman -Qq "$p" >/dev/null 2>&1 ;;
+        apt)    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -qx 'install ok installed' ;;
+        dnf)    rpm -q "$p" >/dev/null 2>&1 ;;
+        *)      return 1 ;;
+    esac
+}
+
+# Is the package available in ANY enabled repo (no install)?
+pkg_available() {
+    case "$PKG" in
+        pacman) pacman -Si "$1" >/dev/null 2>&1 ;;
+        apt)    apt-cache show "$1" >/dev/null 2>&1 ;;
+        dnf)    dnf -q info "$1" >/dev/null 2>&1 ;;
+        *)      return 1 ;;
+    esac
+}
+
+# Refresh the package databases so pkg_available/resolution sees reality.
+refresh_dbs() {
+    case "$PKG" in
+        pacman) sudo pacman -Sy ;;
+        apt)    sudo apt-get update -qq ;;
+        dnf)    sudo dnf -q makecache --refresh >/dev/null 2>&1 || sudo dnf -q makecache ;;
+    esac
+}
+
+# Raw install of already-resolved package names.
+install_pkgs() {
+    case "$PKG" in
+        pacman) sudo pacman -S --noconfirm --needed "$@" ;;
+        apt)    DEBIAN_FRONTEND=noninteractive sudo -E apt-get install -y -qq "$@" ;;
+        dnf)    sudo dnf install -y "$@" ;;
+    esac
+}
+
+# Full system upgrade at the end of the run.
+full_upgrade() {
+    case "$PKG" in
+        pacman) sudo pacman -Syu --noconfirm ;;
+        apt)    sudo apt-get update -qq && DEBIAN_FRONTEND=noninteractive sudo -E apt-get -y -qq full-upgrade ;;
+        dnf)    sudo dnf -y upgrade ;;
+    esac
+}
+
+# Batch install with the same "one bad package aborts the transaction, so
+# retry individually" safety the pacman path always had — generalized here
+# because apt/dnf also abort the whole batch on one unknown name.
+install_pkgs_retriable() {
+    local count="$#" label="$1"; shift
+    local failed=() p
+    if run_spinner "$label — ${#} packages" install_pkgs "$@"; then
+        return 0
+    fi
+    warn "Batch install failed — retrying packages individually"
+    for p in "$@"; do
+        run_spinner "install: $p" install_pkgs "$p" \
+            || { warn "Could not install $p — install it manually"; failed+=("$p"); }
+    done
+    [ "${#failed[@]}" -gt 0 ] && return 1
+    return 0
+}
+
+# ── Package-name map ───────────────────────────────────────────────────
+# map_pkg <alias> prints the distro's install spec for a logical package.
+# Within a spec:
+#   * space-separated names are a CONJUNCTION (all get installed — the
+#     Debian/Fedora split of runtime + -dev/-devel packages the build needs),
+#   * "|" separated groups are ordered ALTERNATIVES (first fully-available
+#     group wins — e.g. distros that renamed swaync).
+map_pkg() {
+    local a="$1"
+    case "$a" in
+        # ── build/runtime libraries for the bar, welcome app, and shell ──
+        freetype2)         case "$DISTRO_KIND" in arch)   echo "freetype2" ;;
+                             fedora) echo "freetype freetype-devel" ;;
+                             debian) echo "libfreetype6 libfreetype-dev" ;; esac ;;
+        gdk-pixbuf2)       case "$DISTRO_KIND" in arch)   echo "gdk-pixbuf2" ;;
+                             fedora) echo "gdk-pixbuf2 gdk-pixbuf2-devel" ;;
+                             debian) echo "libgdk-pixbuf-2.0-0 libgdk-pixbuf-2.0-dev" ;; esac ;;
+        wayland)           case "$DISTRO_KIND" in arch)   echo "wayland" ;;
+                             fedora) echo "wayland-devel" ;;
+                             debian) echo "libwayland-client0 libwayland-dev" ;; esac ;;
+        wayland-protocols) case "$DISTRO_KIND" in fedora) echo "wayland-protocols-devel" ;;
+                             *)      echo "wayland-protocols" ;; esac ;;
+        xkbcommon)         case "$DISTRO_KIND" in arch)   echo "libxkbcommon" ;;
+                             fedora) echo "libxkbcommon libxkbcommon-devel" ;;
+                             debian) echo "libxkbcommon0 libxkbcommon-dev" ;; esac ;;
+        gtk4)              case "$DISTRO_KIND" in arch)   echo "gtk4" ;;
+                             fedora) echo "gtk4 gtk4-devel" ;;
+                             debian) echo "libgtk-4-1 libgtk-4-dev" ;; esac ;;
+        libadwaita)        case "$DISTRO_KIND" in arch)   echo "libadwaita" ;;
+                             fedora) echo "libadwaita libadwaita-devel" ;;
+                             debian) echo "libadwaita-1-0 libadwaita-1-dev" ;; esac ;;
+        # ── the desktop ──
+        playerctl)          echo "playerctl" ;;
+        mate-polkit)        echo "mate-polkit" ;;
+        swaybg)             echo "swaybg" ;;
+        nerd-font)          case "$DISTRO_KIND" in arch) echo "ttf-jetbrains-mono-nerd" ;; *) echo "" ;; esac ;;
+        noto-fonts)         case "$DISTRO_KIND" in arch)   echo "noto-fonts" ;;
+                              fedora) echo "google-noto-sans-fonts|google-noto-sans-vf-fonts" ;;
+                              debian) echo "fonts-noto-core" ;; esac ;;
+        noto-emoji)         case "$DISTRO_KIND" in arch)   echo "noto-fonts-emoji" ;;
+                              fedora) echo "google-noto-emoji-fonts" ;;
+                              debian) echo "fonts-noto-color-emoji" ;; esac ;;
+        fastfetch)          echo "fastfetch" ;;
+        neovim)             echo "neovim" ;;
+        swaync)             case "$DISTRO_KIND" in arch)   echo "swaync" ;;
+                              fedora) echo "sway-notification-center|swaync" ;;
+                              debian) echo "sway-notification-center" ;; esac ;;
+        rofi)               echo "rofi" ;;
+        flatpak)            echo "flatpak" ;;
+        nwg-look)           echo "nwg-look" ;;
+        nwg-drawer)         case "$DISTRO_KIND" in debian) echo "" ;; *) echo "nwg-drawer" ;; esac ;;
+        pavucontrol)        echo "pavucontrol" ;;
+        cava)               echo "cava" ;;
+        pipewire)           echo "pipewire" ;;
+        pipewire-pulse)     case "$DISTRO_KIND" in fedora) echo "pipewire-pulseaudio" ;; *) echo "pipewire-pulse" ;; esac ;;
+        wireplumber)        echo "wireplumber" ;;
+        gnome-disk-utility) echo "gnome-disk-utility" ;;
+        polkit-gnome)       case "$DISTRO_KIND" in debian) echo "" ;; *) echo "polkit-gnome" ;; esac ;;
+        grim)               echo "grim" ;;
+        slurp)              echo "slurp" ;;
+        wlr-randr)          echo "wlr-randr" ;;
+        cliphist)           echo "cliphist" ;;
+        wl-clipboard)       echo "wl-clipboard" ;;
+        python-gobject)     case "$DISTRO_KIND" in arch)   echo "python-gobject" ;;
+                              fedora) echo "python3-gobject" ;;
+                              debian) echo "python3-gi" ;; esac ;;
+        update-tool)        case "$DISTRO_KIND" in arch) echo "pacman-contrib" ;; *) echo "" ;; esac ;;
+        libnotify)          case "$DISTRO_KIND" in debian) echo "libnotify-bin" ;; *) echo "libnotify" ;; esac ;;
+        qt6ct)              echo "qt6ct" ;;
+        breeze)             case "$DISTRO_KIND" in arch)   echo "breeze" ;;
+                              fedora) echo "breeze-gtk|breeze|breeze-icon-theme|breeze-common" ;;
+                              debian) echo "breeze" ;; esac ;;
+        gawk)               echo "gawk" ;;
+        kdeconnect)         case "$DISTRO_KIND" in fedora) echo "kdeconnect|kdeconnectd|kdeconnect-kde" ;; *) echo "kdeconnect" ;; esac ;;
+        quickshell)         echo "quickshell" ;;
+        brightnessctl)      echo "brightnessctl" ;;
+        # ── window managers / portals / graphics ──
+        hyprland)           echo "hyprland" ;;
+        portal-hyprland)    echo "xdg-desktop-portal-hyprland" ;;
+        mangowm)            case "$DISTRO_KIND" in debian) echo "" ;; *) echo "mangowm" ;; esac ;;
+        portal-wlr)         echo "xdg-desktop-portal-wlr" ;;
+        portal-gtk)         echo "xdg-desktop-portal-gtk" ;;
+        easyeffects)        echo "easyeffects" ;;
+        mesa-vulkan)        case "$DISTRO_KIND" in arch) echo "" ;;
+                              *) echo "mesa-vulkan-drivers" ;; esac ;;
+        *)                  echo "" ;;
+    esac
+}
+
+# resolve_pkgs <alias>... → fills:
+#   RESOLVED_ALIAS[i] / RESOLVED_NAME[i] — logical name and chosen install spec
+#   UNRESOLVED — aliases no enabled repo carries (caller prints hints)
+# Aliases whose spec is INTENTIONALLY empty everywhere outside Arch (the
+# Nerd Font has its own tarball fallback, pacman-contrib has no other-distro
+# equivalent, polkit-gnome/nwg-drawer are simply absent on Debian) are
+# skipped silently instead of being reported as "unavailable".
+resolve_pkgs() {
+    RESOLVED_ALIAS=(); RESOLVED_NAME=(); UNRESOLVED=()
+    local alias spec alts alt okalt c chosen
+    for alias in "$@"; do
+        spec="$(map_pkg "$alias")"
+        if [ -z "$spec" ]; then
+            case "${SILENT_SKIP_ALIASES:-}" in
+                *" $alias "*) continue ;;
+            esac
+            UNRESOLVED+=("$alias")
+            continue
+        fi
+        chosen=""
+        IFS='|' read -ra alts <<< "$spec"
+        for alt in "${alts[@]}"; do
+            okalt=1
+            for c in $alt; do
+                pkg_available "$c" || { okalt=0; break; }
+            done
+            if [ "$okalt" = 1 ]; then chosen="$alt"; break; fi
+        done
+        if [ -z "$chosen" ]; then
+            UNRESOLVED+=("$alias")
+        else
+            RESOLVED_ALIAS+=("$alias")
+            RESOLVED_NAME+=("$chosen")
+        fi
+    done
+}
+
+# Verify every resolved spec actually landed (per-word, so the Debian-style
+# runtime+dev pairs are both checked). Fills MISSING_PKGS.
+verify_resolved() {
+    local i spec p
+    MISSING_PKGS=()
+    for i in "${!RESOLVED_ALIAS[@]}"; do
+        spec="${RESOLVED_NAME[$i]}"
+        for p in $spec; do
+            pkg_installed "$p" || { MISSING_PKGS+=("$p"); break; }
+        done
+    done
+    [ "${#MISSING_PKGS[@]}" -eq 0 ]
+}
+
+# True when $1 (a dotted version) is >= $2. Only used to gate zig.
+version_ge() {
+    [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]
+}
+
+# ── Zig toolchain ──────────────────────────────────────────────────────
+# build.zig.zon pins minimum_zig_version 0.16.0, and distro zig packages
+# usually lag far behind (Debian ships none at all). If the system zig is new
+# enough use it; otherwise drop the official static tarball into
+# ~/.local/share/simpbar/zig-<ver> (user-writable, no root, works on every
+# distro) and prepend it to PATH for the builds below.
+ZIG_VERSION="0.16.0"
+ensure_zig() {
+    if command -v zig >/dev/null 2>&1; then
+        local v; v="$(zig version)"
+        if version_ge "$v" "$ZIG_VERSION"; then
+            ok "zig $v found on PATH"
+            return 0
+        fi
+        warn "zig $v is too old (need >= $ZIG_VERSION) — fetching the official tarball"
+    fi
+    local dest="$HOME/.local/share/simpbar/zig-$ZIG_VERSION"
+    if [ -x "$dest/zig" ] && [ "$("$dest/zig" version 2>/dev/null)" = "$ZIG_VERSION" ]; then
+        export PATH="$dest:$PATH"
+        ok "zig $ZIG_VERSION already downloaded ($dest)"
+        return 0
+    fi
+    local zarch
+    case "$(uname -m)" in
+        x86_64)  zarch="x86_64-linux" ;;
+        aarch64) zarch="aarch64-linux" ;;
+        *) die "Unsupported CPU architecture for the zig tarball: $(uname -m)" ;;
+    esac
+    mkdir -p "$(dirname "$dest")"
+    run_spinner "Downloading zig $ZIG_VERSION (official tarball)" \
+        curl -fL --retry 3 -o /tmp/zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-${zarch}-${ZIG_VERSION}.tar.xz" \
+        || die "Could not download zig $ZIG_VERSION — check your network connection."
+    rm -rf "$dest" /tmp/zig-extract
+    mkdir -p /tmp/zig-extract
+    tar -xJf /tmp/zig.tar.xz -C /tmp/zig-extract \
+        || die "Could not extract the zig tarball."
+    mv "/tmp/zig-extract/zig-${zarch}-${ZIG_VERSION}" "$dest"
+    rm -rf /tmp/zig-extract /tmp/zig.tar.xz
+    export PATH="$dest:$PATH"
+    ok "zig $ZIG_VERSION installed to $dest"
+}
+
+# ── Distro detection ───────────────────────────────────────────────────
+# Reads /etc/os-release and picks the package-manager backend. Derivatives
+# are matched through ID plus ID_LIKE, so Manjaro/CachyOS/EndeavourOS land
+# on the Arch path, Nobara/Ultramarine on Fedora, Mint/Pop!_OS/Neon on
+# Debian. Unsupported distros die here with the supported list.
+detect_distro() {
+    DISTRO_KIND=""; DISTRO_ID=""
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        DISTRO_ID="${ID:-}"
+    fi
+    local ids="$DISTRO_ID ${ID_LIKE:-}"
+    case "$ids" in
+        *arch*|*manjaro*|*endeavouros*|*cachyos*|*garuda*|*artix*|*void*|*xero*)
+            DISTRO_KIND="arch";   PKG="pacman" ;;
+        *fedora*|*nobara*|*ultramarine*)
+            DISTRO_KIND="fedora"; PKG="dnf" ;;
+        *debian*|*ubuntu*)
+            DISTRO_KIND="debian"; PKG="apt" ;;
+    esac
+    if [ -z "$DISTRO_KIND" ]; then
+        die "Unsupported distro ('${DISTRO_ID:-unknown}'). Supported: Arch & derivatives (pacman), Fedora & derivatives (dnf), Debian/Ubuntu & derivatives (apt)."
+    fi
+    # Atomic/ostree Fedora variants can't take plain `dnf install` for /usr
+    # packages; everything user-level still works, but say so up front.
+    if [ "$DISTRO_KIND" = fedora ] && command -v rpm-ostree >/dev/null 2>&1; then
+        ATOMIC_FEDORA=1
+        warn "Atomic/ostree Fedora detected (rpm-ostree) — package installs are best-effort; layer them with 'rpm-ostree install' if this run misses some"
+    else
+        ATOMIC_FEDORA=0
+    fi
+    # Debian minimal images often lack sudo entirely; the whole script sudo's.
+    if ! command -v sudo >/dev/null 2>&1; then
+        die "sudo is not installed — install it (apt install sudo on Debian), add your user to the sudo group, then re-run."
+    fi
+}
+
+# Try installing a "would-be-AUR" package from the enabled pacman repos
+# first (Chaotic-AUR carries these as binary packages), falling back to an
+# AUR helper only when the repos don't have it. (Arch only.)
+# install_aur_pkg <display name> <package>
 install_aur_pkg() {
     local name="$1" pkg="$2"
     if pacman -Si "$pkg" >/dev/null 2>&1; then
@@ -384,7 +694,7 @@ install_aur_pkg() {
 
 # Install a batch of packages from the enabled pacman repos when possible,
 # falling back to an AUR helper for anything the repos don't carry. Only asks
-# to install yay/paru when it is actually needed.
+# to install yay/paru when it is actually needed. (Arch only.)
 #   install_repo_or_aur <pkg> [<pkg> ...]
 # Returns 0 when everything installed.
 install_repo_or_aur() {
@@ -468,10 +778,40 @@ install_repo_or_aur() {
     fi
 }
 
-banner
+# Remove already-installed package names (used by the Firefox prompt).
+remove_pkgs() {
+    case "$PKG" in
+        pacman) sudo pacman -Rns --noconfirm "$@" ;;
+        apt)    DEBIAN_FRONTEND=noninteractive sudo -E apt-get remove -y -qq "$@" ;;
+        dnf)    sudo dnf remove -y "$@" ;;
+    esac
+}
 
-# ── Step 0: platform check ─────────────────────────────────────────
-command -v pacman >/dev/null || die "This script is Arch-only (pacman not found)."
+# Install a file to $BIN_DIR — with sudo when that's /usr/bin, plain when
+# it's a user-writable dir (atomic Fedora's ~/.local/bin).
+install_bin() { # install_bin <mode> <src> <dst>
+    local mode="$1" src="$2" dst="$3"
+    if [ "$BIN_DIR" = "/usr/bin" ]; then
+        sudo install -Dm"$mode" "$src" "$dst"
+    else
+        install -Dm"$mode" "$src" "$dst"
+    fi
+}
+
+# Flatpak helper for the non-Arch paths: install an app from Flathub, with a
+# uniform "system install" so the launcher wrappers and pins find it.
+install_flatpak_app() {
+    local name="$1" appid="$2"
+    command -v flatpak >/dev/null 2>&1 || { warn "flatpak missing — install $name manually (flathub: $appid)"; return 1; }
+    run_spinner "flatpak: $name ($appid)" \
+        flatpak install -y --noninteractive flathub "$appid" \
+        || { warn "Could not install $name from Flathub — install manually: flatpak install flathub $appid"; return 1; }
+}
+
+banner
+detect_distro
+
+printf '  %sDetected distro:%s %s%s%s (%s backend)\n' "$C_BOLD" "$C_RESET" "$C_CYAN$C_BOLD" "${DISTRO_ID:-unknown}" "$C_RESET" "$PKG"
 
 # ── Step -1: XeroLinux provisioning (Arch ISO live environments only) ─
 # /run/archiso exists only on a booted Arch ISO. There — and ONLY there —
@@ -490,7 +830,7 @@ command -v pacman >/dev/null || die "This script is Arch-only (pacman not found)
 # root's home, then evaporate on reboot. So success prints the reboot
 # handoff and exits; only a failed/skipped base install falls through
 # below, where the operator owns the consequences.
-if [ -d /run/archiso ]; then
+if [ "$DISTRO_KIND" = arch ] && [ -d /run/archiso ]; then
     printf '\n  %sArch ISO live environment detected.%s\n' "$C_YELLOW" "$C_RESET"
     prompt_choice XERO_CHOICE 2 "Provision this machine with the simpbar base-system installer first?" \
         "Yes, run the base installer" "No, configure with simpbar"
@@ -551,7 +891,12 @@ force_ask=0
 if has_saved_answers && [ -n "$(load_answer REPO_CHOICE)" ]; then
     printf '\n  %sExisting simpbar setup found%s — your previous answers will be\n' "$C_YELLOW" "$C_RESET"
     printf '  reused and the questions below will be skipped.\n'
-    printf '  %s·%s repository     %s\n' "$C_GREEN" "$C_RESET" "Chaotic-AUR"
+    case "$DISTRO_KIND" in
+        fedora) _repo_label="Terra" ;;
+        debian) _repo_label="distro repositories" ;;
+        *)      _repo_label="Chaotic-AUR" ;;
+    esac
+    printf '  %s·%s repository     %s\n' "$C_GREEN" "$C_RESET" "$_repo_label"
     printf '  %s·%s window manager %s\n' "$C_GREEN" "$C_RESET" "$(load_answer WM_CHOICE | sed 's/^1$/Hyprland/;s/^2$/MangoWM/')"
     printf '\n  %sReview and change these answers? [y/N]: %s' "$C_BOLD" "$C_RESET"
     if [ -r /dev/tty ]; then
@@ -562,6 +907,7 @@ if has_saved_answers && [ -n "$(load_answer REPO_CHOICE)" ]; then
     case "$review_reply" in
         [Yy]*) force_ask=1 ;;
     esac
+    unset _repo_label
 fi
 
 # ── XeroLinux-provisioned systems ────────────────────────────────────
@@ -570,9 +916,10 @@ fi
 # the overlapping choices below (repos, browser, Discord, AUR helper,
 # graphics-driver pins) instead of re-asking or fighting them. Everything
 # else (WM, terminals, theming, simpbar itself) still runs. Non-Xero
-# systems never see this.
+# systems never see this. (Arch only by construction: it keys off
+# /etc/pacman.conf.)
 XERO_SYSTEM=0
-if grep -qE '^\[xerolinux\]' /etc/pacman.conf 2>/dev/null; then
+if [ "$DISTRO_KIND" = arch ] && grep -qE '^\[xerolinux\]' /etc/pacman.conf 2>/dev/null; then
     XERO_SYSTEM=1
     ok "XeroLinux-provisioned system detected — repo, browser, Discord, and AUR-helper choices are covered by the Xero install"
 fi
@@ -580,38 +927,67 @@ fi
 # ── Step 1: package repositories ─────────────────────────────────────
 step "Choosing package repositories"
 
-if [ "$XERO_SYSTEM" = 1 ]; then
-    # Chaotic-AUR is already there via Xero, so take it silently.
-    REPO_CHOICE=2; save_answer REPO_CHOICE 2; REPO_DETECTED=0
-    REPO_NAME="Chaotic-AUR"; REPO_LABEL="Chaotic-AUR"
-else
-
-printf '\n  %sChaotic-AUR%s adds a binary repo to pacman so most packages —\n' "$C_YELLOW" "$C_RESET"
-printf '  including things that are AUR-only on plain Arch — install through\n'
-printf '  %ssudo pacman -S%s instead of being compiled by an AUR helper (yay/\n' "$C_CYAN" "$C_RESET"
-printf '  paru only gets used for the few stragglers the repo does not carry).\n\n'
-
-# Chaotic-AUR already configured means nothing to ask — otherwise take it.
 REPO_DETECTED=0
-have_chaotic=0
-grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null && have_chaotic=1
-if [ "$have_chaotic" = 1 ]; then
-    REPO_CHOICE=2; save_answer REPO_CHOICE 2; REPO_DETECTED=1
-else
-    REPO_CHOICE=2; save_answer REPO_CHOICE 2; REPO_DETECTED=0
-fi
-REPO_NAME="Chaotic-AUR"; REPO_LABEL="Chaotic-AUR"
-[ "$REPO_DETECTED" = 1 ] && detected_note "Repositories" "$REPO_NAME"
-ok "Selected ${REPO_NAME} repositories"
-fi
+case "$DISTRO_KIND" in
+    arch)
+        if [ "$XERO_SYSTEM" = 1 ]; then
+            # Chaotic-AUR is already there via Xero, so take it silently.
+            REPO_CHOICE=2; save_answer REPO_CHOICE 2
+            REPO_NAME="Chaotic-AUR"; REPO_LABEL="Chaotic-AUR"
+        else
+            printf '\n  %sChaotic-AUR%s adds a binary repo to pacman so most packages —\n' "$C_YELLOW" "$C_RESET"
+            printf '  including things that are AUR-only on plain Arch — install through\n'
+            printf '  %ssudo pacman -S%s instead of being compiled by an AUR helper (yay/\n' "$C_CYAN" "$C_RESET"
+            printf '  paru only gets used for the few stragglers the repo does not carry).\n\n'
+
+            # Chaotic-AUR already configured means nothing to ask — otherwise take it.
+            have_chaotic=0
+            grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null && have_chaotic=1
+            if [ "$have_chaotic" = 1 ]; then
+                REPO_CHOICE=2; save_answer REPO_CHOICE 2; REPO_DETECTED=1
+            else
+                REPO_CHOICE=2; save_answer REPO_CHOICE 2; REPO_DETECTED=0
+            fi
+            REPO_NAME="Chaotic-AUR"; REPO_LABEL="Chaotic-AUR"
+            [ "$REPO_DETECTED" = 1 ] && detected_note "Repositories" "$REPO_NAME"
+            ok "Selected ${REPO_NAME} repositories"
+            unset have_chaotic
+        fi
+        ;;
+    fedora)
+        # Terra (terrapkg) is the AUR-equivalent rolling repo for Fedora:
+        # it carries MangoWM, the Discord clients, Zen/ProtonPlus/Bibata,
+        # ghostty and zig — none of which Fedora's own repos ship.
+        REPO_NAME="Terra"; REPO_LABEL="Terra"
+        if rpm -q terra-release >/dev/null 2>&1; then
+            REPO_CHOICE=1; save_answer REPO_CHOICE 1; REPO_DETECTED=1
+            detected_note "Repositories" "Terra"
+        elif [ "$ATOMIC_FEDORA" = 1 ]; then
+            REPO_CHOICE=2; save_answer REPO_CHOICE 2
+            warn "Atomic Fedora — skipping the Terra repo (layer terra-release manually with rpm-ostree if you want it)"
+        else
+            prompt_choice REPO_CHOICE 1 "Enable the Terra repository (rolling RPM repo — carries MangoWM, Discord clients, Zen, zig and more)?" \
+                "Yes, enable Terra" "No, Fedora repos only"
+            save_answer REPO_CHOICE "$REPO_CHOICE"
+        fi
+        ok "Selected ${REPO_NAME} repositories"
+        ;;
+    debian)
+        REPO_NAME="the distro repositories"; REPO_LABEL="apt"
+        REPO_CHOICE=0; save_answer REPO_CHOICE 0
+        ok "Using the distro repositories; extras (browsers, Discord clients) come from Flathub"
+        ;;
+esac
 
 # ── Step 2: window manager ───────────────────────────────────────────
-step "Choosing your window manager"
 step "Choosing your window manager"
 
 printf '\n  %sHyprland%s is the default setup (Lua config, %s~/.config/hypr%s).\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$C_RESET"
 printf '  %sMangoWM%s uses your shipped %s~/.config/mango%s config (flat files\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$C_RESET"
 printf '  under %scfg/%s — where simpbar-config writes its Mango pages).\n' "$C_CYAN" "$C_RESET"
+case "$DISTRO_KIND" in
+    debian) printf '  %sNote: MangoWM is not packaged for Debian — Hyprland is.%s\n' "$C_YELLOW" "$C_RESET" ;;
+esac
 
 # A WM package already installed is the answer — asking "which WM" when only
 # mangowm is present just burns a prompt. Both/neither installed falls
@@ -693,9 +1069,21 @@ SUDO_KEEPALIVE_PID=$!
 MISSING_PREREQS=()
 command -v curl  >/dev/null || MISSING_PREREQS+=(curl)
 command -v unzip >/dev/null || MISSING_PREREQS+=(unzip)
+case "$DISTRO_KIND" in
+    arch)   # git ships in the base group; nothing else needed here.
+        ;;
+    fedora) # pkgconf-pkg-config: zig's linkSystemLibrary resolves the
+            # freetype/gtk4/... .pc files through pkg-config.
+            command -v git >/dev/null || MISSING_PREREQS+=(git)
+            pkg_available pkgconf-pkg-config && ! command -v pkg-config >/dev/null && MISSING_PREREQS+=(pkgconf-pkg-config)
+            ;;
+    debian) command -v git >/dev/null || MISSING_PREREQS+=(git)
+            command -v pkg-config >/dev/null || MISSING_PREREQS+=(pkg-config)
+            ;;
+esac
 
 if [ "${#MISSING_PREREQS[@]}" -gt 0 ]; then
-    run_spinner "Installing ${MISSING_PREREQS[*]}" sudo pacman -S --noconfirm --needed "${MISSING_PREREQS[@]}" \
+    run_spinner "Installing ${MISSING_PREREQS[*]}" install_pkgs "${MISSING_PREREQS[@]}" \
         || die "Failed to install prerequisites: ${MISSING_PREREQS[*]}"
 else
     ok "curl and unzip already installed"
@@ -825,6 +1213,14 @@ for f in simpbar-wallpaper simpbar-restore-wallpaper; do
     cp "/tmp/simpbar-temp/simpbar-main/$f" ~/.local/share/simpbar/
 done
 
+# matugen's own config.toml + the simpbar template, staged beside the source.
+# The matugen section later used to reach straight back into /tmp for these —
+# but the /tmp archive is deleted right below, so that fallback could never
+# fire. Stage them like everything else.
+mkdir -p ~/.local/share/simpbar/matugen
+cp /tmp/simpbar-temp/simpbar-main/matugen/config.toml ~/.local/share/simpbar/matugen/config.toml 2>/dev/null || true
+cp /tmp/simpbar-temp/simpbar-main/matugen/simpbar.json ~/.local/share/simpbar/matugen/simpbar.json 2>/dev/null || true
+
 # The app drawer's QML and its toggle script. Staged under ~/.local/share/simpbar
 # (NOT /tmp/simpbar-temp, which is deleted on the next line, and NOT ~/.config,
 # because the drawer needs quickshell, which isn't installed until Step 4).
@@ -849,108 +1245,177 @@ cp /tmp/simpbar-temp/simpbar-main/appdrawer.desktop ~/.local/share/simpbar/appdr
 
 rm -rf /tmp/simpbar-temp
 
-# ── Step 5: set up Chaotic-AUR ─────────────────────────────────────
+# ── Step 5: enable the chosen repositories ─────────────────────────
 step "Setting up ${REPO_NAME}"
 
-# ── Chaotic-AUR ─────────────────────────────────────────────────
-if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
-    ok "Chaotic-AUR already configured"
-else
-    # Keyservers flake — retry a few times before giving up (recv-key
-    # is idempotent, so retries are safe).
-    _key_ok=0
-    for _try in 1 2 3; do
-        if run_spinner "Importing Chaotic-AUR signing key (attempt $_try/3)" \
-            sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com; then
-            _key_ok=1
-            break
+case "$DISTRO_KIND" in
+    arch)
+        # ── Chaotic-AUR ─────────────────────────────────────────────
+        if grep -q '^\[chaotic-aur\]' /etc/pacman.conf 2>/dev/null; then
+            ok "Chaotic-AUR already configured"
+        else
+            # Keyservers flake — retry a few times before giving up (recv-key
+            # is idempotent, so retries are safe).
+            _key_ok=0
+            for _try in 1 2 3; do
+                if run_spinner "Importing Chaotic-AUR signing key (attempt $_try/3)" \
+                    sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com; then
+                    _key_ok=1
+                    break
+                fi
+                [ "$_try" -lt 3 ] && spin_sleep 5
+            done
+            [ "$_key_ok" = 1 ] || die "Failed to import the Chaotic-AUR signing key."
+
+            run_spinner "Trusting Chaotic-AUR signing key" \
+                sudo pacman-key --lsign-key 3056513887B78AEB \
+                || die "Failed to locally sign the Chaotic-AUR key."
+
+            run_spinner "Installing Chaotic-AUR keyring & mirrorlist" \
+                sudo pacman -U --noconfirm \
+                    'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
+                    'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
+                || die "Failed to install the Chaotic-AUR keyring/mirrorlist packages."
+
+            printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
+
+            run_spinner "Syncing package databases" sudo pacman -Sy \
+                || die "Failed to sync package databases after enabling Chaotic-AUR."
+
+            ok "Chaotic-AUR enabled"
         fi
-        [ "$_try" -lt 3 ] && spin_sleep 5
-    done
-    [ "$_key_ok" = 1 ] || die "Failed to import the Chaotic-AUR signing key."
-
-    run_spinner "Trusting Chaotic-AUR signing key" \
-        sudo pacman-key --lsign-key 3056513887B78AEB \
-        || die "Failed to locally sign the Chaotic-AUR key."
-
-    run_spinner "Installing Chaotic-AUR keyring & mirrorlist" \
-        sudo pacman -U --noconfirm \
-            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
-            'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' \
-        || die "Failed to install the Chaotic-AUR keyring/mirrorlist packages."
-
-    printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
-
-    run_spinner "Syncing package databases" sudo pacman -Sy \
-        || die "Failed to sync package databases after enabling Chaotic-AUR."
-
-    ok "Chaotic-AUR enabled"
-fi
+        ;;
+    fedora)
+        if [ "$REPO_CHOICE" = 1 ] && ! rpm -q terra-release >/dev/null 2>&1; then
+            # Terra's documented bootstrap: --nogpgcheck only for this first
+            # transaction (the keys arrive with terra-gpg-keys; everything
+            # after is verified). https://docs.terrapkg.com/usage/installing
+            run_spinner "Enabling the Terra repository" \
+                sudo dnf install -y --nogpgcheck --repofrompath 'terra,https://repos.fyralabs.com/terra$releasever' terra-release terra-gpg-keys \
+                || warn "Could not enable Terra — MangoWM/Discord-client/Bibata installs below may be missing. Enable manually per https://docs.terrapkg.com/usage/installing"
+        fi
+        run_spinner "Refreshing package metadata" refresh_dbs \
+            || warn "Could not refresh package metadata — installs may use stale data"
+        ;;
+    debian)
+        run_spinner "Refreshing package metadata (apt update)" refresh_dbs \
+            || warn "apt update failed — installs may use stale data"
+        ;;
+esac
 
 # ── Step 6: install packages ─────────────────────────────────────────
-# Graphics: the official Mesa Vulkan stack is pinned explicitly below (see the
-# `PACMAN_PKGS+=` for the Vulkan ICDs). There is deliberately no GPU detection:
-# pinning the official ICDs keeps pacman from pulling a conflicting mesa-git /
-# lib32-mesa-git that aborts the whole transaction ("Remove mesa? [Y/n]"
-# answered N by --noconfirm); radeon/intel cover real hardware and swrast
-# covers GPU-less machines (test VMs), so the same fixed set works everywhere.
+# Graphics: on Arch the official Mesa Vulkan stack is pinned explicitly below
+# (see the `PACMAN_PKGS+=` for the Vulkan ICDs). There is deliberately no GPU
+# detection: pinning the official ICDs keeps pacman from pulling a conflicting
+# mesa-git / lib32-mesa-git that aborts the whole transaction ("Remove mesa?
+# [Y/n]" answered N by --noconfirm); radeon/intel cover real hardware and
+# swrast covers GPU-less machines (test VMs), so the same fixed set works
+# everywhere. Fedora/Debian get the distro's own mesa-vulkan-drivers, which
+# already covers AMD+Intel+swrast.
 step "Installing packages"
-
-# The lib32 graphics stack below lives in the multilib repo, which isn't
-# enabled by default.
-if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
-    warn "multilib repo not enabled — enabling it for the lib32 graphics stack"
-    sudo sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /etc/pacman.conf
-    if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
-        printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
-    fi
-    run_spinner "Syncing package databases" sudo pacman -Sy \
-        || die "Failed to sync package databases after enabling multilib."
-fi
 
 # zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl are
 # simpbar's build/runtime deps (Wayland client + layer-shell, FreeType glyph
 # rendering, gdk-pixbuf for tray icon-name decode, and the mpris source it
-# shells out to) — all official-repo, no AUR needed. pacman-contrib
-# (checkupdates) and wireplumber (wpctl) were already here for other
-# reasons but simpbar's pacman-update-count and volume widgets need them too.
-# grim + slurp + wl-clipboard + libnotify + gawk cover the screenshot binds
-# (region/window/fullscreen capture, clipboard copy via wl-copy, notify-send
-# for the toast, and awk to parse the compositor's active-window info for the
-# window-only capture) — the binds are spelled the same in hyprland.lua and
-# the shipped mango keybinds.conf. gawk ships in Arch's base group already on
-# almost every install, but it's listed explicitly rather than assumed.
-# quickshell (official extra repo) runs the app drawer panel. Plain Qt6/QML
-# cannot do this: layer-shell support lives in quickshell's QtWayland fork
-# rather than upstream qt6-wayland, so a hand-rolled QML panel has no way to
-# make a layer-shell surface at all. See the "App drawer" section below for
-# what actually gets deployed.
+# shells out to). xkbcommon links simpbar-shell's sticky-note keymap decode.
+# pacman-contrib (checkupdates) and wireplumber (wpctl) back the
+# pacman-update-count and volume widgets; checkupdates has apt/dnf
+# equivalents built in on the other distros. grim + slurp + wl-clipboard +
+# libnotify + gawk cover the screenshot binds (region/window/fullscreen
+# capture, clipboard copy via wl-copy, notify-send for the toast, and awk to
+# parse the compositor's active-window info for the window-only capture) —
+# the binds are spelled the same in hyprland.lua and the shipped mango
+# keybinds.conf. gawk ships preinstalled almost everywhere, but it's listed
+# explicitly rather than assumed. quickshell runs the app drawer panel:
+# plain Qt6/QML cannot do this, because layer-shell support lives in
+# quickshell's QtWayland fork rather than upstream qt6-wayland, so a
+# hand-rolled QML panel has no way to make a layer-shell surface at all.
 # brightnessctl backs both WMs' XF86MonBrightness* binds.
-PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji fastfetch neovim swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility polkit-gnome grim slurp wlr-randr cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
+BASE_ALIASES=(freetype2 gdk-pixbuf2 wayland wayland-protocols xkbcommon gtk4 libadwaita playerctl mate-polkit swaybg nerd-font noto-fonts noto-emoji fastfetch neovim swaync rofi flatpak nwg-look nwg-drawer pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility polkit-gnome grim slurp wlr-randr cliphist wl-clipboard python-gobject update-tool libnotify qt6ct breeze gawk kdeconnect quickshell brightnessctl)
+# Intentionally-no-spec aliases — never reported as "not available".
+SILENT_SKIP_ALIASES=" nerd-font update-tool polkit-gnome nwg-drawer "
 
-# Official Mesa Vulkan stack — see the Step 6 header: pinning these keeps
-# pacman from resolving the vulkan-driver virtuals to a conflicting mesa-git.
-# Skipped on XeroLinux-provisioned systems: Xero's own graphics-driver step
-# already set up mesa + the vendor stack (possibly custom bundles that
-# conflict with official mesa).
-if [ "$XERO_SYSTEM" = 1 ]; then
-    ok "Graphics drivers skipped (covered by the Xero install)"
+if [ "$DISTRO_KIND" = arch ]; then
+    # ── Arch: the original single pacman batch (Chaotic-AUR first, AUR
+    #    helper for stragglers) ────────────────────────────────────────
+    # The lib32 graphics stack below lives in the multilib repo, which isn't
+    # enabled by default.
+    if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
+        warn "multilib repo not enabled — enabling it for the lib32 graphics stack"
+        sudo sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /etc/pacman.conf
+        if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
+            printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
+        fi
+        run_spinner "Syncing package databases" sudo pacman -Sy \
+            || die "Failed to sync package databases after enabling multilib."
+    fi
+
+    PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji fastfetch neovim swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility polkit-gnome grim slurp wlr-randr cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
+
+    # Official Mesa Vulkan stack — see the Step 6 header: pinning these keeps
+    # pacman from resolving the vulkan-driver virtuals to a conflicting mesa-git.
+    # Skipped on XeroLinux-provisioned systems: Xero's own graphics-driver step
+    # already set up mesa + the vendor stack (possibly custom bundles that
+    # conflict with official mesa).
+    if [ "$XERO_SYSTEM" = 1 ]; then
+        ok "Graphics drivers skipped (covered by the Xero install)"
+    else
+        PACMAN_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon vulkan-intel lib32-vulkan-intel vulkan-swrast lib32-vulkan-swrast)
+    fi
+
+    # The compositor itself plus its desktop portal, chosen in Step 2. MangoWM
+    # also needs the apps the shipped mango config starts/binds on login
+    # (alacritty terminal, easyeffects from autostart).
+    if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
+        PACMAN_PKGS+=(hyprland xdg-desktop-portal-hyprland)
+    else
+        PACMAN_PKGS+=(mangowm xdg-desktop-portal-wlr xdg-desktop-portal-gtk)
+        # NOTE: no terminal here — TERMINAL_CHOICE below adds exactly one, so
+        # mango's old hardcoded alacritty doesn't double-install or fight the pick.
+        PACMAN_PKGS+=(easyeffects)
+    fi
 else
-    PACMAN_PKGS+=(mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon vulkan-intel lib32-vulkan-intel vulkan-swrast lib32-vulkan-swrast)
+    # ── Fedora / Debian: resolve the logical package map against the enabled
+    #    repos, then install. Every alias that no repo carries degrades to a
+    #    warning (and a manual-install hint) instead of aborting the run.
+    resolve_pkgs "${BASE_ALIASES[@]}"
+
+    # Graphics: the distro's Mesa Vulkan ICDs (AMD/Intel/swrast in one pkg).
+    resolve_pkgs mesa-vulkan
+    # The compositor itself plus its desktop portal, chosen in Step 2.
+    if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
+        resolve_pkgs hyprland portal-hyprland portal-gtk
+    else
+        resolve_pkgs mangowm portal-wlr portal-gtk easyeffects
+    fi
+
+    if [ "${#UNRESOLVED[@]}" -gt 0 ]; then
+        warn "Not available in ${REPO_NAME}: ${UNRESOLVED[*]} — the setup continues without them"
+        case "$DISTRO_KIND" in
+            fedora) warn "  (Terra carries some of these — enable it and re-run if you want them)" ;;
+            debian) warn "  (some are Arch-only — e.g. MangoWM; use Hyprland on Debian)" ;;
+        esac
+    fi
+
+    # Flatten the resolved specs into one name list and install.
+    INSTALL_NAMES=()
+    for _spec in "${RESOLVED_NAME[@]}"; do INSTALL_NAMES+=($_spec); done
+    unset _spec
+    if [ "${#INSTALL_NAMES[@]}" -gt 0 ]; then
+        install_pkgs_retriable "${PKG}: installing" "${INSTALL_NAMES[@]}" \
+            || warn "Some packages failed — the build below needs freetype/gdk-pixbuf/gtk4/wayland dev packages to succeed"
+    fi
+
+    if verify_resolved; then
+        ok "Verified all resolved packages are installed"
+    else
+        warn "These packages aren't actually installed: ${MISSING_PKGS[*]}"
+    fi
 fi
 
-# The compositor itself plus its desktop portal, chosen in Step 2. MangoWM
-# also needs the apps the shipped mango config starts/binds on login
-# (alacritty terminal, easyeffects from autostart).
-if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
-    PACMAN_PKGS+=(hyprland xdg-desktop-portal-hyprland)
-else
-    PACMAN_PKGS+=(mangowm xdg-desktop-portal-wlr xdg-desktop-portal-gtk)
-    # NOTE: no terminal here — TERMINAL_CHOICE below adds exactly one, so
-    # mango's old hardcoded alacritty doesn't double-install or fight the pick.
-    PACMAN_PKGS+=(easyeffects)
-fi
-
+# File manager choice — asked on every distro. Arch appends the package to
+# PACMAN_PKGS for the single batch below; Fedora/Debian install it with the
+# batch/verify block at the end of this step.
 if reuse_detected FILE_MANAGER_CHOICE '1:nautilus' '2:nemo' '3:dolphin'; then
     FILE_MANAGER_DETECTED=1
 else
@@ -959,10 +1424,11 @@ else
         "Nautilus" "Nemo" "Dolphin"
 fi
 case "$FILE_MANAGER_CHOICE" in
-    2) FILE_MANAGER_NAME="Nemo";    FILE_MANAGER_BIN="nemo";    PACMAN_PKGS+=(nemo) ;;
-    3) FILE_MANAGER_NAME="Dolphin"; FILE_MANAGER_BIN="dolphin"; PACMAN_PKGS+=(dolphin) ;;
-    *) FILE_MANAGER_NAME="Nautilus"; FILE_MANAGER_BIN="nautilus"; PACMAN_PKGS+=(nautilus) ;;
+    2) FILE_MANAGER_NAME="Nemo";    FILE_MANAGER_BIN="nemo" ;;
+    3) FILE_MANAGER_NAME="Dolphin"; FILE_MANAGER_BIN="dolphin" ;;
+    *) FILE_MANAGER_NAME="Nautilus"; FILE_MANAGER_BIN="nautilus" ;;
 esac
+[ "$DISTRO_KIND" = arch ] && PACMAN_PKGS+=("$FILE_MANAGER_BIN")
 [ "$FILE_MANAGER_DETECTED" = 1 ] && detected_note "File manager" "$FILE_MANAGER_NAME"
 
 # Point whichever config the chosen WM ships at the picked file manager.
@@ -982,6 +1448,8 @@ else
     fi
 fi
 
+# Terminal choice — same shape. Names are identical across Arch/Fedora/Debian
+# (ghostty/wezterm aren't packaged everywhere; the install step below warns).
 if reuse_detected TERMINAL_CHOICE '1:kitty' '2:foot' '3:ghostty' '4:alacritty' '5:wezterm' '6:konsole' '7:ptyxis'; then
     TERMINAL_DETECTED=1
 else
@@ -1002,7 +1470,7 @@ case "$TERMINAL_CHOICE" in
     7) TERMINAL_NAME="Ptyxis";    TERMINAL_BIN="ptyxis";    TERMINAL_PKG="ptyxis";    TERMINAL_CLASS="app.ptyxis.Terminal"; TERMINAL_E="-e" ;;
     *) TERMINAL_NAME="Foot";      TERMINAL_BIN="foot";      TERMINAL_PKG="foot";      TERMINAL_CLASS="foot";                TERMINAL_E="-e" ;;
 esac
-PACMAN_PKGS+=("$TERMINAL_PKG")
+[ "$DISTRO_KIND" = arch ] && PACMAN_PKGS+=("$TERMINAL_PKG")
 [ "$TERMINAL_DETECTED" = 1 ] && detected_note "Terminal emulator" "$TERMINAL_NAME"
 
 # Persist the pick for the GTK apps: every terminal-bound action in
@@ -1034,6 +1502,143 @@ else
     fi
 fi
 
+# ── Discord client choice ────────────────────────────────────────────
+# Arch: repo/chaotic/AUR packages. Fedora/Debian: the same menu installs from
+# Flathub (verified app ids), so the choice set is identical everywhere.
+if [ "$DISTRO_KIND" != arch ]; then
+    # Flathub must be registered BEFORE anything below installs from it
+    # (fresh Debian/Ubuntu/Fedora have no flathub remote yet).
+    run_spinner "Adding Flathub remote" \
+        flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo \
+        || warn "Could not add Flathub remote — apps below may fail; add it manually: flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo"
+fi
+if [ "$XERO_SYSTEM" = 1 ]; then
+    # Xero's Phase 2 covers Discord clients — skip the question and the
+    # install entirely (pin seeding below sees the empty name and skips).
+    DISCORD_DETECTED=0
+    DISCORD_NAME=""
+    DISCORD_AUR_PKG=""
+else
+    if [ "$DISTRO_KIND" = arch ]; then
+        if reuse_detected DISCORD_CHOICE '1:discord' '2:vesktop-bin' '3:equibop-bin equibop'; then
+            DISCORD_DETECTED=1
+        else
+            DISCORD_DETECTED=0
+            prompt_choice DISCORD_CHOICE 4 "Which Discord client would you like to install?" \
+                "Discord" "Vesktop" "Equibop" "Skip — don't install a Discord client"
+        fi
+
+        DISCORD_AUR_PKG=""
+        case "$DISCORD_CHOICE" in
+            1) DISCORD_NAME="Discord"; PACMAN_PKGS+=(discord) ;;
+            2) DISCORD_NAME="Vesktop"; DISCORD_AUR_PKG="vesktop-bin" ;;
+            3) DISCORD_NAME="Equibop"
+               # Either installed twin satisfies the choice — installing the other
+               # would conflict-abort the whole batch (pacman can't resolve [y/N]
+               # under --noconfirm), so install nothing in that case. Otherwise
+               # prefer the repo package name (Chaotic-AUR ships `equibop`; bare
+               # `-bin` only exists in the AUR) with the AUR name as fallback.
+               if pkg_installed equibop || pkg_installed equibop-bin; then DISCORD_AUR_PKG=""
+               elif pacman -Si equibop >/dev/null 2>&1; then DISCORD_AUR_PKG="equibop"
+               else DISCORD_AUR_PKG="equibop-bin"; fi ;;
+            *) DISCORD_NAME="" ;;
+        esac
+        [ "$DISCORD_DETECTED" = 1 ] && [ -n "$DISCORD_NAME" ] && detected_note "Discord client" "$DISCORD_NAME"
+    else
+        if reuse_detected DISCORD_CHOICE '1:flatpak:com.discordapp.Discord' '2:flatpak:dev.vencord.Vesktop' '3:flatpak:org.equicord.equibop'; then
+            DISCORD_DETECTED=1
+        else
+            DISCORD_DETECTED=0
+            prompt_choice DISCORD_CHOICE 4 "Which Discord client would you like to install (Flathub)?" \
+                "Discord" "Vesktop" "Equibop" "Skip — don't install a Discord client"
+        fi
+        DISCORD_AUR_PKG=""
+        case "$DISCORD_CHOICE" in
+            1) DISCORD_NAME="Discord"; DISCORD_FLATPAK_ID="com.discordapp.Discord" ;;
+            2) DISCORD_NAME="Vesktop"; DISCORD_FLATPAK_ID="dev.vencord.Vesktop" ;;
+            3) DISCORD_NAME="Equibop"; DISCORD_FLATPAK_ID="org.equicord.equibop" ;;
+            *) DISCORD_NAME="" ;;
+        esac
+        if [ -n "$DISCORD_NAME" ] && ! pkg_installed "flatpak:$DISCORD_FLATPAK_ID"; then
+            install_flatpak_app "$DISCORD_NAME" "$DISCORD_FLATPAK_ID" || true
+        fi
+        [ -n "$DISCORD_NAME" ] && ok "$DISCORD_NAME installed (Flathub)"
+    fi
+fi
+
+printf '\n  %smatugen%s is the Material You colorscheme generator simpbar uses for\n' "$C_BOLD" "$C_RESET"
+printf '  auto-theming: pick a wallpaper and it recolors the bar to match it\n'
+printf '  (the bar has an %sAuto-theme with matugen%s toggle in simpbar-config).\n' "$C_BOLD" "$C_RESET"
+# matugen is AUR/Chaotic-only today (no Fedora/Debian packaging exists, and
+# building it needs a Dart toolchain we don't want to spring on users) — so
+# auto-theming is an Arch feature; elsewhere the bar keeps its configured
+# colors and the toggle just stays off.
+if [ "$DISTRO_KIND" = arch ]; then
+    printf '  It is AUR-only and compiled from source, so it is the slowest install step.\n'
+    # NOTE: matugen used to be a Yes/No prompt. It is now always installed:
+    # auto-theming is core to the bar, not optional. A saved MATUGEN_CHOICE
+    # answer in install-answers is inert.
+    if reuse_detected MATUGEN_CHOICE '1:matugen'; then
+        MATUGEN_DETECTED=1
+    else
+        MATUGEN_DETECTED=0
+    fi
+    INSTALL_MATUGEN=1
+    [ "$MATUGEN_DETECTED" = 1 ] && detected_note "matugen" "matugen"
+else
+    INSTALL_MATUGEN=0
+    warn "matugen (auto-theming) isn't packaged for ${DISTRO_ID:-this distro} — the bar keeps its configured colors"
+fi
+
+# ── The actual installs ──────────────────────────────────────────────
+if [ "$DISTRO_KIND" = arch ]; then
+    printf '  Installing %d packages via pacman:\n    %s\n' "${#PACMAN_PKGS[@]}" "${PACMAN_PKGS[*]}"
+    run_spinner "pacman: installing ${#PACMAN_PKGS[@]} packages" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
+        || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
+
+    MISSING_PKGS=()
+    for pkg in "${PACMAN_PKGS[@]}"; do
+        pkg_installed "$pkg" || MISSING_PKGS+=("$pkg")
+    done
+    if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
+        warn "pacman reported success but these packages aren't actually installed: ${MISSING_PKGS[*]}"
+    else
+        ok "Verified all pacman packages are installed"
+    fi
+else
+    # Fedora/Debian: the file manager and terminal pick landed after the base
+    # batch, so install them now.
+    if ! pkg_installed "$FILE_MANAGER_BIN"; then
+        run_spinner "install: $FILE_MANAGER_BIN" install_pkgs "$FILE_MANAGER_BIN" \
+            || warn "Could not install $FILE_MANAGER_BIN — install it manually"
+    fi
+    if ! pkg_installed "$TERMINAL_PKG"; then
+        run_spinner "install: $TERMINAL_PKG" install_pkgs "$TERMINAL_PKG" \
+            || warn "Could not install $TERMINAL_PKG — pick another terminal or install it manually"
+    fi
+    if pkg_installed "$FILE_MANAGER_BIN" && pkg_installed "$TERMINAL_PKG"; then
+        ok "File manager ($FILE_MANAGER_BIN) and terminal ($TERMINAL_PKG) installed"
+    fi
+fi
+
+run_spinner "Refreshing font cache" fc-cache -f \
+    || warn "Could not refresh the font cache — run 'fc-cache -f' manually if icons look missing"
+
+# Nerd Font fallback for distros that don't package the patched JetBrainsMono
+# (Fedora & Debian only ship the vanilla font, and the bar's module icons are
+# Nerd Font glyphs). Installs the official upstream tarball system-wide.
+if [ "$DISTRO_KIND" != arch ] && ! pkg_installed "ttf-jetbrains-mono-nerd" \
+   && [ ! -f /usr/local/share/fonts/JetBrainsMono-NF/FontAwesome.ttf ]; then
+    NF_URL="https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/JetBrainsMono.tar.xz"
+    if run_spinner "Installing JetBrainsMono Nerd Font (upstream tarball)" \
+        bash -c "mkdir -p /tmp/nf-jbm && curl -fL --retry 3 -o /tmp/nf-jbm.tar.xz '$NF_URL' && tar -xJf /tmp/nf-jbm.tar.xz -C /tmp/nf-jbm && sudo mkdir -p /usr/local/share/fonts/JetBrainsMono-NF && sudo cp /tmp/nf-jbm/*.ttf /usr/local/share/fonts/JetBrainsMono-NF/ && rm -rf /tmp/nf-jbm /tmp/nf-jbm.tar.xz && fc-cache -f"; then
+        ok "JetBrainsMono Nerd Font installed"
+    else
+        rm -rf /tmp/nf-jbm /tmp/nf-jbm.tar.xz
+        warn "Could not install the Nerd Font — the bar's icons may render as boxes. Get it from https://www.nerdfonts.com/"
+    fi
+fi
+
 # NOTE: OBS Studio and video-editor prompts used to live here. They were
 # removed outright (not gated): neither is needed for the desktop to
 # function, and anyone who wants one installs it directly. Saved
@@ -1043,95 +1648,42 @@ fi
 # picked in the Xero installer's GAMING category, so asking again here would
 # fight it. Saved LAUNCHER_CHOICE answers in install-answers are now inert.
 
-if [ "$XERO_SYSTEM" = 1 ]; then
-    # Xero's Phase 2 covers Discord clients — skip the question and the
-    # install entirely (pin seeding below sees the empty name and skips).
-    DISCORD_DETECTED=0
-    DISCORD_NAME=""
-    DISCORD_AUR_PKG=""
-else
-if reuse_detected DISCORD_CHOICE '1:discord' '2:vesktop-bin' '3:equibop-bin equibop'; then
-    DISCORD_DETECTED=1
-else
-    DISCORD_DETECTED=0
-    prompt_choice DISCORD_CHOICE 4 "Which Discord client would you like to install?" \
-        "Discord" "Vesktop" "Equibop" "Skip — don't install a Discord client"
-fi
-
-DISCORD_AUR_PKG=""
-case "$DISCORD_CHOICE" in
-    1) DISCORD_NAME="Discord"; PACMAN_PKGS+=(discord) ;;
-    2) DISCORD_NAME="Vesktop"; DISCORD_AUR_PKG="vesktop-bin" ;;
-    3) DISCORD_NAME="Equibop"
-       # Either installed twin satisfies the choice — installing the other
-       # would conflict-abort the whole batch (pacman can't resolve [y/N]
-       # under --noconfirm), so install nothing in that case. Otherwise
-       # prefer the repo package name (Chaotic-AUR ships `equibop`; bare
-       # `-bin` only exists in the AUR) with the AUR name as fallback.
-       if pacman -Qq equibop >/dev/null 2>&1 || pacman -Qq equibop-bin >/dev/null 2>&1; then DISCORD_AUR_PKG=""
-       elif pacman -Si equibop >/dev/null 2>&1; then DISCORD_AUR_PKG="equibop"
-       else DISCORD_AUR_PKG="equibop-bin"; fi ;;
-    *) DISCORD_NAME="" ;;
-esac
-[ "$DISCORD_DETECTED" = 1 ] && [ -n "$DISCORD_NAME" ] && detected_note "Discord client" "$DISCORD_NAME"
-fi
-
-printf '\n  %smatugen%s is the Material You colorscheme generator simpbar uses for\n' "$C_BOLD" "$C_RESET"
-printf '  auto-theming: pick a wallpaper and it recolors the bar to match it\n'
-printf '  (the bar has an %sAuto-theme with matugen%s toggle in simpbar-config).\n' "$C_BOLD" "$C_RESET"
-printf '  It is AUR-only and compiled from source, so it is the slowest install step.\n'
-# NOTE: matugen used to be a Yes/No prompt. It is now always installed:
-# auto-theming is core to the bar, not optional. A saved MATUGEN_CHOICE
-# answer in install-answers is inert.
-if reuse_detected MATUGEN_CHOICE '1:matugen'; then
-    MATUGEN_DETECTED=1
-else
-    MATUGEN_DETECTED=0
-fi
-INSTALL_MATUGEN=1
-[ "$MATUGEN_DETECTED" = 1 ] && detected_note "matugen" "matugen"
-
-printf '  Installing %d packages via pacman:\n    %s\n' "${#PACMAN_PKGS[@]}" "${PACMAN_PKGS[*]}"
-run_spinner "pacman: installing ${#PACMAN_PKGS[@]} packages" sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}" \
-    || die "Failed to install official packages: ${PACMAN_PKGS[*]}"
-
-MISSING_PKGS=()
-for pkg in "${PACMAN_PKGS[@]}"; do
-    pacman -Qq "$pkg" >/dev/null 2>&1 || MISSING_PKGS+=("$pkg")
-done
-if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
-    warn "pacman reported success but these packages aren't actually installed: ${MISSING_PKGS[*]}"
-else
-    ok "Verified all pacman packages are installed"
-fi
-
-run_spinner "Refreshing font cache" fc-cache -f \
-    || warn "Could not refresh the font cache — run 'fc-cache -f' manually if icons look missing"
+# ── Toolchain + builds (all distros) ─────────────────────────────────
+ensure_zig
 
 # Build simpbar (the bar) and simpbar-welcome (the GTK4 + libadwaita
 # companion app) from the source placed in ~/.local/share/simpbar/simpbar
-# back in Step 2, now that zig/freetype2/gdk-pixbuf2/wayland-protocols/gtk4/
+# back in Step 4, now that zig/freetype2/gdk-pixbuf2/wayland-protocols/gtk4/
 # libadwaita are actually installed. build.zig defines both as executables
 # under the default install step, so this one invocation builds both. A
 # release build (not the plain debug build simpbar's own dev workflow
 # uses) — this is what ends up running on every login.
+# Binaries land in /usr/bin everywhere except atomic Fedora (read-only /usr),
+# where they go to ~/.local/bin instead.
+if [ "$ATOMIC_FEDORA" = 1 ]; then
+    BIN_DIR="$HOME/.local/bin"
+else
+    BIN_DIR="/usr/bin"
+fi
+mkdir -p "$BIN_DIR" 2>/dev/null || true
+
 run_spinner "Building simpbar" bash -c 'cd ~/.local/share/simpbar/simpbar && zig build -Doptimize=ReleaseFast' \
     || die "Failed to build simpbar — check zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, gtk4, and libadwaita installed correctly."
 
-run_spinner "Installing simpbar to /usr/bin" \
-    sudo install -Dm755 ~/.local/share/simpbar/simpbar/zig-out/bin/simpbar /usr/bin/simpbar \
-    || die "Failed to install the simpbar binary to /usr/bin."
-ok "simpbar built and installed to /usr/bin/simpbar"
+run_spinner "Installing simpbar to $BIN_DIR" \
+    install_bin 755 ~/.local/share/simpbar/simpbar/zig-out/bin/simpbar "$BIN_DIR/simpbar" \
+    || die "Failed to install the simpbar binary."
+ok "simpbar built and installed to $BIN_DIR/simpbar"
 
-run_spinner "Installing simpbar-welcome to /usr/bin" \
-    sudo install -Dm755 ~/.local/share/simpbar/simpbar/zig-out/bin/simpbar-welcome /usr/bin/simpbar-welcome \
-    || die "Failed to install the simpbar-welcome binary to /usr/bin."
-ok "simpbar-welcome built and installed to /usr/bin/simpbar-welcome"
+run_spinner "Installing simpbar-welcome to $BIN_DIR" \
+    install_bin 755 ~/.local/share/simpbar/simpbar/zig-out/bin/simpbar-welcome "$BIN_DIR/simpbar-welcome" \
+    || die "Failed to install the simpbar-welcome binary."
+ok "simpbar-welcome built and installed to $BIN_DIR/simpbar-welcome"
 
-run_spinner "Installing simpbar-config to /usr/bin" \
-    sudo install -Dm755 ~/.local/share/simpbar/simpbar/zig-out/bin/simpbar-config /usr/bin/simpbar-config \
-    || die "Failed to install the simpbar-config binary to /usr/bin."
-ok "simpbar-config built and installed to /usr/bin/simpbar-config"
+run_spinner "Installing simpbar-config to $BIN_DIR" \
+    install_bin 755 ~/.local/share/simpbar/simpbar/zig-out/bin/simpbar-config "$BIN_DIR/simpbar-config" \
+    || die "Failed to install the simpbar-config binary."
+ok "simpbar-config built and installed to $BIN_DIR/simpbar-config"
 
 # Build simpbar-shell (the desktop widgets) too — same zig, against the bar's
 # source layout it was staged next to above. Autostarted on login by whichever
@@ -1139,10 +1691,10 @@ ok "simpbar-config built and installed to /usr/bin/simpbar-config"
 run_spinner "Building simpbar-shell" bash -c 'cd ~/.local/share/simpbar/simpbar-shell && zig build -Doptimize=ReleaseFast' \
     || die "Failed to build simpbar-shell — check zig, freetype2, gdk-pixbuf2, wayland, and wayland-protocols installed correctly."
 
-run_spinner "Installing simpbar-shell to /usr/bin" \
-    sudo install -Dm755 ~/.local/share/simpbar/simpbar-shell/zig-out/bin/simpbar-shell /usr/bin/simpbar-shell \
-    || die "Failed to install the simpbar-shell binary to /usr/bin."
-ok "simpbar-shell built and installed to /usr/bin/simpbar-shell"
+run_spinner "Installing simpbar-shell to $BIN_DIR" \
+    install_bin 755 ~/.local/share/simpbar/simpbar-shell/zig-out/bin/simpbar-shell "$BIN_DIR/simpbar-shell" \
+    || die "Failed to install the simpbar-shell binary."
+ok "simpbar-shell built and installed to $BIN_DIR/simpbar-shell"
 
 # Seed the calendar widget's reminders file with its format reference on
 # first install (the widget appends it on demand too — this just documents
@@ -1198,38 +1750,65 @@ EOF
     ok "rofi set to use the Material theme"
 fi
 
+# Third-party/theme packages. Arch: Chaotic-AUR first, AUR helper for the
+# stragglers (original flow). Fedora/Debian: Terra/distro repos where
+# packaged, Flathub for the GUI apps, upstream tarball for Bibata on Fedora.
+# wlogout is deliberately gone: the app drawer's Power menu (bar power button
+# / SUPER+SHIFT+Q) replaces it. waypaper is deliberately gone too: the app
+# drawer's wallpaper tab owns picking now. Users who already have waypaper
+# keep it working — nothing here uninstalls it.
+if [ "$DISTRO_KIND" = arch ]; then
+    AUR_PKGS=(protonplus bibata-cursor-theme game-devices-udev)
+    [ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
+    [ "$INSTALL_MATUGEN" -eq 1 ] && AUR_PKGS+=(matugen)
 
-# protonplus etc. used to mean an AUR helper — with Chaotic-AUR
-# enabled most of these are now binary packages, so they install
-# through pacman from the chosen repo, and yay/paru are only reached for the
-# stragglers the repo doesn't carry. wlogout is deliberately gone: the app
-# drawer's Power menu (bar power button / SUPER+SHIFT+Q) replaces it.
-# waypaper is deliberately gone too: the app drawer's wallpaper tab owns
-# picking now (see the Wallpaper Button tombstone in the bar source). Users
-# who already have waypaper keep it working — nothing here uninstalls it.
-AUR_PKGS=(protonplus bibata-cursor-theme game-devices-udev)
-[ -n "$DISCORD_AUR_PKG" ] && AUR_PKGS+=("$DISCORD_AUR_PKG")
-[ "$INSTALL_MATUGEN" -eq 1 ] && AUR_PKGS+=(matugen)
+    printf '  Installing %d packages (%s first, AUR helper only if needed):\n    %s\n' "${#AUR_PKGS[@]}" "$REPO_NAME" "${AUR_PKGS[*]}"
+    install_repo_or_aur "${AUR_PKGS[@]}" \
+        || warn "Some packages were not installed — install them manually if needed"
 
-printf '  Installing %d packages (%s first, AUR helper only if needed):\n    %s\n' "${#AUR_PKGS[@]}" "$REPO_NAME" "${AUR_PKGS[*]}"
-install_repo_or_aur "${AUR_PKGS[@]}" \
-    || warn "Some packages were not installed — install them manually if needed"
+    MISSING_AUR=()
+    for pkg in "${AUR_PKGS[@]}"; do
+        pkg_installed "$pkg" || MISSING_AUR+=("$pkg")
+    done
+    if [ "${#MISSING_AUR[@]}" -gt 0 ]; then
+        warn "Packages not installed: ${MISSING_AUR[*]} — install manually if needed"
+    else
+        ok "Verified all requested packages are installed"
+    fi
 
-MISSING_AUR=()
-for pkg in "${AUR_PKGS[@]}"; do
-    pacman -Qq "$pkg" >/dev/null 2>&1 || MISSING_AUR+=("$pkg")
-done
-if [ "${#MISSING_AUR[@]}" -gt 0 ]; then
-    warn "Packages not installed: ${MISSING_AUR[*]} — install manually if needed"
+    if pkg_installed game-devices-udev; then
+        run_spinner "Reloading udev rules for game controllers" \
+            sudo bash -c 'udevadm control --reload-rules && udevadm trigger' \
+            || warn "Could not reload udev rules — replug your controller or reboot for the new rules to apply"
+    fi
 else
-    ok "Verified all requested packages are installed"
-fi
+    # GUI app-store frontends: Flathub everywhere (ids verified against
+    # Flathub's index), so protonplus/bazaar work on Fedora & Debian.
+    pkg_installed "flatpak:com.vysp3r.ProtonPlus" || install_flatpak_app "ProtonPlus" "com.vysp3r.ProtonPlus" || true
+    pkg_installed "flatpak:io.github.kolunmi.Bazaar" || install_flatpak_app "Bazaar" "io.github.kolunmi.Bazaar" || true
 
+    # Bibata cursor: Debian ships bibata-cursor-theme; Fedora gets it from
+    # Terra when enabled, else the upstream release tarball.
+    if ! pkg_installed bibata-cursor-theme; then
+        install_pkgs_retriable "install: bibata-cursor-theme" bibata-cursor-theme \
+            || true
+    fi
+    if ! pkg_installed bibata-cursor-theme; then
+        BIBATA_URL="https://github.com/ful1e5/Bibata_Cursor/releases/download/v2.0.7/Bibata-Modern-Classic.tar.xz"
+        if run_spinner "Installing Bibata cursor (upstream tarball, user-local)" \
+            bash -c "mkdir -p '$HOME/.icons' /tmp/bibata-x && curl -fL --retry 3 -o /tmp/bibata.tar.xz '$BIBATA_URL' && tar -xJf /tmp/bibata.tar.xz -C /tmp/bibata-x && cp -r /tmp/bibata-x/Bibata-Modern-Classic '$HOME/.icons/' && rm -rf /tmp/bibata-x /tmp/bibata.tar.xz"; then
+            ok "Bibata Modern Classic installed to ~/.icons"
+        else
+            rm -rf /tmp/bibata-x /tmp/bibata.tar.xz
+            warn "Could not install the Bibata cursor — grab it from https://github.com/ful1e5/Bibata_Cursor/releases"
+        fi
+    else
+        ok "Bibata cursor theme installed"
+    fi
 
-if pacman -Qq game-devices-udev >/dev/null 2>&1; then
-    run_spinner "Reloading udev rules for game controllers" \
-        sudo bash -c 'udevadm control --reload-rules && udevadm trigger' \
-        || warn "Could not reload udev rules — replug your controller or reboot for the new rules to apply"
+    if [ "$DISTRO_KIND" = debian ]; then
+        warn "game-devices-udev (controller udev rules) is AUR-only — controllers work out of the box on most distros anyway"
+    fi
 fi
 
 # Download today's Bing wallpaper — through the wallpaper engine, not by
@@ -1310,8 +1889,9 @@ fi
 # simpbar-wallpaper re-runs it whenever the wallpaper changes.
 # matugen never sets the wallpaper itself (the [config.wallpaper] block below
 # keeps set = false), so simpbar-wallpaper stays the sole owner of it.
+# (Arch only — the package gating above leaves INSTALL_MATUGEN=0 elsewhere.)
 if [ "$INSTALL_MATUGEN" -eq 1 ]; then
-    if pacman -Qq matugen >/dev/null 2>&1; then
+    if pkg_installed matugen; then
         mkdir -p ~/.config/matugen/templates
 
         if [ -e ~/.config/matugen/config.toml ]; then
@@ -1327,28 +1907,30 @@ if [ "$INSTALL_MATUGEN" -eq 1 ]; then
                 ok "migrated Steam skin paths in matugen config to ~/.local/share/Steam"
             fi
         else
-            warn "matugen config missing — copying from repo's full config"
-            cp "/tmp/simpbar-temp/simpbar-main/matugen/config.toml" ~/.config/matugen/config.toml 2>/dev/null || true
+            warn "matugen config missing — copying from the repo's full config (staged in ~/.local/share/simpbar)"
+            cp "$HOME/.local/share/simpbar/matugen/config.toml" ~/.config/matugen/config.toml 2>/dev/null \
+                || warn "staged matugen config.toml missing — re-run the installer to fetch it"
             ok "matugen config placed in ~/.config/matugen/config.toml"
         fi
 
-        # simpbar template is in repo; ensure it's present
+        # simpbar template is in the staged copy; ensure it's present
         if [ ! -e ~/.config/matugen/templates/simpbar.json ]; then
-            cp "/tmp/simpbar-temp/simpbar-main/matugen/simpbar.json" ~/.config/matugen/templates/simpbar.json 2>/dev/null || true
+            cp "$HOME/.local/share/simpbar/matugen/simpbar.json" ~/.config/matugen/templates/simpbar.json 2>/dev/null \
+                || warn "staged simpbar.json template missing — matugen theming won't reach the bar"
             ok "simpbar template placed in ~/.config/matugen/templates/simpbar.json"
         else
             warn "~/.config/matugen/templates/simpbar.json already exists — leaving your existing template alone"
         fi
 
         # The helper normally comes from the downloaded archive (staged
-        # beside the simpbar source in Step 2). Fall back to an embedded copy
+        # beside the simpbar source in Step 4). Fall back to an embedded copy
         # if that ever didn't happen (e.g. this script run from an older
-        # Installed from the repo copy rather than an inline heredoc. A second,
+        # Install from the repo copy rather than an inline heredoc. A second,
         # drifting copy of this script is exactly how it ended up disagreeing
         # with the engine about which wallpaper was current.
-        run_spinner "Installing simpbar-matugen to /usr/bin" \
-            sudo install -Dm755 ~/.local/share/simpbar/simpbar-matugen /usr/bin/simpbar-matugen \
-            || warn "Could not install the simpbar-matugen helper to /usr/bin"
+        run_spinner "Installing simpbar-matugen to $BIN_DIR" \
+            install_bin 755 "$HOME/.local/share/simpbar/simpbar-matugen" "$BIN_DIR/simpbar-matugen" \
+            || warn "Could not install the simpbar-matugen helper"
 
         if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
             # Never let this step wedge the installer: run_spinner hides all
@@ -1374,7 +1956,7 @@ if [ "$INSTALL_MATUGEN" -eq 1 ]; then
             fi
             [ ! -e "$HOME/.steam/steam" ] && [ -d "$HOME/.local/share/Steam" ] && ln -sfn "$HOME/.local/share/Steam" "$HOME/.steam/steam" 2>/dev/null || true
             run_spinner "Generating the initial matugen scheme from the Bing wallpaper" \
-                timeout 45 bash -c '"$0" "$@" </dev/null' /usr/bin/simpbar-matugen "$BING_FILE" \
+                timeout 45 bash -c '"$0" "$@" </dev/null' "$BIN_DIR/simpbar-matugen" "$BING_FILE" \
                 || warn "Could not generate the initial matugen scheme — it'll apply on the next wallpaper change"
         else
             warn "No wallpaper available for the initial matugen scheme — the bar keeps its configured colors until you pick a wallpaper"
@@ -1386,16 +1968,18 @@ fi
 
 # Apply the Bibata cursor theme, now that it's actually installed. This
 # uses the same gsettings mechanism nwg-look reads/writes, so it shows up
-# as already selected there too.
-
-if pacman -Qq bibata-cursor-theme >/dev/null 2>&1 && command -v gsettings >/dev/null; then
-    run_spinner "Applying Bibata Modern Classic cursor" \
-        gsettings set org.gnome.desktop.interface cursor-theme 'Bibata-Modern-Classic' \
-        || warn "Could not apply the cursor theme — select it manually in nwg-look"
-elif ! pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
-    warn "bibata-cursor-theme isn't installed — skipping cursor theme apply"
+# as already selected there too. (The GH-tarball install on Fedora lands in
+# ~/.icons, which gsettings resolves the same way.)
+if pkg_installed bibata-cursor-theme || [ -d "$HOME/.icons/Bibata-Modern-Classic" ]; then
+    if command -v gsettings >/dev/null; then
+        run_spinner "Applying Bibata Modern Classic cursor" \
+            gsettings set org.gnome.desktop.interface cursor-theme 'Bibata-Modern-Classic' \
+            || warn "Could not apply the cursor theme — select it manually in nwg-look"
+    else
+        warn "gsettings not found — select the Bibata cursor theme manually in nwg-look"
+    fi
 else
-    warn "gsettings not found — select the Bibata cursor theme manually in nwg-look"
+    warn "Bibata cursor theme isn't installed — skipping cursor theme apply"
 fi
 
 # User drop-in dirs for simpbar-config's theme pickers: cursor themes land
@@ -1409,7 +1993,7 @@ mkdir -p ~/.cursors ~/.themes 2>/dev/null || true
 # both the Breeze widget style and the BreezeDark.colors scheme qt6ct points
 # at below.
 BREEZE_DARK_SCHEME="/usr/share/color-schemes/BreezeDark.colors"
-if pacman -Qq qt6ct >/dev/null 2>&1 && pacman -Qq breeze >/dev/null 2>&1; then
+if pkg_installed qt6ct && pkg_installed breeze; then
     if [ -e "$BREEZE_DARK_SCHEME" ]; then
         mkdir -p ~/.config/qt6ct
         if [ -e ~/.config/qt6ct/qt6ct.conf ]; then
@@ -1471,19 +2055,18 @@ if command -v quickshell >/dev/null 2>&1; then
         ok "Existing app drawer favourites kept"
     fi
 
-    # /usr/bin (like every other helper here) rather than ~/.local/bin, so the
-    # Hyprland bind and the .desktop entry can both call a bare `appdrawer`.
-    # ~/.local/bin is NOT on the session PATH, and a .desktop Exec has no
+    # $BIN_DIR (like every other helper here) so the Hyprland bind and the
+    # .desktop entry can both call a bare `appdrawer`. A .desktop Exec has no
     # environment-variable expansion to fall back on.
-    # Checked rather than assumed: an unchecked `sudo install` still prints the
-    # ok line when it fails (no set -e here), so a user without sudo rights or
-    # a read-only /usr/bin would get a cheerful message and a drawer that never
+    # Checked rather than assumed: an unchecked install still prints the ok
+    # line when it fails (no set -e here), so a user without sudo rights or a
+    # read-only /usr/bin would get a cheerful message and a drawer that never
     # opens. Same pattern the other helper installs below use.
-    if sudo install -Dm755 ~/.local/share/simpbar/appdrawer-bin /usr/bin/appdrawer \
-       && sudo install -Dm644 ~/.local/share/simpbar/appdrawer.desktop /usr/share/applications/appdrawer.desktop; then
-        ok "App drawer toggle installed to /usr/bin/appdrawer"
+    if install_bin 755 "$HOME/.local/share/simpbar/appdrawer-bin" "$BIN_DIR/appdrawer" 2>/dev/null \
+       && install -Dm644 "$HOME/.local/share/simpbar/appdrawer.desktop" "$HOME/.local/share/applications/appdrawer.desktop" 2>/dev/null; then
+        ok "App drawer toggle installed to $BIN_DIR/appdrawer"
     else
-        warn "could not install to /usr/bin — put appdrawer somewhere on your PATH yourself, then point"
+        warn "could not install the app drawer toggle — put appdrawer somewhere on your PATH yourself, then point"
         warn "  empty_click_command and the SUPER+Tab bind at it"
     fi
 
@@ -1503,18 +2086,28 @@ if command -v quickshell >/dev/null 2>&1; then
         warn "config.json exists but doesn't set empty_click_command — add \"empty_click_command\": \"appdrawer\" to its appearance block to enable empty-bar clicks (restart the bar after)"
     fi
 else
-    warn "quickshell isn't installed — skipping the app drawer. Install it with 'sudo pacman -S quickshell' and re-run this script."
+    case "$PKG" in
+        pacman) _qs_hint="sudo pacman -S quickshell" ;;
+        apt)    _qs_hint="sudo apt install quickshell" ;;
+        dnf)    _qs_hint="sudo dnf install quickshell" ;;
+    esac
+    warn "quickshell isn't installed — skipping the app drawer. Install it with '$_qs_hint' and re-run this script."
     if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
         warn "  The SUPER+Tab bind in hyprland.lua and the 'App Drawer' menu entry do nothing until then."
     else
         warn "  The SUPER+Space bind in keybinds.conf and the 'App Drawer' menu entry do nothing until then."
     fi
     warn "  Empty bar clicks are unaffected: empty_click_command defaults to off."
+    unset _qs_hint
 fi
 
 # ── Step 7: choose a browser ─────────────────────────────────────────
 step "Choosing a browser"
 
+# Arch: Chaotic-AUR/AUR packages. Fedora/Debian: the identical menu installs
+# from Flathub (app ids verified against Flathub's index) — except Edge,
+# which has no Flathub build and only official Microsoft packages, so it's
+# a polite skip there.
 if [ "$XERO_SYSTEM" = 1 ]; then
     # Xero's Phase 2 covers browsers (and the Firefox keep/remove choice
     # below) — skip the question and the install entirely (pin seeding
@@ -1523,49 +2116,87 @@ if [ "$XERO_SYSTEM" = 1 ]; then
     BROWSER_NAME=""
     BROWSER_PKG=""
 else
-if reuse_detected BROWSER_CHOICE '1:brave-bin' '2:zen-browser-bin' '3:vivaldi' '4:microsoft-edge-stable-bin' '5:librewolf-bin'; then
-    BROWSER_DETECTED=1
-else
-    BROWSER_DETECTED=0
-    prompt_choice BROWSER_CHOICE 6 "Which browser would you like to install?" \
-        "Brave" "Zen Browser" "Vivaldi" "Microsoft Edge" "LibreWolf" "Skip — don't install a browser"
-fi
+    if [ "$DISTRO_KIND" = arch ]; then
+        if reuse_detected BROWSER_CHOICE '1:brave-bin' '2:zen-browser-bin' '3:vivaldi' '4:microsoft-edge-stable-bin' '5:librewolf-bin'; then
+            BROWSER_DETECTED=1
+        else
+            BROWSER_DETECTED=0
+            prompt_choice BROWSER_CHOICE 6 "Which browser would you like to install?" \
+                "Brave" "Zen Browser" "Vivaldi" "Microsoft Edge" "LibreWolf" "Skip — don't install a browser"
+        fi
 
-case "$BROWSER_CHOICE" in
-    1) BROWSER_NAME="Brave";          BROWSER_PKG="brave-bin" ;;
-    2) BROWSER_NAME="Zen Browser";    BROWSER_PKG="zen-browser-bin" ;;
-    3) BROWSER_NAME="Vivaldi";        BROWSER_PKG="vivaldi" ;;
-    4) BROWSER_NAME="Microsoft Edge"; BROWSER_PKG="microsoft-edge-stable-bin" ;;
-    5) BROWSER_NAME="LibreWolf";      BROWSER_PKG="librewolf-bin" ;;
-    *) BROWSER_NAME=""; BROWSER_PKG="" ;;
-esac
-[ "$BROWSER_DETECTED" = 1 ] && [ -n "$BROWSER_NAME" ] && detected_note "Browser" "$BROWSER_NAME"
+        case "$BROWSER_CHOICE" in
+            1) BROWSER_NAME="Brave";          BROWSER_PKG="brave-bin" ;;
+            2) BROWSER_NAME="Zen Browser";    BROWSER_PKG="zen-browser-bin" ;;
+            3) BROWSER_NAME="Vivaldi";        BROWSER_PKG="vivaldi" ;;
+            4) BROWSER_NAME="Microsoft Edge"; BROWSER_PKG="microsoft-edge-stable-bin" ;;
+            5) BROWSER_NAME="LibreWolf";      BROWSER_PKG="librewolf-bin" ;;
+            *) BROWSER_NAME=""; BROWSER_PKG="" ;;
+        esac
+        [ "$BROWSER_DETECTED" = 1 ] && [ -n "$BROWSER_NAME" ] && detected_note "Browser" "$BROWSER_NAME"
 
-if [ -z "$BROWSER_NAME" ]; then
-    if [ "$XERO_SYSTEM" = 1 ]; then ok "Browser install skipped (covered by the Xero install)"; else warn "Skipping browser install, as requested"; fi
-else
-    install_aur_pkg "$BROWSER_NAME" "$BROWSER_PKG" || true
-fi
+        if [ -z "$BROWSER_NAME" ]; then
+            warn "Skipping browser install, as requested"
+        else
+            install_aur_pkg "$BROWSER_NAME" "$BROWSER_PKG" || true
+        fi
 
-if [ -n "$BROWSER_PKG" ] && pacman -Qq "$BROWSER_PKG" >/dev/null 2>&1; then
-    ok "$BROWSER_NAME installed"
-fi
+        if [ -n "$BROWSER_PKG" ] && pkg_installed "$BROWSER_PKG"; then
+            ok "$BROWSER_NAME installed"
+        fi
+    else
+        if reuse_detected BROWSER_CHOICE '1:flatpak:com.brave.Browser' '2:flatpak:app.zen_browser.zen' '3:flatpak:com.vivaldi.Vivaldi' '5:flatpak:io.gitlab.librewolf-community'; then
+            BROWSER_DETECTED=1
+        else
+            BROWSER_DETECTED=0
+            prompt_choice BROWSER_CHOICE 6 "Which browser would you like to install (Flathub)?" \
+                "Brave" "Zen Browser" "Vivaldi" "Microsoft Edge" "LibreWolf" "Skip — don't install a browser"
+        fi
 
-# Firefox often ships preinstalled — ask before touching it. The Remove
-# option is marked _HAS_SKIP_ so a remembered removal never replays: that
-# choice is destructive and must always be a live decision.
-if pacman -Qq firefox >/dev/null 2>&1; then
-    prompt_choice FIREFOX_CHOICE 1 "Firefox is currently installed. Keep it or remove it?" \
-        "Keep Firefox" "Remove Firefox" _HAS_SKIP_
-    case "$FIREFOX_CHOICE" in
-        2)
-            run_spinner "Removing Firefox" sudo pacman -Rns --noconfirm firefox \
-                || warn "Could not remove Firefox — remove it manually: sudo pacman -Rns firefox"
-            ;;
-        1) ok "Keeping Firefox" ;;
-        *) warn "Unrecognized choice — keeping Firefox" ;;
-    esac
-fi
+        BROWSER_FLATPAK_ID=""
+        case "$BROWSER_CHOICE" in
+            1) BROWSER_NAME="Brave";       BROWSER_FLATPAK_ID="com.brave.Browser" ;;
+            2) BROWSER_NAME="Zen Browser"; BROWSER_FLATPAK_ID="app.zen_browser.zen" ;;
+            3) BROWSER_NAME="Vivaldi";     BROWSER_FLATPAK_ID="com.vivaldi.Vivaldi" ;;
+            4) BROWSER_NAME="Microsoft Edge" ;;
+            5) BROWSER_NAME="LibreWolf";   BROWSER_FLATPAK_ID="io.gitlab.librewolf-community" ;;
+            *) BROWSER_NAME="" ;;
+        esac
+        [ "$BROWSER_DETECTED" = 1 ] && [ -n "$BROWSER_NAME" ] && detected_note "Browser" "$BROWSER_NAME"
+
+        if [ -z "$BROWSER_NAME" ]; then
+            warn "Skipping browser install, as requested"
+        elif [ "$BROWSER_CHOICE" = 4 ]; then
+            warn "Microsoft Edge has no Flathub build — install it from https://www.microsoft.com/edge/download if you want it"
+        elif ! pkg_installed "flatpak:$BROWSER_FLATPAK_ID"; then
+            install_flatpak_app "$BROWSER_NAME" "$BROWSER_FLATPAK_ID" || true
+            pkg_installed "flatpak:$BROWSER_FLATPAK_ID" && ok "$BROWSER_NAME installed (Flathub)"
+        else
+            ok "$BROWSER_NAME already installed (Flathub)"
+        fi
+    fi
+
+    # Firefox often ships preinstalled — ask before touching it. The Remove
+    # option is marked _HAS_SKIP_ so a remembered removal never replays: that
+    # choice is destructive and must always be a live decision. Debian calls
+    # it firefox-esr on most installs, so both names are checked.
+    if pkg_installed firefox || pkg_installed firefox-esr; then
+        prompt_choice FIREFOX_CHOICE 1 "Firefox is currently installed. Keep it or remove it?" \
+            "Keep Firefox" "Remove Firefox" _HAS_SKIP_
+        case "$FIREFOX_CHOICE" in
+            2)
+                if pkg_installed firefox-esr; then
+                    run_spinner "Removing Firefox ESR" remove_pkgs firefox-esr \
+                        || warn "Could not remove Firefox ESR — remove it manually"
+                else
+                    run_spinner "Removing Firefox" remove_pkgs firefox \
+                        || warn "Could not remove Firefox — remove it manually"
+                fi
+                ;;
+            1) ok "Keeping Firefox" ;;
+            *) warn "Unrecognized choice — keeping Firefox" ;;
+        esac
+    fi
 fi
 
 # ── Default bar pins ───────────────────────────────────────────────
@@ -1588,29 +2219,36 @@ probe_bin() {
 }
 SEED_PINS=()
 if [ -n "$BROWSER_NAME" ]; then
+    # _fp is the Flathub fallback command for non-Arch installs (the bar
+    # spawns pin commands through `sh -c`, so a full "flatpak run X" line
+    # works as-is).
     case "$BROWSER_CHOICE" in
-        1) _cands="brave brave-browser" ;;
-        2) _cands="zen-browser zen zen-bin" ;;
-        3) _cands="vivaldi-stable vivaldi" ;;
-        4) _cands="microsoft-edge-stable microsoft-edge" ;;
-        5) _cands="librewolf" ;;
-        *) _cands="" ;;
+        1) _cands="brave brave-browser";        _fp="flatpak run com.brave.Browser" ;;
+        2) _cands="zen-browser zen zen-bin";    _fp="flatpak run app.zen_browser.zen" ;;
+        3) _cands="vivaldi-stable vivaldi";     _fp="flatpak run com.vivaldi.Vivaldi" ;;
+        4) _cands="microsoft-edge-stable microsoft-edge"; _fp="" ;;
+        5) _cands="librewolf";                  _fp="flatpak run io.gitlab.librewolf-community" ;;
+        *) _cands=""; _fp="" ;;
     esac
     # Word-splitting intended: _cands is our own literal list above.
     # shellcheck disable=SC2086
     if [ -n "$_cands" ] && BROWSER_BIN="$(probe_bin $_cands)"; then
         SEED_PINS+=("Browser|$BROWSER_BIN|$BROWSER_BIN")
+    elif [ "$DISTRO_KIND" != arch ] && [ -n "${BROWSER_FLATPAK_ID:-}" ] && pkg_installed "flatpak:$BROWSER_FLATPAK_ID"; then
+        SEED_PINS+=("Browser|$_fp|")
     fi
 fi
 if [ -n "$DISCORD_NAME" ]; then
     case "$DISCORD_CHOICE" in
-        1) _dbin="discord" ;;
-        2) _dbin="vesktop" ;;
-        3) _dbin="equibop" ;;
-        *) _dbin="" ;;
+        1) _dbin="discord";  _dfp="flatpak run com.discordapp.Discord" ;;
+        2) _dbin="vesktop";  _dfp="flatpak run dev.vencord.Vesktop" ;;
+        3) _dbin="equibop";  _dfp="flatpak run org.equicord.equibop" ;;
+        *) _dbin=""; _dfp="" ;;
     esac
     if [ -n "$_dbin" ] && command -v "$_dbin" >/dev/null 2>&1; then
         SEED_PINS+=("Discord|$_dbin|$_dbin")
+    elif [ "$DISTRO_KIND" != arch ] && [ -n "${DISCORD_FLATPAK_ID:-}" ] && pkg_installed "flatpak:$DISCORD_FLATPAK_ID"; then
+        SEED_PINS+=("Discord|$_dfp|")
     fi
 fi
 if command -v "$FILE_MANAGER_BIN" >/dev/null 2>&1; then
@@ -1631,7 +2269,7 @@ if command -v steam >/dev/null 2>&1; then
 fi
 SEED_PINS+=("Config|simpbar-config|simpbar-config")
 SEED_PINS+=("Welcome|simpbar-welcome|simpbar-welcome")
-unset _cands _dbin
+unset _cands _fp _dbin _dfp
 mkdir -p ~/.config/simpbar
 if [ ! -f ~/.config/simpbar/config.json ]; then
     SEED_HAVE_FILE=0
@@ -1740,14 +2378,20 @@ iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAACc7UlEQVR42uydd5xddZn/39/vObff6ZOe
 LOGOB64EOF
 
 
-# Background update checker — Arch/AUR package updates + new commits on
-# the simpbar repo — fires a desktop notification via notify-send/swaync.
-sudo tee /usr/bin/simpbar-check-updates >/dev/null <<'CHECKERPEOF'
+# Background update checker — distro package updates (pacman/AUR, apt, dnf)
+# + new commits on the simpbar repo — fires a desktop notification via
+# notify-send/swaync.
+# The wrappers are staged to a temp file first and installed with install_bin
+# so they land in $BIN_DIR (which is ~/.local/bin on atomic Fedora, where
+# /usr/bin is read-only). The bar spawns them by bare name through `sh -c`,
+# so PATH resolution finds them either way.
+cat > /tmp/simpbar-check-updates <<'CHECKERPEOF'
 #!/bin/bash
-# simpbar-check-updates — checks for Arch/AUR package updates and new
-# commits on the simpbar GitHub repo, and fires a desktop notification
-# (via notify-send / swaync) if either is found. Safe to run repeatedly
-# and safe with no network (just does nothing that turn).
+# simpbar-check-updates — checks for package updates (Arch/AUR via
+# checkupdates+yay/paru, Debian via apt, Fedora via dnf) and new commits on
+# the simpbar GitHub repo, and fires a desktop notification (via notify-send
+# / swaync) if either is found. Safe to run repeatedly and safe with no
+# network (just does nothing that turn).
 
 CACHE_DIR="$HOME/.cache/simpbar"
 COMMIT_CACHE="$CACHE_DIR/last-commit-sha"
@@ -1755,13 +2399,24 @@ mkdir -p "$CACHE_DIR"
 
 MESSAGES=()
 
-# Official repo updates — checkupdates syncs its own temp db, no root needed.
+# Distro package updates — each checker here runs unprivileged.
 if command -v checkupdates >/dev/null 2>&1; then
+    # Arch: checkupdates syncs its own temp db, no root needed.
     PKG_COUNT=$(checkupdates 2>/dev/null | wc -l)
     [ "$PKG_COUNT" -gt 0 ] && MESSAGES+=("$PKG_COUNT Arch package update(s) available")
+elif command -v apt-get >/dev/null 2>&1; then
+    # Debian: apt list --upgradable works off the last `apt update`; the
+    # weekly apt-daily.timer keeps that fresh without us needing root here.
+    PKG_COUNT=$(apt list --upgradable 2>/dev/null | tail -n +2 | wc -l)
+    [ "$PKG_COUNT" -gt 0 ] && MESSAGES+=("$PKG_COUNT package update(s) available (apt)")
+elif command -v dnf >/dev/null 2>&1; then
+    # Fedora: dnf check-update returns 100 (not an error for us) when
+    # updates exist and prints them.
+    PKG_COUNT=$(dnf -q check-update 2>/dev/null | grep -vc '^[[:space:]]*$' || true)
+    [ "$PKG_COUNT" -gt 0 ] && MESSAGES+=("$PKG_COUNT package update(s) available (dnf)")
 fi
 
-# AUR updates, if a helper is available.
+# AUR updates, if a helper is available. (Arch only.)
 if command -v yay >/dev/null 2>&1; then
     AUR_COUNT=$(yay -Qua 2>/dev/null | wc -l)
     [ "$AUR_COUNT" -gt 0 ] && MESSAGES+=("$AUR_COUNT AUR update(s) available")
@@ -1789,14 +2444,15 @@ if [ "${#MESSAGES[@]}" -gt 0 ] && command -v notify-send >/dev/null 2>&1; then
         "Simpbar updates available" "$BODY"
 fi
 CHECKERPEOF
-sudo chmod +x /usr/bin/simpbar-check-updates
+install_bin 755 /tmp/simpbar-check-updates "$BIN_DIR/simpbar-check-updates"
+rm -f /tmp/simpbar-check-updates
 
 # Pinned-app launchers for the bar — browser and Discord client are both
 # user-chosen at install time, so these try known binaries in order and
 # launch whichever's actually installed. simpbar-wallpaper is the wallpaper
 # engine: bare, it opens the picker's Wallpapers tab, and it also exposes
 # list/set/random/current for scripting.
-sudo tee /usr/bin/simpbar-launch-browser >/dev/null <<'BROWSERWRAPEOF'
+cat > /tmp/simpbar-launch-browser <<'BROWSERWRAPEOF'
 #!/bin/bash
 # simpbar-launch-browser — checks ~/.config/simpbar/browser-choice first (set
 # via the Welcome app's Setup tab); falls back to trying known binaries in
@@ -1811,13 +2467,20 @@ for bin in brave zen-browser zen vivaldi-stable vivaldi microsoft-edge-stable li
         exec "$bin"
     fi
 done
+# Flathub installs have no bare binary — try the known app ids too.
+for app in com.brave.Browser app.zen_browser.zen com.vivaldi.Vivaldi io.gitlab.librewolf-community; do
+    if command -v flatpak >/dev/null 2>&1 && flatpak info "$app" >/dev/null 2>&1; then
+        exec flatpak run "$app"
+    fi
+done
 command -v notify-send >/dev/null 2>&1 && \
     notify-send -a "Simpbar" "No browser found" \
         "Install one from the Simpbar Welcome app or install script."
 BROWSERWRAPEOF
-sudo chmod +x /usr/bin/simpbar-launch-browser
+install_bin 755 /tmp/simpbar-launch-browser "$BIN_DIR/simpbar-launch-browser"
+rm -f /tmp/simpbar-launch-browser
 
-sudo tee /usr/bin/simpbar-launch-discord >/dev/null <<'DISCORDWRAPEOF'
+cat > /tmp/simpbar-launch-discord <<'DISCORDWRAPEOF'
 #!/bin/bash
 # simpbar-launch-discord — checks ~/.config/simpbar/discord-choice first (set
 # via the Welcome app's Setup tab); falls back to trying known binaries in
@@ -1832,21 +2495,28 @@ for bin in vesktop equibop discord; do
         exec "$bin"
     fi
 done
+# Flathub installs have no bare binary — try the known app ids too.
+for app in dev.vencord.Vesktop org.equicord.equibop com.discordapp.Discord; do
+    if command -v flatpak >/dev/null 2>&1 && flatpak info "$app" >/dev/null 2>&1; then
+        exec flatpak run "$app"
+    fi
+done
 command -v notify-send >/dev/null 2>&1 && \
     notify-send -a "Simpbar" "No Discord client found" \
         "Install one from the Simpbar Welcome app or install script."
 DISCORDWRAPEOF
-sudo chmod +x /usr/bin/simpbar-launch-discord
+install_bin 755 /tmp/simpbar-launch-discord "$BIN_DIR/simpbar-launch-discord"
+rm -f /tmp/simpbar-launch-discord
 
 # The wallpaper engine and its login-time restore come straight from the repo.
-sudo install -Dm755 ~/.local/share/simpbar/simpbar-wallpaper        /usr/bin/simpbar-wallpaper
-sudo install -Dm755 ~/.local/share/simpbar/simpbar-restore-wallpaper /usr/bin/simpbar-restore-wallpaper
+install_bin 755 ~/.local/share/simpbar/simpbar-wallpaper "$BIN_DIR/simpbar-wallpaper"
+install_bin 755 ~/.local/share/simpbar/simpbar-restore-wallpaper "$BIN_DIR/simpbar-restore-wallpaper"
 ok "Pinned-app launchers (browser, Discord), wallpaper picker, and update checker ready for simpbar"
 
 
 cat > ~/.config/systemd/user/simpbar-update-checker.service <<'CHECKERSVCEOF'
 [Unit]
-Description=Check for simpbar/Arch updates
+Description=Check for simpbar/distro package updates
 
 [Service]
 Type=oneshot
@@ -1855,7 +2525,7 @@ CHECKERSVCEOF
 
 cat > ~/.config/systemd/user/simpbar-update-checker.timer <<'CHECKERTIMEREOF'
 [Unit]
-Description=Periodically check for simpbar/Arch updates
+Description=Periodically check for simpbar/package updates
 
 [Timer]
 OnBootSec=10min
@@ -1866,11 +2536,14 @@ Persistent=true
 WantedBy=timers.target
 CHECKERTIMEREOF
 
-if pacman -Qq pacman-contrib >/dev/null 2>&1 && pacman -Qq libnotify >/dev/null 2>&1; then
+# The checker only ever fires a notification, so notify-send is the one hard
+# requirement (libnotify/libnotify-bin on Debian); the distro-specific update
+# backends are all optional inside the script itself.
+if command -v notify-send >/dev/null 2>&1; then
     run_spinner "Enabling simpbar-update-checker.timer" systemctl --user enable --now simpbar-update-checker.timer \
         || warn "Could not enable simpbar-update-checker.timer — enable it manually: systemctl --user enable --now simpbar-update-checker.timer"
 else
-    warn "pacman-contrib/libnotify not fully installed — skipping the update-checker timer"
+    warn "notify-send (libnotify) not installed — skipping the update-checker timer"
 fi
 
 
@@ -1956,36 +2629,51 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/simpbar-welcome --autostart
+ExecStart=$BIN_DIR/simpbar-welcome --autostart
 
 [Install]
 WantedBy=graphical-session.target
 EOF
 
-if pacman -Qq gtk4 >/dev/null 2>&1 && pacman -Qq libadwaita >/dev/null 2>&1 && pacman -Qq python-gobject >/dev/null 2>&1; then
+# Gate the Welcome autostart on its actual runtime deps: the GTK4/libadwaita
+# libraries (distro package names differ — runtime halves suffice, the dev
+# halves were only needed to link). The old check hardcoded pacman names.
+pkg_kind_installed() { # any word of the alias's resolved spec installed?
+    local spec c
+    spec="$(map_pkg "$1")"
+    for c in $spec; do
+        pkg_installed "$c" && return 0
+    done
+    return 1
+}
+if pkg_kind_installed gtk4 && pkg_kind_installed libadwaita && command -v python3 >/dev/null 2>&1; then
     run_spinner "Enabling simpbar-welcome.service" systemctl --user enable --now simpbar-welcome.service \
         || warn "Could not enable simpbar-welcome.service — launch it manually: simpbar-welcome"
     ok "Simpbar Welcome app installed — will show once on first login, or launch it anytime from rofi"
 else
-    warn "GTK4/libadwaita/python-gobject not fully installed — skipping Simpbar Welcome autostart"
+    warn "GTK4/libadwaita not fully installed — skipping Simpbar Welcome autostart"
 fi
 
 
-run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfirm \
-    || warn "Full system update failed — run 'sudo pacman -Syu' manually to check for issues"
+run_spinner "Updating the full system" full_upgrade \
+    || warn "Full system update failed — update manually (pacman -Syu / apt full-upgrade / dnf upgrade) to check for issues"
 
 # ── Step 9: done ────────────────────────────────────────────────────
 step "Done"
-ok "Full system updated (pacman -Syu)"
-ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, ${TERMINAL_PKG}, fastfetch, neovim, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, cava, pipewire, gnome-disk-utility, nwg-drawer, kdeconnect, brightnessctl, wlr-randr installed (pacman)"
-if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
-    ok "Hyprland + xdg-desktop-portal-hyprland installed (pacman)"
+ok "Full system updated"
+if [ "$DISTRO_KIND" = arch ]; then
+    ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, ${TERMINAL_PKG}, fastfetch, neovim, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, cava, pipewire, gnome-disk-utility, nwg-drawer, kdeconnect, brightnessctl, wlr-randr installed (pacman)"
 else
-    ok "MangoWM + xdg-desktop-portal-wlr installed (pacman) — start it with 'mango' from a TTY or via your display manager"
+    ok "Core desktop packages installed via $PKG (build deps, fonts, notifications, terminals, pipewire, portals, quickshell, and more)"
+fi
+if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
+    ok "Hyprland + xdg-desktop-portal-hyprland installed ($PKG)"
+else
+    ok "MangoWM + xdg-desktop-portal-wlr installed ($PKG) — start it with 'mango' from a TTY or via your display manager"
 fi
 ok "$FILE_MANAGER_NAME installed and bound to SUPER + E"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
-if pacman -Qq cliphist >/dev/null 2>&1; then
+if pkg_installed cliphist; then
     ok "cliphist installed (bind a key to it yourself — e.g. SUPER+C in the config)"
 fi
 if [ -n "$DISCORD_NAME" ]; then
@@ -1995,9 +2683,9 @@ elif [ "$XERO_SYSTEM" = 1 ]; then
 else
     ok "Discord client install skipped, as requested"
 fi
-ok "Flathub remote added for flatpak/bazaar"
+ok "Flathub remote added for flatpak apps"
 ok "nwg-look set to prefer dark theme"
-if pacman -Qq bibata-cursor-theme >/dev/null 2>&1; then
+if pkg_installed bibata-cursor-theme || [ -d "$HOME/.icons/Bibata-Modern-Classic" ]; then
     ok "Bibata Modern Classic cursor installed and applied"
 fi
 if [ "$WM_IS_HYPRLAND" -eq 1 ] && [ -e ~/.config/hypr/hyprland-simpbar.lua ]; then
@@ -2006,24 +2694,32 @@ fi
 if [ "$WM_IS_MANGO" -eq 1 ]; then
     ok "Mango settings active — simpbar-config writes its Mango pages straight to ~/.config/mango/cfg/*.conf"
 fi
-if pacman -Qq game-devices-udev >/dev/null 2>&1; then
+if pkg_installed game-devices-udev; then
     ok "game-devices-udev installed — Xbox/PlayStation/generic controllers get proper permissions"
 fi
 if [ -e ~/.config/systemd/user/simpbar-update-checker.timer ]; then
-    ok "Update checker enabled — notifies on new Arch/AUR updates or new commits on the simpbar repo (checks every 6h)"
+    ok "Update checker enabled — notifies on package updates or new commits on the simpbar repo (checks every 6h)"
 fi
 if [ -e ~/.config/rofi/config.rasi ]; then
     ok "rofi configured with the Material theme"
 fi
-ok "protonplus and the theme packages installed (from ${REPO_NAME} or AUR helper)"
+case "$DISTRO_KIND" in
+    arch)   ok "protonplus and the theme packages installed (from ${REPO_NAME} or AUR helper)"
+            ok "Chaotic-AUR repo enabled" ;;
+    fedora) ok "protonplus and the theme packages installed (Terra and/or Flathub)"
+            [ "$REPO_CHOICE" = 1 ] && ok "Terra repo enabled" ;;
+    debian) ok "protonplus and the theme packages installed (Flathub)" ;;
+esac
 if [ -n "$BROWSER_NAME" ]; then
-    ok "$BROWSER_NAME installed (from ${REPO_NAME} or AUR helper)"
+    case "$DISTRO_KIND" in
+        arch)   ok "$BROWSER_NAME installed (from ${REPO_NAME} or AUR helper)" ;;
+        *)      ok "$BROWSER_NAME installed (Flathub)" ;;
+    esac
 elif [ "$XERO_SYSTEM" = 1 ]; then
     ok "Browser install skipped (covered by the Xero install)"
 else
     ok "Browser install skipped, as requested"
 fi
-ok "Chaotic-AUR repo enabled"
 if [ -n "$BING_FILE" ] && [ -e "$BING_FILE" ]; then
     ok "Today's Bing wallpaper downloaded to ~/Pictures/Wallpaper"
 fi
@@ -2033,14 +2729,14 @@ fi
 if [ "$INSTALL_MATUGEN" -eq 1 ] && [ -e ~/.config/simpbar/matugen.json ]; then
     ok "matugen auto-theming set up — the bar recolors to each wallpaper (toggle off in simpbar-config anytime)"
 fi
-if [ -x /usr/bin/simpbar ]; then
-    ok "simpbar built and installed to /usr/bin/simpbar (source in ~/.local/share/simpbar/simpbar)"
+if [ -x "$BIN_DIR/simpbar" ]; then
+    ok "simpbar built and installed to $BIN_DIR/simpbar (source in ~/.local/share/simpbar/simpbar)"
 fi
-if [ -x /usr/bin/simpbar-config ]; then
-    ok "simpbar-config installed to /usr/bin/simpbar-config — configure the bar's appearance, modules, and shortcuts anytime from rofi/nwg-drawer, or run 'simpbar-config'"
+if [ -x "$BIN_DIR/simpbar-config" ]; then
+    ok "simpbar-config installed to $BIN_DIR/simpbar-config — configure the bar's appearance, modules, and shortcuts anytime from rofi/nwg-drawer, or run 'simpbar-config'"
 fi
-if [ -x /usr/bin/simpbar-shell ]; then
-    ok "simpbar-shell installed to /usr/bin/simpbar-shell — desktop widget cards on every output"
+if [ -x "$BIN_DIR/simpbar-shell" ]; then
+    ok "simpbar-shell installed to $BIN_DIR/simpbar-shell — desktop widget cards on every output"
 fi
 if command -v quickshell >/dev/null 2>&1; then
     if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
@@ -2083,7 +2779,23 @@ printf '  %ssimpbar-wallpaper%s                    # open the picker (Wallpapers
 printf '  %ssimpbar-wallpaper random%s             # set a random wallpaper\n' "$C_CYAN" "$C_RESET"
 printf '  %ssimpbar-wallpaper bing%s               # fetch today'"'"'s Bing wallpaper\n' "$C_CYAN" "$C_RESET"
 printf '  %ssimpbar-wallpaper search '"'"'northern lights'"'"'%s   # search wallhaven.cc\n' "$C_CYAN" "$C_RESET"
-printf '  %s/usr/lib/mate-polkit/polkit-mate-authentication-agent-1 &%s   # needed for GUI auth prompts\n' "$C_CYAN" "$C_RESET"
+# The polkit agent's install path varies by distro (Arch uses
+# /usr/lib/mate-polkit/..., Debian/Fedora use /usr/libexec or a multilib dir) —
+# find the one that's actually there so the hint works everywhere.
+POLKIT_AGENT=""
+for _pa in /usr/lib/mate-polkit/polkit-mate-authentication-agent-1 \
+           /usr/libexec/polkit-mate-authentication-agent-1 \
+           /usr/lib/*/polkit-mate/polkit-mate-authentication-agent-1 \
+           /usr/lib/*/polkit-mate-authentication-agent-1; do
+    _hit=$(compgen -G "$_pa" 2>/dev/null | head -n1 || true)
+    if [ -n "$_hit" ] && [ -x "$_hit" ]; then POLKIT_AGENT="$_hit"; break; fi
+done
+unset _pa _hit
+if [ -n "$POLKIT_AGENT" ]; then
+    printf '  %s%s &%s   # needed for GUI auth prompts\n' "$C_CYAN" "$POLKIT_AGENT" "$C_RESET"
+else
+    printf '  %s(polkit-mate-authentication-agent-1) &%s   # needed for GUI auth prompts (path varies by distro)\n' "$C_CYAN" "$C_RESET"
+fi
 
 printf '\n%sKeybindings:%s\n' "$C_BOLD" "$C_RESET"
 printf '  %sSUPER%s                    = Windows key\n' "$C_CYAN" "$C_RESET"
