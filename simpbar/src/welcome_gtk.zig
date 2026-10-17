@@ -326,3 +326,33 @@ pub extern "c" fn gtk_list_box_get_row_at_y(self: *GtkListBox, y: c_int) ?*GtkLi
 // than pulling icontheme.zig's raw-pixel decoder (built for the bar's SHM
 // buffer, not a GTK widget) into this binary.
 pub extern "c" fn gtk_image_set_from_icon_name(self: *GtkImage, icon_name: ?[*:0]const u8) void;
+
+// GtkFileDialog (GTK 4.10+) — Boot tab's wallpaper picker. The GTK3-era
+// chooser dialog is gone; the native portal-aware dialog opens async:
+// gtk_file_dialog_open() takes a GAsyncReadyCallback and the picked file
+// comes back as a GioFile through gtk_file_dialog_open_finish(). All
+// symbols verified present in the linked libgtk-4.so.1 / libglib-2.0.so.0
+// via `nm -D` (same discipline as the drag-and-drop section above — a
+// wrong signal signature is a silent ABI mismatch that crashes at runtime).
+pub const GtkFileDialog = opaque {};
+pub const GAsyncResult = opaque {};
+pub const GioFile = opaque {};
+pub const GAsyncReadyCallback = ?*const fn (?*anyopaque, *GAsyncResult, ?*anyopaque) callconv(.c) void;
+pub extern "c" fn gtk_file_dialog_new() *GtkFileDialog;
+pub extern "c" fn gtk_file_dialog_set_title(self: *GtkFileDialog, title: [*:0]const u8) void;
+pub extern "c" fn gtk_file_dialog_open(self: *GtkFileDialog, parent: ?*GtkWindow, cancellable: ?*anyopaque, callback: GAsyncReadyCallback, user_data: ?*anyopaque) void;
+pub extern "c" fn gtk_file_dialog_open_finish(self: *GtkFileDialog, result: *GAsyncResult) ?*GioFile;
+pub extern "c" fn g_file_get_path(file: *GioFile) ?[*:0]const u8;
+
+// g_timeout_add — Boot tab's post-apply verification loop: the conf copy
+// runs under pkexec (a detached polkit password prompt), so the GUI polls
+// /boot/limine.conf every 1.6 s afterward to tell "authorized, file now
+// matches" from "cancelled, file unchanged". GSourceFunc receives the
+// user_data pointer and returns 1 to be re-scheduled or 0 to remove the
+// source. Symbol verified in libglib-2.0.so.0 via `nm -D`.
+pub extern "c" fn g_timeout_add(interval_ms: c_uint, function: *const fn (?*anyopaque) callconv(.c) c_int, data: ?*anyopaque) c_uint;
+
+// Released by callers owning fresh references from the async open result
+// (GioFile handles out of gtk_file_dialog_open_finish). Symbol verified in
+// libgobject-2.0.so.0 via `nm -D`.
+pub extern "c" fn g_object_unref(object: *anyopaque) void;

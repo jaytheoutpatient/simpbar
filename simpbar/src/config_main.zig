@@ -3562,6 +3562,812 @@ fn buildModulesPage() *gtk.GtkBox {
 }
 
 // ---------------------------------------------------------------------
+// Boot (Limine) — "Boot" tab. Restyles the Limine menu by editing the
+// COSMETIC HEADER of /boot/limine.conf: menu timeout, colors (term_palette
+// / term_palette_bright / term_foreground / term_background), the boot()
+// wallpaper, and the interface_branding footer. Everything from the first
+// "/Title" entry line on — Featherlite's kernels plus limine-snapper-sync's
+// snapshot entries — is preserved byte-for-byte, and unknown header keys
+// pass through untouched; only known keys are replaced in place (appended
+// at the header's end when missing). The keys are stock Limine config
+// syntax — the same theme-snippet set CachyOS-style tooling and Fedora's
+// Limine switcher emit — so anything hand-tuned stays inside the pickers
+// instead of being clobbered.
+//
+// Root writes: /boot is root-owned, so Apply stages the new conf in /tmp
+// and copies it into place with ONE pkexec (the same graphical-polkit flow
+// the installer's package installs use), then verifies by polling the on-
+// disk conf for a match to tell "authorized" from "cancelled". The
+// wallpaper lands as /boot/limine-wallpaper.<ext> — the boot() URI and the
+// copied file share the format's extension (PNG is the Limine-theme
+// community standard; the CachyOS and Fedora Limine themes both ship
+// .png). Changes show on the next reboot.
+// ---------------------------------------------------------------------
+
+const limine_conf_path: [:0]const u8 = "/boot/limine.conf";
+const limine_stage_path: [:0]const u8 = "/tmp/featherlite-limine.conf";
+const limine_stage_path_s: []const u8 = "/tmp/featherlite-limine.conf";
+
+// Fixed scratch buffer holding the current value plus its length. Empty
+// length means "unset" — the conf builder only writes keys for set values,
+// so an unset one simply falls back to Limine's own defaults.
+const LimineVal = struct {
+    data: []u8 = &.{},
+    len: usize = 0,
+    fn set(self: *LimineVal, s: []const u8) void {
+        const n = @min(s.len, self.data.len);
+        @memcpy(self.data[0..n], s[0..n]);
+        self.len = n;
+    }
+    fn text(self: *const LimineVal) []const u8 {
+        return self.data[0..self.len];
+    }
+    fn clear(self: *LimineVal) void {
+        self.len = 0;
+    }
+    fn isSet(self: *const LimineVal) bool {
+        return self.len != 0;
+    }
+};
+
+var limine_hex_storage: [3][20]u8 = undefined; // backdrop, text, footer accent (worst value: RRGGBBAA)
+var limine_branding_storage: [96]u8 = undefined;
+var limine_palette_storage: [128]u8 = undefined;
+var limine_bright_storage: [128]u8 = undefined;
+var limine_wall_storage: [512]u8 = undefined;
+
+var limine_bg_v = LimineVal{ .data = &limine_hex_storage[0] };
+var limine_fg_v = LimineVal{ .data = &limine_hex_storage[1] };
+var limine_accent_v = LimineVal{ .data = &limine_hex_storage[2] };
+var limine_branding_v = LimineVal{ .data = &limine_branding_storage };
+var limine_palette_v = LimineVal{ .data = &limine_palette_storage };
+var limine_bright_v = LimineVal{ .data = &limine_bright_storage };
+var limine_wall_v = LimineVal{ .data = &limine_wall_storage };
+
+var limine_found = false; // read succeeded at least once
+var limine_missing = false; // /boot/limine.conf absent — not a Limine system
+var limine_locked = false; // present but unreadable without root
+var limine_wall_foreign = false; // a wallpaper URI we didn't write is on disk
+var limine_wall_picked = false; // some wallpaper is "ours" (parsed back or just picked)
+var limine_wall_on = true;
+var limine_timeout: i64 = 5;
+var g_limine_base: []u8 = ""; // current conf text the edits re-apply on top of
+var limine_inited = false; // full lazy load (incl. optional polkit read) done
+
+// Color presets — a compact catalog inspired by the Limine theme
+// collections (Catppuccin variants, Tokyo Night, Nord, Rose Pine and
+// Dracula are recreations of those communities' published palettes —
+// Fedora's limine switcher and the CachyOS theme repositories both curate
+// the same families). "Keep current colors" (index 0) leaves whatever is
+// on disk alone.
+const LiminePreset = struct {
+    label: [:0]const u8,
+    palette: []const u8,
+    bright: []const u8,
+    fg: []const u8,
+    bg: []const u8,
+};
+
+const LIMINE_PRESETS = [_]LiminePreset{
+    .{
+        .label = "Catppuccin Mocha",
+        .palette = "1e1e2e;f38ba8;a6e3a1;f9e2af;89b4fa;f5c2e7;94e2d5;cdd6f4",
+        .bright = "585b70;f38ba8;a6e3a1;f9e2af;89b4fa;f5c2e7;94e2d5;cdd6f4",
+        .fg = "cdd6f4",
+        .bg = "1e1e2e",
+    },
+    .{
+        .label = "Tokyo Night",
+        .palette = "1a1b26;f7768e;9ece6a;e0af68;7aa2f7;bb9af7;7dcfff;a9b1d6",
+        .bright = "414868;ff7a93;b9f27c;ff9e64;7da6ff;bb9af7;0db9d7;c0caf5",
+        .fg = "c0caf5",
+        .bg = "1a1b26",
+    },
+    .{
+        .label = "Nord",
+        .palette = "2e3440;bf616a;a3be8c;ebcb8b;81a1c1;b48ead;88c0d0;d8dee9",
+        .bright = "3b4252;bf616a;a3be8c;ebcb8b;81a1c1;b48ead;8fbcbb;eceff4",
+        .fg = "eceff4",
+        .bg = "2e3440",
+    },
+    .{
+        .label = "Rose Pine",
+        .palette = "191724;eb6f92;31748f;f6c177;3e8fb0;c4a7e7;9ccfd8;e0def4",
+        .bright = "26233a;eb6f92;31748f;f6c177;3e8fb0;c4a7e7;9ccfd8;e0def4",
+        .fg = "e0def4",
+        .bg = "191724",
+    },
+    .{
+        .label = "Dracula",
+        .palette = "21222c;ff5555;50fa7b;f1fa8c;bd93f9;ff79c6;8be9fd;f8f8f2",
+        .bright = "6272a4;ff6e6e;69ff94;ffffa5;d6acff;ff92df;a4ffff;ffffff",
+        .fg = "f8f8f2",
+        .bg = "282a36",
+    },
+};
+const LIMINE_PRESET_LABELS = [_][*:0]const u8{ "Keep current colors", "Catppuccin Mocha", "Tokyo Night", "Nord", "Rose Pine", "Dracula" };
+
+// Widget handles the callbacks poke (pages are built once at startup, so
+// later loads just refresh these existing widgets).
+var g_limine_page_stack: ?*gtk.GtkStack = null;
+var g_limine_timeout_spin: ?*gtk.GtkSpinButton = null;
+var g_limine_color_btns: [3]?*gtk.GtkColorDialogButton = .{ null, null, null }; // backdrop, text, footer accent
+var g_limine_preset_combo: ?*gtk.AdwComboRow = null;
+var g_limine_branding_buffer: ?*gtk.GtkEntryBuffer = null;
+var g_limine_wall_row: ?*gtk.AdwActionRow = null;
+var g_limine_wall_switch: ?*gtk.GtkSwitch = null;
+var g_limine_status_label: ?*gtk.GtkLabel = null;
+var g_limine_file_dialog: ?*gtk.GtkFileDialog = null;
+
+// Post-apply verification polling — compare the on-disk conf against the
+// staged bytes until they match (authorized) or the window expires.
+var g_limine_poll_target: ?[]u8 = null;
+var g_limine_poll_ticks: i32 = 0;
+
+// The managed wallpaper's boot() URI — resolved away from a static
+// comptime string because the format suffix follows the picked file.
+var limine_wall_key_buf: [32]u8 = undefined;
+
+fn setLimineBase(text: []const u8) void {
+    if (g_limine_base.len > 0) gpa.free(g_limine_base);
+    g_limine_base = gpa.dupe(u8, text) catch "";
+}
+
+fn resetLimineState() void {
+    limine_found = false;
+    limine_missing = false;
+    limine_locked = false;
+    limine_wall_foreign = false;
+    limine_wall_picked = false;
+    limine_timeout = 5;
+    limine_bg_v.clear();
+    limine_fg_v.clear();
+    limine_accent_v.clear();
+    limine_palette_v.clear();
+    limine_bright_v.clear();
+    limine_wall_v.clear();
+    limine_wall_on = true;
+    limine_branding_v.set("Featherlite");
+}
+
+fn parseLimineConf(text: []const u8) void {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line0| {
+        const line = std.mem.trim(u8, line0, " \t\r");
+        if (line.len == 0) continue;
+        if (line[0] == '/') break; // entry block starts — header done
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..colon], " \t");
+        const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(key, "timeout")) {
+            limine_timeout = std.fmt.parseInt(i64, val, 10) catch limine_timeout;
+        } else if (std.ascii.eqlIgnoreCase(key, "term_background")) {
+            limine_bg_v.set(if (val.len > 8) val[0..8] else val);
+        } else if (std.ascii.eqlIgnoreCase(key, "term_foreground")) {
+            limine_fg_v.set(if (val.len > 8) val[0..8] else val);
+        } else if (std.ascii.eqlIgnoreCase(key, "term_palette")) {
+            limine_palette_v.set(val);
+        } else if (std.ascii.eqlIgnoreCase(key, "term_palette_bright")) {
+            limine_bright_v.set(val);
+        } else if (std.ascii.eqlIgnoreCase(key, "interface_branding")) {
+            limine_branding_v.set(val);
+        } else if (std.ascii.eqlIgnoreCase(key, "interface_branding_colour")) {
+            limine_accent_v.set(val);
+        } else if (std.ascii.eqlIgnoreCase(key, "wallpaper")) {
+            if (std.mem.indexOf(u8, val, "/limine-wallpaper.") != null) {
+                // A wallpaper we wrote: keep it managed. The source for a
+                // re-copy is the file already sitting on the boot partition,
+                // so re-applying without touching anything is a no-op copy,
+                // never a broken URI.
+                if (std.mem.lastIndexOfScalar(u8, val, '/')) |slash| {
+                    const base = val[slash + 1 ..];
+                    if (std.fmt.bufPrint(limine_wall_v.data, "/boot/{s}", .{base})) |filled| {
+                        limine_wall_v.len = filled.len;
+                    } else |_| {
+                        limine_wall_v.clear();
+                    }
+                }
+                limine_wall_on = true;
+                limine_wall_picked = true;
+            } else {
+                // Not ours — preserved verbatim by the builder until the
+                // user picks their own file.
+                limine_wall_foreign = true;
+                limine_wall_on = true;
+            }
+        }
+    }
+}
+
+/// Loads the state from disk. `allow_pkexec` permits one privileged read
+/// via polkit for root-locked boot directories — only ever used from a
+/// direct user action (opening the Boot tab or its buttons), never at
+/// application startup.
+fn loadLimineState(allow_pkexec: bool) void {
+    resetLimineState();
+    // Existence vs. lockdown comes through the same raw open() the file
+    // readers use (Zig 0.16 moved std.fs's access helpers behind the new
+    // explicit-Io API; libc remains this file's native dialect).
+    const probe = open(limine_conf_path, 0, 0);
+    if (probe < 0) {
+        const e = std.posix.errno(probe);
+        if (e == .ACCES or e == .PERM) {
+            limine_locked = true;
+            if (allow_pkexec) {
+                // Boot files locked down (protective fmask): ask once
+                // through the installer's ordinary polkit flow instead.
+                // The GUI pauses briefly while the agent's prompt is up.
+                const out = runCaptured(&.{ "pkexec", "/usr/bin/cat", limine_conf_path }, 20000) orelse return;
+                defer gpa.free(out);
+                setLimineBase(out);
+                parseLimineConf(out);
+                limine_locked = false;
+                limine_found = true;
+            }
+        } else {
+            limine_missing = true;
+        }
+        return;
+    }
+    _ = close(probe);
+    const stored = readFileAll(limine_conf_path) orelse {
+        limine_locked = true;
+        return;
+    };
+    defer gpa.free(stored);
+    setLimineBase(stored);
+    parseLimineConf(stored);
+    limine_found = true;
+}
+
+const LiminePending = struct {
+    timeout: ?i64 = null,
+    wallpaper: ?[]const u8 = null,
+    palette: ?[]const u8 = null,
+    bright: ?[]const u8 = null,
+    fg: ?[]const u8 = null,
+    bg: ?[]const u8 = null,
+    branding: ?[]const u8 = null,
+    accent: ?[]const u8 = null,
+};
+
+fn appendLimineKey(list: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
+    try list.appendSlice(gpa, key);
+    try list.appendSlice(gpa, ": ");
+    try list.appendSlice(gpa, value);
+    try list.appendSlice(gpa, "\n");
+}
+
+fn flushLiminePending(out: *std.ArrayList(u8), pending: *const LiminePending) !void {
+    if (pending.timeout) |t| {
+        var nb: [21]u8 = undefined;
+        const ts = std.fmt.bufPrint(&nb, "{d}", .{t}) catch "5";
+        try appendLimineKey(out, "timeout", ts);
+    }
+    if (pending.wallpaper) |v| try appendLimineKey(out, "wallpaper", v);
+    if (pending.palette) |v| try appendLimineKey(out, "term_palette", v);
+    if (pending.bright) |v| try appendLimineKey(out, "term_palette_bright", v);
+    if (pending.fg) |v| try appendLimineKey(out, "term_foreground", v);
+    if (pending.bg) |v| try appendLimineKey(out, "term_background", v);
+    if (pending.branding) |v| try appendLimineKey(out, "interface_branding", v);
+    if (pending.accent) |v| try appendLimineKey(out, "interface_branding_colour", v);
+}
+
+/// The boot() URI for the managed wallpaper — extension follows the picked
+/// file's format so what limine.conf references is what gets copied.
+fn limineWallSuffix() []const u8 {
+    const src = limine_wall_v.text();
+    const dot = std.mem.lastIndexOfScalar(u8, src, '.') orelse return ".png";
+    const ext = src[dot..];
+    if (ext.len < 2 or ext.len > 6) return ".png";
+    for (ext[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c)) return ".png";
+    }
+    return ext;
+}
+
+fn limineWallKey() []const u8 {
+    const s = limineWallSuffix();
+    return std.fmt.bufPrint(&limine_wall_key_buf, "boot():/limine-wallpaper{s}", .{s}) catch "boot():/limine-wallpaper.png";
+}
+
+/// True when this app owns the wallpaper slot enough to write it: the
+/// feature is switched on AND a file is actually ours (picked this session
+/// or parsed back from our slot). With a foreign URI and no pick, the
+/// builder preserves that line verbatim instead.
+fn limineWritesWall() bool {
+    return limine_wall_on and limine_wall_picked and limine_wall_v.isSet();
+}
+
+/// Rebuilds the conf text: replaces known key lines with the current
+/// values, drops managed keys that are unset, passes everything else
+/// (entries, comments, unknown keys, foreign wallpapers) through verbatim,
+/// and flushes missing managed keys just before the first entry line.
+fn limineApplyInto(base: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    var pending = LiminePending{ .timeout = limine_timeout };
+    if (limine_branding_v.isSet()) pending.branding = limine_branding_v.text();
+    if (limine_accent_v.isSet()) pending.accent = limine_accent_v.text();
+    if (limineWritesWall()) pending.wallpaper = limineWallKey();
+    if (limine_palette_v.isSet()) pending.palette = limine_palette_v.text();
+    if (limine_bright_v.isSet()) pending.bright = limine_bright_v.text();
+    if (limine_fg_v.isSet()) pending.fg = limine_fg_v.text();
+    if (limine_bg_v.isSet()) pending.bg = limine_bg_v.text();
+
+    var it = std.mem.splitScalar(u8, base, '\n');
+    var entries_started = false;
+    while (it.next()) |raw| {
+        if (it.peek() == null and raw.len == 0) break; // trailing newline artifact
+        if (!entries_started) {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len > 0 and line[0] == '/') {
+                entries_started = true;
+                try flushLiminePending(&out, &pending);
+                try out.appendSlice(gpa, raw);
+                try out.appendSlice(gpa, "\n");
+                continue;
+            }
+            const colon = std.mem.indexOfScalar(u8, line, ':');
+            if (line.len == 0 or line[0] == '#' or colon == null) {
+                try out.appendSlice(gpa, raw);
+                try out.appendSlice(gpa, "\n");
+                continue;
+            }
+            const key = std.mem.trim(u8, line[0..colon.?], " \t");
+            if (std.ascii.eqlIgnoreCase(key, "timeout")) {
+                var nb: [21]u8 = undefined;
+                const ts = std.fmt.bufPrint(&nb, "{d}", .{limine_timeout}) catch "5";
+                try appendLimineKey(&out, key, ts);
+                pending.timeout = null;
+            } else if (std.ascii.eqlIgnoreCase(key, "term_palette")) {
+                if (limine_palette_v.isSet()) try appendLimineKey(&out, key, limine_palette_v.text());
+                pending.palette = null;
+            } else if (std.ascii.eqlIgnoreCase(key, "term_palette_bright")) {
+                if (limine_bright_v.isSet()) try appendLimineKey(&out, key, limine_bright_v.text());
+                pending.bright = null;
+            } else if (std.ascii.eqlIgnoreCase(key, "term_foreground")) {
+                if (limine_fg_v.isSet()) try appendLimineKey(&out, key, limine_fg_v.text());
+                pending.fg = null;
+            } else if (std.ascii.eqlIgnoreCase(key, "term_background")) {
+                if (limine_bg_v.isSet()) try appendLimineKey(&out, key, limine_bg_v.text());
+                pending.bg = null;
+            } else if (std.ascii.eqlIgnoreCase(key, "interface_branding")) {
+                if (limine_branding_v.isSet()) try appendLimineKey(&out, key, limine_branding_v.text());
+                pending.branding = null;
+            } else if (std.ascii.eqlIgnoreCase(key, "interface_branding_colour")) {
+                if (limine_accent_v.isSet()) try appendLimineKey(&out, key, limine_accent_v.text());
+                pending.accent = null;
+            } else if (std.ascii.eqlIgnoreCase(key, "wallpaper")) {
+                if (limineWritesWall()) {
+                    // Ours replaces whatever was there — foreign line or
+                    // our earlier slot (already the same bytes when idle).
+                    try appendLimineKey(&out, key, limineWallKey());
+                } else if (limine_wall_foreign and !limine_wall_picked and limine_wall_on) {
+                    try out.appendSlice(gpa, raw);
+                    try out.appendSlice(gpa, "\n");
+                } // else: no wallpaper wanted — any existing line is dropped.
+                pending.wallpaper = null;
+            } else {
+                try out.appendSlice(gpa, raw);
+                try out.appendSlice(gpa, "\n");
+            }
+            continue;
+        }
+        // Entry block: byte-for-byte.
+        try out.appendSlice(gpa, raw);
+        try out.appendSlice(gpa, "\n");
+    }
+    if (!entries_started) return error.NoEntries;
+    return out.toOwnedSlice(gpa);
+}
+
+fn limineStatus(comptime fmt: []const u8, args: anytype) void {
+    const label = g_limine_status_label orelse return;
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
+    buf[msg.len] = 0; // bufPrint already guarded the overflow case
+    gtk.gtk_label_set_text(label, buf[0..msg.len :0]);
+}
+
+fn appendShellQuoted(out: *std.ArrayList(u8), s: []const u8) !void {
+    try out.append(gpa, '\'');
+    for (s) |ch| {
+        if (ch == '\'') {
+            try out.appendSlice(gpa, "'\\''");
+        } else try out.append(gpa, ch);
+    }
+    try out.append(gpa, '\'');
+}
+
+/// The single pkexec shell line: wallpaper file shuffle (when one is
+/// active), the staged conf into /boot, the ESP fallback copy, and a+r so
+/// later direct reads never need a password. Ends in `true` so a missing
+/// ESP subdirectory never "fails" the chain — the poll, not the exit code,
+/// is the source of truth.
+fn buildLiminePkexec(wall_src: ?[]const u8) ?[:0]u8 {
+    var cmd: std.ArrayList(u8) = .empty;
+    errdefer cmd.deinit(gpa);
+    if (wall_src) |src| {
+        cmd.appendSlice(gpa, "[ -f ") catch return null;
+        appendShellQuoted(&cmd, src) catch return null;
+        cmd.appendSlice(gpa, " ] && cp ") catch return null;
+        appendShellQuoted(&cmd, src) catch return null;
+        cmd.appendSlice(gpa, " /boot/limine-wallpaper") catch return null;
+        cmd.appendSlice(gpa, limineWallSuffix()) catch return null;
+        cmd.appendSlice(gpa, "; ") catch return null;
+    } else {
+        cmd.appendSlice(gpa, "rm -f /boot/limine-wallpaper.*; ") catch return null;
+    }
+    cmd.appendSlice(gpa, "cp ") catch return null;
+    cmd.appendSlice(gpa, limine_stage_path_s) catch return null;
+    cmd.appendSlice(gpa, " /boot/limine.conf && chmod a+r /boot/limine.conf; [ -d /boot/EFI/BOOT ] && cp ") catch return null;
+    cmd.appendSlice(gpa, limine_stage_path_s) catch return null;
+    cmd.appendSlice(gpa, " /boot/EFI/BOOT/limine.conf; true") catch return null;
+    cmd.append(gpa, 0) catch return null;
+    return cmd.items[0 .. cmd.items.len - 1 :0];
+}
+
+fn doLimineApply() void {
+    if (!limine_found) return;
+    if (g_limine_base.len == 0) {
+        limineStatus("No config loaded — reload first.", .{});
+        return;
+    }
+    // Fresh base: picks up edits made outside this app since the last load.
+    if (readFileAll(limine_conf_path)) |fresh| {
+        defer gpa.free(fresh);
+        setLimineBase(fresh);
+    }
+    // Safety net: refuse to write a header-only conf — a boot menu with no
+    // "/Title" entries would leave the system unbootable.
+    var has_entry = false;
+    var eit = std.mem.splitScalar(u8, g_limine_base, '\n');
+    while (eit.next()) |l0| {
+        const l = std.mem.trim(u8, l0, " \t\r");
+        if (l.len > 0 and l[0] == '/') {
+            has_entry = true;
+            break;
+        }
+    }
+    if (!has_entry) {
+        limineStatus("No boot entries found — refusing to apply.", .{});
+        return;
+    }
+    const newconf = limineApplyInto(g_limine_base) catch {
+        limineStatus("Failed to build the new boot menu config.", .{});
+        return;
+    };
+    if (!writeFileAll(limine_stage_path, newconf)) {
+        gpa.free(newconf);
+        limineStatus("Failed to stage {s}.", .{limine_stage_path_s});
+        return;
+    }
+
+    const wall_src: ?[]const u8 = if (limineWritesWall()) limine_wall_v.text() else null;
+    const cmd = buildLiminePkexec(wall_src) orelse {
+        gpa.free(newconf);
+        limineStatus("Out of memory building the apply command.", .{});
+        return;
+    };
+    defer gpa.free(cmd);
+    launchDetached(&.{ "pkexec", "/usr/bin/bash", "-c", cmd });
+
+    // Kick off the verification poll (authorized vs cancelled detection).
+    if (g_limine_poll_target) |t| gpa.free(t);
+    g_limine_poll_target = gpa.dupe(u8, newconf) catch null;
+    g_limine_poll_ticks = 0;
+    gpa.free(newconf);
+    if (g_limine_poll_target != null) {
+        limineStatus("Waiting for the polkit password prompt…", .{});
+        _ = gtk.g_timeout_add(1600, liminePollTick, null);
+    }
+}
+
+/// Authorized when the on-disk conf comes to equal the staged bytes.
+fn liminePollTick(_: ?*anyopaque) callconv(.c) c_int {
+    const target = g_limine_poll_target orelse return 0;
+    g_limine_poll_ticks += 1;
+    const now = readFileAll(limine_conf_path);
+    if (now == null and g_limine_poll_ticks < 20) return 1;
+    if (now) |data| {
+        defer gpa.free(data);
+        if (std.mem.eql(u8, data, target)) {
+            setLimineBase(data);
+            gpa.free(g_limine_poll_target.?);
+            g_limine_poll_target = null;
+            limineStatus("Applied. Reboot to see the new boot menu.", .{});
+            return 0;
+        }
+    }
+    if (g_limine_poll_ticks >= 20) {
+        gpa.free(g_limine_poll_target.?);
+        g_limine_poll_target = null;
+        limineStatus("Apply cancelled — polkit prompt dismissed or timed out.", .{});
+        return 0;
+    }
+    return 1;
+}
+
+fn limineSetPicker(idx: usize, hex: []const u8) void {
+    const btn = g_limine_color_btns[idx] orelse return;
+    const picked = if (hex.len >= 8) hex[0..6] else hex; // RRGGBBAA → drop alpha for the swatch
+    const rgba = hexToRgba(picked) orelse return;
+    gtk.gtk_color_dialog_button_set_rgba(btn, &rgba);
+}
+
+fn limineUpdateStack() void {
+    const st = g_limine_page_stack orelse return;
+    const name: [*:0]const u8 = if (limine_found) "full" else if (limine_locked) "locked" else "missing";
+    gtk.gtk_stack_set_visible_child_name(st, name);
+}
+
+fn limineUpdateWallRow() void {
+    const row = g_limine_wall_row orelse return;
+    var sub_buf: [640]u8 = undefined;
+    const msg = if (limine_wall_foreign) blk: {
+        break :blk std.fmt.bufPrint(&sub_buf, "This limine.conf carries its own wallpaper URI — it stays until you pick a file here.", .{}) catch "Wallpaper line present.";
+    } else if (limine_wall_v.isSet()) blk: {
+        break :blk std.fmt.bufPrint(&sub_buf, "Copies to /boot/limine-wallpaper in the Apply pass. Source: {s}", .{limine_wall_v.text()}) catch "";
+    } else blk: {
+        break :blk std.fmt.bufPrint(&sub_buf, "No wallpaper — the backdrop color paints the screen instead.", .{}) catch "";
+    };
+    sub_buf[msg.len] = 0;
+    gtk.adw_action_row_set_subtitle(row, sub_buf[0..msg.len :0]);
+}
+
+fn limineUpdateWidgets() void {
+    limineUpdateStack();
+    if (!limine_found) return;
+    if (g_limine_timeout_spin) |s| gtk.gtk_spin_button_set_value(s, @floatFromInt(limine_timeout));
+    limineSetPicker(0, limine_bg_v.text());
+    limineSetPicker(1, limine_fg_v.text());
+    limineSetPicker(2, limine_accent_v.text());
+    if (g_limine_branding_buffer) |b| {
+        limine_branding_storage[limine_branding_v.len] = 0;
+        gtk.gtk_entry_buffer_set_text(@ptrCast(b), @ptrCast(&limine_branding_storage), @intCast(limine_branding_v.len));
+    }
+    if (g_limine_wall_switch) |sw| {
+        // "On" reflects anything live on disk: our slot or a foreign URI.
+        gtk.gtk_switch_set_active(sw, if (limine_wall_on and (limine_wall_v.isSet() or limine_wall_foreign)) 1 else 0);
+    }
+    limineUpdateWallRow();
+}
+
+fn onLimineTimeoutChanged(spin: *gtk.GtkSpinButton, _: ?*anyopaque) callconv(.c) void {
+    limine_timeout = @intCast(@min(gtk.gtk_spin_button_get_value_as_int(spin), 120));
+}
+
+fn onLiminePresetChanged(row: *gtk.AdwComboRow, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const idx = gtk.adw_combo_row_get_selected(row);
+    if (idx == 0 or idx > LIMINE_PRESETS.len) return; // 0 = keep current
+    const preset = LIMINE_PRESETS[idx - 1];
+    limine_palette_v.set(preset.palette);
+    limine_bright_v.set(preset.bright);
+    limine_fg_v.set(preset.fg);
+    limine_bg_v.set(preset.bg);
+    limineSetPicker(0, limine_bg_v.text());
+    limineSetPicker(1, limine_fg_v.text());
+}
+
+fn onLimineColorChanged(button: *gtk.GtkColorDialogButton, _: *gtk.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
+    if (user_data == null) return;
+    const idx = @as(usize, @intFromPtr(user_data));
+    if (idx >= g_limine_color_btns.len) return;
+    const rgba = gtk.gtk_color_dialog_button_get_rgba(button);
+    var hex: [8]u8 = undefined;
+    const owned = rgbaToHex(rgba.*, &hex);
+    switch (idx) {
+        0 => limine_bg_v.set(owned),
+        1 => limine_fg_v.set(owned),
+        else => limine_accent_v.set(owned),
+    }
+}
+
+fn onLimineBrandingChanged(_: *gtk.GtkEntryBuffer, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    const b = g_limine_branding_buffer orelse return;
+    limine_branding_v.set(std.mem.span(gtk.gtk_entry_buffer_get_text(b)));
+}
+
+fn onLimineWallSwitchChanged(sw: *gtk.GtkSwitch, _: *gtk.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+    limine_wall_on = gtk.gtk_switch_get_active(sw) != 0;
+}
+
+fn onLimineFilePicked(src: ?*anyopaque, res: *gtk.GAsyncResult, _: ?*anyopaque) callconv(.c) void {
+    const dlg = src orelse return;
+    const file = gtk.gtk_file_dialog_open_finish(@ptrCast(dlg), res) orelse return; // dismissed
+    defer gtk.g_object_unref(@ptrCast(file));
+    const path_c = gtk.g_file_get_path(file) orelse return;
+    limine_wall_v.set(std.mem.sliceTo(path_c, 0));
+    limine_wall_on = true;
+    limine_wall_picked = true;
+    limineUpdateWallRow();
+}
+
+fn onLimineWallChoose(button: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    _ = button;
+    if (g_limine_file_dialog == null) {
+        g_limine_file_dialog = gtk.gtk_file_dialog_new();
+        if (g_limine_file_dialog) |d| {
+            gtk.gtk_file_dialog_set_title(d, "Boot menu wallpaper (PNG / JPG / BMP)");
+        }
+    }
+    const d = g_limine_file_dialog orelse return;
+    const parent: ?*gtk.GtkWindow = if (g_window) |w| @ptrCast(w) else null;
+    gtk.gtk_file_dialog_open(d, parent, null, onLimineFilePicked, null);
+}
+
+/// Both the locked card's "Load with password" button and the loaded
+/// config's refresh button land here — a full (polkit-allowed) read.
+fn onLimineReloadClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    loadLimineState(true);
+    limineUpdateWidgets();
+}
+
+fn onLimineApplyClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    doLimineApply();
+}
+
+fn addLimineColorRow(group: *gtk.AdwPreferencesGroup, title: [:0]const u8, subtitle: [:0]const u8, idx: usize) void {
+    const row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(row), title);
+    gtk.adw_action_row_set_subtitle(row, subtitle);
+    const dlg = gtk.gtk_color_dialog_new();
+    const btn = gtk.gtk_color_dialog_button_new(dlg);
+    gtk.gtk_widget_set_valign(@ptrCast(btn), gtk.ALIGN_CENTER);
+    g_limine_color_btns[idx] = btn;
+    _ = gtk.g_signal_connect_data(@ptrCast(btn), "notify::rgba", @ptrCast(&onLimineColorChanged), @as(?*anyopaque, @ptrFromInt(idx)), null, 0);
+    gtk.adw_action_row_add_suffix(row, @ptrCast(btn));
+    gtk.adw_preferences_group_add(group, @ptrCast(row));
+}
+
+fn buildLimineFullPage(stack: *gtk.GtkStack) void {
+    const page = gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 18);
+    _ = gtk.gtk_stack_add_named(stack, @ptrCast(page), "full");
+
+    const menu_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(menu_group, "Boot Menu");
+    gtk.adw_preferences_group_set_description(menu_group, "The Limine menu on this machine's boot partition. Entry lines — kernels and snapper snapshots — are never touched by this page.");
+
+    const status_row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(status_row), "/boot/limine.conf");
+    gtk.adw_action_row_set_subtitle(status_row, "Timeout, colors, wallpaper and footer live in the header above the entries.");
+    const reload_btn = gtk.gtk_button_new_from_icon_name("view-refresh-symbolic");
+    gtk.gtk_widget_set_valign(@ptrCast(reload_btn), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(reload_btn), "clicked", @ptrCast(&onLimineReloadClicked), null, null, 0);
+    gtk.adw_action_row_add_suffix(status_row, @ptrCast(reload_btn));
+    gtk.adw_preferences_group_add(menu_group, @ptrCast(status_row));
+
+    const spin = gtk.gtk_spin_button_new_with_range(0, 120, 1);
+    gtk.gtk_widget_set_valign(@ptrCast(spin), gtk.ALIGN_CENTER);
+    g_limine_timeout_spin = spin;
+    _ = gtk.g_signal_connect_data(@ptrCast(spin), "value-changed", @ptrCast(&onLimineTimeoutChanged), null, null, 0);
+    const spin_row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(spin_row), "Menu timeout (seconds)");
+    gtk.adw_action_row_set_subtitle(spin_row, "How long the menu waits before auto-booting. 0 boots straight away.");
+    gtk.adw_action_row_add_suffix(spin_row, @ptrCast(spin));
+    gtk.adw_preferences_group_add(menu_group, @ptrCast(spin_row));
+    gtk.gtk_box_append(page, @ptrCast(menu_group));
+
+    const color_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(color_group, "Menu Colors");
+    gtk.adw_preferences_group_set_description(color_group, "A preset fills backdrop and text instantly; Apply writes /boot/limine.conf. Each preset also sets the eight terminal palette slots.");
+    const combo = gtk.adw_combo_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(combo), "Color preset");
+    gtk.adw_action_row_set_subtitle(@ptrCast(combo), "Pick a palette for the menu, or keep whatever is already in the config.");
+    var preset_buf: [LIMINE_PRESET_LABELS.len + 1]?[*:0]const u8 = undefined;
+    for (LIMINE_PRESET_LABELS, 0..) |label, i| preset_buf[i] = label;
+    preset_buf[LIMINE_PRESET_LABELS.len] = null;
+    gtk.adw_combo_row_set_model(combo, @ptrCast(gtk.gtk_string_list_new(@ptrCast(&preset_buf))));
+    gtk.adw_combo_row_set_selected(combo, 0);
+    g_limine_preset_combo = combo;
+    _ = gtk.g_signal_connect_data(@ptrCast(combo), "notify::selected", @ptrCast(&onLiminePresetChanged), null, null, 0);
+    gtk.adw_preferences_group_add(color_group, @ptrCast(combo));
+    addLimineColorRow(color_group, "Backdrop (no wallpaper)", "Screen behind the menu when no wallpaper is on.", 0);
+    addLimineColorRow(color_group, "Menu text", "Foreground color of the entry list.", 1);
+    gtk.gtk_box_append(page, @ptrCast(color_group));
+
+    const wall_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(wall_group, "Wallpaper");
+    gtk.adw_preferences_group_set_description(wall_group, "Copied onto the boot partition as limine-wallpaper.png (or .jpg, .bmp — matching the source's format) in the same Apply pass that writes the config. PNG is what Limine theme packs ship.");
+    const wall_row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(wall_row), "Wallpaper");
+    g_limine_wall_row = wall_row;
+    const wswitch = gtk.gtk_switch_new();
+    gtk.gtk_widget_set_valign(@ptrCast(wswitch), gtk.ALIGN_CENTER);
+    g_limine_wall_switch = wswitch;
+    _ = gtk.g_signal_connect_data(@ptrCast(wswitch), "notify::active", @ptrCast(&onLimineWallSwitchChanged), null, null, 0);
+    gtk.adw_action_row_add_suffix(wall_row, @ptrCast(wswitch));
+    const pick_btn = gtk.gtk_button_new_with_label("Choose…");
+    gtk.gtk_widget_set_valign(@ptrCast(pick_btn), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(pick_btn), "clicked", @ptrCast(&onLimineWallChoose), null, null, 0);
+    gtk.adw_action_row_add_suffix(wall_row, @ptrCast(pick_btn));
+    gtk.adw_preferences_group_add(wall_group, @ptrCast(wall_row));
+    gtk.gtk_box_append(page, @ptrCast(wall_group));
+
+    const brand_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(brand_group, "Menu Footer");
+    gtk.adw_preferences_group_set_description(brand_group, "Text printed in the menu's corner via Limine's interface_branding.");
+    const brand_row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(brand_row), "Footer text");
+    const entry = gtk.gtk_entry_new();
+    gtk.gtk_entry_set_placeholder_text(entry, "Featherlite");
+    gtk.gtk_widget_set_size_request(@ptrCast(entry), 180, -1);
+    gtk.gtk_widget_set_valign(@ptrCast(entry), gtk.ALIGN_CENTER);
+    const buffer = gtk.gtk_entry_get_buffer(entry);
+    g_limine_branding_buffer = buffer;
+    _ = gtk.g_signal_connect_data(@ptrCast(buffer), "notify::text", @ptrCast(&onLimineBrandingChanged), null, null, 0);
+    gtk.adw_action_row_add_suffix(brand_row, @ptrCast(entry));
+    gtk.adw_preferences_group_add(brand_group, @ptrCast(brand_row));
+    addLimineColorRow(brand_group, "Footer accent", "An accent color for the footer (interface_branding_colour).", 2);
+    gtk.gtk_box_append(page, @ptrCast(brand_group));
+
+    const apply_group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_description(apply_group, "Staging and copying runs under one pkexec password prompt, then the result is verified by re-reading the config. Applies on the next reboot.");
+    const apply_row = gtk.adw_action_row_new();
+    gtk.adw_preferences_row_set_title(@ptrCast(apply_row), "Write the new boot menu");
+    const apply_btn = gtk.gtk_button_new_with_label("Apply");
+    gtk.gtk_widget_add_css_class(@ptrCast(apply_btn), "suggested-action");
+    gtk.gtk_widget_set_valign(@ptrCast(apply_btn), gtk.ALIGN_CENTER);
+    _ = gtk.g_signal_connect_data(@ptrCast(apply_btn), "clicked", @ptrCast(&onLimineApplyClicked), null, null, 0);
+    gtk.adw_action_row_add_suffix(apply_row, @ptrCast(apply_btn));
+    gtk.adw_preferences_group_add(apply_group, @ptrCast(apply_row));
+    gtk.gtk_box_append(page, @ptrCast(apply_group));
+
+    const status_lbl = gtk.gtk_label_new(" ");
+    gtk.gtk_label_set_xalign(status_lbl, 0);
+    gtk.gtk_widget_add_css_class(@ptrCast(status_lbl), "dim-label");
+    g_limine_status_label = status_lbl;
+    gtk.gtk_box_append(page, @ptrCast(status_lbl));
+
+    limineUpdateWidgets();
+}
+
+fn buildBootPage() *gtk.GtkBox {
+    loadLimineState(false); // silent direct read — polkit only on user action
+    limine_inited = limine_found or limine_missing;
+
+    const outer = gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 18);
+    gtk.gtk_widget_set_margin_top(@ptrCast(outer), 24);
+    gtk.gtk_widget_set_margin_bottom(@ptrCast(outer), 24);
+    gtk.gtk_widget_set_margin_start(@ptrCast(outer), 24);
+    gtk.gtk_widget_set_margin_end(@ptrCast(outer), 24);
+
+    const inner = gtk.gtk_stack_new();
+    g_limine_page_stack = inner;
+    gtk.gtk_box_append(outer, @ptrCast(inner));
+
+    // Not-a-Limine-system card. Hooks in via the sidebar's lazy-load
+    // (never re-prompted) — there is simply nothing to style here.
+    const missing_box = gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 12);
+    const missing_lbl = gtk.gtk_label_new("No /boot/limine.conf on this machine — it isn't booted with Limine, so there is no boot menu to style here.");
+    gtk.gtk_label_set_wrap(missing_lbl, 1);
+    gtk.gtk_label_set_justify(missing_lbl, gtk.JUSTIFY_CENTER);
+    gtk.gtk_box_append(missing_box, @ptrCast(missing_lbl));
+    _ = gtk.gtk_stack_add_named(inner, @ptrCast(missing_box), "missing");
+
+    // Locked card — boot directory unreadable without root. One polkit
+    // prompt through the ordinary approval flow reads it and swaps to the
+    // full editor (the GUI pauses briefly while the prompt is up).
+    const locked_box = gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 12);
+    const locked_lbl = gtk.gtk_label_new("The boot menu lives in a root-only directory. Approve a password prompt to read /boot/limine.conf, then it can be restyled.");
+    gtk.gtk_label_set_wrap(locked_lbl, 1);
+    gtk.gtk_label_set_justify(locked_lbl, gtk.JUSTIFY_CENTER);
+    gtk.gtk_box_append(locked_box, @ptrCast(locked_lbl));
+    const unlock_btn = gtk.gtk_button_new_with_label("Load with password");
+    _ = gtk.g_signal_connect_data(@ptrCast(unlock_btn), "clicked", @ptrCast(&onLimineReloadClicked), null, null, 0);
+    gtk.gtk_widget_set_halign(@ptrCast(unlock_btn), gtk.ALIGN_CENTER);
+    gtk.gtk_box_append(locked_box, @ptrCast(unlock_btn));
+    _ = gtk.gtk_stack_add_named(inner, @ptrCast(locked_box), "locked");
+
+    buildLimineFullPage(inner);
+
+    limineUpdateStack();
+    return outer;
+}
+
+// ---------------------------------------------------------------------
 // Window / application — structure mirrors welcome_main.zig's buildWindow.
 // ---------------------------------------------------------------------
 
@@ -3569,12 +4375,14 @@ const PAGE_NAMES = [_][:0]const u8{ "Appearance", "Modules", "Shortcuts" };
 const PAGE_ICONS = [_][:0]const u8{ "applications-graphics-symbolic", "view-list-symbolic", "user-bookmarks-symbolic" };
 const BAR_COUNT = PAGE_NAMES.len;
 
-// "Bar" pages + compositor pages, in sidebar order. The compositor section is
-// Hyprland on Hyprland and Mango on MangoWM; both decks have the same number
-// of pages (9), so only the names/icons and the section header change at
-// runtime. The header rows ("Bar" / "Hyprland"|"Mango") are inserted between
-// the two groups at build time.
-const SB_COUNT = BAR_COUNT + hypr_pages.pages.names.len;
+// "Bar" pages + compositor pages + the System deck's Boot page, in sidebar
+// order. The compositor section is Hyprland on Hyprland and Mango on
+// MangoWM; both decks have the same number of pages (9), so only the
+// names/icons and the section header change at runtime. Section header
+// rows ("Bar" / "Hyprland"|"Mango" / "System") are inserted between the
+// groups at build time.
+const BOOT_PAGE_INDEX = BAR_COUNT + hypr_pages.pages.names.len; // first (only) page of the System deck
+const SB_COUNT = BOOT_PAGE_INDEX + 1;
 var g_sb_names: [SB_COUNT][:0]const u8 = undefined;
 var g_sb_icons: [SB_COUNT][:0]const u8 = undefined;
 
@@ -3587,6 +4395,8 @@ fn setupSidebarNames() void {
     const icons = if (hypr_pages.g_mango) &mango_pages.pages.icons else &hypr_pages.pages.icons;
     for (names.*, 0..) |n, i| g_sb_names[BAR_COUNT + i] = n;
     for (icons.*, 0..) |ic, i| g_sb_icons[BAR_COUNT + i] = ic;
+    g_sb_names[BOOT_PAGE_INDEX] = "Boot";
+    g_sb_icons[BOOT_PAGE_INDEX] = "system-reboot-symbolic";
 }
 
 var g_sidebar_rows: [SB_COUNT]*gtk.GtkListBoxRow = undefined;
@@ -3597,6 +4407,13 @@ fn onSidebarRowSelected(_: *gtk.GtkListBox, row: ?*gtk.GtkListBoxRow, _: ?*anyop
     const r = row orelse return;
     for (g_sidebar_rows, 0..) |sr, i| {
         if (sr == r) {
+            // The Boot tab takes its one privileged read (polkit) lazily,
+            // on the first actual visit — never at application startup.
+            if (i == BOOT_PAGE_INDEX and !limine_inited) {
+                limine_inited = true;
+                loadLimineState(true);
+                limineUpdateWidgets();
+            }
             gtk.gtk_stack_set_visible_child_name(g_content_stack.?, g_sb_names[i]);
             return;
         }
@@ -3671,14 +4488,17 @@ fn buildWindow(app: *anyopaque) *gtk.AdwApplicationWindow {
         addSidebarRow(sidebar_list, PAGE_NAMES[i], PAGE_ICONS[i], true, i);
     }
     addSidebarRow(sidebar_list, section_title, "", false, SB_COUNT);
-    for (BAR_COUNT..SB_COUNT) |i| {
+    for (BAR_COUNT..BOOT_PAGE_INDEX) |i| {
         addSidebarRow(sidebar_list, g_sb_names[i], g_sb_icons[i], true, i);
     }
+    addSidebarRow(sidebar_list, "System", "", false, SB_COUNT);
+    addSidebarRow(sidebar_list, g_sb_names[BOOT_PAGE_INDEX], g_sb_icons[BOOT_PAGE_INDEX], true, BOOT_PAGE_INDEX);
 
     const sec_widgets = if (hypr_pages.g_mango) mango_pages.pages.widgets() else hypr_pages.pages.widgets();
     var page_widgets: [SB_COUNT]*gtk.GtkBox = undefined;
     for (bar_pages, 0..) |p, i| page_widgets[i] = p;
     for (sec_widgets, 0..) |p, i| page_widgets[BAR_COUNT + i] = p;
+    page_widgets[BOOT_PAGE_INDEX] = buildBootPage();
 
     for (g_sb_names, 0..) |name, i| {
         const scrolled = gtk.gtk_scrolled_window_new();

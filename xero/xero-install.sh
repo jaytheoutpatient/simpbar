@@ -2884,6 +2884,9 @@ write_limine_conf() {
     {
         echo "timeout: 5"
         echo "default_entry: 1"
+        # Menu footer branding — simpbar-config's Boot tab picks this up as
+        # its default and restyles it (colors/wallpaper) on demand.
+        echo "interface_branding: Featherlite"
         echo ""
         local k stem title entries=0
         # Base kernel first, then every extra (headers skipped). Missing
