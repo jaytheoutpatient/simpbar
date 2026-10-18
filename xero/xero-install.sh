@@ -435,7 +435,8 @@ draw_progress_bar() {
 # — the two loops never write the same rows and never scroll the screen (the
 # frame's last print has no trailing newline). The game loop forks NOTHING per
 # frame: `read -t` is the frame timer, $RANDOM drives the bombs, geometry
-# re-checks happen every 20th tick. Colors reuse the 198/45/212 set the
+# re-checks happen every 8th tick (~0.45 s) or on WINCH where delivered. Colors
+# reuse the 198/45/212 set the
 # progress bar already prints on this console. Ends when the step ends (stop
 # file vanishes / SIGTERM) or on q; a breach spills into a fresh wave (score
 # keeps, ship respawns) so it always stays playable during a long install.
@@ -444,12 +445,21 @@ draw_progress_bar() {
 # with the installer's ERR trap.
 
 INVADERS_PID=""
-INVADERS_STOP=""
+# Fixed paths: a crashed installer (ERR trap / Ctrl-C mid-step) leaves an
+# orphaned game behind — the next start finds the pidfile and kills it first.
+INVADERS_STOP="/tmp/featherlite-invaders.stop"
+INVADERS_PIDFILE="/tmp/featherlite-invaders.pid"
 
 # Background main loop. $1 = stop file; playing while it exists.
 invaders_play() {
     local stopfile="$1"
-    local FW=33 SHIP_R=8              # field width, ship row (field rows 0..8)
+    local FW=33 SHIP_R=8 BOTTOM_PAD=2   # field width; ship row (0..8); rows kept clear at the bottom
+    local bottom=$(( 24 - BOTTOM_PAD )) # last usable screen row (BOTTOM_PAD above the claimed bottom)
+    # Real parent pid for the orphan check: in a subshell $PPID is only a
+    # preserved copy of the parent's own parent, so read /proc/<BASHPID>/stat
+    # (field 4) once — no fork; $PPID stays as the fallback.
+    local myppid
+    read -r _ _ _st myppid _ < "/proc/$BASHPID/stat" 2>/dev/null || myppid=$PPID
     local rows_base=0 lines=24 cols=80 left=1
     local frame=0 cleaned=0 painted=0 geo_dirty=1
     local score=0 wave=1 lives=3
@@ -475,16 +485,16 @@ invaders_play() {
     reseed
 
     quiet_exit() {
-        # farewell row (lines-13) plus the 12 strip rows (lines-12..lines-1)
+        # farewell row + the 12 strip rows (bottom-11 .. bottom)
         local i
         for (( i = 0; i < 13; i++ )); do
-            printf '\033[%d;1H\033[K' "$(( lines - 13 + i ))" 2>/dev/null || true
+            printf '\033[%d;1H\033[K' "$(( bottom - 12 + i ))" 2>/dev/null || true
         done
     }
     farewell() {
         quiet_exit
         printf '\033[%d;1H\033[K\033[38;5;245m        (arcade closed — install continues)\033[0m' \
-            "$(( lines - 13 ))"
+            "$(( bottom - 12 ))"
     }
     finish() {
         if (( cleaned == 0 )); then
@@ -505,6 +515,14 @@ invaders_play() {
     while read -rsN1 -t 0.001 -u 0 pick; do :; done 2>/dev/null
 
     while :; do
+        # Orphan-proof: if the installer shell died (Ctrl-C / ERR trap), no one
+        # will ever remove the stop file — bail out instead of haunting the
+        # console with a stale-geometry strip. kill -0 is a builtin: no fork.
+        if ! kill -0 "$myppid" 2>/dev/null; then
+            cleaned=1
+            quiet_exit
+            break
+        fi
         if [[ ! -e "$stopfile" ]]; then
             cleaned=1
             farewell
@@ -561,12 +579,14 @@ invaders_play() {
         frame=$(( frame + 1 ))
         if (( frame > 1000 )); then frame=0; fi
         # The progress frame owns (lines-h)/2 .. +h where h is 8 (or 14 with
-        # the logo at cols >= 58). The strip needs clean air below it:
-        # min height = h + 26 rows, otherwise the game just idles.
+        # the logo at cols >= 58); the strip (rows_base..bottom) needs the row
+        # below the frame clear: minimum height = h + 28, else the game idles
+        # until the terminal grows.
         local content_h=8
         if [[ $cols -ge 58 ]]; then content_h=14; fi
-        if (( lines < content_h + 26 )); then continue; fi
-        rows_base=$(( lines - 12 ))
+        if (( lines < content_h + 28 )); then continue; fi
+        bottom=$(( lines - BOTTOM_PAD ))
+        rows_base=$(( bottom - 11 ))
         left=$(( (cols - FW) / 2 ))
         if (( left < 1 )); then left=1; fi
 
@@ -750,14 +770,34 @@ invaders_play() {
 # Starts the game in a background subshell (stdout = this terminal).
 invaders_start() {
     if [[ -n "$INVADERS_PID" ]]; then return 0; fi
-    INVADERS_STOP=$(mktemp -u /tmp/featherlite-invaders.XXXXXX) || return 0
-    # mktemp -u names are unique, but the stop file must EXIST before play starts
-    if ! : > "$INVADERS_STOP" 2>/dev/null; then
-        INVADERS_STOP=""
-        return 0
+
+    # Kill any orphan left behind by a dead installer (fixed pidfile):
+    # strip races and double-headers never get a chance to exist.
+    if [[ -e "$INVADERS_PIDFILE" ]]; then
+        local oldpid
+        oldpid=$(cat "$INVADERS_PIDFILE" 2>/dev/null) || oldpid=""
+        if [[ "$oldpid" =~ ^[0-9]+$ ]] && kill -0 "$oldpid" 2>/dev/null; then
+            rm -f "$INVADERS_STOP"
+            kill "$oldpid" 2>/dev/null || true
+            wait_or_timeout() {   # bounded: never wedge the installer on a zombie
+                local n=0
+                while (( n < 20 )); do
+                    kill -0 "$oldpid" 2>/dev/null || return 0
+                    n=$(( n + 1 ))
+                    sleep 0.05
+                done
+                kill -9 "$oldpid" 2>/dev/null || true
+            }
+            wait_or_timeout
+            rm -f "$INVADERS_PIDFILE"
+        fi
     fi
+
+    if ! : > "$INVADERS_STOP" 2>/dev/null; then return 0; fi
+    : > "$INVADERS_PIDFILE" 2>/dev/null || return 0
     invaders_play "$INVADERS_STOP" &
     INVADERS_PID=$!
+    echo "$INVADERS_PID" > "$INVADERS_PIDFILE" 2>/dev/null || true
 }
 
 # Ends the current game (if any): stop file vanishes, one SIGTERM backup,
@@ -768,8 +808,8 @@ invaders_stop() {
         kill "$INVADERS_PID" 2>/dev/null || true
         wait "$INVADERS_PID" 2>/dev/null || true
         INVADERS_PID=""
-        INVADERS_STOP=""
     fi
+    rm -f "$INVADERS_PIDFILE" 2>/dev/null || true
     return 0
 }
 run_step_visual() {
