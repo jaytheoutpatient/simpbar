@@ -182,7 +182,8 @@ trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
 # Always restore the cursor and kill run_step_visual's background redraw
 # loop (a forked process, not a child that dies on its own) on any exit.
 DISPLAY_PID=""
-trap 'kill "$DISPLAY_PID" 2>/dev/null || true; tput cnorm 2>/dev/null || true' EXIT
+INVADERS_PID=""
+trap 'kill "$DISPLAY_PID" 2>/dev/null || true; invaders_stop; tput cnorm 2>/dev/null || true' EXIT
 
 # ────────────────────────────────────────────────────────────────────────────────
 # UTILITY FUNCTIONS
@@ -427,6 +428,329 @@ draw_progress_bar() {
     printf '\033[38;5;245m%s\033[0m\033[K\n' "$(center_pad "(Be patient while system installs. If it looks stuck it's normal.)" "$cols")"
 }
 
+# ─── Space Invaders (bottom strip while a step runs) ─────────────────────────
+# Pure-bash invaders occupying the bottom 12 rows during run_step_visual: the
+# progress frame is vertically centered (vpad_for) and its loop only ever
+# repaints those centered rows via cup, so the bottom strip belongs to the game
+# — the two loops never write the same rows and never scroll the screen (the
+# frame's last print has no trailing newline). The game loop forks NOTHING per
+# frame: `read -t` is the frame timer, $RANDOM drives the bombs, geometry
+# re-checks happen every 20th tick. Colors reuse the 198/45/212 set the
+# progress bar already prints on this console. Ends when the step ends (stop
+# file vanishes / SIGTERM) or on q; a breach spills into a fresh wave (score
+# keeps, ship respawns) so it always stays playable during a long install.
+# set -Eeuo pipefail is ON everywhere — every conditional here is an `if`
+# statement, never a bare `cond && action` chain that could kill the subshell
+# with the installer's ERR trap.
+
+INVADERS_PID=""
+INVADERS_STOP=""
+
+# Background main loop. $1 = stop file; playing while it exists.
+invaders_play() {
+    local stopfile="$1"
+    local FW=33 SHIP_R=8              # field width, ship row (field rows 0..8)
+    local rows_base=0 lines=24 cols=80 left=1
+    local frame=0 cleaned=0
+    local score=0 wave=1 lives=3
+    local origin=2 dirn=1 drop=0 step=0 step_every=6
+    local spawn_every=12 spawn_at=12
+    local phase=0 ship_x=16 flash=0
+    local p1x=-1 p1y=-1 p2x=-1 p2y=-1
+    local b1x=-1 b1y=-1 b2x=-1 b2y=-1
+    local i pick any_alive lowest r c breed fy
+    declare -a ALIVE=() FLASH=()
+
+    reseed() {
+        ALIVE=(); FLASH=()
+        # 3 alien rows x 6 aliens, 4-col spacing (3-wide sprites)
+        for (( i = 0; i < 18; i++ )); do
+            ALIVE[i]=1; FLASH[i]=-1000
+        done
+        origin=2; dirn=1; drop=0; step=0
+        spawn_every=$(( 16 - 2 * wave ))
+        if (( spawn_every < 7 )); then spawn_every=7; fi
+        spawn_at=$spawn_every
+    }
+    reseed
+
+    quiet_exit() {
+        local i
+        for (( i = 0; i < 12; i++ )); do
+            printf '\033[%d;1H\033[K' "$(( lines - 11 + i ))" 2>/dev/null || true
+        done
+    }
+    farewell() {
+        quiet_exit
+        printf '\033[%d;1H\033[K\033[38;5;245m        (arcade closed — install continues)\033[0m' \
+            "$(( lines - 12 ))"
+    }
+    finish() {
+        if (( cleaned == 0 )); then
+            quiet_exit
+            tput cnorm 2>/dev/null || true
+        fi
+    }
+    trap 'finish; exit 0' TERM INT EXIT
+
+    # Swallow stale bytes queued from pre-step gum prompts (1ms drain).
+    while read -rsN1 -t 0.001 -u 0 pick; do :; done 2>/dev/null
+
+    while :; do
+        if [[ ! -e "$stopfile" ]]; then
+            cleaned=1
+            farewell
+            tput cnorm 2>/dev/null || true
+            break
+        fi
+
+        # ── input ──
+        pick=""
+        ttrc=0
+        read -rsN1 -t 0.055 pick 2>/dev/null || ttrc=$?
+        if [[ $ttrc == 1 ]]; then
+            # stdin closed (Renamed pipe tee'd out mid-step): yield instead of
+            # spinning; a real TTY never EOFs while the installer owns it.
+            sleep 0.25 2>/dev/null || true
+        fi
+        if [[ "$pick" == $'\e' ]]; then
+            read -rsN2 -t 0.05 pick 2>/dev/null || true
+            if [[ "$pick" == "[C" ]]; then
+                if (( ship_x < FW - 3 )); then ship_x=$(( ship_x + 1 )); fi
+            elif [[ "$pick" == "[D" ]]; then
+                if (( ship_x > 3 )); then ship_x=$(( ship_x - 1 )); fi
+            fi
+        elif [[ "$pick" == "d" ]]; then
+            if (( ship_x < FW - 3 )); then ship_x=$(( ship_x + 1 )); fi
+        elif [[ "$pick" == "a" ]]; then
+            if (( ship_x > 3 )); then ship_x=$(( ship_x - 1 )); fi
+        elif [[ "$pick" == " " ]]; then
+            if [[ $p1y -lt 0 ]]; then
+                p1x=$ship_x; p1y=$(( SHIP_R - 1 ))
+            elif [[ $p2y -lt 0 ]]; then
+                p2x=$ship_x; p2y=$(( SHIP_R - 1 ))
+            fi
+        elif [[ "$pick" == "q" ]]; then
+            cleaned=1
+            farewell
+            tput cnorm 2>/dev/null || true
+            break
+        fi
+
+        # ── geometry: refresh every 20th tick (~1s); shrinks self-heal ──
+        if (( frame % 20 == 0 )); then
+            lines=$(term_lines) 2>/dev/null || lines=24
+            cols=$(term_cols)   2>/dev/null || cols=80
+            if (( cols < 40 )); then cols=40; fi
+        fi
+        frame=$(( frame + 1 ))
+        if (( frame > 1000 )); then frame=0; fi
+        if (( lines < 16 )); then continue; fi   # too small to play — keep ticking
+        rows_base=$(( lines - 12 ))
+        left=$(( (cols - FW) / 2 ))
+        if (( left < 1 )); then left=1; fi
+
+        # ── aliens: next wave on wipeout, march + bounce otherwise ──
+        any_alive=0
+        for (( i = 0; i < 18; i++ )); do
+            if [[ ${ALIVE[i]} -eq 1 ]]; then any_alive=1; fi
+        done
+        if (( any_alive == 0 )); then
+            score=$(( score + 50 * wave ))
+            wave=$(( wave + 1 ))
+            reseed
+        else
+            step=$(( step + 1 ))
+            if (( step >= step_every )); then
+                step=0
+                phase=$(( 1 - phase ))
+                origin=$(( origin + dirn ))
+                if (( origin < 1 )) || (( origin + 23 > FW )); then
+                    dirn=$(( -dirn ))
+                    drop=$(( drop + 1 ))
+                    if (( drop > 5 )); then drop=5; fi
+                fi
+            fi
+        fi
+
+        # ── breach: an invader reached the ship line ──
+        lowest=-1
+        for (( i = 17; i >= 0; i-- )); do
+            if [[ ${ALIVE[i]} -eq 1 ]]; then
+                lowest=$(( i / 6 + drop ))
+                break
+            fi
+        done
+        if (( lowest >= SHIP_R - 1 )); then
+            lives=$(( lives - 1 ))
+            flash=6
+            if (( lives <= 0 )); then
+                lives=3
+                score=$(( score / 2 ))
+            fi
+            reseed
+        fi
+
+        # ── player bullets: rise 1 row/tick (2 would skip alien lanes) ──
+        if (( p1y >= 0 )); then
+            p1y=$(( p1y - 1 ))
+            if (( p1y < 0 )); then p1y=-1; fi
+        fi
+        if (( p2y >= 0 )); then
+            p2y=$(( p2y - 1 ))
+            if (( p2y < 0 )); then p2y=-1; fi
+        fi
+        for (( i = 0; i < 18; i++ )); do
+            if [[ ${ALIVE[i]} -eq 0 ]]; then continue; fi
+            fy=$(( i / 6 + drop ))
+            c=$(( origin + (i % 6) * 4 ))
+            if (( p1y == fy )) && (( p1x >= c && p1x <= c + 2 )); then
+                ALIVE[i]=0; FLASH[i]=$frame; p1y=-1; score=$(( score + 10 ))
+            elif (( p2y == fy )) && (( p2x >= c && p2x <= c + 2 )); then
+                ALIVE[i]=0; FLASH[i]=$frame; p2y=-1; score=$(( score + 10 ))
+            fi
+        done
+
+        # ── invader bombs: spawn on cadence from a live column, drop 1/tick ──
+        spawn_at=$(( spawn_at - 1 ))
+        if (( spawn_at <= 0 )); then
+            spawn_at=$spawn_every
+            pick=-1
+            for (( i = 0; i < 8; i++ )); do
+                pick=$(( RANDOM % 18 ))
+                if [[ ${ALIVE[pick]} -eq 1 ]]; then break; fi
+                pick=-1
+            done
+            if (( pick >= 0 )); then
+                # re-aim at the lowest alien in that column so drops look fair
+                fy=$(( pick % 6 ))
+                local col
+                col=$(( pick % 6 ))
+                for (( i = pick; i < 18; i += 6 )); do
+                    if [[ ${ALIVE[i]} -eq 1 ]]; then pick=$i; fi
+                done
+                # if the column died mid-aim, skip this cadence instead of
+                # bombing from a dead alien's dust
+                if [[ ${ALIVE[pick]} -eq 1 ]]; then
+                    if (( b1y < 0 )); then
+                        b1x=$(( origin + col * 4 + 1 ))
+                        b1y=$(( pick / 6 + drop + 1 ))
+                    elif (( b2y < 0 )); then
+                        b2x=$(( origin + col * 4 + 1 ))
+                        b2y=$(( pick / 6 + drop + 1 ))
+                    fi
+                fi
+            fi
+        fi
+        if (( b1y >= 0 )); then
+            b1y=$(( b1y + 1 ))
+            if (( b1y > SHIP_R )); then b1y=-1; b1x=-1; fi
+        fi
+        if (( b2y >= 0 )); then
+            b2y=$(( b2y + 1 ))
+            if (( b2y > SHIP_R )); then b2y=-1; b2x=-1; fi
+        fi
+        if [[ $b1y == $SHIP_R ]] && (( b1x >= ship_x - 1 && b1x <= ship_x + 1 )); then
+            b1y=-1; lives=$(( lives - 1 )); flash=6
+            if (( lives <= 0 )); then lives=3; score=$(( score / 2 )); fi
+        elif [[ $b2y == $SHIP_R ]] && (( b2x >= ship_x - 1 && b2x <= ship_x + 1 )); then
+            b2y=-1; lives=$(( lives - 1 )); flash=6
+            if (( lives <= 0 )); then lives=3; score=$(( score / 2 )); fi
+        fi
+        if (( flash > 0 )); then flash=$(( flash - 1 )); fi
+
+        # ── render: 12 rows, top to bottom, everything erased each pass ──
+        # header: rows_base
+        printf '\033[%d;1H\033[K\033[38;5;245m    \033[38;5;198mSPACE INVADERS\033[38;5;245m  · ◀ ▶ a/d move · space shoot · q stop\033[0m' \
+            "$rows_base" 2>/dev/null || true
+        # alien field rows 0..SHIP_R: rows_base+1..rows_base+9
+        for (( i = 0; i <= SHIP_R; i++ )); do
+            printf '\033[%d;%dH\033[K' "$(( rows_base + 1 + i ))" "$left" 2>/dev/null || true
+        done
+        # aliens / recent explosions
+        for (( i = 0; i < 18; i++ )); do
+            fy=$(( i / 6 + drop ))
+            c=$(( origin + (i % 6) * 4 ))
+            r=$(( rows_base + 1 + fy ))
+            if [[ ${ALIVE[i]} -eq 1 ]]; then
+                if (( fy >= SHIP_R )); then continue; fi   # guard: never past ship
+                breed="38;5;212"
+                case $(( i / 6 )) in
+                    1) breed="38;5;141" ;;
+                    2) breed="38;5;45" ;;
+                esac
+                if (( phase == 1 )); then
+                    printf '\033[%d;%dH\033[%sm▀▄▀\033[0m' "$r" "$(( left + c ))" "$breed" 2>/dev/null || true
+                else
+                    printf '\033[%d;%dH\033[%sm▄▀▄\033[0m' "$r" "$(( left + c ))" "$breed" 2>/dev/null || true
+                fi
+            elif (( (frame - FLASH[i]) < 3 )); then
+                printf '\033[%d;%dH\033[38;5;196m✶✶✶\033[0m' "$r" "$(( left + c ))" 2>/dev/null || true
+            fi
+        done
+        # player bullets
+        if (( p1y >= 0 )); then
+            printf '\033[%d;%dH\033[38;5;231m│\033[0m' \
+                "$(( rows_base + 1 + p1y ))" "$(( left + p1x ))" 2>/dev/null || true
+        fi
+        if (( p2y >= 0 )); then
+            printf '\033[%d;%dH\033[38;5;231m│\033[0m' \
+                "$(( rows_base + 1 + p2y ))" "$(( left + p2x ))" 2>/dev/null || true
+        fi
+        # bombs
+        if (( b1y >= 0 )); then
+            printf '\033[%d;%dH\033[38;5;208m◆\033[0m' \
+                "$(( rows_base + 1 + b1y ))" "$(( left + b1x ))" 2>/dev/null || true
+        fi
+        if (( b2y >= 0 )); then
+            printf '\033[%d;%dH\033[38;5;208m◆\033[0m' \
+                "$(( rows_base + 1 + b2y ))" "$(( left + b2x ))" 2>/dev/null || true
+        fi
+        # ship (red + BREACH! while flashing)
+        if (( flash > 0 )); then
+            printf '\033[%d;%dH\033[1m\033[38;5;196m┬▲┬\033[0m \033[38;5;196mBREACH!\033[0m' \
+                "$(( rows_base + 1 + SHIP_R ))" "$(( left + ship_x - 1 ))" 2>/dev/null || true
+        else
+            printf '\033[%d;%dH\033[38;5;45m┬▲┬\033[0m' \
+                "$(( rows_base + 1 + SHIP_R ))" "$(( left + ship_x - 1 ))" 2>/dev/null || true
+        fi
+        # hud: rows_base + 10
+        printf '\033[%d;%dH\033[K\033[38;5;45m SCORE %06d\033[38;5;245m   WAVE %d   LIVES ' \
+            "$(( rows_base + 10 ))" "$left" "$score" "$wave" 2>/dev/null || true
+        printf '\033[38;5;212m'
+        for (( i = 0; i < lives; i++ )); do
+            printf '▲ ' 2>/dev/null || true
+        done
+        printf '\033[0m' 2>/dev/null || true
+    done
+    finish || true
+}
+
+# Starts the game in a background subshell (stdout = this terminal).
+invaders_start() {
+    if [[ -n "$INVADERS_PID" ]]; then return 0; fi
+    INVADERS_STOP=$(mktemp -u /tmp/featherlite-invaders.XXXXXX) || return 0
+    # mktemp -u names are unique, but the stop file must EXIST before play starts
+    if ! : > "$INVADERS_STOP" 2>/dev/null; then
+        INVADERS_STOP=""
+        return 0
+    fi
+    invaders_play "$INVADERS_STOP" &
+    INVADERS_PID=$!
+}
+
+# Ends the current game (if any): stop file vanishes, one SIGTERM backup,
+# quiet re-join. Safe to call repeatedly.
+invaders_stop() {
+    if [[ -n "$INVADERS_PID" ]]; then
+        rm -f "$INVADERS_STOP" 2>/dev/null || true
+        kill "$INVADERS_PID" 2>/dev/null || true
+        wait "$INVADERS_PID" 2>/dev/null || true
+        INVADERS_PID=""
+        INVADERS_STOP=""
+    fi
+    return 0
+}
 run_step_visual() {
     # Runs a function/command in the CURRENT shell (no subshell), so CONFIG
     # changes persist. Additionally shows a live percent bar + step title +
@@ -494,8 +818,16 @@ run_step_visual() {
     local display_pid=$!
     DISPLAY_PID="$display_pid"
 
+    # Bottom-strip Space Invaders for the duration of the step (may take
+    # many minutes on slow disks). The progress frame never paints below its
+    # centered block, so the strip belongs to the game exclusively. Stopped
+    # right after the step function returns, below.
+    invaders_start
+
     "$func" "$@" > "$logfile" 2>&1
     local status=$?
+
+    invaders_stop
 
     # `wait` on a job we just killed reports its SIGTERM exit status (143) —
     # that's expected, not a real failure, but under `set -e` a bare nonzero
