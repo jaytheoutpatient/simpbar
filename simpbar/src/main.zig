@@ -7359,6 +7359,34 @@ fn textPixelWidth(font: *font_mod.Font, text: []const u8) i64 {
     return total;
 }
 
+/// Widest prefix of `text` whose drawn width plus a trailing "…" fits
+/// `max_w`, copied into `buf` (size it at the source text's capacity — the
+/// output is always a prefix of the input plus three bytes). Returns the
+/// full `text` when it already fits, and an empty slice when even the
+/// ellipsis alone doesn't — the caller decides whether "draw nothing" beats
+/// overlapping something else. Advances come from the same per-codepoint
+/// walk textPixelWidth sums, so a prefix capped here draws at exactly the
+/// width it was measured against.
+fn ellipsizeToFit(buf: []u8, font: *font_mod.Font, text: []const u8, max_w: i64) []const u8 {
+    if (max_w <= 0) return "";
+    if (textPixelWidth(font, text) <= max_w) return text;
+    const ell_w = textPixelWidth(font, "…");
+    if (ell_w > max_w) return "";
+    var i: usize = 0;
+    var used: i64 = 0;
+    var keep: usize = 0;
+    while (nextUtf8Codepoint(text, &i)) |cp| {
+        const adv: i64 = (font.glyph(cp) catch continue).advance_x;
+        if (used + adv + ell_w > max_w) break;
+        used += adv;
+        keep = i; // nextUtf8Codepoint leaves i past the codepoint just read
+    }
+    if (keep + "…".len > buf.len) return "";
+    @memcpy(buf[0..keep], text[0..keep]);
+    @memcpy(buf[keep .. keep + "…".len], "…");
+    return buf[0 .. keep + "…".len];
+}
+
 /// Baseline y-coordinate that vertically centers this font's line height
 /// (ascent + descent) within a `buf_height`-tall buffer.
 fn baselineY(buf_height: u32, font: *const font_mod.Font) i64 {
@@ -7447,6 +7475,16 @@ fn drawWorkspaces(
 }
 
 const MPRIS_CONTROL_GAP: i64 = 6; // spacing between the three control glyphs, and before the track text
+/// Clearance the LEFT group's mpris run keeps between its pill's right edge
+/// and the center group's left edge (centerGroupStartX). The track title is
+/// the only unbounded content in that chain — the clock's cell is the one
+/// bound drawLeftGroup ever consults — so a long title used to grow
+/// rightward until the pill touched the centered middle modules. Content is
+/// capped so the pill's own 4px overhang still leaves a full MODULE_GAP of
+/// air against the center group's leftmost pill (which overhangs up to
+/// LAUNCHER_GAP/2 left of its start edge). Dock/morph modes pass their
+/// packed center start as that same bound, so the cap holds in every layout.
+const MPRIS_CENTER_CLEARANCE: i64 = 4 + MODULE_GAP;
 
 /// Draws the previous/play-pause/next glyphs immediately before the mpris
 /// track text, each a small click region targeting whichever player is
@@ -7733,7 +7771,32 @@ fn drawLeftGroup(
                 // Same pill as the center module (static text + round toggle
                 // + progress) — one shared code path with the center module.
                 // Empty text draws nothing and advances nothing.
-                x0 = drawMprisPill(pixels, buf_width, buf_height, font, y0, x0, mpris_text, mpris_playing, mpris_frac, click_regions);
+                //
+                // The track title is unbounded content: nothing in this
+                // chain ever bounded it against the center group's left
+                // edge (the clock's reserveLeftCell below is the only bound
+                // drawLeftGroup has), so a long title grew rightward until
+                // the pill ran into the centered middle modules. Cap the
+                // run at that edge instead: draw in the room actually left,
+                // ellipsizing the title when it doesn't fit, and draw
+                // nothing when not even the round toggle fits (a missing
+                // module beats one overlapping the middle of the bar).
+                if (mpris_text.len > 0) {
+                    const toggle_w = MPRIS_CONTROL_GAP + mprisToggleSide(font, mpris_playing);
+                    const avail = center_start_x - MPRIS_CENTER_CLEARANCE - x0;
+                    if (textPixelWidth(font, mpris_text) + toggle_w <= avail) {
+                        x0 = drawMprisPill(pixels, buf_width, buf_height, font, y0, x0, mpris_text, mpris_playing, mpris_frac, click_regions);
+                    } else if (avail > toggle_w) {
+                        // mpris_text is capped at 64 bytes upstream
+                        // (paintFrame's mpris_buf); the ellipsized output is
+                        // a prefix of it plus three bytes.
+                        var tbuf: [67]u8 = undefined;
+                        const capped = ellipsizeToFit(&tbuf, font, mpris_text, avail - toggle_w);
+                        if (capped.len > 0) {
+                            x0 = drawMprisPill(pixels, buf_width, buf_height, font, y0, x0, capped, mpris_playing, mpris_frac, click_regions);
+                        }
+                    }
+                }
             },
             else => {}, // RIGHT-only kind in left: no left-anchored render for it
         }
