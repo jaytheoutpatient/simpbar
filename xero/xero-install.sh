@@ -451,7 +451,7 @@ invaders_play() {
     local stopfile="$1"
     local FW=33 SHIP_R=8              # field width, ship row (field rows 0..8)
     local rows_base=0 lines=24 cols=80 left=1
-    local frame=0 cleaned=0
+    local frame=0 cleaned=0 painted=0 geo_dirty=1
     local score=0 wave=1 lives=3
     local origin=2 dirn=1 drop=0 step=0 step_every=6
     local spawn_every=12 spawn_at=12
@@ -475,15 +475,16 @@ invaders_play() {
     reseed
 
     quiet_exit() {
+        # farewell row (lines-13) plus the 12 strip rows (lines-12..lines-1)
         local i
-        for (( i = 0; i < 12; i++ )); do
-            printf '\033[%d;1H\033[K' "$(( lines - 11 + i ))" 2>/dev/null || true
+        for (( i = 0; i < 13; i++ )); do
+            printf '\033[%d;1H\033[K' "$(( lines - 13 + i ))" 2>/dev/null || true
         done
     }
     farewell() {
         quiet_exit
         printf '\033[%d;1H\033[K\033[38;5;245m        (arcade closed — install continues)\033[0m' \
-            "$(( lines - 12 ))"
+            "$(( lines - 13 ))"
     }
     finish() {
         if (( cleaned == 0 )); then
@@ -492,6 +493,13 @@ invaders_play() {
         fi
     }
     trap 'finish; exit 0' TERM INT EXIT
+
+    # Terminal resizes: non-interactive bash inherits SIGWINCH as ignored and
+    # refuses to trap it, so the poll below is the real mechanism; keep the
+    # trap anyway for shells that do deliver WINCH. On any change the OLD
+    # (stale) strip is erased at its previous coordinates first — a mid-step
+    # resize can never leave ghosts or scroll the screen.
+    trap 'geo_dirty=1' WINCH
 
     # Swallow stale bytes queued from pre-step gum prompts (1ms drain).
     while read -rsN1 -t 0.001 -u 0 pick; do :; done 2>/dev/null
@@ -537,15 +545,27 @@ invaders_play() {
             break
         fi
 
-        # ── geometry: refresh every 20th tick (~1s); shrinks self-heal ──
-        if (( frame % 20 == 0 )); then
-            lines=$(term_lines) 2>/dev/null || lines=24
-            cols=$(term_cols)   2>/dev/null || cols=80
-            if (( cols < 40 )); then cols=40; fi
+        # ── geometry: cheap poll every 8 ticks (~0.45s), repaint + erase
+        # the old strip only when the terminal actually changed ──
+        if (( frame % 8 == 0 )) || (( geo_dirty != 0 )); then
+            geo_dirty=0
+            local nl nc
+            nl=$(term_lines) 2>/dev/null || nl=24
+            nc=$(term_cols)  2>/dev/null || nc=80
+            if [[ "$nl/$nc" != "$lines/$cols" ]]; then
+                if (( painted != 0 )); then quiet_exit; fi
+                lines=$nl
+                cols=$nc
+            fi
         fi
         frame=$(( frame + 1 ))
         if (( frame > 1000 )); then frame=0; fi
-        if (( lines < 16 )); then continue; fi   # too small to play — keep ticking
+        # The progress frame owns (lines-h)/2 .. +h where h is 8 (or 14 with
+        # the logo at cols >= 58). The strip needs clean air below it:
+        # min height = h + 26 rows, otherwise the game just idles.
+        local content_h=8
+        if [[ $cols -ge 58 ]]; then content_h=14; fi
+        if (( lines < content_h + 26 )); then continue; fi
         rows_base=$(( lines - 12 ))
         left=$(( (cols - FW) / 2 ))
         if (( left < 1 )); then left=1; fi
@@ -660,6 +680,7 @@ invaders_play() {
         if (( flash > 0 )); then flash=$(( flash - 1 )); fi
 
         # ── render: 12 rows, top to bottom, everything erased each pass ──
+        painted=1
         # header: rows_base
         printf '\033[%d;1H\033[K\033[38;5;245m    \033[38;5;198mSPACE INVADERS\033[38;5;245m  · ◀ ▶ a/d move · space shoot · q stop\033[0m' \
             "$rows_base" 2>/dev/null || true
