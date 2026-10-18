@@ -2564,7 +2564,7 @@ fn buildMonitorRow(group: *gtk.AdwPreferencesGroup) void {
 
     const row = gtk.adw_combo_row_new();
     gtk.adw_preferences_row_set_title(@ptrCast(row), "Monitor");
-    gtk.adw_action_row_set_subtitle(@ptrCast(row), "Takes effect on the next bar restart, not live");
+    gtk.adw_action_row_set_subtitle(@ptrCast(row), "Per-monitor workspaces follow this pick; applies on the next bar restart");
 
     var buf: [MAX_MONITOR_ENTRIES + 3]?[*:0]const u8 = undefined;
     buf[0] = "Compositor Default";

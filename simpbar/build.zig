@@ -80,6 +80,19 @@ pub fn build(b: *Build) !void {
     const run_step = b.step("run", "Run simpbar");
     run_step.dependOn(&run_cmd.step);
 
+    // Unit tests: the ~40 `test` blocks at the bottom of src/main.zig (the
+    // file calls itself `main` as a module, so everything above is linker
+    // dead weight — the tests only pull what they exercise). Runs with
+    // `zig build test`; same module wiring as the exe, minus the install.
+    const tests = b.addTest(.{
+        .root_module = exe_mod,
+        .use_llvm = true, // same backend pin as the exe above
+        .use_lld = true,
+    });
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run src/main.zig unit tests");
+    test_step.dependOn(&run_tests.step);
+
     // simpbar-welcome: separate GTK4/libadwaita companion app, independent
     // of the bar above (no Wayland/freetype/gdk-pixbuf deps). Talks to
     // GTK/libadwaita through hand-written extern bindings in

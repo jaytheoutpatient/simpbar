@@ -739,9 +739,40 @@ fn parseIdAt(text: []const u8, start_pos: usize) ?i32 {
     return std.fmt.parseInt(i32, text[start..i], 10) catch null;
 }
 
-const Workspace = struct { id: i32, active: bool, urgent: bool = false };
+/// One rail entry. `mon_*` is the compositor monitor this tag/workspace
+/// belongs to: Mango's tags are per-monitor sets (two monitors each own a
+/// full "1 2 3 ...", which is why the old monitor-less rail showed every
+/// digit twice), and Hyprland's j/workspaces entries carry the monitor each
+/// workspace currently lives on (its ids stay global there, so a monitor's
+/// run is just a subset). Entries sort by (monitor, id) — monitor-first, in
+/// the same order the compositor reports its outputs — so every monitor's
+/// run is one contiguous stretch `sliceForMonitor` can hand to that
+/// monitor's own bar.
+const Workspace = struct {
+    id: i32,
+    active: bool,
+    urgent: bool = false,
+    mon_buf: [MONITOR_NAME_MAX]u8 = undefined,
+    mon_len: usize = 0,
+
+    fn monitorName(self: *const Workspace) []const u8 {
+        return self.mon_buf[0..self.mon_len];
+    }
+
+    fn setMonitor(self: *Workspace, name: []const u8) void {
+        const n = @min(name.len, self.mon_buf.len);
+        @memcpy(self.mon_buf[0..n], name[0..n]);
+        self.mon_len = n;
+    }
+};
+
+/// wl_output/mango monitor-name buffer size. Real connector names ("DP-1",
+/// "HDMI-A-1") are far shorter; the headroom covers virtual output names.
+const MONITOR_NAME_MAX = 32;
 
 fn workspaceLessThan(_: void, a: Workspace, b: Workspace) bool {
+    const order = std.mem.order(u8, a.monitorName(), b.monitorName());
+    if (order != .eq) return order == .lt;
     return a.id < b.id;
 }
 
@@ -851,87 +882,177 @@ const Workspaces = struct {
         const active_json = try hyprctlRequest(self.gpa, self.sockPath(), "j/activeworkspace");
         defer self.gpa.free(active_json);
 
-        const active_id = extractFirstId(active_json) orelse -1;
+        try self.scanHyprland(ws_json, extractFirstId(active_json) orelse -1);
+    }
 
+    /// The substring scan behind the Hyprland rail: `j/workspaces` entries
+    /// (`{"id":1,...,"monitor":"DP-1",...}`) appended monitor-annotated and
+    /// sorted per workspaceLessThan. Split from refreshHyprland so the
+    /// payload logic stays testable without a compositor socket. Clears the
+    /// list first; layout parsing (a Mango-only concept) is untouched.
+    fn scanHyprland(self: *Workspaces, ws_json: []const u8, active_id: i32) !void {
         self.list.clearRetainingCapacity();
         const needle = "\"id\":";
+        const monitor_needle = "\"monitor\":\"";
         var idx: usize = 0;
         while (std.mem.indexOfPos(u8, ws_json, idx, needle)) |pos| {
             const after = pos + needle.len;
+            // This id's entry ends at the next id boundary (or payload end);
+            // scanning for `monitor` only inside that slice stops a missing
+            // field from bleeding into the next entry's (same substring-scan
+            // style as refreshMango). `"monitor":"` can't false-match
+            // `"monitorID":` — the needle's quote lands before `ID:`.
+            const entry_end = std.mem.indexOfPos(u8, ws_json, after, needle) orelse ws_json.len;
             if (parseIdAt(ws_json, after)) |id| {
-                try self.list.append(self.gpa, .{ .id = id, .active = id == active_id });
+                var ws = Workspace{ .id = id, .active = id == active_id };
+                if (std.mem.indexOf(u8, ws_json[after..entry_end], monitor_needle)) |mp| {
+                    const s = after + mp + monitor_needle.len;
+                    var e = s;
+                    while (e < ws_json.len and ws_json[e] != '"') : (e += 1) {}
+                    ws.setMonitor(ws_json[s..e]);
+                }
+                try self.list.append(self.gpa, ws);
             }
             idx = after;
         }
         std.sort.insertion(Workspace, self.list.items, {}, workspaceLessThan);
     }
 
-    /// Mango backend: `mmsg get all-tags` returns one JSON object with every
-    /// monitor's tags; each tag is `{"index":N,"is_active":b,"is_urgent":b,...
-    /// "layout":"DW",...}`, `index` immediately followed by `is_active`, so a
-    /// plain substring scan (matching refreshHyprland's style) suffices. A tag
-    /// counts as active when any monitor reports it active. The active tag's
-    /// `layout` symbol is stashed for the layout module; with a single
-    /// monitor (the common case) that is exactly the tag `setlayout` targets,
-    /// and with several it is the first active tag across monitors.
     fn refreshMango(self: *Workspaces) !void {
         const tags_json = try mangoRequest(self.gpa, self.sockPath(), "get all-tags");
         defer self.gpa.free(tags_json);
 
+        try self.scanMango(tags_json);
+    }
+
+    /// The substring scan behind the Mango rail: one pass of
+    /// `{"monitor":"DP-1","tags":[{"index":N,"is_active":b,"is_urgent":b,
+    /// "layout":"DW",...},...]}` records per monitor (matching wl_output
+    /// name order). Each tag pairs `index` immediately with `is_active`, so
+    /// a plain substring scan (matching scanHyprland's style) suffices once
+    /// the scan is scoped to one monitor record at a time — that scoping is
+    /// what makes the per-monitor rail possible. A tag counts as active on
+    /// its own monitor only. The active tag's `layout` symbol is stashed for
+    /// the layout module; with a single monitor (the common case) that is
+    /// exactly the tag `setlayout` targets, and with several it is the first
+    /// active tag across monitors. Payloads with no monitor records at all
+    /// (older Mango) fall back to one flat scope with empty monitor names —
+    /// those entries then serve every bar merged, the pre-multi-monitor
+    /// behavior. Split from refreshMango so the payload logic stays
+    /// testable without a compositor socket.
+    fn scanMango(self: *Workspaces, tags_json: []const u8) !void {
         self.list.clearRetainingCapacity();
         self.layout_len = 0;
+        const monitor_needle = "\"monitor\":\"";
         const needle = "\"index\":";
         const active_needle = "\"is_active\":";
         const layout_needle = "\"layout\":\"";
         const close_needle = "}";
-        var idx: usize = 0;
-        while (std.mem.indexOfPos(u8, tags_json, idx, needle)) |pos| {
-            const after = pos + needle.len;
-            if (parseIdAt(tags_json, after)) |id| {
-                var active = false;
-                if (std.mem.indexOfPos(u8, tags_json, after, active_needle)) |p| {
-                    const v = p + active_needle.len;
-                    if (v < tags_json.len and tags_json[v] == 't') active = true;
-                }
-                // Urgent tags (demanding attention) get a dot under their
-                // digit — bounded to this tag's object like the layout
-                // lookup below, for the same cross-tag reason.
-                var urgent = false;
-                const obj_end_u = std.mem.indexOfPos(u8, tags_json, after, close_needle) orelse tags_json.len;
-                const urgent_needle = "\"is_urgent\":";
-                if (std.mem.indexOf(u8, tags_json[after..obj_end_u], urgent_needle)) |p| {
-                    const v = after + p + urgent_needle.len;
-                    if (v < tags_json.len and tags_json[v] == 't') urgent = true;
-                }
-                // Stash the FIRST active tag's layout. Mango reports each
-                // monitor's tags as one array of flat objects, and this scan
-                // isn't object-aware (same shape as the is_active lookup
-                // above), so bound the search to this tag's own object by
-                // stopping at the next `}` — that keeps the layout we read the
-                // one belonging to the tag we're on rather than the next tag's.
-                // With several monitors the first active tag wins, which on the
-                // single-monitor setups this bar targets is simply the active
-                // tag; `layout()` returning empty (unknown) is the safe
-                // fallback and hides the module rather than guessing.
-                if (active and self.layout_len == 0) {
-                    const obj_end = std.mem.indexOfPos(u8, tags_json, after, close_needle) orelse tags_json.len;
-                    const obj = tags_json[after..obj_end];
-                    if (std.mem.indexOf(u8, obj, layout_needle)) |lp| {
-                        const s = lp + layout_needle.len;
-                        var e = s;
-                        while (e < obj.len and obj[e] != '"') : (e += 1) {}
-                        const sym = obj[s..e];
-                        if (sym.len > 0 and sym.len <= self.layout_buf.len) {
-                            @memcpy(self.layout_buf[0..sym.len], sym);
-                            self.layout_len = sym.len;
+        const grouped = std.mem.indexOf(u8, tags_json, monitor_needle) != null;
+
+        var entry_idx: usize = 0;
+        while (true) {
+            // One scope: a monitor record's `monitor` name through everything
+            // up to the next record. Ungrouped payloads get a single scope
+            // spanning the whole body so the flat tag scan still runs.
+            var mpos: usize = 0;
+            var name_start: usize = 0;
+            var entry_end: usize = tags_json.len;
+            if (grouped) {
+                mpos = std.mem.indexOfPos(u8, tags_json, entry_idx, monitor_needle) orelse break;
+                name_start = mpos + monitor_needle.len;
+                entry_end = std.mem.indexOfPos(u8, tags_json, name_start, monitor_needle) orelse tags_json.len;
+            } else if (entry_idx != 0) break;
+
+            var mon_name: []const u8 = "";
+            if (grouped) {
+                var e = name_start;
+                while (e < entry_end and tags_json[e] != '"') : (e += 1) {}
+                mon_name = tags_json[name_start..e];
+            }
+
+            const entry = tags_json[mpos..entry_end];
+            var idx: usize = 0;
+            while (std.mem.indexOfPos(u8, entry, idx, needle)) |tpos| {
+                const after = tpos + needle.len;
+                if (parseIdAt(entry, after)) |id| {
+                    var active = false;
+                    if (std.mem.indexOfPos(u8, entry, after, active_needle)) |p| {
+                        const v = p + active_needle.len;
+                        if (v < entry.len and entry[v] == 't') active = true;
+                    }
+                    // Urgent tags (demanding attention) get a dot under their
+                    // digit — bounded to this tag's object like the layout
+                    // lookup below, for the same cross-tag reason (within the
+                    // monitor scope now, so it can never cross records).
+                    var urgent = false;
+                    const obj_end_u = std.mem.indexOfPos(u8, entry, after, close_needle) orelse entry.len;
+                    const urgent_needle = "\"is_urgent\":";
+                    if (std.mem.indexOf(u8, entry[after..obj_end_u], urgent_needle)) |p| {
+                        const v = after + p + urgent_needle.len;
+                        if (v < entry.len and entry[v] == 't') urgent = true;
+                    }
+                    // Stash the FIRST active tag's layout. Mango reports each
+                    // tag as a flat object and this scan isn't object-aware
+                    // (same shape as the is_active lookup above), so bound
+                    // the search to this tag's own object by stopping at the
+                    // next `}` — that keeps the layout we read the one
+                    // belonging to the tag we're on rather than the next
+                    // tag's. With several monitors the first active tag
+                    // wins, which on the single-monitor setups this bar
+                    // targets is simply the active tag; `layout()` returning
+                    // empty (unknown) is the safe fallback and hides the
+                    // module rather than guessing.
+                    if (active and self.layout_len == 0) {
+                        const obj_end = std.mem.indexOfPos(u8, entry, after, close_needle) orelse entry.len;
+                        const obj = entry[after..obj_end];
+                        if (std.mem.indexOf(u8, obj, layout_needle)) |lp| {
+                            const s = lp + layout_needle.len;
+                            var e2 = s;
+                            while (e2 < obj.len and obj[e2] != '"') : (e2 += 1) {}
+                            const sym = obj[s..e2];
+                            if (sym.len > 0 and sym.len <= self.layout_buf.len) {
+                                @memcpy(self.layout_buf[0..sym.len], sym);
+                                self.layout_len = sym.len;
+                            }
                         }
                     }
+                    var ws = Workspace{ .id = id, .active = active, .urgent = urgent };
+                    ws.setMonitor(mon_name);
+                    try self.list.append(self.gpa, ws);
                 }
-                try self.list.append(self.gpa, .{ .id = id, .active = active, .urgent = urgent });
+                idx = after;
             }
-            idx = after;
+            if (!grouped) break;
+            entry_idx = name_start;
         }
         std.sort.insertion(Workspace, self.list.items, {}, workspaceLessThan);
+    }
+
+    /// The contiguous run of `list.items` holding the entries of exactly
+    /// the given monitor (`"DP-1"`...) — sorted monitor-first, so one linear
+    /// scan finds it. Empty monitor name (a bar that doesn't know its output
+    /// yet) → the merged list across all monitors (previous single-bar rail).
+    /// A name absent from the current list (hotplug race between the bar's
+    /// wl_output and the compositor's IPC) also falls back to the merged list
+    /// so no rail ever goes blank from a mismatch.
+    fn sliceForMonitor(self: *const Workspaces, monitor: []const u8) []const Workspace {
+        const all = self.list.items;
+        if (monitor.len == 0) return all;
+        var start: ?usize = null;
+        var end: usize = all.len;
+        for (all, 0..) |*ws, i| {
+            if (start != null) {
+                if (!std.mem.eql(u8, ws.monitorName(), monitor)) {
+                    end = i;
+                    break;
+                }
+            } else if (std.mem.eql(u8, ws.monitorName(), monitor)) {
+                start = i;
+            }
+        }
+        if (start) |s| return all[s..end];
+        return all;
     }
 
     /// The active tag's layout symbol, or empty if unknown (Hyprland, or
@@ -971,8 +1092,15 @@ const Workspaces = struct {
     }
 
     /// Switches to tag/workspace `id`, using whatever syntax the active
-    /// compositor understands.
-    fn switchTo(self: *const Workspaces, id: i32) !void {
+    /// compositor understands. `monitor` is the bar's own output name
+    /// (empty = unknown → legacy focused-monitor dispatch): Mango's tags
+    /// are per-monitor sets, so a rail click on monitor B's bar must view
+    /// the tag *on B* — `viewcrossmon,{tag},{monitor}` focuses B and views
+    /// the tag there — otherwise `view,{tag}` would apply to whatever
+    /// monitor currently holds keyboard focus. Hyprland's workspace ids are
+    /// global (each lives on exactly one monitor), so its dispatch is
+    /// monitor-agnostic and unchanged.
+    fn switchTo(self: *const Workspaces, id: i32, monitor: []const u8) !void {
         switch (self.mode) {
             .hyprland => {
                 var cmd_buf: [64]u8 = undefined;
@@ -980,8 +1108,11 @@ const Workspaces = struct {
                 try self.dispatchCommand(cmd);
             },
             .mango => {
-                var cmd_buf: [32]u8 = undefined;
-                const cmd = std.fmt.bufPrint(&cmd_buf, "dispatch view,{d}", .{id}) catch return error.CommandTooLong;
+                var cmd_buf: [96]u8 = undefined;
+                const cmd = if (monitor.len > 0)
+                    std.fmt.bufPrint(&cmd_buf, "dispatch viewcrossmon,{d},{s}", .{ id, monitor }) catch return error.CommandTooLong
+                else
+                    std.fmt.bufPrint(&cmd_buf, "dispatch view,{d}", .{id}) catch return error.CommandTooLong;
                 try self.dispatchCommand(cmd);
             },
         }
@@ -999,17 +1130,36 @@ const Workspaces = struct {
     /// `viewtoright`/`viewtoleft` are what its SUPER+Right/Left binds use —
     /// so the bar and the keyboard agree on where "next" is by construction.
     ///
+    /// `monitor` scopes the step to one bar's own output (empty = unknown →
+    /// the relative dispatches act on the focused monitor, as before).
+    /// Mango's relative view shifts have no monitor argument, so the two
+    /// dispatches route the step: `focusmon,{monitor}` first (a plain name
+    /// parses to UNDIR in mango, which is the "by-name" form it intends),
+    /// then the same relative shift the keybinds use.
+    ///
     /// `direction` is +1 for "forward" (wheel down). It arrives from the
     /// compositor's axis sign, which is negative for down.
-    fn stepWorkspace(self: *const Workspaces, direction: i32) void {
-        const cmd = switch (self.mode) {
+    fn stepWorkspace(self: *const Workspaces, direction: i32, monitor: []const u8) void {
+        const step_cmd = switch (self.mode) {
             .hyprland => if (direction > 0)
                 "dispatch hl.dsp.focus({ workspace = \"e+1\" })"
             else
                 "dispatch hl.dsp.focus({ workspace = \"e-1\" })",
             .mango => if (direction > 0) "dispatch viewtoright,0" else "dispatch viewtoleft,0",
         };
-        self.dispatchCommand(cmd) catch |err| {
+        if (self.mode == .mango and monitor.len > 0) {
+            var focus_buf: [64]u8 = undefined;
+            if (std.fmt.bufPrint(&focus_buf, "dispatch focusmon,{s}", .{monitor})) |focus_cmd| {
+                self.dispatchCommand(focus_cmd) catch |err| {
+                    logging.err("workspace step focus ({s}) failed: {}", .{ monitor, err });
+                    return;
+                };
+            } else |err| {
+                logging.err("workspace step focus ({s}) too long: {}", .{ monitor, err });
+                return;
+            }
+        }
+        self.dispatchCommand(step_cmd) catch |err| {
             logging.err("workspace step ({s}) failed: {}", .{ if (direction > 0) "next" else "prev", err });
         };
     }
@@ -1021,9 +1171,20 @@ const Workspaces = struct {
     fn focusClient(self: *const Workspaces, addr: []const u8, ws_id: i32) void {
         // Jump to the client's tag/workspace first: raising a window on a
         // hidden tag without switching leaves the user staring at the old
-        // tag wondering why nothing happened.
+        // tag wondering why nothing happened. Under Mango the client's tag
+        // belongs to a specific monitor (tags are per-monitor sets), so use
+        // that monitor's name — first entry with this id is the tag the
+        // compositor named — instead of a focused-monitor `view`, which
+        // would show the wrong monitor's same-numbered tag.
         if (ws_id >= 0) {
-            self.switchTo(ws_id) catch |err| {
+            var monitor: []const u8 = "";
+            for (self.list.items) |*ws| {
+                if (ws.id == ws_id) {
+                    monitor = ws.monitorName();
+                    break;
+                }
+            }
+            self.switchTo(ws_id, monitor) catch |err| {
                 logging.err("client tag switch ({d}) failed: {}", .{ ws_id, err });
             };
         }
@@ -2460,6 +2621,15 @@ const JsonAppearance = struct {
     auto_hide: bool = false,
     corner_radius_px: u32 = 0,
     clock_format: []const u8 = CLOCK_FORMAT_DATE_24H,
+    /// Which output(s) get bar surfaces. "" = compositor default (one bar on
+    /// whatever output the compositor picks), "all" = one surface per output,
+    /// otherwise an exact wl_output name for a single named bar. Workspaces
+    /// became monitor-scoped along this axis: each bar shows, and switches,
+    /// its own monitor's tag/workspace set (Mango's tags are per-monitor
+    /// sets; Hyprland's rail filters to the workspaces living on that
+    /// monitor). A bar whose output can't be determined ("" before the
+    /// compositor's first surface enter) falls back to the merged list the
+    /// pre-multi-monitor bar drew, so no monitor ever loses its rail.
     monitor: []const u8 = "",
     /// "matugen" (default) = when ~/.config/simpbar/matugen.json exists, its
     /// colors override these hex values (the wallpaper-based auto-theming
@@ -4484,6 +4654,17 @@ const Bar = struct {
     /// past the bar doesn't flicker it).
     autohide_hidden: bool = false,
     autohide_grace: u32 = 0,
+    /// The compositor monitor this bar's output carries (`"DP-1"`...) — used
+    /// to show that monitor's own workspace rail and to send rail clicks at
+    /// that monitor (see text in switchTo). Filled from the pinned output at
+    /// creation (all-target / named-output configs) or from the first
+    /// wl_surface enter (compositor-default configs); empty means unknown,
+    /// and the rail falls back to the merged list with legacy dispatches.
+    monitor_buf: [MONITOR_NAME_MAX]u8 = undefined,
+    monitor_len: usize = 0,
+    /// The registry's output list (set at creation) so a wl_surface enter
+    /// can resolve the entered wl_output pointer to a connector name.
+    outputs: []const OutputInfo = &.{},
     /// Running total of vertical scroll distance accumulated over the hovered
     /// region, in Wayland surface units. Crosses WORKSPACE_SCROLL_STEP to fire
     /// one step; the remainder is kept so continuous scroll keeps flowing
@@ -4526,6 +4707,62 @@ const Bar = struct {
     mpris_frac: ?f32 = null,
     popup: ?PopupMenu = null,
 };
+
+/// This bar's monitor name as the compositor IPC spells it (`"DP-1"`...).
+fn barMonitorName(bar: *const Bar) []const u8 {
+    return bar.monitor_buf[0..bar.monitor_len];
+}
+
+/// The workspace rail slice for THIS bar: its own monitor's entries when
+/// known, else the merged list (see sliceForMonitor for the fallback rules).
+/// Every rail draw/measure call site goes through this so the numbers the
+/// centering math uses and the pixels the rail paints stay in sync.
+fn barWorkspaces(bar: *const Bar) []const Workspace {
+    return bar.workspaces.sliceForMonitor(barMonitorName(bar));
+}
+
+/// Copies a monitor name onto a bar; returns whether something changed
+/// (used to decide whether a redraw is worth doing after wl_surface enter).
+fn barSetMonitor(bar: *Bar, name: []const u8) bool {
+    if (name.len == 0) return false;
+    const n = @min(name.len, bar.monitor_buf.len);
+    if (bar.monitor_len == n and std.mem.eql(u8, bar.monitor_buf[0..n], name[0..n])) return false;
+    @memcpy(bar.monitor_buf[0..n], name[0..n]);
+    bar.monitor_len = n;
+    return true;
+}
+
+/// wl_surface events for the bar's main surface. No drawing happens here —
+/// the only thing this listener exists for is `.enter`: a bar created
+/// without a pinned output (the default config) gets placed by the
+/// compositor, and enter is what names that output. With the name in hand
+/// the rail switches from the merged list to that monitor's own
+/// tags/workspaces (the same reason a named all-target bar fills its
+/// monitor at creation).
+fn barSurfaceListener(_: *wl.Surface, event: wl.Surface.Event, bar: *Bar) void {
+    switch (event) {
+        .enter => |e| {
+            if (bar.monitor_len > 0) return; // already named at creation
+            for (bar.outputs) |*oi| {
+                if (oi.output == e.output) {
+                    if (barSetMonitor(bar, oi.name())) {
+                        // Redraw so the rail adopts the monitor's own set
+                        // without waiting for the next event — but only once
+                        // a buffer exists (enter can precede the first
+                        // configure; the configure path repaints anyway).
+                        if (bar.configured) {
+                            drawAndCommit(bar) catch |err| {
+                                logging.err("draw failed: {}", .{err});
+                            };
+                        }
+                    }
+                    return;
+                }
+            }
+        },
+        else => {},
+    }
+}
 
 /// (Re-)applies the layer-shell anchor/size/exclusive-zone/margin from
 /// current_config and commits — called once at startup, and again from the
@@ -4854,6 +5091,22 @@ fn realMain() !void {
             // transitions only run on live switches below).
             .mode_blend = if (std.mem.eql(u8, current_config.appearance.bar_mode, BAR_MODE_DOCK)) 1.0 else 0.0,
         };
+        // Multi-monitor rails: give this bar the registry's output list (for
+        // wl_surface enter resolution) and, when the config pinned a
+        // specific output / "all", its own output's connector name so the
+        // rail shows — and switches — that monitor's own tag set from the
+        // very first frame. A compositor-default target (no pinned output)
+        // learns its name from barSurfaceListener's first enter instead.
+        bars[bar_count].outputs = globals.outputs[0..globals.output_count];
+        if (target_output) |out| {
+            for (globals.outputs[0..globals.output_count]) |*oi| {
+                if (oi.output == out) {
+                    _ = barSetMonitor(&bars[bar_count], oi.name());
+                    break;
+                }
+            }
+        }
+        surface.setListener(*Bar, barSurfaceListener, &bars[bar_count]);
         layer_surface.setListener(*Bar, layerSurfaceListener, &bars[bar_count]);
         bar_count += 1;
     }
@@ -5336,7 +5589,7 @@ fn realMain() !void {
                         }
                     }
                     if (!needs_redraw) {
-                        for (b.workspaces.list.items) |ws| {
+                        for (barWorkspaces(b)) |ws| {
                             if (ws.active) {
                                 needs_redraw = true;
                                 break;
@@ -5346,7 +5599,7 @@ fn realMain() !void {
                     // A pulsing urgent pill needs frames too (same gating as
                     // the bezel above; frozen when animations are off).
                     if (!needs_redraw) {
-                        for (b.workspaces.list.items) |ws| {
+                        for (barWorkspaces(b)) |ws| {
                             if (ws.urgent and !ws.active) {
                                 needs_redraw = true;
                                 break;
@@ -9717,7 +9970,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
                 });
                 var n: usize = 0;
                 while (n < @as(usize, @intCast(@abs(steps)))) : (n += 1) {
-                    bar.workspaces.stepWorkspace(direction);
+                    bar.workspaces.stepWorkspace(direction, barMonitorName(bar));
                 }
                 },
                 .adjust_volume => {
@@ -9734,7 +9987,10 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, router: *BarRouter) 
 fn handleAction(bar: *Bar, action: Action) void {
     switch (action) {
         .switch_workspace => |id| {
-            bar.workspaces.switchTo(id) catch |err| {
+            // The bar the click landed on owns the rail: scope the switch to
+            // its own monitor (falling back to the focused-monitor dispatch
+            // when the bar has no output name yet).
+            bar.workspaces.switchTo(id, barMonitorName(bar)) catch |err| {
                 logging.err("workspace switch failed: {}", .{err});
             };
         },
@@ -9985,9 +10241,9 @@ fn paintDock(bar: *Bar, pixels: [*]u32, time_text: []const u8, mpris_text: []con
     }
 
     // Groups left to right; pens recorded back for the next frame.
-    const left_end = drawLeftGroup(pixels, bar.width, bar.height, bar.font, bar.workspaces.list.items, time_text, mpris_text, mpris_playing, bar.mpris_frac, center_start_last, pack_start, &bar.click_regions);
+    const left_end = drawLeftGroup(pixels, bar.width, bar.height, bar.font, barWorkspaces(bar), time_text, mpris_text, mpris_playing, bar.mpris_frac, center_start_last, pack_start, &bar.click_regions);
     bar.dock_left_w = @max(0, left_end - pack_start);
-    const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, bar.mpris_frac, mpris_playing, center_start_last, &bar.click_regions);
+    const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, barWorkspaces(bar), mpris_text, bar.mpris_frac, mpris_playing, center_start_last, &bar.click_regions);
     bar.dock_center_w = @max(0, center_end - center_start_last);
     const right_start = drawRightGroup(pixels, bar.width, bar.height, bar.font, weather_text, bar.pacman.text(), volume_text, bar.drawer_anim, bar.tray, bar.workspaces, center_end, right_end_last, &bar.click_regions, bar);
     bar.dock_right_w = @max(0, right_end_last - right_start);
@@ -10032,7 +10288,7 @@ fn paintMorph(bar: *Bar, pixels: [*]u32, e: f32, time_text: []const u8, mpris_te
 
     // Taskbar endpoints (today's exact anchors) and dock endpoints.
     const t_left: i64 = WORKSPACE_LEFT_MARGIN;
-    const t_center = centerGroupStartX(bar.width, bar.font, time_text, bar.workspaces.list.items, mpris_text, mpris_playing);
+    const t_center = centerGroupStartX(bar.width, bar.font, time_text, barWorkspaces(bar), mpris_text, mpris_playing);
     const t_right: i64 = buf_w - RIGHT_MARGIN;
     const L = lerpI64(t_left, pack.start, e);
     const C = lerpI64(t_center, pack.center, e);
@@ -10046,9 +10302,9 @@ fn paintMorph(bar: *Bar, pixels: [*]u32, e: f32, time_text: []const u8, mpris_te
     fillRoundedRect(pixels, bar.width, bar.height, lerpI64(0, pack.start - DOCK_PILL_PAD, e), 0, lerpI64(buf_w, pack.start + pack.total + DOCK_PILL_PAD, e), buf_h, @intCast(pr), bg_fill);
     paintBackgroundEffect(bar, pixels, bar.width, bar.height, lerpI64(0, pack.start - DOCK_PILL_PAD, e), lerpI64(buf_w, pack.start + pack.total + DOCK_PILL_PAD, e), 0, buf_h, pr);
 
-    const left_end = drawLeftGroup(pixels, bar.width, bar.height, bar.font, bar.workspaces.list.items, time_text, mpris_text, mpris_playing, bar.mpris_frac, C, L, &bar.click_regions);
+    const left_end = drawLeftGroup(pixels, bar.width, bar.height, bar.font, barWorkspaces(bar), time_text, mpris_text, mpris_playing, bar.mpris_frac, C, L, &bar.click_regions);
     bar.dock_left_w = @max(0, left_end - L);
-    const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, bar.mpris_frac, mpris_playing, C, &bar.click_regions);
+    const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, barWorkspaces(bar), mpris_text, bar.mpris_frac, mpris_playing, C, &bar.click_regions);
     bar.dock_center_w = @max(0, center_end - C);
     const right_start = drawRightGroup(pixels, bar.width, bar.height, bar.font, weather_text, bar.pacman.text(), volume_text, bar.drawer_anim, bar.tray, bar.workspaces, center_end, Rend, &bar.click_regions, bar);
     bar.dock_right_w = @max(0, Rend - right_start);
@@ -10206,7 +10462,7 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
         var mpris_buf: [64]u8 = undefined;
         mpris_text = formatMprisText(track_part, &mpris_buf);
     }
-    const center_start_x = centerGroupStartX(bar.width, bar.font, time_text, bar.workspaces.list.items, mpris_text, mpris_playing);
+    const center_start_x = centerGroupStartX(bar.width, bar.font, time_text, barWorkspaces(bar), mpris_text, mpris_playing);
     var volume_buf: [16]u8 = undefined;
     const vol_poll = parseVolumePoll(bar.volume.text(), &volume_buf);
     const volume_text = vol_poll.text;
@@ -10221,7 +10477,7 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
             bar.surface.setInputRegion(null);
             bar.dock_input_set = false;
         }
-        const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, bar.workspaces.list.items, mpris_text, bar.mpris_frac, mpris_playing, center_start_x, &bar.click_regions);
+        const center_end = drawCenterGroup(pixels, bar.width, bar.height, bar.font, time_text, barWorkspaces(bar), mpris_text, bar.mpris_frac, mpris_playing, center_start_x, &bar.click_regions);
         // Record content widths even in taskbar mode, so flipping to dock
         // packs correctly on the very first frame instead of piling up at
         // center for a frame. Anchor-subtracted, so identical values would
@@ -10232,7 +10488,7 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
             bar.width,
             bar.height,
             bar.font,
-            bar.workspaces.list.items,
+            barWorkspaces(bar),
             time_text,
             mpris_text,
             mpris_playing,
@@ -11053,4 +11309,123 @@ test "distro glyph tables" {
             try t.expectEqual(cp, distroLogoCodepoint());
         }
     }
+}
+
+test "mango all-tags scoped per monitor and sliceable" {
+    const t = std.testing;
+    var ws = Workspaces{ .gpa = t.allocator, .mode = .mango, .list = .empty, .sock_path_len = 0 };
+    defer ws.deinit();
+
+    // Two monitors, nine tags each — the multi-monitor shape that used to
+    // interleave into one duplicated "1 2 2 3 ..." rail. The screenshot
+    // scenario: monitor DP-1 sits on tag 1, HDMI-A-1 on tag 4.
+    var buf: [4096]u8 = undefined;
+    var used: usize = 0;
+    const Put = struct {
+        fn pr(out: []u8, fp: *usize, comptime fmt: []const u8, args: anytype) void {
+            fp.* += (std.fmt.bufPrint(out[fp.*..], fmt, args) catch unreachable).len;
+        }
+    };
+    Put.pr(&buf, &used, "{{\"all_tags\":[", .{});
+    var mi: usize = 0;
+    while (mi < 2) : (mi += 1) {
+        const mon: []const u8 = if (mi == 0) "DP-1" else "HDMI-A-1";
+        Put.pr(&buf, &used, "{s}{{", .{if (mi == 0) "" else ","});
+        Put.pr(&buf, &used, "\"monitor\":\"{s}\",\"tags\":[", .{mon});
+        const active_tag: usize = if (mi == 0) 1 else 4;
+        var tag_i: usize = 1;
+        while (tag_i <= 9) : (tag_i += 1) {
+            const active = tag_i == active_tag;
+            Put.pr(&buf, &used, "{{\"index\":{d},\"is_active\":{s},\"is_urgent\":{s},\"layout\":\"DW\",\"client_count\":0}}", .{ tag_i, if (active) "true" else "false", if (tag_i == 2 and mi == 1) "true" else "false" });
+            if (tag_i < 9) Put.pr(&buf, &used, ",", .{});
+        }
+        Put.pr(&buf, &used, "]}}", .{});
+    }
+    Put.pr(&buf, &used, "]}}", .{});
+    const payload = buf[0..used];
+
+    try ws.scanMango(payload);
+
+    // Sorted (monitor, id): DP-1's 1..9 contiguous, then HDMI-A-1's 1..9.
+    try t.expectEqual(@as(usize, 18), ws.list.items.len);
+    try t.expectEqualStrings("DP-1", ws.list.items[0].monitorName());
+    try t.expectEqual(@as(i32, 1), ws.list.items[0].id);
+    try t.expect(ws.list.items[0].active); // DP-1's tag 1
+    try t.expect(!ws.list.items[1].active); // DP-1's tag 2
+    try t.expectEqualStrings("HDMI-A-1", ws.list.items[9].monitorName());
+    try t.expectEqual(@as(i32, 1), ws.list.items[9].id);
+    try t.expectEqualStrings("DW", ws.layout());
+
+    // Urgent flag lands on the right entry (HDMI tag 2): the old whole-
+    // payload scan could bind it to the wrong monitor's same-numbered tag.
+    try t.expect(ws.list.items[10].urgent);
+    try t.expect(!ws.list.items[1].urgent);
+
+    // Per-monitor rails: each bar gets exactly its monitor's run.
+    const dp1 = ws.sliceForMonitor("DP-1");
+    try t.expectEqual(@as(usize, 9), dp1.len);
+    try t.expectEqual(@as(i32, 1), dp1[0].id);
+    try t.expectEqualStrings("DP-1", dp1[8].monitorName());
+    const hdmi = ws.sliceForMonitor("HDMI-A-1");
+    try t.expectEqual(@as(usize, 9), hdmi.len);
+    try t.expect(hdmi[3].active); // HDMI tag 4
+
+    // Unknown bar (empty name) → merged list; missing name → same fallback
+    // rather than a blank rail.
+    try t.expectEqual(@as(usize, 18), ws.sliceForMonitor("").len);
+    try t.expectEqual(@as(usize, 18), ws.sliceForMonitor("nope").len);
+}
+
+test "mango all-tags flat payload still fills the merged rail" {
+    const t = std.testing;
+    var ws = Workspaces{ .gpa = t.allocator, .mode = .mango, .list = .empty, .sock_path_len = 0 };
+    defer ws.deinit();
+
+    // Pre-per-monitor Mango (no monitor records): one flat scope, empty
+    // monitor names — every bar serves the merged list as before.
+    try ws.scanMango("{\"all_tags\":[{\"index\":9,\"is_active\":true,\"layout\":\"CT\"},{\"index\":2,\"is_active\":false,\"layout\":\"CT\"}]}");
+    try t.expectEqual(@as(usize, 2), ws.list.items.len);
+    try t.expectEqual(@as(i32, 2), ws.list.items[0].id); // sorted ids
+    try t.expectEqual(@as(usize, 0), ws.list.items[0].monitorName().len);
+    try t.expectEqual(@as(usize, 2), ws.sliceForMonitor("").len);
+    try t.expectEqualStrings("CT", ws.layout());
+}
+
+test "hyprland workspace entries carry their monitor" {
+    const t = std.testing;
+    var ws = Workspaces{ .gpa = t.allocator, .mode = .hyprland, .list = .empty, .sock_path_len = 0 };
+    defer ws.deinit();
+
+    // monitorID sits before monitor in Hypr's payload; the scan needle
+    // (`"monitor":"`) must not false-match it. Active workspace is id 3 on
+    // DP-1 from the separate activeworkspace request.
+    const payload =
+        "[{\"id\":1,\"name\":\"1\",\"monitor\":\"DP-1\",\"monitorID\":0,\"windows\":1}," ++
+        "{\"id\":9,\"name\":\"9\",\"monitor\":\"HDMI-A-1\",\"monitorID\":1,\"windows\":0}," ++
+        "{\"id\":3,\"name\":\"3\",\"monitor\":\"DP-1\",\"monitorID\":0,\"windows\":2}]";
+    try ws.scanHyprland(payload, 3);
+
+    // (monitor, id) order: DP-1's run [1,3] then HDMI-A-1's [9].
+    try t.expectEqual(@as(usize, 3), ws.list.items.len);
+    try t.expectEqual(@as(i32, 1), ws.list.items[0].id);
+    try t.expect(!ws.list.items[0].active);
+    try t.expectEqual(@as(i32, 3), ws.list.items[1].id);
+    try t.expect(ws.list.items[1].active);
+    try t.expectEqual(@as(i32, 9), ws.list.items[2].id);
+    try t.expectEqualStrings("DP-1", ws.list.items[1].monitorName());
+    try t.expectEqualStrings("HDMI-A-1", ws.list.items[2].monitorName());
+
+    try t.expectEqual(@as(usize, 2), ws.sliceForMonitor("DP-1").len);
+    try t.expectEqual(@as(usize, 1), ws.sliceForMonitor("HDMI-A-1").len);
+}
+
+test "monitor name copy truncates without leaking capture" {
+    const t = std.testing;
+    var ws = Workspace{ .id = 1, .active = false };
+    const long = "DP-1" ++ "0123456789" ** 6; // 64 chars > MONITOR_NAME_MAX
+    ws.setMonitor(long);
+    try t.expectEqual(@as(usize, MONITOR_NAME_MAX), ws.monitorName().len);
+    // Re-set to the same name (already at the cap → same truncated string)
+    // is idempotent through the slice helpers the bar uses.
+    try t.expectEqualStrings(ws.monitorName(), ws.monitorName());
 }

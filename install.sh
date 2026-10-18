@@ -940,7 +940,11 @@ fi
 # make a layer-shell surface at all. See the "App drawer" section below for
 # what actually gets deployed.
 # brightnessctl backs both WMs' XF86MonBrightness* binds.
-PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji fastfetch neovim swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility polkit-gnome grim slurp wlr-randr cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
+# gnome-keyring backs both file managers' remote-share auth (nautilus/nemo
+# network mounts, dolphin via kio's credentials dialogue) and anything
+# storing secrets (secret-service D-Bus API); the PAM auto-unlock lines go
+# in at Step 8.
+PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji fastfetch neovim swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility polkit-gnome gnome-keyring grim slurp wlr-randr cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
 
 # Official Mesa Vulkan stack — see the Step 6 header: pinning these keeps
 # pacman from resolving the vulkan-driver virtuals to a conflicting mesa-git.
@@ -978,6 +982,17 @@ case "$FILE_MANAGER_CHOICE" in
     *) FILE_MANAGER_NAME="Nautilus"; FILE_MANAGER_BIN="nautilus"; PACMAN_PKGS+=(nautilus) ;;
 esac
 [ "$FILE_MANAGER_DETECTED" = 1 ] && detected_note "File manager" "$FILE_MANAGER_NAME"
+
+# Archive companions ride the file-manager pick so archive extracting is
+# covered out of the box: the GTK pair (nautilus/nemo) gets file-roller's
+# extract-here integration, KDE's dolphin gets its ark counterpart.
+if [ "$FILE_MANAGER_CHOICE" = 3 ]; then
+    PACMAN_PKGS+=(ark)
+    ARCHIVER_NAME="Ark"
+else
+    PACMAN_PKGS+=(file-roller)
+    ARCHIVER_NAME="File Roller"
+fi
 
 # Point whichever config the chosen WM ships at the picked file manager.
 if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
@@ -1992,12 +2007,44 @@ run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfir
 step "Done"
 ok "Full system updated (pacman -Syu)"
 ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, ${TERMINAL_PKG}, fastfetch, neovim, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, cava, pipewire, gnome-disk-utility, nwg-drawer, kdeconnect, brightnessctl, wlr-randr installed (pacman)"
+
+# gnome-keyring auto-unlock at login: two `optional` PAM lines (optional =
+# they can never block login, even if the module ever disappears) appended
+# to the greeter's stack AFTER the password prompt (the module just caches
+# the already-entered password) so the first "Enter password for the
+# default keyring" prompt on login disappears. Idempotent — grep first,
+# skip files that don't exist (greeter may not be ly on this system).
+if grep -qs "pam_gnome_keyring\.so" /etc/pam.d/ly; then
+    ok "gnome-keyring PAM unlock already configured for ly"
+else
+    if [ -f /etc/pam.d/ly ]; then
+        run_spinner "gnome-keyring: PAM unlock for ly" \
+            bash -c 'printf "\nauth\t\toptional\tpam_gnome_keyring.so\nsession\toptional\tpam_gnome_keyring.so auto_start\n" >> /etc/pam.d/ly' \
+            || warn "Could not edit /etc/pam.d/ly — keyring will prompt on first use"
+        ok "gnome-keyring unlocks automatically at the ly login prompt"
+    else
+        warn "/etc/pam.d/ly not found — keyring PAM setup skipped (it will prompt once per session instead)"
+    fi
+fi
+# Keep the keyring synced when the login password changes later (the
+# wiki's standard line for /etc/pam.d/passwd; same idempotence rule).
+if grep -qs "pam_gnome_keyring\.so" /etc/pam.d/passwd; then
+    :
+else
+    if [ -f /etc/pam.d/passwd ]; then
+        run_spinner "gnome-keyring: PAM sync for passwd" \
+            bash -c 'printf "\npassword\toptional\tpam_gnome_keyring.so\n" >> /etc/pam.d/passwd' \
+            || warn "Could not edit /etc/pam.d/passwd — keyring password may drift from the login password"
+        ok "gnome-keyring stays in sync on password changes"
+    fi
+fi
 if [ "$WM_IS_HYPRLAND" -eq 1 ]; then
     ok "Hyprland + xdg-desktop-portal-hyprland installed (pacman)"
 else
     ok "MangoWM + xdg-desktop-portal-wlr installed (pacman) — start it with 'mango' from a TTY or via your display manager"
 fi
 ok "$FILE_MANAGER_NAME installed and bound to SUPER + E"
+ok "$ARCHIVER_NAME installed alongside it (archive extract/compress in $FILE_MANAGER_NAME)"
 ok "pipewire, pipewire-pulse, wireplumber enabled as user services"
 if pacman -Qq cliphist >/dev/null 2>&1; then
     ok "cliphist installed (bind a key to it yourself — e.g. SUPER+C in the config)"

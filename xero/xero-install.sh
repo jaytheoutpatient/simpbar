@@ -3245,6 +3245,13 @@ install_base_system() {
     # Firmware (some may not apply to all hardware)
     optional+=" fwupd sof-firmware linux-firmware-intel"
 
+    # Secrets service — file managers (nautilus/nemo remote shares, dolphin
+    # via kio) and anything using the secret-service D-Bus API want it; the
+    # PAM auto-unlock lines are install.sh's job (this step only carries the
+    # package). Optional not critical: a failed fetch here has no business
+    # aborting the whole base install.
+    optional+=" gnome-keyring"
+
     show_info "Installing optional base packages (failures non-fatal)..."
     # shellcheck disable=SC2086
     stdbuf -oL -eL pacstrap -K "$MOUNTPOINT" --noconfirm $optional 2>/dev/null || \
