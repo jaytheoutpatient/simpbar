@@ -41,16 +41,44 @@ NC='\033[0m'
 # ── Screen-size-aware centering ────────────────────────────────────────────────
 # Real terminal width, not a hardcoded guess — so centering actually centers on
 # whatever console resolution the ISO booted into, not just an assumed 80 cols.
+# Ask the CONTROLLING terminal for its size. Never rely on tput's own fd
+# probing here: run_step_visual's redraw loop is a background job, and bash
+# points a background job's stdin at /dev/null. With stdout captured by $(...)
+# and stderr silenced, tput then finds no tty at all and silently reports the
+# terminfo default (80x24) -- while the Space Invaders process (stdin =
+# /dev/tty) sees the real size. The two then drew with DIFFERENT geometry and
+# painted over each other (stacked/duplicated frames, off-center bar).
+# stty reading /dev/tty gives every process the same, real answer.
+_term_size() {
+    local sz=""
+    if sz=$(stty size 2>/dev/null </dev/tty) && [[ "$sz" =~ ^[0-9]+\ [0-9]+$ ]]; then
+        local r=${sz% *} c=${sz#* }
+        if (( r > 0 && c > 0 )); then
+            echo "$r $c"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 term_cols() {
-    local cols
-    cols=$(tput cols 2>/dev/null) || cols=80
+    local sz cols
+    if sz=$(_term_size); then
+        echo "${sz#* }"
+        return 0
+    fi
+    cols=$(tput cols 2>/dev/null </dev/tty) || cols=80
     [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
     echo "$cols"
 }
 
 term_lines() {
-    local lines
-    lines=$(tput lines 2>/dev/null) || lines=24
+    local sz lines
+    if sz=$(_term_size); then
+        echo "${sz% *}"
+        return 0
+    fi
+    lines=$(tput lines 2>/dev/null </dev/tty) || lines=24
     [[ "$lines" =~ ^[0-9]+$ ]] || lines=24
     echo "$lines"
 }
@@ -395,11 +423,17 @@ FEATHERLITELOGO=(
 # hit real panics there under rapid repeated invocation.
 draw_progress_bar() {
     local pct="$1" step_num="$2" total="$3" title="$4"
-    # $5 lets the caller pin the column width for the whole redraw loop
-    # instead of re-querying term_cols() every 0.3s, which occasionally
-    # flickered between values across frames and (since frames are never
-    # cleared between redraws) left two widths' text visible at once.
+    # $5 lets the caller pin the column width for the whole redraw loop.
     local cols="${5:-$(term_cols)}"
+    # $6 = zero-based top row. When given, EVERY line is placed with its own
+    # absolute cursor-position escape (no "\n" at all) and the whole frame is
+    # emitted with ONE printf. This is what keeps it from fighting the Space
+    # Invaders process: both write to the same terminal, and a shared cursor
+    # is shared state -- if the game wrote in the middle of a line-by-line
+    # frame, the rest of the frame continued at the game's cursor (bottom of
+    # the screen) and each "\n" there scrolled the whole screen, leaving the
+    # stacked, duplicated frames. Without $6 (error path) lines end in "\n".
+    local top="${6:-}"
     local width=50
     [[ $width -gt $(( cols - 10 )) ]] && width=$(( cols - 10 ))
     [[ $width -lt 10 ]] && width=10
@@ -409,27 +443,39 @@ draw_progress_bar() {
     [[ $filled -gt 0 ]] && bar+=$(printf '█%.0s' $(seq 1 "$filled"))
     [[ $empty -gt 0 ]] && bar+=$(printf '░%.0s' $(seq 1 "$empty"))
 
-    # Wordmark only fits a real terminal, not the narrowest ones this still
-    # has to support — skipped below that width rather than wrapped/clipped.
+    local out="" row=0 t
+    # _pl <sgr-or-empty> <text>: append one frame line to $out.
+    _pl() {
+        local pre="" post='\n'
+        if [[ -n "$top" ]]; then
+            printf -v pre '\033[%d;1H' $(( top + 1 + row ))
+            post=''
+        fi
+        row=$(( row + 1 ))
+        if [[ -n "$2" ]]; then
+            printf -v t '%s%b%s\033[0m\033[K%b' "$pre" "$1" "$(center_pad "$2" "$cols")" "$post"
+        else
+            printf -v t '%s\033[K%b' "$pre" "$post"
+        fi
+        out+="$t"
+    }
+
     if [[ $cols -ge 58 ]]; then
         local logo_line
         for logo_line in "${FEATHERLITELOGO[@]}"; do
-            printf '\033[38;5;198m\033[1m%s\033[0m\033[K\n' "$(center_pad "$logo_line" "$cols")"
+            _pl '\033[38;5;198m\033[1m' "$logo_line"
         done
-        printf '\033[K\n'
+        _pl '' ''
     fi
-
-    # \033[K erases to end of line: center_pad only adds leading padding,
-    # so without this a wider previous frame's tail would never get
-    # overwritten (frames are never cleared between redraws, to avoid flicker).
-    printf '\033[38;5;198m\033[1m%s\033[0m\033[K\n' "$(center_pad "${pct}%" "$cols")"
-    printf '\033[K\n'
-    printf '\033[38;5;45m%s\033[0m\033[K\n' "$(center_pad "$bar" "$cols")"
-    printf '\033[K\n'
-    printf '\033[38;5;45m\033[1m%s\033[0m\033[K\n' "$(center_pad "$PART_LABEL" "$cols")"
-    printf '\033[38;5;212m\033[1m%s\033[0m\033[K\n' "$(center_pad "Step $step_num of $total: $title" "$cols")"
-    printf '\033[K\n'
-    printf '\033[38;5;245m%s\033[0m\033[K\n' "$(center_pad "(Be patient while system installs. If it looks stuck it's normal.)" "$cols")"
+    _pl '\033[38;5;198m\033[1m' "${pct}%"
+    _pl '' ''
+    _pl '\033[38;5;45m' "$bar"
+    _pl '' ''
+    _pl '\033[38;5;45m\033[1m' "$PART_LABEL"
+    _pl '\033[38;5;212m\033[1m' "Step $step_num of $total: $title"
+    _pl '' ''
+    _pl '\033[38;5;245m' "(Be patient while system installs. If it looks stuck it's normal.)"
+    printf '%s' "$out"
 }
 
 # ─── Space Invaders (bottom strip while a step runs) ─────────────────────────
@@ -492,6 +538,11 @@ invaders_play() {
     ilog() {
         printf '%s %s\n' "${EPOCHREALTIME:-}" "$*" >> "$INVADERS_LOG" 2>/dev/null || true
     }
+    # emit: append to the frame buffer instead of writing. The whole frame is
+    # flushed with ONE printf at the end of the render block, so the progress
+    # bar process can never land its cursor moves in the middle of it.
+    local OUT=""
+    emit() { local _t; printf -v _t "$@"; OUT+="$_t"; }
     : > "$INVADERS_LOG" 2>/dev/null || true
     ilog "start pid=$BASHPID parent=$myppid tty_saved=$([[ -n "$tty_saved" ]] && echo yes || echo no)"
     local rows_base=0 lines=24 cols=80 left=1
@@ -754,15 +805,16 @@ invaders_play() {
 
         # ── render: 12 rows, top to bottom, everything erased each pass ──
         painted=1
+        OUT=""
         # header: rows_base. "(beta)" rides along only on wide consoles so the
         # line can never wrap on small ones.
         local beta_tag=""
         if (( cols >= 80 )); then beta_tag=" (beta)"; fi
-        printf '\033[%d;1H\033[K\033[38;5;245m    \033[38;5;198mSPACE INVADERS%s\033[38;5;245m  · ◀ ▶ a/d move · space shoot · q stop\033[0m' \
-            "$rows_base" "$beta_tag" 2>/dev/null || true
+        emit '\033[%d;1H\033[K\033[%d;%dH\033[38;5;198mSPACE INVADERS%s\033[38;5;245m  · ◀ ▶ a/d move · space shoot · q stop\033[0m' \
+            "$rows_base" "$rows_base" "$left" "$beta_tag" 2>/dev/null || true
         # alien field rows 0..SHIP_R: rows_base+1..rows_base+9
         for (( i = 0; i <= SHIP_R; i++ )); do
-            printf '\033[%d;%dH\033[K' "$(( rows_base + 1 + i ))" "$left" 2>/dev/null || true
+            emit '\033[%d;%dH\033[K' "$(( rows_base + 1 + i ))" "$left" 2>/dev/null || true
         done
         # aliens / recent explosions
         for (( i = 0; i < 18; i++ )); do
@@ -777,48 +829,50 @@ invaders_play() {
                     2) breed="38;5;45" ;;
                 esac
                 if (( phase == 1 )); then
-                    printf '\033[%d;%dH\033[%sm▀▄▀\033[0m' "$r" "$(( left + c ))" "$breed" 2>/dev/null || true
+                    emit '\033[%d;%dH\033[%sm▀▄▀\033[0m' "$r" "$(( left + c ))" "$breed" 2>/dev/null || true
                 else
-                    printf '\033[%d;%dH\033[%sm▄▀▄\033[0m' "$r" "$(( left + c ))" "$breed" 2>/dev/null || true
+                    emit '\033[%d;%dH\033[%sm▄▀▄\033[0m' "$r" "$(( left + c ))" "$breed" 2>/dev/null || true
                 fi
             elif (( (frame - FLASH[i]) < 3 )); then
-                printf '\033[%d;%dH\033[38;5;196m✶✶✶\033[0m' "$r" "$(( left + c ))" 2>/dev/null || true
+                emit '\033[%d;%dH\033[38;5;196m✶✶✶\033[0m' "$r" "$(( left + c ))" 2>/dev/null || true
             fi
         done
         # player bullets
         if (( p1y >= 0 )); then
-            printf '\033[%d;%dH\033[38;5;231m│\033[0m' \
+            emit '\033[%d;%dH\033[38;5;231m│\033[0m' \
                 "$(( rows_base + 1 + p1y ))" "$(( left + p1x ))" 2>/dev/null || true
         fi
         if (( p2y >= 0 )); then
-            printf '\033[%d;%dH\033[38;5;231m│\033[0m' \
+            emit '\033[%d;%dH\033[38;5;231m│\033[0m' \
                 "$(( rows_base + 1 + p2y ))" "$(( left + p2x ))" 2>/dev/null || true
         fi
         # bombs
         if (( b1y >= 0 )); then
-            printf '\033[%d;%dH\033[38;5;208m◆\033[0m' \
+            emit '\033[%d;%dH\033[38;5;208m◆\033[0m' \
                 "$(( rows_base + 1 + b1y ))" "$(( left + b1x ))" 2>/dev/null || true
         fi
         if (( b2y >= 0 )); then
-            printf '\033[%d;%dH\033[38;5;208m◆\033[0m' \
+            emit '\033[%d;%dH\033[38;5;208m◆\033[0m' \
                 "$(( rows_base + 1 + b2y ))" "$(( left + b2x ))" 2>/dev/null || true
         fi
         # ship (red + BREACH! while flashing)
         if (( flash > 0 )); then
-            printf '\033[%d;%dH\033[1m\033[38;5;196m┬▲┬\033[0m \033[38;5;196mBREACH!\033[0m' \
+            emit '\033[%d;%dH\033[1m\033[38;5;196m┬▲┬\033[0m \033[38;5;196mBREACH!\033[0m' \
                 "$(( rows_base + 1 + SHIP_R ))" "$(( left + ship_x - 1 ))" 2>/dev/null || true
         else
-            printf '\033[%d;%dH\033[38;5;45m┬▲┬\033[0m' \
+            emit '\033[%d;%dH\033[38;5;45m┬▲┬\033[0m' \
                 "$(( rows_base + 1 + SHIP_R ))" "$(( left + ship_x - 1 ))" 2>/dev/null || true
         fi
         # hud: rows_base + 10
-        printf '\033[%d;%dH\033[K\033[38;5;45m SCORE %06d\033[38;5;245m   WAVE %d   LIVES ' \
+        emit '\033[%d;%dH\033[K\033[38;5;45m SCORE %06d\033[38;5;245m   WAVE %d   LIVES ' \
             "$(( rows_base + 10 ))" "$left" "$score" "$wave" 2>/dev/null || true
-        printf '\033[38;5;212m'
+        emit '\033[38;5;212m'
         for (( i = 0; i < lives; i++ )); do
-            printf '▲ ' 2>/dev/null || true
+            emit '▲ ' 2>/dev/null || true
         done
-        printf '\033[0m' 2>/dev/null || true
+        emit '\033[0m' 2>/dev/null || true
+        # One write for the whole frame (see emit above).
+        printf '%s' "$OUT" 2>/dev/null || true
     done
     finish || true
 }
@@ -938,8 +992,6 @@ run_step_visual() {
                 top_row=$(vpad_for "$content_height")
                 last_cols=$cols
                 last_rows=$rows_now
-            else
-                tput cup "$top_row" 0
             fi
             local lines sub live_pct
             lines=$(wc -l < "$logfile" 2>/dev/null || echo 0)
@@ -947,7 +999,7 @@ run_step_visual() {
             [[ $sub -gt $(( range - 1 )) ]] && sub=$(( range - 1 ))
             [[ $sub -lt 0 ]] && sub=0
             live_pct=$(( base_pct + sub ))
-            draw_progress_bar "$live_pct" "$step_num" "$total" "$title" "$cols"
+            draw_progress_bar "$live_pct" "$step_num" "$total" "$title" "$cols" "$top_row"
             sleep 0.3
         done
     ) &
