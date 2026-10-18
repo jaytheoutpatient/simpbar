@@ -1227,6 +1227,28 @@ select_timezone() {
     show_info "Select your timezone"
     echo ""
 
+    # Auto-detect first (installer is online for packages anyway); the manual
+    # picker below is the fallback and stays fully usable on its own.
+    local mode=""
+    mode=$(printf '%s\n' \
+        "Auto-detect from internet (recommended)" \
+        "Choose manually" \
+        | gum choose --height 3 --header "Timezone:") || true
+
+    if [[ "$mode" == "Auto-detect"* ]]; then
+        local detected=""
+        detected=$(curl -sfL --max-time 5 "https://ipinfo.io/timezone") \
+            || detected=$(curl -sfL --max-time 5 "https://ipapi.co/timezone") \
+            || true
+        if [[ "$detected" == */* ]] && [[ -e "/usr/share/zoneinfo/$detected" ]]; then
+            CONFIG[timezone]="$detected"
+            show_success "Timezone: ${CONFIG[timezone]}"
+            sleep 0.5
+            return
+        fi
+        show_warning "Auto-detect failed — choose manually"
+    fi
+
     local regions=""
     regions=$(find /usr/share/zoneinfo -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | \
               grep -vE '^(\+|posix|right|zoneinfo)$' | sort) || true
@@ -1243,16 +1265,19 @@ select_timezone() {
             local city=""
             city=$(echo "$cities" | gum filter --placeholder "Search city..." --height 12 --header "Select city:") || true
 
-            if [[ -n "$city" ]]; then
+            # Note: tzdata lists state aliases alongside cities (e.g. Australia
+            # shows Victoria -> Melbourne, which observes DST; Queensland ->
+            # Brisbane does not). Validate before storing so nothing invalid
+            # reaches /etc/localtime via the chroot below.
+            if [[ -n "$city" ]] && [[ -e "/usr/share/zoneinfo/$region/$city" ]]; then
                 CONFIG[timezone]="$region/$city"
+                show_success "Timezone: ${CONFIG[timezone]}"
             else
-                CONFIG[timezone]="$region"
+                show_warning "No valid zone picked — keeping ${CONFIG[timezone]}"
             fi
         else
-            CONFIG[timezone]="$region"
+            show_warning "No zones under $region — keeping ${CONFIG[timezone]}"
         fi
-
-        show_success "Timezone: ${CONFIG[timezone]}"
     fi
 
     sleep 0.5
@@ -2742,6 +2767,7 @@ add_repos() {
 configure_system() {
     arch-chroot "$MOUNTPOINT" ln -sf "/usr/share/zoneinfo/${CONFIG[timezone]}" /etc/localtime
     arch-chroot "$MOUNTPOINT" hwclock --systohc
+    arch-chroot "$MOUNTPOINT" systemctl enable systemd-timesyncd
 
     echo "${CONFIG[locale]} UTF-8" >> "$MOUNTPOINT/etc/locale.gen"
     echo "en_US.UTF-8 UTF-8" >> "$MOUNTPOINT/etc/locale.gen"
