@@ -104,6 +104,10 @@ CONFIG[gfx_driver]="mesa"
 CONFIG[parallel_downloads]="5"
 CONFIG[aur_helper]="paru"
 CONFIG[extra_kernel]=""
+# Bottom-strip arcade (Space Invaders during install steps): off by default,
+# the config menu asks and warns — experimental and glitchy. Pressing q
+# mid-game also silences it for the rest of the run (INVADERS_OPTOUT file).
+CONFIG[play_invaders]="off"
 # First-boot WM (Hyprland/MangoWM + terminal): chosen here, staged by
 # install_firstboot_wm after the user exists. Phase 1 installs ONLY the WM,
 # its portal and the terminal — the full desktop still comes from install.sh,
@@ -429,8 +433,12 @@ draw_progress_bar() {
 }
 
 # ─── Space Invaders (bottom strip while a step runs) ─────────────────────────
-# Pure-bash invaders occupying the bottom 12 rows during run_step_visual: the
-# progress frame is vertically centered (vpad_for) and its loop only ever
+# Pure-bash invaders occupying the bottom 12 rows during run_step_visual — but
+# strictly opt-in: the game only runs when the user enabled the arcade in the
+# config menu (off by default), and pressing q during play opts out for the
+# rest of the session. Still experimental — expect visual oddities at odd
+# terminal sizes.
+# Mechanics: the progress frame is vertically centered (vpad_for) and its loop only ever
 # repaints those centered rows via cup, so the bottom strip belongs to the game
 # — the two loops never write the same rows and never scroll the screen (the
 # frame's last print has no trailing newline). The game loop forks NOTHING per
@@ -452,6 +460,10 @@ INVADERS_PIDFILE="/tmp/featherlite-invaders.pid"
 # Forensics log: one line per EVENT (start / geometry change / exit), never
 # per frame — lets a post-mortem reconstruct the strip's geometry timeline.
 INVADERS_LOG="/tmp/featherlite-invaders.log"
+# Per-session kill switch: pressing q during a game touches this file and
+# invaders_start then refuses every subsequent start (until the next installer
+# run on a fresh /tmp). Off-by-default opt-in lives in CONFIG[play_invaders].
+INVADERS_OPTOUT="/tmp/featherlite-invaders.optout"
 
 # Background main loop. $1 = stop file; playing while it exists.
 invaders_play() {
@@ -515,8 +527,8 @@ invaders_play() {
     }
     farewell() {
         quiet_exit
-        printf '\033[%d;1H\033[K\033[38;5;245m        (arcade closed — install continues)\033[0m' \
-            "$(( bottom - 12 ))"
+        printf '\033[%d;1H\033[K\033[38;5;245m        %s\033[0m' \
+            "$(( bottom - 12 ))" "${1:-(arcade closed — install continues)}"
     }
     finish() {
         if [[ -n "$tty_saved" ]]; then
@@ -586,8 +598,11 @@ invaders_play() {
             fi
         elif [[ "$pick" == "q" ]]; then
             cleaned=1
-            ilog "exit q geo=${lines}x${cols}"
-            farewell
+            # Per-session kill switch: q opts out of the arcade for every
+            # remaining step (invaders_start checks INVADERS_OPTOUT).
+            : > "$INVADERS_OPTOUT" 2>/dev/null || true
+            ilog "exit q — arcade opted out for the session geo=${lines}x${cols}"
+            farewell "(arcade off — no more this session)"
             tput cnorm 2>/dev/null || true
             break
         fi
@@ -739,9 +754,12 @@ invaders_play() {
 
         # ── render: 12 rows, top to bottom, everything erased each pass ──
         painted=1
-        # header: rows_base
-        printf '\033[%d;1H\033[K\033[38;5;245m    \033[38;5;198mSPACE INVADERS\033[38;5;245m  · ◀ ▶ a/d move · space shoot · q stop\033[0m' \
-            "$rows_base" 2>/dev/null || true
+        # header: rows_base. "(beta)" rides along only on wide consoles so the
+        # line can never wrap on small ones.
+        local beta_tag=""
+        if (( cols >= 80 )); then beta_tag=" (beta)"; fi
+        printf '\033[%d;1H\033[K\033[38;5;245m    \033[38;5;198mSPACE INVADERS%s\033[38;5;245m  · ◀ ▶ a/d move · space shoot · q stop\033[0m' \
+            "$rows_base" "$beta_tag" 2>/dev/null || true
         # alien field rows 0..SHIP_R: rows_base+1..rows_base+9
         for (( i = 0; i <= SHIP_R; i++ )); do
             printf '\033[%d;%dH\033[K' "$(( rows_base + 1 + i ))" "$left" 2>/dev/null || true
@@ -808,6 +826,12 @@ invaders_play() {
 # Starts the game in a background subshell (stdout = this terminal).
 invaders_start() {
     if [[ -n "$INVADERS_PID" ]]; then return 0; fi
+
+    # Strictly opt-in: no spawn unless the user enabled the arcade in the
+    # config menu. Pressing q during play also touched the opt-out file, and
+    # that silences every remaining step of this session.
+    if [[ "${CONFIG[play_invaders]:-off}" != "on" ]]; then return 0; fi
+    if [[ -e "$INVADERS_OPTOUT" ]]; then return 0; fi
 
     # Kill any orphan left behind by a dead installer (fixed pidfile):
     # strip races and double-headers never get a chance to exist.
@@ -931,9 +955,11 @@ run_step_visual() {
     DISPLAY_PID="$display_pid"
 
     # Bottom-strip Space Invaders for the duration of the step (may take
-    # many minutes on slow disks). The progress frame never paints below its
-    # centered block, so the strip belongs to the game exclusively. Stopped
-    # right after the step function returns, below.
+    # many minutes on slow disks). Strictly opt-in — invaders_start returns
+    # immediately unless the user enabled the arcade in the config menu (and
+    # hasn't opted out mid-session with q). The progress frame never paints
+    # below its centered block, so the strip belongs to the game exclusively.
+    # Stopped right after the step function returns, below.
     invaders_start
 
     "$func" "$@" > "$logfile" 2>&1
@@ -1833,6 +1859,40 @@ select_extra_kernel() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────────
+# 14. BOTTOM-STRIP ARCADE (opt-in, experimental)
+# ────────────────────────────────────────────────────────────────────────────────
+
+select_arcade() {
+    show_header
+    show_submenu_header "🎮 Bottom-strip Arcade"
+    echo ""
+
+    show_info "A little Space Invaders renders in the bottom rows while each install step runs"
+    echo ""
+
+    local options=(
+        "off │ Recommended (keep the console clean)"
+        "on  │ Experimental and still glitchy — expect visual oddities"
+    )
+
+    local selection=""
+    selection=$(printf '%s\n' "${options[@]}" | gum choose --height 4 --header "Play the arcade during the install?") || true
+
+    case "$selection" in
+        "on "*)
+            CONFIG[play_invaders]="on"
+            show_success "Arcade: on (experimental — press q during play to turn it off for the rest of the install)"
+            ;;
+        "off "*)
+            CONFIG[play_invaders]="off"
+            show_success "Arcade: off"
+            ;;
+    esac
+
+    sleep 0.5
+}
+
+# ────────────────────────────────────────────────────────────────────────────────
 # FIRST-BOOT WM (choice staged in phase 1, desktop via install.sh)
 # ────────────────────────────────────────────────────────────────────────────────
 # Records which WM (and terminal) the installed system boots into the
@@ -2272,8 +2332,9 @@ show_main_menu() {
             "11. Additional Kernel     │ $kernel_label"
             "12. Extra Packages        │ $extra_pkg_label"
             "13. First-boot Desktop    │ $firstboot_item_label"
+            "14. Bottom-strip Arcade   │ ${CONFIG[play_invaders]}"
             "──────────────────────────────────────────────"
-            "14. Start Installation"
+            "15. Start Installation"
             "0.  Exit"
         )
 
@@ -2310,7 +2371,8 @@ show_main_menu() {
             "11."*) select_extra_kernel ;;
             "12."*) configure_extra_packages ;;
             "13."*) select_firstboot ;;
-            "14."*)
+            "14."*) select_arcade ;;
+            "15."*)
                 if validate_config; then
                     show_summary
                     local confirm_msg=""
@@ -2405,6 +2467,9 @@ show_summary() {
         firstboot_summary+=" — run install.sh yourself post-reboot"
     fi
 
+    local arcade_summary="off"
+    if [[ "${CONFIG[play_invaders]}" == "on" ]]; then arcade_summary="on (experimental)"; fi
+
     if [[ "${CONFIG[partition_mode]}" == "manual" ]]; then
         local efi_note=""
         [[ "${CONFIG[reuse_efi]}" == "yes" ]] && efi_note=" (reused, not formatted)"
@@ -2432,7 +2497,8 @@ show_summary() {
             "Boot Mode:        $boot_mode" \
             "Bootloader:       Limine (on ${CONFIG[disk]})" \
             "Downloads:        ${CONFIG[parallel_downloads]} parallel" \
-            "Extra Packages:   $extra_pkg_summary"
+            "Extra Packages:   $extra_pkg_summary" \
+            "Arcade:           $arcade_summary"
 
         echo ""
         gum style --foreground 196 --bold --margin "0 2" \
@@ -2461,7 +2527,8 @@ show_summary() {
             "Boot Mode:        $boot_mode" \
             "Bootloader:       Limine" \
             "Downloads:        ${CONFIG[parallel_downloads]} parallel" \
-            "Extra Packages:   $extra_pkg_summary"
+            "Extra Packages:   $extra_pkg_summary" \
+            "Arcade:           $arcade_summary"
 
         echo ""
         gum style --foreground 196 --bold --margin "0 2" \
