@@ -449,6 +449,9 @@ INVADERS_PID=""
 # orphaned game behind — the next start finds the pidfile and kills it first.
 INVADERS_STOP="/tmp/featherlite-invaders.stop"
 INVADERS_PIDFILE="/tmp/featherlite-invaders.pid"
+# Forensics log: one line per EVENT (start / geometry change / exit), never
+# per frame — lets a post-mortem reconstruct the strip's geometry timeline.
+INVADERS_LOG="/tmp/featherlite-invaders.log"
 
 # Background main loop. $1 = stop file; playing while it exists.
 invaders_play() {
@@ -460,8 +463,27 @@ invaders_play() {
     # (field 4) once — no fork; $PPID stays as the fallback.
     local myppid
     read -r _ _ _st myppid _ < "/proc/$BASHPID/stat" 2>/dev/null || myppid=$PPID
+
+    # Hold the terminal in cbreak+noecho for the WHOLE game: bash's `read -s`
+    # only silences echo for the lifetime of each individual read call, so
+    # between frames a keypress would echo itself at the render cursor and
+    # paint stray characters into the strip. One save + set at start, one
+    # restore at exit: three forks total, none per frame. On a non-tty stdin
+    # (tests) stty fails and the game falls back silently.
+    local tty_saved=""
+    tty_saved=$(stty -g <&0 2>/dev/null) || tty_saved=""
+    if [[ -n "$tty_saved" ]]; then
+        stty -echo -icanon <&0 2>/dev/null || tty_saved=""
+    fi
+
+    # Event logger: EPOCHREALTIME is a bash builtin, so an event costs no fork.
+    ilog() {
+        printf '%s %s\n' "${EPOCHREALTIME:-}" "$*" >> "$INVADERS_LOG" 2>/dev/null || true
+    }
+    : > "$INVADERS_LOG" 2>/dev/null || true
+    ilog "start pid=$BASHPID parent=$myppid tty_saved=$([[ -n "$tty_saved" ]] && echo yes || echo no)"
     local rows_base=0 lines=24 cols=80 left=1
-    local frame=0 cleaned=0 painted=0 geo_dirty=1
+    local frame=0 cleaned=0 painted=0 geo_dirty=1 refuse_last=""
     local score=0 wave=1 lives=3
     local origin=2 dirn=1 drop=0 step=0 step_every=6
     local spawn_every=12 spawn_at=12
@@ -497,12 +519,16 @@ invaders_play() {
             "$(( bottom - 12 ))"
     }
     finish() {
+        if [[ -n "$tty_saved" ]]; then
+            stty "$tty_saved" <&0 2>/dev/null || true
+            tty_saved=""
+        fi
         if (( cleaned == 0 )); then
             quiet_exit
             tput cnorm 2>/dev/null || true
         fi
     }
-    trap 'finish; exit 0' TERM INT EXIT
+    trap 'ilog "exit trap (TERM/INT/EXIT)"; finish; exit 0' TERM INT EXIT
 
     # Terminal resizes: non-interactive bash inherits SIGWINCH as ignored and
     # refuses to trap it, so the poll below is the real mechanism; keep the
@@ -520,11 +546,13 @@ invaders_play() {
         # console with a stale-geometry strip. kill -0 is a builtin: no fork.
         if ! kill -0 "$myppid" 2>/dev/null; then
             cleaned=1
+            ilog "exit orphan parent=$myppid died geo=${lines}x${cols}"
             quiet_exit
             break
         fi
         if [[ ! -e "$stopfile" ]]; then
             cleaned=1
+            ilog "exit stopfile geo=${lines}x${cols}"
             farewell
             tput cnorm 2>/dev/null || true
             break
@@ -558,6 +586,7 @@ invaders_play() {
             fi
         elif [[ "$pick" == "q" ]]; then
             cleaned=1
+            ilog "exit q geo=${lines}x${cols}"
             farewell
             tput cnorm 2>/dev/null || true
             break
@@ -571,9 +600,11 @@ invaders_play() {
             nl=$(term_lines) 2>/dev/null || nl=24
             nc=$(term_cols)  2>/dev/null || nc=80
             if [[ "$nl/$nc" != "$lines/$cols" ]]; then
+                ilog "geo ${lines}x${cols} -> ${nl}x${nc} frame=$frame"
                 if (( painted != 0 )); then quiet_exit; fi
                 lines=$nl
                 cols=$nc
+                if (( cols < 40 )); then cols=40; fi
             fi
         fi
         frame=$(( frame + 1 ))
@@ -584,7 +615,14 @@ invaders_play() {
         # until the terminal grows.
         local content_h=8
         if [[ $cols -ge 58 ]]; then content_h=14; fi
-        if (( lines < content_h + 28 )); then continue; fi
+        if (( lines < content_h + 28 )); then
+            if [[ "$lines/$cols" != "${refuse_last:-}" ]]; then
+                refuse_last="$lines/$cols"
+                ilog "idle ${lines}x${cols} too small, need h=${content_h}+28 rows of air"
+            fi
+            continue
+        fi
+        refuse_last=""
         bottom=$(( lines - BOTTOM_PAD ))
         rows_base=$(( bottom - 11 ))
         left=$(( (cols - FW) / 2 ))
@@ -789,13 +827,25 @@ invaders_start() {
                 kill -9 "$oldpid" 2>/dev/null || true
             }
             wait_or_timeout
+            printf '%s killed stale game pid=%s\n' "${EPOCHREALTIME:-}" "$oldpid" >> "$INVADERS_LOG" 2>/dev/null || true
             rm -f "$INVADERS_PIDFILE"
         fi
     fi
 
     if ! : > "$INVADERS_STOP" 2>/dev/null; then return 0; fi
     : > "$INVADERS_PIDFILE" 2>/dev/null || return 0
-    invaders_play "$INVADERS_STOP" &
+
+    # POSIX redirects a background job's stdin to /dev/null when job control
+    # is off (how the installer's bash runs) — without an explicit source the
+    # game would read nothing: no keys, tty hold measures /dev/null and the
+    # console would echo every keystroke raw while the game renders. The
+    # explicit source wins; the controlling terminal drives the game.
+    local stdin_src=/dev/tty
+    if ! { : < /dev/tty; } 2>/dev/null; then
+        stdin_src=/dev/null
+        printf '%s no controlling tty — game input disabled\n' "${EPOCHREALTIME:-}" >> "$INVADERS_LOG" 2>/dev/null || true
+    fi
+    invaders_play "$INVADERS_STOP" < "$stdin_src" &
     INVADERS_PID=$!
     echo "$INVADERS_PID" > "$INVADERS_PIDFILE" 2>/dev/null || true
 }
@@ -808,6 +858,7 @@ invaders_stop() {
         kill "$INVADERS_PID" 2>/dev/null || true
         wait "$INVADERS_PID" 2>/dev/null || true
         INVADERS_PID=""
+        printf '%s installer stop\n' "${EPOCHREALTIME:-}" >> "$INVADERS_LOG" 2>/dev/null || true
     fi
     rm -f "$INVADERS_PIDFILE" 2>/dev/null || true
     return 0
