@@ -3863,40 +3863,66 @@ pub const IconsWidget = struct {
     }
 
     /// Icon= for one item → decoded ARGB square buffer (null = letter chip
-    /// fallback, like the drawer's untiled look). Absolute paths go straight
-    /// to disk; steam_app_<id> names reach the Steam library caches; theme
-    /// names walk the bar's resolver (user flatpak exports + user icon dirs
-    /// first, then hicolor/Adwaita/pixmaps).
+    /// fallback, like the drawer's untiled look).
     fn decodeArt(self: *IconsWidget, item: *const DesktopItem) ?[]u32 {
-        const icon_name = item.icon();
-        if (icon_name.len == 0) return null;
-
         var path_buf: [ICON_PATH_MAX + 1]u8 = undefined;
-        var found: ?[]const u8 = null;
-        var n: usize = 0;
-        if (icon_name[0] == '/') {
-            if (setStored(path_buf[0..ICON_PATH_MAX], &n, icon_name)) found = path_buf[0..n];
-        } else if (resolveIconArtPath(icon_name, path_buf[0..ICON_PATH_MAX])) |hit| {
-            found = hit;
-        }
-        const path = found orelse return null;
-        if (n >= path_buf.len) return null;
-        _ = path; // path_buf+n already carry the NUL-terminated file path
-        path_buf[n] = 0;
+        const path_len = iconArtPath(item, path_buf[0..ICON_PATH_MAX]) orelse {
+            logging.step("icons: no icon file for '{s}' (Icon={s})", .{ item.name(), item.icon() });
+            return null;
+        };
+        path_buf[path_len] = 0;
+        logging.step("icons: '{s}' art <- {s}", .{ item.name(), path_buf[0..path_len] });
 
-        const decoded = icontheme.decodeIcon(self.gpa, path_buf[0..n :0], @intCast(ICON_PX)) catch return null;
+        const decoded = icontheme.decodeIcon(self.gpa, path_buf[0..path_len :0], @intCast(ICON_PX)) catch {
+            logging.step("icons: decode failed for '{s}'", .{path_buf[0..path_len]});
+            return null;
+        };
         defer self.gpa.free(decoded.pixels);
         const square = self.gpa.alloc(u32, @as(usize, @intCast(ICON_PX)) * @as(usize, @intCast(ICON_PX))) catch return null;
         icontheme.copyIntoIconBuffer(decoded, square, @intCast(ICON_PX));
         return square;
     }
 
-    /// Steam first — a .desktop link like Balatro's usually carries
-    /// steam_app_<id> — then the freedesktop walk the bar runs.
-    fn resolveIconArtPath(name: []const u8, out: []u8) ?[]const u8 {
-        if (icontheme.steamGameIconPath(name, out)) |hit| return hit;
-        if (icontheme.resolveIconPath(name, out)) |hit| return hit;
+    /// Resolves an item's art file into `out` (icontheme's resolvers return
+    /// slices of the very buffer they write, so the length travels with it).
+    /// Order: the game id inside a steam://rungameid exec, then the Icon=
+    /// name itself. The exec-first order is what makes Steam shortcuts
+    /// right: the client writes Icon=steam for every game — the generic
+    /// client icon — while the exec names the game, whose square art sits
+    /// in the library cache; the drawer-written shortcut resolves that same
+    /// client png into an absolute Icon= path, which must not outrank the
+    /// game art either. The client's own entry execs /usr/bin/steam with no
+    /// rungameid, so it keeps the client icon.
+    fn iconArtPath(item: *const DesktopItem, out: *[ICON_PATH_MAX]u8) ?usize {
+        // A rungameid exec marks a game shortcut whatever Icon= says; the
+        // steam_app_ wrapper is what icontheme's cache walk keys on.
+        var norm_buf: [24]u8 = undefined;
+        if (steamAppIdFromExec(item.exec())) |appid| {
+            if (std.fmt.bufPrint(&norm_buf, "steam_app_{s}", .{appid})) |norm| {
+                if (icontheme.steamGameIconPath(norm, out)) |hit| return hit.len;
+            } else |_| {}
+        }
+        const name = item.icon();
+        if (name[0] == '/') {
+            // Absolute Icon= goes straight to disk.
+            if (name.len > out.len) return null;
+            @memcpy(out[0..name.len], name);
+            return name.len;
+        }
+        if (icontheme.steamGameIconPath(name, out)) |hit| return hit.len;
+        if (icontheme.resolveIconPath(name, out)) |hit| return hit.len;
         return null;
+    }
+
+    /// The appid digits in a steam://rungameid/<appid> exec — the marker of
+    /// a per-game shortcut. Returns a subslice of `exec`.
+    fn steamAppIdFromExec(exec: []const u8) ?[]const u8 {
+        const marker = "rungameid/";
+        const at = std.mem.indexOf(u8, exec, marker) orelse return null;
+        var end = at + marker.len;
+        while (end < exec.len and exec[end] >= '0' and exec[end] <= '9') end += 1;
+        if (end == at + marker.len) return null;
+        return exec[at + marker.len .. end];
     }
 
     /// Grid rect for `count` items: fixed 2-column width, rows follow the
@@ -4304,6 +4330,14 @@ test "icons: desktop file parsing" {
     try std.testing.expect(parseDesktopFile(&item, "[Desktop Entry]\nTerminal=true\nExec=kitty\n", "/d", "Terminal App.desktop"));
     try std.testing.expect(item.terminal);
     try std.testing.expectEqualStrings("Terminal App", item.name());
+}
+
+test "icons: exec rungameid extraction" {
+    try std.testing.expectEqualStrings("2379780", IconsWidget.steamAppIdFromExec("steam steam://rungameid/2379780").?);
+    try std.testing.expectEqualStrings("440", IconsWidget.steamAppIdFromExec("/usr/bin/steam steam://rungameid/440 %U").?);
+    // The client's own shortcut and other launchers: no game id present.
+    try std.testing.expect(IconsWidget.steamAppIdFromExec("/usr/bin/steam %U") == null);
+    try std.testing.expect(IconsWidget.steamAppIdFromExec("lutris lutris:rungame/diablo") == null);
 }
 
 test "icons: grid sizing" {
