@@ -699,6 +699,278 @@ const APPLY_ALL_UPDATES_SCRIPT = "sudo pacman -Syu --noconfirm; " ++
     "command -v flatpak >/dev/null && flatpak update -y; " ++
     "echo; read -p 'Press Enter to close...'";
 
+// ---------------------------------------------------------------------
+// Keychron keyboards: WebHID udev rule (Keychron Launcher / VIA)
+// ---------------------------------------------------------------------
+
+/// The Keychron Launcher (launcher.keychron.com) and VIA talk to keyboards
+/// through WebHID, which needs raw access to /dev/hidraw*. Linux denies that
+/// to unprivileged users, so Chromium silently lists no keyboards until a
+/// udev rule grants the seat user access.
+///
+/// The `70-` prefix is load-bearing. systemd's 73-seat-late.rules applies the
+/// `uaccess` ACL, and udev evaluates rule files in lexical order — a file
+/// named 99-keychron.rules, as most guides suggest, is evaluated after that
+/// pass and grants nothing at all.
+const KEYCHRON_RULES_PATH: [:0]const u8 = "/etc/udev/rules.d/70-keychron.rules";
+const KEYCHRON_LAUNCHER_URL: [:0]const u8 = "https://launcher.keychron.com";
+
+const KEYCHRON_RULES_CONTENT =
+    "# Keychron Launcher WebHID permissions (written by simpbar-welcome)\n" ++
+    "#\n" ++
+    "# The 70- prefix matters: 73-seat-late.rules applies the uaccess ACL,\n" ++
+    "# and udev evaluates rule files in lexical order — a 99- rule is too\n" ++
+    "# late and silently grants nothing.\n" ++
+    "\n" ++
+    "# Keychron keyboards, mice and 2.4GHz receivers (USB vendor 3434).\n" ++
+    "KERNEL==\"hidraw*\", SUBSYSTEM==\"hidraw\", ATTRS{idVendor}==\"3434\", MODE=\"0660\", TAG+=\"uaccess\"\n" ++
+    "\n" ++
+    "# STM32 bootloader mode (hold Esc while plugging in) for firmware updates.\n" ++
+    "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"0483\", ATTRS{idProduct}==\"df11\", MODE=\"0660\", TAG+=\"uaccess\"\n" ++
+    "\n" ++
+    "# The USB device nodes themselves, so Chromium can enumerate Keychron\n" ++
+    "# devices for its WebHID device chooser.\n" ++
+    "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"3434\", MODE=\"0660\", TAG+=\"uaccess\"\n";
+
+/// Chromium-family browsers, in preference order. WebHID is Chromium-only:
+/// Firefox never implements it, so the Launcher's Connect button cannot work
+/// there no matter what the udev rules say.
+const KeychronBrowserInfo = struct { bin: []const u8, label: []const u8 };
+
+const KEYCHRON_BROWSERS = [_]KeychronBrowserInfo{
+    .{ .bin = "chromium", .label = "Chromium" },
+    .{ .bin = "helium-browser", .label = "Helium" },
+    .{ .bin = "google-chrome-stable", .label = "Chrome" },
+    .{ .bin = "google-chrome", .label = "Chrome" },
+    .{ .bin = "brave-browser", .label = "Brave" },
+    .{ .bin = "brave", .label = "Brave" },
+    .{ .bin = "vivaldi-stable", .label = "Vivaldi" },
+    .{ .bin = "microsoft-edge-stable", .label = "Edge" },
+};
+
+var keychron_browser_buf: [64]u8 = undefined;
+var keychron_model_buf: [96]u8 = undefined;
+
+var g_keychron_row: ?*gtk.AdwActionRow = null;
+var g_keychron_button: ?*gtk.GtkButton = null;
+var g_keychron_polling: bool = false;
+var g_keychron_poll_ticks: u32 = 0;
+
+const KeychronBrowser = struct { bin: [:0]const u8, label: []const u8 };
+
+/// First Chromium-family browser on PATH, as a NUL-terminated slice (for
+/// exec) plus a friendly name (for the row subtitle).
+fn keychronBrowser() ?KeychronBrowser {
+    for (KEYCHRON_BROWSERS) |entry| {
+        if (!commandExists(entry.bin)) continue;
+        if (entry.bin.len >= keychron_browser_buf.len) continue;
+        @memcpy(keychron_browser_buf[0..entry.bin.len], entry.bin);
+        keychron_browser_buf[entry.bin.len] = 0;
+        return .{ .bin = keychron_browser_buf[0..entry.bin.len :0], .label = entry.label };
+    }
+    return null;
+}
+
+/// Finds a Keychron device in `lsusb` output and returns its model name
+/// (e.g. "Keychron K2 HE"). Prefers a keyboard over a Link receiver.
+fn keychronUsbModel() ?[]const u8 {
+    if (!commandExists("lsusb")) return null;
+    const out = runCaptured(&[_][:0]const u8{"lsusb"}, 1500) orelse return null;
+    defer gpa.free(out);
+
+    var first: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        const at = std.mem.indexOf(u8, line, "3434:") orelse continue;
+        const rest = line[at..];
+        const space = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+        var model = std.mem.trim(u8, rest[space + 1 ..], " \r\t");
+        // lsusb repeats the vendor name: "Keychron Keychron K2 HE".
+        if (std.mem.startsWith(u8, model, "Keychron "))
+            model = model["Keychron ".len..];
+        if (model.len == 0 or model.len > keychron_model_buf.len) continue;
+        if (std.mem.indexOf(u8, model, "Link") != null or
+            std.mem.indexOf(u8, model, "Receiver") != null)
+        {
+            if (first == null) first = model;
+            continue;
+        }
+        @memcpy(keychron_model_buf[0..model.len], model);
+        return keychron_model_buf[0..model.len];
+    }
+    if (first) |model| {
+        @memcpy(keychron_model_buf[0..model.len], model);
+        return keychron_model_buf[0..model.len];
+    }
+    return null;
+}
+
+fn keychronRulesInstalled() bool {
+    return fileExists(KEYCHRON_RULES_PATH);
+}
+
+fn keychronRulesCurrent() bool {
+    const data = readFileAll(KEYCHRON_RULES_PATH) orelse return false;
+    defer gpa.free(data);
+    return std.mem.eql(u8, data, KEYCHRON_RULES_CONTENT);
+}
+
+fn keychronSetupSubtitle(buf: []u8) [:0]const u8 {
+    const exists = keychronRulesInstalled();
+    const current = exists and keychronRulesCurrent();
+    const detected = keychronUsbModel();
+    const state_text: [:0]const u8 = if (current)
+        "Rules installed. Replug the keyboard, then open launcher.keychron.com in a Chromium-based browser."
+    else if (exists)
+        "An older rule file is installed \u{2014} update it to grant WebHID access to every Keychron device."
+    else
+        "Not installed. Grants your user WebHID access to every Keychron keyboard, mouse and receiver, plus the firmware-update bootloader.";
+    if (detected) |model| {
+        return std.fmt.bufPrintZ(buf, "{s} Detected: {s}.", .{ state_text, model }) catch state_text;
+    }
+    return std.fmt.bufPrintZ(buf, "{s}", .{state_text}) catch state_text;
+}
+
+fn keychronRunScript(buf: []u8, staged_path: [:0]const u8, pkexec_style: bool) ?[:0]const u8 {
+    // udevadm/install are absolute because pkexec resets PATH; the same
+    // string shape works for the sudo terminal fallback. bufPrintZ() wants
+    // a comptime format string, hence one literal per branch.
+    if (pkexec_style) {
+        return std.fmt.bufPrintZ(buf,
+            "/usr/bin/install -Dm644 '{s}' /etc/udev/rules.d/70-keychron.rules && " ++
+                "/usr/bin/udevadm control --reload-rules && " ++
+                "/usr/bin/udevadm trigger --subsystem-match=hidraw && " ++
+                "/usr/bin/udevadm trigger --subsystem-match=usb && " ++
+                "/usr/bin/rm -f '{s}'",
+            .{ staged_path, staged_path }) catch null;
+    }
+    return std.fmt.bufPrintZ(buf,
+        "sudo /usr/bin/install -Dm644 '{s}' /etc/udev/rules.d/70-keychron.rules && " ++
+            "sudo /usr/bin/udevadm control --reload-rules && " ++
+            "sudo /usr/bin/udevadm trigger --subsystem-match=hidraw && " ++
+            "sudo /usr/bin/udevadm trigger --subsystem-match=usb; " ++
+            "rm -f '{s}'; echo; read -p 'Press Enter to close...'",
+        .{ staged_path, staged_path }) catch null;
+}
+
+fn onKeychronSetupClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    // Stage the rule content as the user first: the privileged half is then
+    // a plain install(1) of a known file, with no shell quoting of the rule
+    // text and no stdin tricks.
+    _ = mkdir(g_simpbar_config_dir, 0o755);
+    var staged_buf: [512]u8 = undefined;
+    const staged = std.fmt.bufPrintZ(&staged_buf, "{s}/keychron-70.rules", .{g_simpbar_config_dir}) catch return;
+    if (!writeFileAll(staged, KEYCHRON_RULES_CONTENT)) {
+        logging.warn("keychron: could not stage rules file at {s}", .{staged});
+        return;
+    }
+
+    var cmd_buf: [1024]u8 = undefined;
+    if (commandExists("pkexec")) {
+        // One graphical polkit prompt (polkit-gnome/mate-polkit ship with
+        // every simpbar install) — no terminal window for a two-line write.
+        const cmd = keychronRunScript(&cmd_buf, staged, true) orelse return;
+        launchArgv(&[_][:0]const u8{ "pkexec", "/usr/bin/sh", "-c", cmd });
+        logging.step("keychron: staged rules, pkexec prompt launched", .{});
+    } else {
+        // Systems stripped of polkit: same work, but sudo in a terminal so
+        // the password prompt and any error stay visible.
+        const script = keychronRunScript(&cmd_buf, staged, false) orelse return;
+        launchInTerminal(script);
+        logging.step("keychron: staged rules, terminal sudo fallback launched", .{});
+    }
+
+    // The prompt is asynchronous: poll for the file so the row flips to
+    // "Reinstall" without a restart when (and only when) the rule landed.
+    if (!g_keychron_polling) {
+        g_keychron_polling = true;
+        g_keychron_poll_ticks = 0;
+        _ = gtk.g_timeout_add(1000, &onKeychronPoll, null);
+    }
+}
+
+fn onKeychronPoll(_: ?*anyopaque) callconv(.c) c_int {
+    g_keychron_poll_ticks += 1;
+    if (keychronRulesCurrent()) {
+        g_keychron_polling = false;
+        if (g_keychron_button) |button| gtk.gtk_button_set_label(button, "Reinstall");
+        if (g_keychron_row) |row| {
+            var buf: [512]u8 = undefined;
+            gtk.adw_action_row_set_subtitle(row, keychronSetupSubtitle(&buf));
+        }
+        return 0; // G_SOURCE_REMOVE
+    }
+    if (g_keychron_poll_ticks >= 180) {
+        g_keychron_polling = false;
+        return 0;
+    }
+    return 1; // G_SOURCE_CONTINUE
+}
+
+fn onKeychronOpenClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (keychronBrowser()) |browser| {
+        launchArgv(&[_][:0]const u8{ browser.bin, KEYCHRON_LAUNCHER_URL });
+        return;
+    }
+    launchInTerminal("sudo pacman -S --noconfirm --needed chromium; echo; read -p 'Press Enter to close...'");
+}
+
+fn buildKeychronGroup() *gtk.AdwPreferencesGroup {
+    const group = gtk.adw_preferences_group_new();
+    gtk.adw_preferences_group_set_title(group, "Keychron keyboards");
+    gtk.adw_preferences_group_set_description(group,
+        "WebHID access for the Keychron Launcher and VIA. Browser-based " ++
+            "configurators cannot see the keyboard without these rules.");
+
+    {
+        const row = gtk.adw_action_row_new();
+        gtk.adw_preferences_row_set_title(@ptrCast(row), "Keychron Launcher support");
+        var sub_buf: [512]u8 = undefined;
+        gtk.adw_action_row_set_subtitle(row, keychronSetupSubtitle(&sub_buf));
+        gtk.adw_action_row_set_icon_name(row, "input-keyboard-symbolic");
+        const label: [:0]const u8 = if (keychronRulesCurrent())
+            "Reinstall"
+        else if (keychronRulesInstalled())
+            "Update"
+        else
+            "Set up";
+        const button = gtk.gtk_button_new_with_label(label);
+        gtk.gtk_widget_add_css_class(@ptrCast(button), "flat");
+        gtk.gtk_widget_set_valign(@ptrCast(button), gtk.ALIGN_CENTER);
+        _ = gtk.g_signal_connect_data(@ptrCast(button), "clicked", @ptrCast(&onKeychronSetupClicked), null, null, 0);
+        gtk.adw_action_row_add_suffix(row, @ptrCast(button));
+        gtk.adw_action_row_set_activatable_widget(row, @ptrCast(button));
+        g_keychron_row = row;
+        g_keychron_button = button;
+        gtk.adw_preferences_group_add(group, @ptrCast(row));
+    }
+
+    {
+        const row = gtk.adw_action_row_new();
+        gtk.adw_preferences_row_set_title(@ptrCast(row), "Open the Keychron Launcher");
+        if (keychronBrowser()) |browser| {
+            var buf: [256]u8 = undefined;
+            const sub = std.fmt.bufPrintZ(&buf, "Opens launcher.keychron.com in {s}.", .{browser.label}) catch
+                "Opens launcher.keychron.com in a Chromium-based browser.";
+            gtk.adw_action_row_set_subtitle(row, sub);
+        } else {
+            gtk.adw_action_row_set_subtitle(row,
+                "Chromium isn't installed. Firefox cannot use WebHID, so this installs Chromium first.");
+        }
+        gtk.adw_action_row_set_icon_name(row, "web-browser-symbolic");
+        const label: [:0]const u8 = if (keychronBrowser() != null) "Open" else "Install Chromium";
+        const button = gtk.gtk_button_new_with_label(label);
+        gtk.gtk_widget_add_css_class(@ptrCast(button), "flat");
+        gtk.gtk_widget_set_valign(@ptrCast(button), gtk.ALIGN_CENTER);
+        _ = gtk.g_signal_connect_data(@ptrCast(button), "clicked", @ptrCast(&onKeychronOpenClicked), null, null, 0);
+        gtk.adw_action_row_add_suffix(row, @ptrCast(button));
+        gtk.adw_action_row_set_activatable_widget(row, @ptrCast(button));
+        gtk.adw_preferences_group_add(group, @ptrCast(row));
+    }
+
+    return group;
+}
+
 const GRAPHICS_OPTIONS = [_][:0]const u8{ "GIMP", "Inkscape", "Krita" };
 const GRAPHICS_PACKAGES = [_][:0]const u8{ "gimp", "inkscape", "krita" };
 
@@ -984,6 +1256,8 @@ fn buildSetupPage() *gtk.GtkBox {
         gtk.adw_preferences_group_add(editor_group, @ptrCast(row));
     }
     gtk.gtk_box_append(box, @ptrCast(editor_group));
+
+    gtk.gtk_box_append(box, @ptrCast(buildKeychronGroup()));
 
     const pins_group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(pins_group, "Pinned apps");

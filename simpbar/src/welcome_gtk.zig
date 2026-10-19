@@ -120,6 +120,7 @@ pub extern "c" fn gtk_switch_get_active(self: *GtkSwitch) c_int;
 // GtkButton
 pub extern "c" fn gtk_button_new_with_label(label: [*:0]const u8) *GtkButton;
 pub extern "c" fn gtk_button_new_from_icon_name(icon_name: [*:0]const u8) *GtkButton;
+pub extern "c" fn gtk_button_set_label(self: *GtkButton, label: [*:0]const u8) void;
 
 // GtkSpinner
 pub extern "c" fn gtk_spinner_new() *GtkSpinner;
