@@ -172,18 +172,37 @@ fn scanApplicationsDir(
     }
 }
 
+/// Fills `out` with the applications dirs in scan order, all strings owned
+/// by `arena` (NUL-terminated for opendir). Order decides "first wins" for
+/// a basename, so the user's own dir leads and Flatpak's exports follow the
+/// system dirs they may override.
+///
+/// Both Flatpak installations are listed, and the *user* one matters as
+/// much as the system one: `flatpak install --user` (the default prompt on
+/// most setups) exports its .desktop files and icons under
+/// ~/.local/share/flatpak/exports/share — which XDG_DATA_DIRS puts ahead of
+/// /var/lib/flatpak, and which a bar that only scans the system tree can
+/// never see. That's the whole reason a running sandboxed app's dot had no
+/// icon to wear.
+pub fn applicationsDirs(arena: std.mem.Allocator, home: []const u8, out: *std.ArrayList([:0]const u8)) !void {
+    // allocPrintSentinel, not bufPrintZ: the returned slices outlive this
+    // frame, and opendir wants them NUL-terminated.
+    try out.append(arena, try std.fmt.allocPrintSentinel(arena, "{s}/.local/share/applications", .{home}, 0));
+    try out.append(arena, try std.fmt.allocPrintSentinel(arena, "{s}/.local/share/flatpak/exports/share/applications", .{home}, 0));
+    try out.append(arena, "/usr/local/share/applications");
+    try out.append(arena, "/usr/share/applications");
+    try out.append(arena, "/var/lib/flatpak/exports/share/applications");
+}
+
 /// Appends every installed, pinnable application to `out`, all strings owned
 /// by `arena`. Order: user dir first (so ~/.local/share overrides win), then
-/// /usr/local, /usr, and Flatpak exports.
+/// the user's Flatpak exports, /usr/local, /usr, and system Flatpak exports.
 pub fn enumerateInstalledApps(arena: std.mem.Allocator, out: *std.ArrayList(DesktopEntry)) !void {
     var seen: std.ArrayList([]const u8) = .empty;
     defer seen.deinit(arena);
 
     const home = std.mem.span(getenv("HOME") orelse "/root");
-    var user_dir_buf: [512]u8 = undefined;
-    const user_dir = std.fmt.bufPrintZ(&user_dir_buf, "{s}/.local/share/applications", .{home}) catch return;
-    scanApplicationsDir(arena, out, &seen, user_dir);
-    scanApplicationsDir(arena, out, &seen, "/usr/local/share/applications");
-    scanApplicationsDir(arena, out, &seen, "/usr/share/applications");
-    scanApplicationsDir(arena, out, &seen, "/var/lib/flatpak/exports/share/applications");
+    var dirs: std.ArrayList([:0]const u8) = .empty;
+    try applicationsDirs(arena, home, &dirs);
+    for (dirs.items) |dir| scanApplicationsDir(arena, out, &seen, dir);
 }

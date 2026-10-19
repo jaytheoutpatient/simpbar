@@ -317,7 +317,13 @@ fn invalidateLauncherIcons() void {
 /// startup from enumerateInstalledApps; first source wins, so user
 /// overrides in ~/.local/share/applications beat system files, matching
 /// the app drawer's own listing order.
-const MAX_DESKTOP_IDX: usize = 384;
+///
+/// Sized to swallow a busy desktop: every entry is 144 bytes of BSS, and a
+/// full index fails silently from the caller's side (the app just keeps
+/// its label). Flatpak exports are scanned last, so a too-small cap shows
+/// up as exactly "sandboxed apps have no icons" — 1024 clears a full KDE
+/// install plus a couple of hundred Flatpak exports with room to spare.
+const MAX_DESKTOP_IDX: usize = 1024;
 const DesktopIdxEntry = struct {
     key_buf: [64]u8 = undefined,
     key_len: usize = 0,
@@ -391,6 +397,12 @@ fn buildDesktopIndex() void {
             const sl = lowerCopy(&sbuf, app.id);
             desktopIndexAdd(sbuf[0..sl], app.icon);
         }
+    }
+    // desktopIndexAdd drops everything past the cap, and Flatpak exports
+    // are the last source scanned — so a full index shows up as "sandboxed
+    // apps have no icon and nothing else looks wrong". Say so out loud.
+    if (desktop_idx_len >= desktop_idx.len) {
+        logging.warn("desktop icon index full ({d} entries) — apps past the cap (flatpak exports scan last) get no icon", .{desktop_idx.len});
     }
 }
 
@@ -551,6 +563,16 @@ fn ensureTailIcons() void {
         const al = @min(s.appid_buf.len, id.len);
         @memcpy(s.appid_buf[0..al], id[0..al]);
         s.appid_len = al;
+        // Steam games first: "steam_app_<appid>" has no .desktop entry for
+        // the index below to find — its icon only exists in Steam's own
+        // library cache, so try there before any name-based resolution.
+        var steam_path_buf: [512]u8 = undefined;
+        if (icontheme.steamGameIconPath(id, &steam_path_buf)) |path| {
+            if (decodeIconIntoPixels(path, &s.pixels)) {
+                s.has_icon = true;
+                continue;
+            }
+        }
         var short = id;
         if (std.mem.lastIndexOfScalar(u8, id, '.')) |dot| short = id[dot + 1 ..];
         const cand = desktopIndexLookupDeep(id) orelse short;
@@ -11346,6 +11368,26 @@ test "taskbar icons resolve" {
     try t.expect(tailIconPixels("alacritty") == null);
     var g = UnpinnedGroup{ .client_idx = 99999 };
     try t.expect(!tailHasIcon(&g));
+}
+
+test "applications dirs cover user flatpak exports" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var dirs: std.ArrayList([:0]const u8) = .empty;
+    try desktop_entries.applicationsDirs(arena, "/home/tester", &dirs);
+    // Scan order is the "first wins" order: the user's own dir leads, then
+    // the user's Flatpak exports — `flatpak install --user` is the default
+    // prompt on most setups, and those entries were invisible here, which
+    // is how a running sandboxed app ended up with a dot but no icon.
+    try t.expectEqual(@as(usize, 5), dirs.items.len);
+    try t.expectEqualStrings("/home/tester/.local/share/applications", dirs.items[0]);
+    try t.expectEqualStrings("/home/tester/.local/share/flatpak/exports/share/applications", dirs.items[1]);
+    try t.expectEqualStrings("/usr/local/share/applications", dirs.items[2]);
+    try t.expectEqualStrings("/usr/share/applications", dirs.items[3]);
+    try t.expectEqualStrings("/var/lib/flatpak/exports/share/applications", dirs.items[4]);
 }
 
 test "cava curve interpolates" {
