@@ -29,6 +29,7 @@ const MAX_OUTPUTS: usize = 8;
 const MAX_WIDGETS: usize = 8;
 const FONT_PIXEL_SIZE: u32 = 13;
 const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
 
 // getenv by hand — enough here, no env-map machinery needed (same approach
 // as the bar).
@@ -118,6 +119,11 @@ const DEFAULT_WIDGETS = [_]WidgetCfg{
     // The analog watch stands alone on the right — it draws its own steel
     // case instead of a frosted card.
     .{ .id = .watch, .x = 1711, .y = 24 },
+    // The desktop-icon grid (~/Desktop shortcuts) floats top-center: both
+    // side columns belong to the widget stack and the watch. Its height
+    // grows and shrinks with the scanned shortcut count; drag it anywhere
+    // with Ctrl+left-click.
+    .{ .id = .icons, .x = 380, .y = 24 },
 };
 
 var shell_config_path_buf: [512]u8 = undefined;
@@ -128,6 +134,8 @@ var reminders_path_buf: [512]u8 = undefined;
 var reminders_path: [:0]const u8 = "";
 var notes_dir_path_buf: [512]u8 = undefined;
 var notes_dir_path: [:0]const u8 = "";
+var desktop_dir_path_buf: [512]u8 = undefined;
+var desktop_dir_path: [:0]const u8 = "";
 var widgets_disabled_path_buf: [512]u8 = undefined;
 var widgets_disabled_path: [:0]const u8 = "";
 var shell_pidfile_path_buf: [512]u8 = undefined;
@@ -188,6 +196,11 @@ fn resolveConfigPaths() void {
     reminders_path = std.fmt.bufPrintZ(&reminders_path_buf, "{s}/reminders.txt", .{dir}) catch "";
     notes_dir_path = std.fmt.bufPrintZ(&notes_dir_path_buf, "{s}/notes", .{dir}) catch "";
     if (notes_dir_path.len > 0) _ = posix.system.mkdir(notes_dir_path.ptr, 0o755); // sticky-note slots
+    // The shortcuts folder — the freedesktop ~/Desktop. Never mkdir'd
+    // here on purpose: an empty desktop shows no grid, and the app
+    // drawer's "Add to desktop" creates it on the first drop.
+    const homez = std.mem.span(getenv("HOME") orelse "");
+    desktop_dir_path = std.fmt.bufPrintZ(&desktop_dir_path_buf, "{s}/Desktop", .{homez}) catch "";
     // Per-widget on/off list (written by simpbar-config, one widget id per
     // line): widgets named here are skipped at startup. Missing file means
     // all enabled, so fresh installs behave exactly as before. A separate
@@ -624,6 +637,7 @@ fn initWidgets(host: *Host, cfg: ShellConfig) void {
             .calendar => .{ .calendar = .{} },
             .note1 => .{ .note1 = .{} },
             .watch => .{ .watch = .{} },
+            .icons => .{ .icons = .{} },
         };
         if (wc.id == .calendar) {
             host.widgets[host.widget_count].calendar.configure(
@@ -634,6 +648,9 @@ fn initWidgets(host: *Host, cfg: ShellConfig) void {
         } else switch (wc.id) {
             // Sticky note loads its text (possibly empty) from disk.
             .note1 => host.widgets[host.widget_count].note1.configure(notes_dir_path, 1),
+            // Desktop icons arm the inotify watch and take their first
+            // scan right away; sizing waits for the first paintDesktop.
+            .icons => host.widgets[host.widget_count].icons.configure(host.gpa, desktop_dir_path),
             else => {},
         }
         host.widget_rects[host.widget_count] = .{
@@ -802,6 +819,10 @@ fn paintDesktop(host: *Host, d: *Desktop) !void {
     // every widget pixel below is blitted from its tile — the untouched
     // background stays fully transparent.
 
+    // 0) Content-driven icons: the grid's tile grows/shrinks with the
+    //    scanned shortcut count before its dirty-bit tile renders.
+    applyIconsSize(host);
+
     // 1) Re-render the tiles whose widgets asked for it (state change from
     //    tick/onPipe/click, or a frame-wide hover/theme change). A tile is
     //    widget-local: rect at (0, 0), so paint coordinates stay small.
@@ -829,21 +850,28 @@ fn paintDesktop(host: *Host, d: *Desktop) !void {
         };
         const tr = widgets_mod.Rect{ .x = 0, .y = 0, .w = rect.w, .h = rect.h };
         // The watch draws its own steel case — no frosted card behind it
-        // (the case and bracelet ARE the widget chrome). Cards never
-        // highlight on hover — the fill stays bg_color under the pointer;
-        // hover tracking itself (clicks, the weather condition-fx) is
-        // untouched, only the wash is gone.
-        if (std.meta.activeTag(host.widgets[i]) != .watch) {
-            const fill = widgets_mod.withAlpha(
-                host.theme.bg_color,
-                host.theme.card_alpha,
-            );
-            tc.card(tr, fill, host.theme.border_color);
+        // (the case and bracelet ARE the widget chrome). Same for the
+        // desktop-icon grid: bare glyphs over the wallpaper like a classic
+        // desktop. Cards never highlight on hover — the fill stays bg_color
+        // under the pointer; hover tracking itself (clicks, the weather
+        // condition-fx) is untouched, only the wash is gone.
+        switch (std.meta.activeTag(host.widgets[i])) {
+            .watch, .icons => {},
+            else => {
+                const fill = widgets_mod.withAlpha(
+                    host.theme.bg_color,
+                    host.theme.card_alpha,
+                );
+                tc.card(tr, fill, host.theme.border_color);
+            },
         }
         host.widgets[i].paint(tc, tr);
         // Resize affordance over the content (tile-local): visible while
-        // hovered or grabbed, repainted away with the tile otherwise.
-        if (host.hovered_index == i or host.resize_index == i) {
+        // hovered or grabbed, repainted away with the tile otherwise. The
+        // icons grid is content-sized, so it never shows the grip.
+        if ((host.hovered_index == i or host.resize_index == i) and
+            std.meta.activeTag(host.widgets[i]) != .icons)
+        {
             drawResizeGrip(tc, tr);
         }
     }
@@ -906,6 +934,81 @@ fn markAllDirty(host: *Host) void {
     host.tile_dirty = 0xFFFF;
 }
 
+/// Content-driven sizing for the desktop-icons grid: each scan changes the
+/// item count, so the widget's rect tracks the grid (zero = no grid at
+/// all). Runs at the top of paintDesktop so a resize lands before the tile
+/// renders; a rect change also re-establishes input regions immediately.
+fn applyIconsSize(host: *Host) void {
+    for (0..host.widget_count) |i| {
+        if (std.meta.activeTag(host.widgets[i]) != .icons) continue;
+        const want = widgets_mod.IconsWidget.gridSizeFor(host.widgets[i].icons.item_count);
+        const r = &host.widget_rects[i];
+        if (r.w == want[0] and r.h == want[1]) continue;
+        r.w = @intCast(want[0]);
+        r.h = @intCast(want[1]);
+        if (want[0] == 0 or want[1] == 0) {
+            // Empty folder: drop the tile; a zero rect paints and blits
+            // nothing and keeps no input region (initWidgets allocated a
+            // base-size tile for the first frame only).
+            if (host.tiles[i]) |t| host.gpa.free(t);
+            host.tiles[i] = null;
+            markDirty(host, i);
+        } else {
+            reallocTile(host, i); // frees, reallocs, marks dirty
+        }
+        refreshInputRegions(host);
+        host.needs_repaint = true;
+    }
+}
+
+/// Motion pass for the desktop icons (hover wash + popup rows). Returns
+/// repaint-need; `active` = the pointer currently sits on a desktop surface.
+fn iconsPointerChanged(host: *Host, active: bool) bool {
+    var changed = false;
+    for (0..host.widget_count) |i| {
+        if (std.meta.activeTag(host.widgets[i]) != .icons) continue;
+        if (host.widgets[i].icons.pointer(host.widget_rects[i], active, host.pointer_x, host.pointer_y)) {
+            markDirty(host, i);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+/// Any open icons popup closes (a press landed elsewhere, or the pointer
+/// left the grid entirely).
+fn closeIconsMenus(host: *Host) void {
+    for (0..host.widget_count) |i| {
+        if (std.meta.activeTag(host.widgets[i]) != .icons) continue;
+        if (host.widgets[i].icons.menu_open) {
+            host.widgets[i].icons.closeMenu();
+            markDirty(host, i);
+        }
+    }
+}
+
+/// Right-button press routing: over the icons grid it opens the Open/Remove
+/// popup for the cell under the pointer; anywhere else it just dismisses
+/// an open popup. Driven through pointerButton like every other press, so
+/// the self-test exercises the same path.
+fn handleRightPress(host: *Host) void {
+    var hit: ?usize = null;
+    for (0..host.widget_count) |i| {
+        if (host.widget_rects[i].contains(host.pointer_x, host.pointer_y)) {
+            hit = i;
+            break;
+        }
+    }
+    if (hit) |i| {
+        if (std.meta.activeTag(host.widgets[i]) == .icons) {
+            host.widgets[i].icons.rightClick(host.widget_rects[i], host.pointer_x, host.pointer_y);
+            markDirty(host, i);
+            return;
+        }
+    }
+    closeIconsMenus(host);
+}
+
 fn layerSurfaceListener(_: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, d: *Desktop) void {
     switch (event) {
         .configure => |cfg| {
@@ -959,6 +1062,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
             host.pointer_x = e.surface_x.toInt();
             host.pointer_y = e.surface_y.toInt();
             if (updateHover(host)) markAllDirty(host);
+            _ = iconsPointerChanged(host, true);
         },
         .leave => {
             if (host.pointer_over_ov) {
@@ -973,6 +1077,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
                 host.hovered_index = null;
                 markAllDirty(host);
             }
+            _ = iconsPointerChanged(host, false);
         },
         .motion => |e| {
             if (host.pointer_over_ov) {
@@ -1017,7 +1122,11 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
                 clampWidget(host, i);
                 host.hovered_index = i;
                 host.needs_repaint = true;
-            } else if (updateHover(host)) markAllDirty(host);
+            } else {
+                if (updateHover(host)) markAllDirty(host);
+                // Cell-level hover wash + popup row highlight (icons grid).
+                _ = iconsPointerChanged(host, true);
+            }
         },
         .button => |e| {
             if (host.pointer_over_ov) {
@@ -1040,10 +1149,21 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, host: *Host) void {
 /// isn't the note being edited commits that note first (Plasma-style: the
 /// focused-vs-clicking ordering can otherwise eat keystrokes).
 fn pointerButton(host: *Host, btn: u32, pressed: bool) void {
+    if (btn == BTN_RIGHT) {
+        if (pressed) handleRightPress(host);
+        return;
+    }
     if (btn != BTN_LEFT) return;
     if (pressed) {
         host.left_down = true;
         host.press_index = host.hovered_index;
+        // A press outside the desktop-icons widget closes its popup (a
+        // press inside routes through the click below, where the row acts).
+        if (host.hovered_index) |hi| {
+            if (std.meta.activeTag(host.widgets[hi]) != .icons) closeIconsMenus(host);
+        } else {
+            closeIconsMenus(host);
+        }
         if (host.edit_index) |ei| {
             const pi = host.press_index;
             if (pi == null or pi != ei) endEdit(host);
@@ -1184,6 +1304,8 @@ fn tryStartResize(host: *Host) bool {
     if (!host.left_down or host.resize_index != null) return false;
     if (host.drag_index != null or host.bezel_index != null) return false;
     const index = host.press_index orelse host.hovered_index orelse return false;
+    // The icons grid is content-sized — its corner grip does nothing.
+    if (std.meta.activeTag(host.widgets[index]) == .icons) return false;
     const r = host.widget_rects[index];
     if (!resizeHit(r, host.pointer_x, host.pointer_y)) return false;
     host.resize_index = index;
@@ -1401,7 +1523,10 @@ fn keyPress(host: *Host, keycode: u32) void {
 /// base size, never below 1 (cards can't shrink past base). Note1 is
 /// exempt — it reflows instead of zooming.
 fn widgetZoom(host: *Host, i: usize) f32 {
-    if (std.meta.activeTag(host.widgets[i]) == .note1) return 1.0;
+    // Notes reflow at base size and the icons grid is content-sized —
+    // neither participates in corner-resize zoom.
+    if (std.meta.activeTag(host.widgets[i]) == .note1 or
+        std.meta.activeTag(host.widgets[i]) == .icons) return 1.0;
     const base = widgets_mod.cardSizeFor(std.meta.activeTag(host.widgets[i]), host.font);
     const zw = @as(f32, @floatFromInt(host.widget_rects[i].w)) / @as(f32, @floatFromInt(base[0]));
     const zh = @as(f32, @floatFromInt(host.widget_rects[i].h)) / @as(f32, @floatFromInt(base[1]));
@@ -1414,7 +1539,8 @@ fn widgetZoom(host: *Host, i: usize) f32 {
 /// sets Canvas.zoom to match; font metrics and layout scaling stay in
 /// sync by construction.
 fn zoomFontFor(host: *Host, i: usize, zoom: f32) *font_mod.Font {
-    if (std.meta.activeTag(host.widgets[i]) == .note1) return host.font;
+    if (std.meta.activeTag(host.widgets[i]) == .note1 or
+        std.meta.activeTag(host.widgets[i]) == .icons) return host.font;
     const want: u32 = @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(host.font.pixel_size)) * zoom))));
     if (host.zoom_fonts[i] == null or host.zoom_px[i] != want) {
         if (host.zoom_fonts[i]) |*f| f.deinit();

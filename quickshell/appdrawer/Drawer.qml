@@ -38,6 +38,10 @@ PanelWindow {
     // Overlay popups are mutually exclusive: opening one closes the other,
     // instead of letting a second one paint over an open menu.
     property bool optionsOpen: false
+    // "Add to desktop" confirm popup: the app whose launcher link will be
+    // written to ~/Desktop on confirmation (set by a tile right-click).
+    property bool deskOpen: false
+    property var deskApp: null
     // Wallpapers tab only: when true, the top search box asks wallhaven.cc
     // instead of filtering local tiles, and the grid below becomes a remote
     // preview feed until a tile is clicked.
@@ -132,6 +136,7 @@ PanelWindow {
         win.tab = id
         win.powerOpen = ""
         win.optionsOpen = false
+        win.deskOpen = false
         resetSearch()
         // Refresh on entry: the wallpaper list and the current wallpaper can
         // both change underneath us (a random pick from a terminal, a file added
@@ -174,6 +179,7 @@ PanelWindow {
         if (!win.open)
             openDrawer()
         win.optionsOpen = false
+        win.deskOpen = false
         win.powerOpen = "menu"
     }
 
@@ -193,6 +199,7 @@ PanelWindow {
         win.open = false
         win.powerOpen = ""
         win.optionsOpen = false
+        win.deskOpen = false
         resetSearch()
         // Unmap once the slide-out finishes, otherwise the full-screen
         // invisible surface would keep swallowing clicks and the keyboard.
@@ -708,7 +715,14 @@ PanelWindow {
                         AppModel.launch(app);
                         win.closeDrawer();
                     }
-                    onToggleFavourite: AppModel.toggleFav(app.id)
+                    // Right-click no longer silently flips a pin: it opens
+                    // the add-to-desktop / favourite mini panel.
+                    onMenu: {
+                        win.optionsOpen = false;
+                        win.powerOpen = "";
+                        win.deskApp = app;
+                        win.deskOpen = true;
+                    }
                 }
 
                 Text {
@@ -1466,6 +1480,192 @@ PanelWindow {
                 }
             }
         }
+
+        // ---- add-to-desktop confirm panel (overlaid, inside the panel) ---
+        // Right-clicking a tile asks before writing anything here. Add
+        // creates a real .desktop file (the same kind any classic desktop
+        // context menu would leave behind) in ~/Desktop, which the
+        // simpbar-shell icon grid reads straight off disk: the file appears
+        // as an icon on the wallpaper without touching the daemon.
+        Rectangle {
+            id: deskPanel
+            visible: win.deskOpen
+            anchors.right: parent.right
+            anchors.rightMargin: win.padX
+            anchors.bottom: footer.top
+            anchors.bottomMargin: 6
+            width: 320
+            height: 186
+            radius: 12
+            color: Theme.window
+            border.width: 1
+            border.color: Theme.separator
+            z: 50
+
+            property string status: ""
+            readonly property string deskDir: Quickshell.env("HOME") + "/Desktop"
+
+            onVisibleChanged: {
+                if (!visible) {
+                    win.deskApp = null;
+                    deskPanel.status = "";
+                }
+            }
+
+            // Filenames should stay boring: / and friends otherwise make
+            // the file land in the wrong place or not at all.
+            function sanitizeBase(name) {
+                return String(name).replace(/[\/\\:*?"<>|]/g, "-").trim();
+            }
+
+            function content(app) {
+                var s = "[Desktop Entry]\nType=Application\nVersion=1.0\nName="
+                        + app.name + "\n";
+                // The resolved absolute path when the drawer found one;
+                // otherwise the raw theme name (steam_app_N and friends —
+                // the shell's resolver knows those too).
+                var icon = app.icon !== "" ? app.icon : String(app.entry.icon || "");
+                if (icon !== "")
+                    s += "Icon=" + icon + "\n";
+                s += "Exec=" + String(app.entry.execString || app.name) + "\n";
+                s += "Terminal=" + (app.entry.runInTerminal ? "true" : "false") + "\n";
+                return s;
+            }
+
+            function add() {
+                if (!win.deskApp || deskWriter.running)
+                    return;
+                deskWriter.command = ["sh", "-c",
+                    'mkdir -p "$2"\n' +
+                    'f="$2/$3.desktop"; n=0\n' +
+                    'while [ -e "$f" ]; do n=$((n+1)); f="$2/$3 ($n).desktop"; done\n' +
+                    'cat > "$f"\n' +
+                    'echo "Added to the desktop: ${f##*/}"',
+                    "simpbar-add-desktop",
+                    deskPanel.content(win.deskApp),
+                    deskPanel.deskDir,
+                    deskPanel.sanitizeBase(win.deskApp.name)];
+                deskWriter.running = true;
+            }
+
+            Column {
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: 10
+
+                Item {
+                    width: parent.width
+                    height: 20
+
+                    Text {
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Add to desktop"
+                        color: Theme.text
+                        font.pixelSize: 14
+                        font.bold: true
+                    }
+                    Rectangle {
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 22
+                        height: 18
+                        radius: 6
+                        color: deskXHover.hovered ? Theme.hover : "transparent"
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "×"
+                            color: Theme.dim
+                            font.pixelSize: 13
+                        }
+
+                        HoverHandler { id: deskXHover }
+                        TapHandler { onTapped: win.deskOpen = false }
+                    }
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: 1
+                    color: Theme.separator
+                }
+
+                Text {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: win.deskApp
+                          ? "A launcher link for “" + win.deskApp.name + "” lands in ~/Desktop — the icon grid on the wallpaper picks it up on the spot."
+                          : "A launcher link lands in ~/Desktop."
+                    color: Theme.dim
+                    font.pixelSize: 12
+                }
+
+                Row {
+                    width: parent.width
+                    spacing: 8
+
+                    Item {
+                        width: 148
+                        height: 28
+
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: 8
+                            color: deskAddHover.hovered ? Theme.hover : Theme.accent
+                            opacity: 0.9
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: "Add to desktop"
+                                color: deskAddHover.hovered ? Theme.accent : Theme.window
+                                font.pixelSize: 12
+                                font.bold: true
+                            }
+                        }
+                        HoverHandler { id: deskAddHover }
+                        TapHandler { onTapped: deskPanel.add() }
+                    }
+
+                    Item {
+                        width: 148
+                        height: 28
+
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: 8
+                            color: deskFavHover.hovered ? Theme.hover : "transparent"
+                            border.width: 1
+                            border.color: Theme.separator
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: (win.deskApp && AppModel.isFav(win.deskApp.id))
+                                      ? "Remove from favourites"
+                                      : "Add to favourites"
+                                color: Theme.text
+                                font.pixelSize: 12
+                            }
+                        }
+                        HoverHandler { id: deskFavHover }
+                        TapHandler {
+                            onTapped: {
+                                if (win.deskApp)
+                                    AppModel.toggleFav(win.deskApp.id);
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    width: parent.width
+                    elide: Text.ElideRight
+                    text: deskPanel.status
+                    color: Theme.dim
+                    font.pixelSize: 11
+                }
+            }
+        }
     }
 
     function toggleOptions() {
@@ -1476,6 +1676,7 @@ PanelWindow {
         if (!win.open)
             win.openDrawer();
         win.powerOpen = "";
+        win.deskOpen = false;
         win.optionsOpen = true;
     }
 
@@ -1590,6 +1791,30 @@ PanelWindow {
             whOpts.saving = false;
             if (whOpts.status === "Saving…")
                 whOpts.status = "Saved";
+        }
+    }
+
+    // Writes the add-to-desktop .desktop file (content is positional arg 1,
+    // dir arg 2, sanitized basename arg 3; stdout reports the final name so
+    // "(n)" collision numbering is visible).
+    Process {
+        id: deskWriter
+        stdout: StdioCollector {
+            onStreamFinished: {
+                deskPanel.status = text.trim();
+                deskWriter.running = false;
+            }
+        }
+        stderr: StdioCollector {
+            onStreamFinished: {
+                var msg = text.trim();
+                if (msg.length > 0)
+                    deskPanel.status = msg;
+            }
+        }
+        onExited: {
+            if (deskPanel.status === "")
+                deskPanel.status = "Added";
         }
     }
 }

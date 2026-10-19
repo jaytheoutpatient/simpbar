@@ -9,7 +9,7 @@ Item {
     property bool selected: false
 
     signal triggered()
-    signal toggleFavourite()
+    signal menu()
 
     implicitWidth: Theme.tileWidth
     implicitHeight: Theme.tileHeight
@@ -94,6 +94,6 @@ Item {
 
     TapHandler {
         acceptedButtons: Qt.RightButton
-        onTapped: tile.toggleFavourite()
+        onTapped: tile.menu()
     }
 }

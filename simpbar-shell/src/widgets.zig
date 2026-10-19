@@ -18,8 +18,9 @@ const posix = std.posix;
 const font_mod = @import("font");
 const art_mod = @import("art");
 const logging = @import("logging");
+const icontheme = @import("icontheme");
 
-pub const WidgetId = enum { clock, weather, media, system, calendar, watch, note1 };
+pub const WidgetId = enum { clock, weather, media, system, calendar, watch, note1, icons };
 
 /// Axis-aligned rect in surface coordinates. The host keeps one per widget
 /// (measured from the font at startup, placed from config).
@@ -89,6 +90,26 @@ const WATCH_W: i64 = 190;
 const WATCH_H: i64 = 200;
 const WATCH_CASE_R: f64 = 86;
 
+// Desktop-icons geometry: a 2-column grid of icon cells (44px bitmap + up
+// to two 13px label lines), no card background — these sit directly on the
+// wallpaper the way a classic desktop does. Sizing is content-driven: the
+// host sizes the widget's rect from the scanned item count (see IconsWidget
+// gridSize and main.zig applyIconsSize), so the corner-resize grip is
+// disabled for this widget while Ctrl+drag keeps working.
+pub const ICON_PX: i64 = 44; // icon bitmap box inside a cell
+pub const ICON_CELL_W: i64 = 96; // cell width incl. side padding
+pub const ICON_CELL_H: i64 = 88; // icon + two label lines
+pub const ICON_GAP: i64 = 6; // between cells
+pub const ICON_TILE_PAD: i64 = 10;
+pub const ICON_COLS: usize = 2;
+pub const MENU_W: i64 = 132;
+pub const MENU_ROW_H: i64 = 26;
+pub const MAX_ICONS: usize = 64; // scan cap (a desktop with 64+ shortcuts needs folders, not this list)
+pub const ICON_NAME_MAX: usize = 128;
+pub const ICON_PATH_MAX: usize = 340;
+pub const ICON_EXEC_MAX: usize = 340;
+pub const ICON_ARGS_MAX: usize = 16;
+
 /// 0xAARRGGBB with alpha rescaled to `alpha_pct` (0-100), RGB untouched.
 /// Used for card fills so only the background's opacity varies.
 pub fn withAlpha(color: u32, alpha_pct: u32) u32 {
@@ -119,6 +140,10 @@ pub fn cardSizeFor(id: WidgetId, font: *const font_mod.Font) [2]u32 {
         .note1 => .{ @intCast(NoteWidget.NOTE_W), @intCast(2 * CARD_PAD + NoteWidget.VISIBLE_LINES * lh) },
         // Fixed-size: the watch is drawn from its own geometry, not the font.
         .watch => .{ @intCast(WATCH_W), @intCast(WATCH_H) },
+        // Desktop icons: the real size is content-driven (rescan count =>
+        // applyIconsSize); the base is just the empty-state minimum so the
+        // first frame has a tile to paint into.
+        .icons => .{ @intCast(2 * ICON_TILE_PAD + ICON_COLS * ICON_CELL_W + (ICON_COLS - 1) * ICON_GAP), @intCast(2 * ICON_TILE_PAD + ICON_CELL_H) },
     };
 }
 
@@ -285,6 +310,32 @@ pub const Canvas = struct {
                 if (pxu >= self.width or pyu >= self.height) continue;
                 if (!insideRounded(px, py, x, y, iw, ih, radius)) continue;
                 const src = (a << 24) | (@as(u32, rgba[o]) << 16) | (@as(u32, rgba[o + 1]) << 8) | rgba[o + 2];
+                self.pixels[pyu * self.width + pxu] = blendOver(self.pixels[pyu * self.width + pxu], src);
+            }
+        }
+    }
+
+    /// Blits straight-alpha ARGB32 (`w*h` row-major 0xAARRGGBB) — the
+    /// icontheme decoder's icon tiles (desktop icons). Per-pixel OVER
+    /// blend with the same rounded mask as blitRgba, so transparent
+    /// corners and antialiased rims composite instead of punching holes.
+    pub fn blitArgb(self: Canvas, x: i64, y: i64, w: u64, h: u64, argb: []const u32, radius: i64) void {
+        const iw: i64 = @intCast(w);
+        const ih: i64 = @intCast(h);
+        var row: u64 = 0;
+        while (row < h) : (row += 1) {
+            var col: u64 = 0;
+            while (col < w) : (col += 1) {
+                const src = argb[row * w + col];
+                const a: u32 = (src >> 24) & 0xFF;
+                if (a == 0) continue;
+                const px = x + @as(i64, @intCast(col));
+                const py = y + @as(i64, @intCast(row));
+                if (px < 0 or py < 0) continue;
+                const pxu: usize = @intCast(px);
+                const pyu: usize = @intCast(py);
+                if (pxu >= self.width or pyu >= self.height) continue;
+                if (!insideRounded(px, py, x, y, iw, ih, radius)) continue;
                 self.pixels[pyu * self.width + pxu] = blendOver(self.pixels[pyu * self.width + pxu], src);
             }
         }
@@ -3276,6 +3327,992 @@ pub const NoteWidget = struct {
 /// Mode-independent font advance — the layout math reads glyph advances
 /// through this so the same code runs in painting and in tests (tests use a
 /// fixed-advance stand-in via `measure: anytype`).
+// --- desktop shortcuts (~/Desktop as real desktop icons) -------------------
+//
+// Scans Type=Application .desktop files and shows a self-arranging 2-column
+// grid of 44px icons on the same bottom-layer surface the widgets paint —
+// above the wallpaper, behind windows, exactly like a classic desktop.
+// Single click selects, double click launches, right click opens a small
+// Open/Remove popup. The folder is watched with inotify, so files the app
+// drawer's "Add to desktop" (or Steam, or a file manager) drop there appear
+// and disappear live, never needing a restart.
+//
+// Icon art reuses the bar's resolver (icontheme.*): an absolute Icon= path
+// is used straight from disk, steam_app_<id> names reach the Steam library
+// caches, everything else goes through the freedesktop theme walk (user
+// flatpak exports and user icon dirs first, then hicolor). No hit means a
+// letter chip, mirroring the app drawer's fallback tile.
+//
+// The grid is the classic "auto-arrange" mode: items sort alphabetically and
+// flow into the columns; free per-icon dragging (the reference shell's
+// desktop_icons_layout.txt) is a v2 idea. The grid itself Ctrl+drags like
+// every other widget; the corner-resize grip is disabled since its size is
+// content-driven.
+
+/// inotify bits (sys/inotify.h), bound by hand like the rest of libc here.
+/// The watch covers exactly what can change a grid: entry add/delete, both
+/// halves of a rename, a finished content write, and an mtime bump.
+const IN_ATTRIB: u32 = 0x4;
+const IN_CLOSE_WRITE: u32 = 0x8;
+const IN_MOVED_FROM: u32 = 0x40;
+const IN_MOVED_TO: u32 = 0x80;
+const IN_CREATE: u32 = 0x100;
+const IN_DELETE: u32 = 0x200;
+const IN_WATCH_MASK: u32 = IN_ATTRIB | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE;
+
+extern "c" fn inotify_init1(flags: c_int) c_int;
+extern "c" fn inotify_add_watch(fd: c_int, path: [*:0]const u8, mask: u32) c_int;
+extern "c" fn fork() c_int;
+extern "c" fn setsid() i32;
+extern "c" fn chdir(path: [*:0]const u8) c_int;
+extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
+extern "c" fn _exit(code: c_int) noreturn;
+
+// IN_NONBLOCK | IN_CLOEXEC (O_NONBLOCK, O_CLOEXEC)
+const INOTIFY_FLAGS: c_int = 0o4000 | 0o2000000;
+
+/// glibc's struct dirent64 (x86_64/Linux layout) + directory iteration —
+/// the same declaration desktop_entries.zig and icontheme.zig use. Only
+/// d_name (and d_type when it's populated) is read here.
+const libc_dir = struct {
+    const DT_DIR: u8 = 4;
+    const Dirent = extern struct {
+        d_ino: u64 = 0,
+        d_off: i64 = 0,
+        d_reclen: u16 = 0,
+        d_type: u8 = 0,
+        d_name: [256]u8 = undefined,
+    };
+    extern "c" fn opendir(path: [*:0]const u8) ?*anyopaque;
+    extern "c" fn readdir(dirp: *anyopaque) ?*const Dirent;
+    extern "c" fn closedir(dirp: *anyopaque) c_int;
+};
+
+/// One desktop shortcut. Fixed buffers, zero lifetime juggling: every rescan
+/// overwrites the list wholesale (items copy by value), pixels free first.
+pub const DesktopItem = struct {
+    name_buf: [ICON_NAME_MAX]u8 = undefined,
+    name_len: usize = 0,
+    path_buf: [ICON_PATH_MAX]u8 = undefined,
+    path_len: usize = 0,
+    icon_buf: [ICON_PATH_MAX]u8 = undefined,
+    icon_len: usize = 0,
+    exec_buf: [ICON_EXEC_MAX]u8 = undefined,
+    exec_len: usize = 0,
+    cwd_buf: [ICON_PATH_MAX]u8 = undefined,
+    cwd_len: usize = 0,
+    terminal: bool = false,
+    /// Decoded ARGB8888 square (ICON_PX², aspect-fit, icontheme.copyIntoIconBuffer
+    /// layout — transparent where nothing painted). null = letter chip.
+    pixels: ?[]u32 = null,
+
+    pub fn name(self: *const DesktopItem) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    pub fn path(self: *const DesktopItem) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
+    pub fn exec(self: *const DesktopItem) []const u8 {
+        return self.exec_buf[0..self.exec_len];
+    }
+    pub fn cwd(self: *const DesktopItem) []const u8 {
+        return self.cwd_buf[0..self.cwd_len];
+    }
+    pub fn icon(self: *const DesktopItem) []const u8 {
+        return self.icon_buf[0..self.icon_len];
+    }
+};
+
+/// Copies `s` into a fixed buffer, truncating. Returns false when anything
+/// was cut (callers treat critical fields as unlaunchable on truncation).
+fn setStored(dst: []u8, dst_len: *usize, s: []const u8) bool {
+    const n = @min(s.len, dst.len);
+    @memcpy(dst[0..n], s[0..n]);
+    dst_len.* = n;
+    return s.len == n;
+}
+
+fn hasSuffix(s: []const u8, suffix: []const u8) bool {
+    return s.len >= suffix.len and std.mem.eql(u8, s[s.len - suffix.len ..], suffix);
+}
+
+/// Parses one .desktop file body into `out`'s fixed buffers. Only the
+/// [Desktop Entry] group matters — a later `[...]` header ends key parsing
+/// (localized Name[xx] variants and action groups never leak in). Returns
+/// false when the entry is not a launchable app: no [Desktop Entry], no
+/// Exec=value, an overflowed critical buffer (path/exec), or a stripped
+/// name that came out empty without a usable file stem.
+pub fn parseDesktopFile(rec: *DesktopItem, raw: []const u8, dir: []const u8, file_name: []const u8) bool {
+    rec.* = .{};
+
+    var in_entry = false;
+    var has_exec = false;
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '[') {
+            in_entry = std.mem.eql(u8, line, "[Desktop Entry]");
+            continue;
+        }
+        if (!in_entry) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        if (std.mem.eql(u8, key, "Type")) {
+            if (!std.mem.eql(u8, value, "Application")) return false;
+        } else if (std.mem.eql(u8, key, "Name")) {
+            if (!setStored(rec.name_buf[0..], &rec.name_len, value)) return false;
+        } else if (std.mem.eql(u8, key, "Icon")) {
+            if (!setStored(rec.icon_buf[0..], &rec.icon_len, value)) return false;
+        } else if (std.mem.eql(u8, key, "Exec")) {
+            if (!setStored(rec.exec_buf[0..], &rec.exec_len, value)) return false;
+            has_exec = true;
+        } else if (std.mem.eql(u8, key, "Path")) {
+            if (!setStored(rec.cwd_buf[0..], &rec.cwd_len, value)) return false;
+        } else if (std.mem.eql(u8, key, "Terminal")) {
+            rec.terminal = std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1");
+        }
+    }
+    if (rec.name_len == 0) {
+        // Localized files commonly lack an unqualified Name=; fall back to
+        // the file stem. Still unusable when THAT is empty.
+        const stem_end = if (hasSuffix(file_name, ".desktop")) file_name.len - ".desktop".len else file_name.len;
+        if (stem_end == 0) return false;
+        if (!setStored(rec.name_buf[0..], &rec.name_len, file_name[0..stem_end])) return false;
+    }
+    if (!has_exec or rec.exec_len == 0) return false;
+
+    // The item's absolute path is what launch/remove acts on. A path too
+    // long for a *launchable* item can't be truncated safely — drop it.
+    if (!setStored(rec.path_buf[0..], &rec.path_len, dir)) return false;
+    if (rec.path_len > 0 and rec.path_buf[rec.path_len - 1] != '/') {
+        if (rec.path_len + 1 > ICON_PATH_MAX) return false;
+        rec.path_buf[rec.path_len] = '/';
+        rec.path_len += 1;
+    }
+    if (rec.path_len + file_name.len > ICON_PATH_MAX) return false;
+    @memcpy(rec.path_buf[rec.path_len..][0..file_name.len], file_name);
+    rec.path_len += file_name.len;
+    return true;
+}
+
+/// Tokenizes a desktop Exec= value into `scratch`-backed argv. Honors the
+/// spec's quoting (double, single, backslash-next) and drops field-code
+/// material we can't satisfy without file/URL context (%f %F %u %U %i %c %k;
+/// %% collapses to a literal %). Free-standing code tokens disappear
+/// entirely; a token built from surrounding text with embedded codes keeps
+/// its other characters. argv slices point into `scratch`; each is
+/// NUL-terminated per token.
+pub const ExecArgv = struct {
+    argv: [ICON_ARGS_MAX][*:0]const u8 = undefined,
+    argc: usize = 0,
+};
+
+/// One Exec= parse in flight: argv slots fill from a cursor over `scratch`,
+/// so token bytes are compacted in place as quotes resolve.
+const ExecCursor = struct {
+    scratch: []u8,
+    out: *ExecArgv,
+    sp: usize = 0,
+    tok_head: usize = 0,
+    tok_len: usize = 0,
+    /// False while the token has only contained dropped field-code bytes —
+    /// such a token vanishes at the boundary instead of becoming "".
+    tok_subst: bool = false,
+
+    fn put(self: *ExecCursor, ch: u8) void {
+        if (self.sp >= self.scratch.len) return; // overflow guard: drop
+        self.scratch[self.sp] = ch;
+        self.sp += 1;
+        self.tok_len += 1;
+        self.tok_subst = true;
+    }
+
+    /// Ends the current token at the next boundary: free-standing or
+    /// empty tokens roll the scratch stick back and vanish; real tokens
+    /// commit a NUL byte and take an argv slot.
+    fn endToken(self: *ExecCursor) void {
+        const commit = self.tok_len > 0 and self.tok_subst and
+            self.out.argc < ICON_ARGS_MAX and self.sp < self.scratch.len;
+        if (commit) {
+            self.scratch[self.sp] = 0;
+            self.out.argv[self.out.argc] = self.scratch[self.tok_head..self.sp :0].ptr;
+            self.out.argc += 1;
+            self.sp += 1;
+        } else {
+            self.sp = self.tok_head;
+        }
+        self.tok_head = self.sp;
+        self.tok_len = 0;
+        self.tok_subst = false;
+    }
+};
+
+/// Tokenizes a desktop Exec= value into `scratch`-backed argv. Honors the
+/// spec's quoting (double, single, backslash-next) and drops field-code
+/// material we can't satisfy without file/URL context (%f %F %u %U %i %c %k;
+/// %% collapses to a literal %). Free-standing code tokens disappear
+/// entirely; a token built from surrounding text with embedded codes keeps
+/// its other characters. argv slices point into `scratch`, each
+/// NUL-terminated, so the array stays valid while `scratch` does.
+pub fn parseExec(exec: []const u8, scratch: []u8) ExecArgv {
+    var out = ExecArgv{};
+    var cur = ExecCursor{ .scratch = scratch, .out = &out };
+    var state: enum { normal, dquote, squote } = .normal;
+    var i: usize = 0;
+    while (i < exec.len) {
+        const ch = exec[i];
+        switch (state) {
+            .normal => switch (ch) {
+                ' ', '\t' => {
+                    cur.endToken();
+                    i += 1;
+                },
+                '"' => {
+                    state = .dquote;
+                    i += 1;
+                },
+                '\'' => {
+                    state = .squote;
+                    i += 1;
+                },
+                '\\' => {
+                    // Out of quotes backslash escapes the next byte.
+                    if (i + 1 < exec.len) {
+                        cur.put(exec[i + 1]);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                },
+                '%' => {
+                    if (i + 1 < exec.len) {
+                        const code = exec[i + 1];
+                        if (code == '%') {
+                            cur.put('%');
+                            i += 2;
+                        } else if (code == 'f' or code == 'F' or code == 'u' or
+                            code == 'U' or code == 'i' or code == 'c' or code == 'k')
+                        {
+                            // A dropped field code contributes no bytes;
+                            // the token closes empty at the boundary.
+                            i += 2;
+                        } else {
+                            cur.put(ch); // unknown +%x: keep the % literal
+                            i += 1;
+                        }
+                    } else {
+                        cur.put(ch);
+                        i += 1;
+                    }
+                },
+                else => {
+                    cur.put(ch);
+                    i += 1;
+                },
+            },
+            .dquote => switch (ch) {
+                '"' => {
+                    state = .normal;
+                    i += 1;
+                },
+                '\\' => blk: {
+                    // Inside double quotes the spec honors only these four
+                    // escapes; any other backslash stays literal.
+                    if (i + 1 < exec.len) switch (exec[i + 1]) {
+                        '"', '\\', '$', '`' => {
+                            cur.put(exec[i + 1]);
+                            i += 2;
+                            break :blk;
+                        },
+                        else => {},
+                    };
+                    cur.put('\\');
+                    i += 1;
+                },
+                else => {
+                    cur.put(ch);
+                    i += 1;
+                },
+            },
+            .squote => switch (ch) {
+                '\'' => {
+                    state = .normal;
+                    i += 1;
+                },
+                else => {
+                    cur.put(ch); // backslashes are literal in single quotes
+                    i += 1;
+                },
+            },
+        }
+    }
+    cur.endToken();
+    return out;
+}
+
+pub const IconsWidget = struct {
+    /// Grid rescan cadence. The inotify watch makes file events instant;
+    /// this tick only re-arms a failed watch when ~/Desktop appears
+    /// mid-session.
+    pub const interval_ms: i64 = 5000;
+    /// Two releases over the same cell inside this window launch.
+    pub const dbl_click_ms: i64 = 500;
+    pub const MENU_H: i64 = 2 * MENU_ROW_H + 14;
+    pub const MENU_PAD: i64 = 7;
+
+    gpa: std.mem.Allocator = undefined,
+    dir_buf: [ICON_PATH_MAX]u8 = undefined,
+    dir_len: usize = 0,
+    items: [MAX_ICONS]DesktopItem = undefined,
+    item_count: usize = 0,
+    notify_fd: posix.fd_t = -1,
+    hover: ?u16 = null,
+    /// Selected icon; dropped automatically when a scan loses it.
+    selected: ?u16 = null,
+    last_click_idx: ?u16 = null,
+    last_click_ms: i64 = 0,
+    /// The Open/Remove popup, in tile-local coordinates, for `menu_item`'s row.
+    menu_open: bool = false,
+    menu_x: i64 = 0,
+    menu_y: i64 = 0,
+    menu_item: usize = 0,
+    /// 0 = none, 1 = Open row, 2 = Remove row.
+    menu_hover: u8 = 0,
+
+    pub fn configure(self: *IconsWidget, gpa: std.mem.Allocator, directory: []const u8) void {
+        self.gpa = gpa;
+        if (setStored(self.dir_buf[0..], &self.dir_len, directory)) {
+            self.dir_len = @min(self.dir_len, self.dir_buf.len);
+        }
+        self.armWatch();
+        _ = self.rescan();
+    }
+
+    fn dir(self: *const IconsWidget) []const u8 {
+        return self.dir_buf[0..self.dir_len];
+    }
+
+    /// One nonblocking cloexec inotify watch on the folder. A missing dir
+    /// (fresh session, before anything created it) leaves notify_fd at -1 —
+    /// the tick re-arms every 5s until either the app drawer's mkdir runs
+    /// for "Add to desktop" or the user creates the folder.
+    fn armWatch(self: *IconsWidget) void {
+        if (self.notify_fd >= 0) _ = posix.system.close(self.notify_fd);
+        self.notify_fd = -1;
+        var zbuf: [ICON_PATH_MAX + 1]u8 = undefined;
+        if (self.dir_len == 0 or self.dir_len > zbuf.len - 1) return;
+        @memcpy(zbuf[0..self.dir_len], self.dir_buf[0..self.dir_len]);
+        zbuf[self.dir_len] = 0;
+        const fd: posix.fd_t = @intCast(inotify_init1(INOTIFY_FLAGS));
+        if (fd < 0) return;
+        const wd = inotify_add_watch(fd, zbuf[0..self.dir_len :0].ptr, IN_WATCH_MASK);
+        if (wd < 0) {
+            _ = posix.system.close(fd);
+            return;
+        }
+        self.notify_fd = fd;
+    }
+
+    /// Cadence tick: re-arm a dead watch, and rescan when that finally
+    /// succeeds (a notify_fd of -1 is the only state that tick repairs).
+    pub fn tick(self: *IconsWidget) bool {
+        if (self.notify_fd >= 0) return false;
+        self.armWatch();
+        if (self.notify_fd < 0) return false;
+        return self.rescan();
+    }
+
+    /// Drains the inotify queue and rescans if anything arrived. One rescan
+    /// per drain, not per event — mkdir/cp/sed bursts collapse into one.
+    pub fn onPipe(self: *IconsWidget) bool {
+        var any = false;
+        var buf: [4096]u8 align(4) = undefined;
+        while (true) {
+            const n = posix.read(self.notify_fd, &buf) catch break;
+            if (n == 0) break;
+            any = true;
+            var i: usize = 0;
+            while (i + 16 <= n) {
+                const name_len = std.mem.readInt(u32, buf[i + 12 ..][0..4], .little);
+                if (name_len == 0 or i + 16 + name_len > n) break;
+                i += 16 + name_len;
+            }
+        }
+        if (!any) return false;
+        return self.rescan();
+    }
+
+    /// Rescans ~/Desktop into fresh items and swaps the list in when the
+    /// set changed. Identical name/path/exec/terminal rows with decode
+    /// caches alive keep the old list untouched (no icon re-decode churn
+    /// on attribute-only notifications). Returns true when pixels changed.
+    pub fn rescan(self: *IconsWidget) bool {
+        var fresh: [MAX_ICONS]DesktopItem = undefined;
+        var count: usize = 0;
+
+        blk: {
+            var zbuf: [ICON_PATH_MAX + 1]u8 = undefined;
+            if (self.dir_len == 0 or self.dir_len > zbuf.len - 1) break :blk;
+            @memcpy(zbuf[0..self.dir_len], self.dir_buf[0..self.dir_len]);
+            zbuf[self.dir_len] = 0;
+            const dirp = libc_dir.opendir(zbuf[0..self.dir_len :0].ptr) orelse break :blk;
+            defer _ = libc_dir.closedir(dirp);
+            var ent_opt = libc_dir.readdir(dirp);
+            while (ent_opt) |ent| {
+                ent_opt = libc_dir.readdir(dirp);
+                const name = std.mem.sliceTo(&ent.d_name, 0);
+                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or ent.d_type == libc_dir.DT_DIR) continue;
+                if (!hasSuffix(name, ".desktop")) continue;
+                if (count >= MAX_ICONS) {
+                    logging.step("icons: >{d} shortcuts in {s} — the rest stay hidden", .{ MAX_ICONS, self.dir() });
+                    break;
+                }
+                var pbuf: [ICON_PATH_MAX + 1]u8 = undefined;
+                const rel = std.fmt.bufPrintZ(&pbuf, "{s}/{s}", .{ self.dir(), name }) catch continue;
+                var raw: [8192]u8 = undefined;
+                const got = readFileCapped(rel, &raw);
+                if (!parseDesktopFile(&fresh[count], raw[0..got], self.dir(), name)) continue;
+                count += 1;
+            }
+        }
+        // The grid sorts alphabetically like a classic desktop.
+        sortItems(fresh[0..count]);
+
+        var unchanged = count == self.item_count;
+        if (unchanged) {
+            for (fresh[0..count], self.items[0..count]) |*nf, *of| {
+                if (!std.mem.eql(u8, nf.name(), of.name()) or
+                    !std.mem.eql(u8, nf.path(), of.path()) or
+                    !std.mem.eql(u8, nf.exec(), of.exec()) or
+                    nf.terminal != of.terminal or
+                    of.pixels == null)
+                {
+                    unchanged = false;
+                    break;
+                }
+            }
+        }
+        if (unchanged) return false;
+
+        for (self.items[0..self.item_count]) |*old| {
+            if (old.pixels) |px| self.gpa.free(px);
+        }
+        // Histogram-tail entries beyond `count` are stale garbage but
+        // unreachable (item_count bounds every loop).
+        self.items = fresh;
+        self.item_count = count;
+        if (self.selected) |s| {
+            if (s >= count) self.selected = null;
+        }
+        if (self.menu_open and self.menu_item >= count) self.menu_open = false;
+        for (self.items[0..count]) |*item| {
+            item.pixels = self.decodeArt(item);
+        }
+        logging.step("icons: {d} shortcut(s) on the desktop", .{count});
+        return true;
+    }
+
+    fn nameSort(_: void, a: *const DesktopItem, b: *const DesktopItem) bool {
+        const an = std.ascii.allocLowerString(std.heap.page_allocator, a.name()) catch return false;
+        defer std.heap.page_allocator.free(an);
+        const bn = std.ascii.allocLowerString(std.heap.page_allocator, b.name()) catch return true;
+        defer std.heap.page_allocator.free(bn);
+        return std.mem.lessThan(u8, an, bn);
+    }
+
+    /// Insertion sort over the (≤64) items — alphabetical by name, the
+    /// classic auto-arranged desktop order.
+    fn sortItems(items: []DesktopItem) void {
+        for (1..items.len) |i| {
+            var j = i;
+            while (j > 0 and nameLess(&items[j], &items[j - 1])) {
+                const tmp = items[j];
+                items[j] = items[j - 1];
+                items[j - 1] = tmp;
+                j -= 1;
+            }
+        }
+    }
+
+    fn nameLess(a: *const DesktopItem, b: *const DesktopItem) bool {
+        const max = @max(a.name_len, b.name_len);
+        var i: usize = 0;
+        while (i < max) : (i += 1) {
+            const ca = if (i < a.name_len) std.ascii.toLower(a.name_buf[i]) else 0;
+            const cb = if (i < b.name_len) std.ascii.toLower(b.name_buf[i]) else 0;
+            if (ca != cb) return ca < cb;
+        }
+        return false;
+    }
+
+    fn readFileCapped(path: [:0]const u8, buf: []u8) usize {
+        const raw_fd = posix.system.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(posix.mode_t, 0));
+        if (raw_fd < 0) return 0;
+        const fd: posix.fd_t = @intCast(raw_fd);
+        defer _ = posix.system.close(fd);
+        var got: usize = 0;
+        while (got < buf.len) {
+            const n = posix.read(fd, buf[got..]) catch break;
+            if (n == 0) break;
+            got += n;
+        }
+        return got;
+    }
+
+    /// Icon= for one item → decoded ARGB square buffer (null = letter chip
+    /// fallback, like the drawer's untiled look). Absolute paths go straight
+    /// to disk; steam_app_<id> names reach the Steam library caches; theme
+    /// names walk the bar's resolver (user flatpak exports + user icon dirs
+    /// first, then hicolor/Adwaita/pixmaps).
+    fn decodeArt(self: *IconsWidget, item: *const DesktopItem) ?[]u32 {
+        const icon_name = item.icon();
+        if (icon_name.len == 0) return null;
+
+        var path_buf: [ICON_PATH_MAX + 1]u8 = undefined;
+        var found: ?[]const u8 = null;
+        var n: usize = 0;
+        if (icon_name[0] == '/') {
+            if (setStored(path_buf[0..ICON_PATH_MAX], &n, icon_name)) found = path_buf[0..n];
+        } else if (resolveIconArtPath(icon_name, path_buf[0..ICON_PATH_MAX])) |hit| {
+            found = hit;
+        }
+        const path = found orelse return null;
+        if (n >= path_buf.len) return null;
+        _ = path; // path_buf+n already carry the NUL-terminated file path
+        path_buf[n] = 0;
+
+        const decoded = icontheme.decodeIcon(self.gpa, path_buf[0..n :0], @intCast(ICON_PX)) catch return null;
+        defer self.gpa.free(decoded.pixels);
+        const square = self.gpa.alloc(u32, @as(usize, @intCast(ICON_PX)) * @as(usize, @intCast(ICON_PX))) catch return null;
+        icontheme.copyIntoIconBuffer(decoded, square, @intCast(ICON_PX));
+        return square;
+    }
+
+    /// Steam first — a .desktop link like Balatro's usually carries
+    /// steam_app_<id> — then the freedesktop walk the bar runs.
+    fn resolveIconArtPath(name: []const u8, out: []u8) ?[]const u8 {
+        if (icontheme.steamGameIconPath(name, out)) |hit| return hit;
+        if (icontheme.resolveIconPath(name, out)) |hit| return hit;
+        return null;
+    }
+
+    /// Grid rect for `count` items: fixed 2-column width, rows follow the
+    /// count, zero size when the folder has no shortcuts at all (nothing
+    /// to paint, nothing to click).
+    pub fn gridSizeFor(count: usize) [2]u32 {
+        if (count == 0) return .{ 0, 0 };
+        const w: i64 = 2 * ICON_TILE_PAD +
+            @as(i64, @intCast(ICON_COLS)) * ICON_CELL_W +
+            @as(i64, @intCast(ICON_COLS - 1)) * ICON_GAP;
+        const rows = (count + ICON_COLS - 1) / ICON_COLS;
+        const h: i64 = 2 * ICON_TILE_PAD +
+            @as(i64, @intCast(rows)) * ICON_CELL_H +
+            @as(i64, @intCast(rows - 1)) * ICON_GAP;
+        return .{ @intCast(w), @intCast(h) };
+    }
+
+    fn columnsFor(width: u32) usize {
+        const inner = @as(i64, width) - 2 * ICON_TILE_PAD;
+        if (inner < ICON_CELL_W) return 1;
+        const n = @divFloor(inner + ICON_GAP, ICON_CELL_W + ICON_GAP);
+        return @intCast(@max(n, 1));
+    }
+
+    /// Grid cell under a tile-local point, or null between cells.
+    fn cellAt(self: *const IconsWidget, r: Rect, px: i32, py: i32) ?usize {
+        const lx: i64 = px - r.x;
+        const ly: i64 = py - r.y;
+        const cols = columnsFor(r.w);
+        const step_w = ICON_CELL_W + ICON_GAP;
+        const step_h = ICON_CELL_H + ICON_GAP;
+        if (lx < ICON_TILE_PAD or ly < ICON_TILE_PAD) return null;
+        const col = @divFloor(lx - ICON_TILE_PAD, step_w);
+        const row = @divFloor(ly - ICON_TILE_PAD, step_h);
+        if (@mod(lx - ICON_TILE_PAD, step_w) >= ICON_CELL_W) return null;
+        if (@mod(ly - ICON_TILE_PAD, step_h) >= ICON_CELL_H) return null;
+        if (col < 0 or row < 0) return null;
+        const idx = @as(i64, row) * @as(i64, @intCast(cols)) + col;
+        if (idx < 0 or idx >= @as(i64, @intCast(self.item_count))) return null;
+        return @intCast(idx);
+    }
+
+    /// Per-motion pointer pass (surface coords + whether the pointer is on
+    /// a desktop surface): hover state for the wash and the popup rows.
+    /// Returns repaint-need.
+    pub fn pointer(self: *IconsWidget, r: Rect, active: bool, px: i32, py: i32) bool {
+        const old_hover = self.hover;
+        const old_menu_hover = self.menu_hover;
+        const wanted: ?u16 = if (active) blk: {
+            const c0 = self.cellAt(r, px, py) orelse break :blk null;
+            break :blk @intCast(c0);
+        } else null;
+        self.hover = wanted;
+        if (self.menu_open) {
+            const lx: i64 = px - r.x;
+            const ly: i64 = py - r.y;
+            self.menu_hover = if (active) self.menuRowAt(lx, ly) else 0;
+        }
+        return !std.meta.eql(old_hover, self.hover) or old_menu_hover != self.menu_hover;
+    }
+
+    /// Row (1=Open, 2=Remove) under a tile-local point, or 0 outside.
+    fn menuRowAt(self: *const IconsWidget, lx: i64, ly: i64) u8 {
+        if (lx < self.menu_x or lx >= self.menu_x + MENU_W) return 0;
+        if (ly < self.menu_y or ly >= self.menu_y + MENU_H) return 0;
+        const rel = ly - self.menu_y - MENU_PAD;
+        return if (rel >= 0 and rel < MENU_ROW_H)
+            1
+        else if (rel >= MENU_ROW_H and rel < 2 * MENU_ROW_H)
+            2
+        else
+            0;
+    }
+
+    pub fn closeMenu(self: *IconsWidget) void {
+        self.menu_open = false;
+        self.menu_hover = 0;
+    }
+
+    /// Left click (surface coords): popup rows act, presses elsewhere close
+    /// it, then a cell click selects — and a second one inside the window
+    /// launches. Empty cells clear the selection.
+    pub fn click(self: *IconsWidget, r: Rect, px: i32, py: i32) void {
+        const lx: i64 = px - r.x;
+        const ly: i64 = py - r.y;
+        if (self.menu_open) {
+            const row = self.menuRowAt(lx, ly);
+            if (row != 0) {
+                self.closeMenu();
+                if (row == 2) {
+                    self.remove(self.menu_item);
+                } else {
+                    self.launch(self.menu_item);
+                }
+                return;
+            }
+            self.closeMenu();
+        }
+        const cell = self.cellAt(r, px, py);
+        if (cell == null) {
+            self.selected = null;
+            self.last_click_idx = null;
+            return;
+        }
+        const idx_u: usize = cell.?;
+        const idx: u16 = @intCast(idx_u);
+        const now = monoMs();
+        if (self.last_click_idx != null and self.last_click_idx.? == idx and
+            now - self.last_click_ms <= dbl_click_ms)
+        {
+            self.launch(idx_u);
+            self.selected = idx;
+            self.last_click_idx = null;
+            return;
+        }
+        self.selected = idx;
+        self.last_click_idx = idx;
+        self.last_click_ms = now;
+    }
+
+    /// Right press over a cell: open the Open/Remove popup there. Over
+    /// empty grid or with nothing under the pointer it just dismisses.
+    pub fn rightClick(self: *IconsWidget, r: Rect, px: i32, py: i32) void {
+        const cell = self.cellAt(r, px, py);
+        if (cell == null) {
+            self.closeMenu();
+            return;
+        }
+        const lx: i64 = px - r.x;
+        const ly: i64 = py - r.y;
+        self.menu_x = std.math.clamp(lx - @divFloor(MENU_W, 2), ICON_TILE_PAD, @max(ICON_TILE_PAD, @as(i64, r.w) - MENU_W - ICON_TILE_PAD));
+        self.menu_y = std.math.clamp(ly + 8, ICON_TILE_PAD, @max(ICON_TILE_PAD, @as(i64, r.h) - MENU_H - ICON_TILE_PAD));
+        self.menu_item = cell.?;
+        self.hover = @intCast(cell.?);
+        self.menu_open = true;
+        self.menu_hover = 0;
+    }
+
+    /// Deletes the .desktop file behind an item — the inotify delete event
+    /// collapses the grid right after.
+    pub fn remove(self: *IconsWidget, idx: usize) void {
+        if (idx >= self.item_count) return;
+        const item = &self.items[idx];
+        var zbuf: [ICON_PATH_MAX + 1]u8 = undefined;
+        if (item.path_len >= zbuf.len) return;
+        @memcpy(zbuf[0..item.path_len], item.path_buf[0..item.path_len]);
+        zbuf[item.path_len] = 0;
+        if (unlink(zbuf[0..item.path_len :0].ptr) != 0) {
+            logging.step("icons: remove failed: {s}", .{item.path()});
+            return;
+        }
+        // No rescan here: the watch fires IN_DELETE on the next poll.
+        logging.step("icons: removed {s}", .{item.path()});
+    }
+
+    /// Forks + execs the item's command, detached (own session, so the
+    /// widgets' lifetime never limits the launched app). Terminal= entries
+    /// wrap in foot → sh -c exactly like the app drawer's launcher.
+    pub fn launch(self: *IconsWidget, idx: usize) void {
+        if (idx >= self.item_count) return;
+        const item = &self.items[idx];
+
+        var execz: [ICON_EXEC_MAX + 1]u8 = undefined;
+        @memcpy(execz[0..item.exec_len], item.exec_buf[0..item.exec_len]);
+        execz[item.exec_len] = 0;
+
+        var scratch: [2 * ICON_EXEC_MAX + 2 * ICON_ARGS_MAX]u8 = undefined;
+        var child_argv = [_]?[*:0]const u8{null} ** (ICON_ARGS_MAX + 1);
+        var argc: usize = 0;
+
+        if (item.terminal) {
+            child_argv[0] = "foot";
+            child_argv[1] = "-e";
+            child_argv[2] = "sh";
+            child_argv[3] = "-c";
+            child_argv[4] = execz[0..item.exec_len :0].ptr;
+            argc = 5;
+        } else {
+            const toks = parseExec(execz[0..item.exec_len], &scratch);
+            argc = toks.argc;
+            for (0..argc) |k| child_argv[k] = toks.argv[k];
+        }
+        if (argc == 0) {
+            logging.step("icons: exec '{s}' produced no argv", .{item.exec()});
+            return;
+        }
+        child_argv[argc] = null;
+
+        const pid = fork();
+        if (pid < 0) {
+            logging.step("icons: fork failed (errno {d})", .{pid});
+            return;
+        }
+        if (pid == 0) {
+            // Child: separate session, optional working dir, then exec.
+            _ = setsid();
+            if (item.cwd_len > 0) {
+                var cwdz: [ICON_PATH_MAX + 1]u8 = undefined;
+                @memcpy(cwdz[0..item.cwd_len], item.cwd_buf[0..item.cwd_len]);
+                cwdz[item.cwd_len] = 0;
+                _ = chdir(cwdz[0..item.cwd_len :0].ptr);
+            }
+            _ = execvp(child_argv[0].?, @ptrCast(&child_argv));
+            _exit(127); // execvp only returns on failure — don't touch state
+        }
+        logging.step("icons: launched \"{s}\" (pid {d})", .{ item.name(), pid });
+    }
+
+    /// Paints the grid into the widget tile: cells at fixed geometry, hover
+    /// wash, selection ring, decoded icon (or letter chip), wrapped label —
+    /// with the popup drawn last so it sits above every cell.
+    pub fn paint(self: *const IconsWidget, c: Canvas, r: Rect) void {
+        if (self.item_count == 0 or r.w == 0 or r.h == 0) return;
+        const cols = columnsFor(r.w);
+        const pad: i64 = c.zx(ICON_TILE_PAD);
+        const cell_w: i64 = c.zx(ICON_CELL_W);
+        const cell_h: i64 = c.zx(ICON_CELL_H);
+        const gap: i64 = c.zx(ICON_GAP);
+        const icon_px: i64 = c.zx(ICON_PX);
+        const lh: i64 = lineH(c.font);
+
+        for (0..self.item_count) |idx| {
+            const col: i64 = @intCast(idx % cols);
+            const row: i64 = @intCast(idx / cols);
+            const x = pad + col * (cell_w + gap);
+            const y = pad + row * (cell_h + gap);
+            const cell = Rect{ .x = @intCast(x), .y = @intCast(y), .w = @intCast(cell_w), .h = @intCast(cell_h) };
+            const hovered = self.hover != null and @as(?u16, @intCast(idx)) == self.hover;
+            const selected = self.selected != null and @as(?u16, @intCast(idx)) == self.selected;
+            if (hovered or selected) {
+                // Windows-style wash: selection stronger than hover.
+                const alpha: u32 = if (selected) 55 else 30;
+                c.card(cell, withAlpha(c.theme.hover_color, alpha), if (selected) dim(c.theme.hover_color, 210) else 0);
+            }
+            const item = &self.items[idx];
+            const icon_x = x + @divFloor(cell_w - icon_px, 2);
+            const icon_y = y + c.zx(3);
+            const icon_rect = Rect{ .x = @intCast(icon_x), .y = @intCast(icon_y), .w = @intCast(icon_px), .h = @intCast(icon_px) };
+            if (item.pixels) |px_buf| {
+                c.blitArgb(icon_x, icon_y, @intCast(icon_px), @intCast(icon_px), px_buf, c.zx(8));
+            } else {
+                // Letter chip fallback (mirrors the app drawer's tiles).
+                c.card(icon_rect, withAlpha(c.theme.border_color, 60), 0);
+                var cp_end: usize = 0;
+                const cp = nextUtf8Codepoint(item.name(), &cp_end) orelse ' ';
+                _ = cp;
+                const first = item.name()[0..@min(cp_end, item.name_len)];
+                if (first.len > 0) {
+                    const lw = c.textWidth(first);
+                    const baseline = icon_y + @divFloor(icon_px, 2) + @divFloor(@as(i64, c.font.ascentPx()), 2);
+                    _ = c.drawText(icon_x + @divFloor(icon_px - lw, 2), baseline, first, c.theme.text_color);
+                }
+            }
+            // Label: up to two wrapped 13px lines under the icon, centered.
+            const budget = cell_w - c.zx(8);
+            const parts = wrapLabel(c, item.name(), budget);
+            const label_top = icon_y + icon_px + c.zx(5);
+            var baseline = label_top + @as(i64, c.font.ascentPx());
+            for (parts[0..2], 0..) |part, li| {
+                if (part.bytes.len == 0) continue;
+                var lw = c.textWidth(part.bytes);
+                if (part.ellipsize) lw += cpAdvance(c, "…", 0, 3);
+                var pen = x + @divFloor(cell_w - lw, 2);
+                pen = c.drawText(pen, baseline, part.bytes, dim(c.theme.text_color, 215));
+                if (part.ellipsize) _ = c.drawText(pen, baseline, "…", dim(c.theme.text_color, 215));
+                if (li == 0) baseline += lh - c.zx(2) else break;
+            }
+        }
+
+        if (self.menu_open) {
+            const mr = Rect{
+                .x = @intCast(self.menu_x),
+                .y = @intCast(self.menu_y),
+                .w = @intCast(MENU_W),
+                .h = @intCast(MENU_H),
+            };
+            c.card(mr, withAlpha(c.theme.bg_color, 88), c.theme.border_color);
+            const rows = [_][]const u8{ "Open", "Remove" };
+            for (rows, 1..) |label, row_no| {
+                const row_u8: u8 = @intCast(row_no);
+                const ry = self.menu_y + MENU_PAD + @as(i64, @intCast(row_no - 1)) * MENU_ROW_H;
+                const rr = Rect{ .x = @intCast(self.menu_x + 4), .y = @intCast(ry), .w = @intCast(MENU_W - 8), .h = @intCast(MENU_ROW_H) };
+                if (self.menu_hover == row_u8) {
+                    c.card(rr, withAlpha(c.theme.hover_color, 70), 0);
+                }
+                const color = if (row_no == 2) dim(c.theme.holiday_color, 230) else c.theme.text_color;
+                const baseline = ry + @divFloor(MENU_ROW_H, 2) - @divFloor(lh, 2) + @as(i64, c.font.ascentPx());
+                _ = c.drawText(self.menu_x + 12, baseline, label, color);
+            }
+        }
+    }
+};
+
+/// One wrapped label part: bytes plus whether to append the ellipsis after.
+const LabelPart = struct { bytes: []const u8, ellipsize: bool = false };
+
+/// Splits a shortcut name into at most two label lines, each under `budget`
+/// px wide, preferring a space break; the tail of line 2 elides with `…`.
+fn wrapLabel(c: Canvas, text: []const u8, budget: i64) [2]LabelPart {
+    var out = [2]LabelPart{ .{ .bytes = text[0..0] }, .{ .bytes = text[0..0] } };
+    if (c.textWidth(text) <= budget) {
+        out[0] = .{ .bytes = text };
+        return out;
+    }
+    // Longest prefix that fits becomes line 1.
+    var fit_end: usize = 0;
+    var w: i64 = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const start = i;
+        if (nextUtf8Codepoint(text, &i) == null) break;
+        const adv = cpAdvance(c, text, start, i);
+        if (w + adv > budget) break;
+        w += adv;
+        fit_end = i;
+    }
+    var l1 = text[0..fit_end];
+    var rest = text[fit_end..];
+    if (fit_end > 0) {
+        if (std.mem.lastIndexOfScalar(u8, l1, ' ')) |sp| {
+            // Break at the last space instead of mid-word.
+            l1 = text[0..sp];
+            rest = text[sp + 1 ..];
+        }
+    }
+    out[0] = .{ .bytes = l1 };
+    if (c.textWidth(rest) <= budget) {
+        out[1] = .{ .bytes = rest };
+        return out;
+    }
+    const dots_w = cpAdvance(c, "…", 0, 3);
+    var fit2: usize = 0;
+    var w2: i64 = 0;
+    var j: usize = 0;
+    while (j < rest.len) {
+        const start = j;
+        if (nextUtf8Codepoint(rest, &j) == null) break;
+        const adv = cpAdvance(c, rest, start, j);
+        if (w2 + adv + dots_w > budget) break;
+        w2 += adv;
+        fit2 = j;
+    }
+    out[1] = .{ .bytes = rest[0..fit2], .ellipsize = true };
+    return out;
+}
+
+fn cpAdvance(c: Canvas, s: []const u8, start: usize, end: usize) i64 {
+    if (end <= start or start >= s.len) return 0;
+    var j = start;
+    const cp = nextUtf8Codepoint(s, &j) orelse return 0;
+    const g = c.font.glyph(cp) catch return 0;
+    return g.advance_x;
+}
+
+test "icons: exec tokenizing strips field codes and honors quotes" {
+    var scratch: [512]u8 = undefined;
+
+    var toks = parseExec("steam steam://rungameid/1245620", &scratch);
+    try std.testing.expectEqual(@as(usize, 2), toks.argc);
+    try std.testing.expectEqualStrings("steam", std.mem.span(toks.argv[0]));
+    try std.testing.expectEqualStrings("steam://rungameid/1245620", std.mem.span(toks.argv[1]));
+
+    toks = parseExec("\"foo bar\" -x %f %U", &scratch);
+    try std.testing.expectEqual(@as(usize, 2), toks.argc);
+    try std.testing.expectEqualStrings("foo bar", std.mem.span(toks.argv[0]));
+    try std.testing.expectEqualStrings("-x", std.mem.span(toks.argv[1]));
+
+    toks = parseExec("kitty -e 'test a'", &scratch);
+    try std.testing.expectEqual(@as(usize, 3), toks.argc);
+    try std.testing.expectEqualStrings("kitty", std.mem.span(toks.argv[0]));
+    try std.testing.expectEqualStrings("-e", std.mem.span(toks.argv[1]));
+    try std.testing.expectEqualStrings("test a", std.mem.span(toks.argv[2]));
+
+    // Field codes vanish; %% collapses; unknown codes stay literal.
+    toks = parseExec("100%% sure%z %f", &scratch);
+    try std.testing.expectEqual(@as(usize, 2), toks.argc);
+    try std.testing.expectEqualStrings("100%", std.mem.span(toks.argv[0]));
+    try std.testing.expectEqualStrings("sure%z", std.mem.span(toks.argv[1]));
+}
+
+test "icons: desktop file parsing" {
+    var item: DesktopItem = undefined;
+    try std.testing.expect(parseDesktopFile(&item,
+        \\[Desktop Entry]
+        \\Type=Application
+        \\Name=Balatro
+        \\Exec=steam steam://rungameid/1245620
+        \\Icon=steam_app_1245620
+        \\[Desktop Action window]
+        \\Name=Window
+        \\Exec=steam steam://bad
+        \\
+    , "/home/x/Desktop", "Balatro.desktop"));
+    try std.testing.expectEqualStrings("Balatro", item.name());
+    try std.testing.expectEqualStrings("steam steam://rungameid/1245620", item.exec());
+    try std.testing.expectEqualStrings("steam_app_1245620", item.icon());
+    try std.testing.expectEqualStrings("/home/x/Desktop/Balatro.desktop", item.path());
+
+    // Not launchable: type mismatch, no Exec, no [Desktop Entry] header.
+    try std.testing.expect(!parseDesktopFile(&item, "[Desktop Entry]\nType=Link\nExec=whatever\n", "/d", "x.desktop"));
+    try std.testing.expect(!parseDesktopFile(&item, "[Desktop Entry]\nName=No exec\n", "/d", "x.desktop"));
+    try std.testing.expect(!parseDesktopFile(&item, "Type=Link\nExec=before-header\n", "/d", "x.desktop"));
+
+    // Name falls back to the file stem; Terminal parses both spellings.
+    try std.testing.expect(parseDesktopFile(&item, "[Desktop Entry]\nTerminal=true\nExec=kitty\n", "/d", "Terminal App.desktop"));
+    try std.testing.expect(item.terminal);
+    try std.testing.expectEqualStrings("Terminal App", item.name());
+}
+
+test "icons: grid sizing" {
+    try std.testing.expectEqual(@as(u32, 218), IconsWidget.gridSizeFor(2)[0]);
+    try std.testing.expectEqual(@as(u32, 296), IconsWidget.gridSizeFor(5)[1]); // 3 rows
+    try std.testing.expectEqual(@as(u32, 108), IconsWidget.gridSizeFor(1)[1]);
+    try std.testing.expectEqual(@as(u32, 0), IconsWidget.gridSizeFor(0)[0]);
+}
+
 pub const FontMeasure = struct {
     font: *font_mod.Font,
     pub fn advance(self: FontMeasure, cp: u32) i64 {
@@ -3422,6 +4459,7 @@ pub const Widget = union(WidgetId) {
     calendar: CalendarWidget,
     watch: WatchWidget,
     note1: NoteWidget,
+    icons: IconsWidget,
 
     pub fn intervalMs(self: Widget) i64 {
         return switch (self) {
@@ -3435,6 +4473,8 @@ pub const Widget = union(WidgetId) {
             // Editing notes blink every half second; idle ones never repaint.
             .note1 => |n| if (n.editing) NoteWidget.interval_ms else NoteWidget.idle_interval_ms,
             .watch => WatchWidget.interval_ms,
+            // The icons grid only self-heals a dead inotify watch here.
+            .icons => IconsWidget.interval_ms,
         };
     }
 
@@ -3475,6 +4515,9 @@ pub const Widget = union(WidgetId) {
             .watch => |*w| blk: {
                 break :blk w.tick();
             },
+            .icons => |*ic| blk: {
+                break :blk ic.tick();
+            },
         };
     }
 
@@ -3484,6 +4527,8 @@ pub const Widget = union(WidgetId) {
             .weather => |w| w.fetch.fd(),
             .media => |m| m.fetch.fd(),
             .calendar => |k| k.fetch.fd(),
+            // The desktop icons' inotify watch: folder events land here.
+            .icons => |ic| ic.notify_fd,
             else => -1,
         };
     }
@@ -3495,6 +4540,7 @@ pub const Widget = union(WidgetId) {
             .weather => |*w| w.onPipe(),
             .media => |*m| m.onPipe(),
             .calendar => |*k| k.onPipe(),
+            .icons => |*ic| ic.onPipe(),
             else => false,
         };
     }
@@ -3510,6 +4556,7 @@ pub const Widget = union(WidgetId) {
             .calendar => |*k| k.clickAt(r, font, zoom, x, y),
             .note1 => |*n| n.clickAt(r, font, x, y),
             .watch => |*w| w.click(),
+            .icons => |*ic| ic.click(r, x, y),
         }
     }
 
@@ -3523,6 +4570,7 @@ pub const Widget = union(WidgetId) {
             .calendar => |w| w.paint(c, r),
             .note1 => |n| n.paint(c, r),
             .watch => |w| w.paint(c, r),
+            .icons => |ic| ic.paint(c, r),
         }
     }
 };

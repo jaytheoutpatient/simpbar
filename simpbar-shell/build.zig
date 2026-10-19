@@ -73,6 +73,20 @@ pub fn build(b: *Build) !void {
     art_mod.addIncludePath(b.path("../simpbar/src")); // gdkpixbuf_shim.h lives with the bar's sources
     widgets_mod.addImport("art", art_mod);
 
+    // Desktop icons: icon NAME -> file resolution + pixbuf decode, straight
+    // from the bar (it walks user flatpak exports, user icon dirs, hicolor,
+    // and the Steam library caches, and its decodeIcon returns 0xAARRGGBB
+    // tiles). Grabs the same ../simpbar/src include path for the shim header;
+    // the shim's symbols themselves come from the executable's compiled copy.
+    const icontheme_mod = b.createModule(.{
+        .root_source_file = b.path("../simpbar/src/icontheme.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    icontheme_mod.addIncludePath(b.path("../simpbar/src")); // gdkpixbuf_shim.h
+    widgets_mod.addImport("icontheme", icontheme_mod);
+
     // Overview mode (Alt+W): the second layer surface on the overlay layer,
     // screencopy thumbnails, hyprctl window/workspace queries. Own module so
     // main.zig stays the host/wiring file.

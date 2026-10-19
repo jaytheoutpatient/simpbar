@@ -2004,6 +2004,7 @@ const WIDGET_TABLE = [_]WidgetToggle{
     .{ .id = "calendar", .title = "Calendar", .subtitle = "Calendar card with reminders" },
     .{ .id = "watch", .title = "Watch", .subtitle = "Analog watch" },
     .{ .id = "note1", .title = "Sticky note", .subtitle = "Sticky note card" },
+    .{ .id = "icons", .title = "Desktop icons", .subtitle = "~/Desktop shortcuts as a grid of launchable icons" },
 };
 
 /// Flips one desktop widget off/on: updates the live mask, persists the
