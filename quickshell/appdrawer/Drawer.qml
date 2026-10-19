@@ -701,6 +701,13 @@ PanelWindow {
 
                 clip: true
                 interactive: win.open
+                // The add-to-desktop popup floats over this grid, and its
+                // action row happens to sit on top of real tiles (Rofi's
+                // tile shares exactly that region). While the popup is up
+                // the grid must accept no pointer input at all — otherwise
+                // a click meant for a popup button can also reach the tile
+                // underneath and launch it.
+                enabled: !win.deskOpen
                 model: AppModel.visibleApps
                 cellWidth: Theme.tileWidth
                 cellHeight: Theme.tileHeight
@@ -747,6 +754,11 @@ PanelWindow {
                 visible: win.showingWallpapers && !win.whOnline
                 clip: true
                 interactive: win.open
+                // The options popup floats over the rightmost tiles of these
+                // grids' bottom rows; while it is open the grids take no
+                // pointer input, so a click meant for a popup control can't
+                // also reach the tile underneath.
+                enabled: !win.optionsOpen
                 model: WallpaperModel.visibleItems
                 cellWidth: 156
                 cellHeight: 132
@@ -783,6 +795,7 @@ PanelWindow {
                 visible: win.showingWallpapers && win.whOnline
                 clip: true
                 interactive: win.open
+                enabled: !win.optionsOpen
                 model: WallhavenSearch.results
                 cellWidth: 156
                 cellHeight: 132
@@ -1210,6 +1223,15 @@ PanelWindow {
             border.color: Theme.separator
             z: 50
 
+            // Same reasoning as the add-to-desktop popup: this rect floats
+            // over wallpaper tiles, so stray presses inside the popup must
+            // never leak through to whatever tile sits under it.
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.AllButtons
+                cursorShape: Qt.ArrowCursor
+            }
+
             // Current file contents, kept apart from the widgets so the widgets
             // can be edited freely and committed only by Save.
             property string fileKey: ""
@@ -1504,6 +1526,17 @@ PanelWindow {
 
             property string status: ""
             readonly property string deskDir: Quickshell.env("HOME") + "/Desktop"
+
+            // Swallow-everything press sink: while this popup is open the app
+            // grid sits underneath it and a press landing anywhere in these
+            // bounds must never leak to a tile (Rofi's tile sits directly
+            // under the action row). MouseArea takes every press; the real
+            // controls are declared after this, so they still get theirs.
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.AllButtons
+                cursorShape: Qt.ArrowCursor
+            }
 
             onVisibleChanged: {
                 if (!visible) {
