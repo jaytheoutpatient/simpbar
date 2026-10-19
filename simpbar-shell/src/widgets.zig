@@ -3682,6 +3682,14 @@ pub const IconsWidget = struct {
     /// 0 = none, 1 = Open row, 2 = Remove row.
     menu_hover: u8 = 0,
 
+    /// Desktop labels sit on the wallpaper, not on a card: theme text colors
+    /// are tuned for card backgrounds and a dimmed copy of one reads dark and
+    /// heavy over a dark wallpaper. The desktop convention everywhere else
+    /// applies instead — near-white with a soft dark shadow behind it, so a
+    /// label stays legible on any wallpaper.
+    const label_color: u32 = 0xEAFFFFFF; // ~92% white
+    const shadow_color: u32 = dim(0x000000, 100); // ~40% black
+
     pub fn configure(self: *IconsWidget, gpa: std.mem.Allocator, directory: []const u8) void {
         self.gpa = gpa;
         if (setStored(self.dir_buf[0..], &self.dir_len, directory)) {
@@ -4176,18 +4184,27 @@ pub const IconsWidget = struct {
                     _ = c.drawText(icon_x + @divFloor(icon_px - lw, 2), baseline, first, c.theme.text_color);
                 }
             }
-            // Label: up to two wrapped 13px lines under the icon, centered.
+            // Label: up to two wrapped 13px lines under the icon, centered —
+            // shadow pass first (+1,+1), then the text on top.
             const budget = cell_w - c.zx(8);
             const parts = wrapLabel(c, item.name(), budget);
             const label_top = icon_y + icon_px + c.zx(5);
             var baseline = label_top + @as(i64, c.font.ascentPx());
             for (parts[0..2], 0..) |part, li| {
                 if (part.bytes.len == 0) continue;
-                var lw = c.textWidth(part.bytes);
-                if (part.ellipsize) lw += cpAdvance(c, "…", 0, 3);
-                var pen = x + @divFloor(cell_w - lw, 2);
-                pen = c.drawText(pen, baseline, part.bytes, dim(c.theme.text_color, 215));
-                if (part.ellipsize) _ = c.drawText(pen, baseline, "…", dim(c.theme.text_color, 215));
+                const dots_w: i64 = if (part.ellipsize) cpAdvance(c, "…", 0, 3) else 0;
+                const lw = c.textWidth(part.bytes) + dots_w;
+                const pen = x + @divFloor(cell_w - lw, 2);
+                if (part.ellipsize) {
+                    const body_w = lw - dots_w;
+                    _ = c.drawText(pen + 1, baseline + 1, part.bytes, shadow_color);
+                    _ = c.drawText(pen + body_w + 1, baseline + 1, "…", shadow_color);
+                    _ = c.drawText(pen, baseline, part.bytes, label_color);
+                    _ = c.drawText(pen + body_w, baseline, "…", label_color);
+                } else {
+                    _ = c.drawText(pen + 1, baseline + 1, part.bytes, shadow_color);
+                    _ = c.drawText(pen, baseline, part.bytes, label_color);
+                }
                 if (li == 0) baseline += lh - c.zx(2) else break;
             }
         }

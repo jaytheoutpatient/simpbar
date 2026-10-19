@@ -1539,7 +1539,10 @@ PanelWindow {
                     'mkdir -p "$2"\n' +
                     'f="$2/$3.desktop"; n=0\n' +
                     'while [ -e "$f" ]; do n=$((n+1)); f="$2/$3 ($n).desktop"; done\n' +
-                    'cat > "$f"\n' +
+                    // The content travels as arg 1: stdin of a Quickshell
+                    // Process is empty by design, so cat produced empty
+                    // files and empty files parse as no icon at all.
+                    'printf \'%s\' "$1" > "$f"\n' +
                     'echo "Added to the desktop: ${f##*/}"',
                     "simpbar-add-desktop",
                     deskPanel.content(win.deskApp),
