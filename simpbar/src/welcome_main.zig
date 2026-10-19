@@ -48,6 +48,7 @@ const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
 const F_OK: c_int = 0;
 const X_OK: c_int = 1;
+const WNOHANG: c_int = 1;
 
 // ---------------------------------------------------------------------
 // Constants
@@ -755,6 +756,7 @@ var g_keychron_row: ?*gtk.AdwActionRow = null;
 var g_keychron_button: ?*gtk.GtkButton = null;
 var g_keychron_polling: bool = false;
 var g_keychron_poll_ticks: u32 = 0;
+var g_keychron_pkexec_pid: c_int = -1;
 
 const KeychronBrowser = struct { bin: [:0]const u8, label: []const u8 };
 
@@ -853,6 +855,56 @@ fn keychronRunScript(buf: []u8, staged_path: [:0]const u8, pkexec_style: bool) ?
         .{ staged_path, staged_path }) catch null;
 }
 
+const KeychronPkexecOutcome = union(enum) {
+    none,
+    running,
+    exited: c_int,
+};
+
+/// pkexec authorizes its *parent* process: it reads getppid() and refuses to
+/// run when that is init ("Refusing to render service to dead parents").
+/// launchArgv()'s double fork detaches exactly like that, which is why the
+/// row's button did nothing; here the welcome process stays the direct parent
+/// for the whole polkit round trip and the 1 s poll reaps the child.
+fn keychronSpawnPkexec(argv: []const [:0]const u8) bool {
+    if (argv.len == 0 or argv.len > 14) return false;
+    const pid = libc_proc.fork();
+    if (pid < 0) {
+        logging.warn("keychron: fork failed for pkexec", .{});
+        return false;
+    }
+    if (pid == 0) {
+        var buf: [16]?[*:0]const u8 = undefined;
+        buf[0] = "/usr/bin/env";
+        for (argv, 0..) |a, i| buf[i + 1] = a;
+        buf[argv.len + 1] = null;
+        _ = std.c.execve("/usr/bin/env", @ptrCast(&buf), std.c.environ);
+        std.c._exit(127);
+    }
+    g_keychron_pkexec_pid = pid;
+    return true;
+}
+
+fn keychronPkexecOutcome() KeychronPkexecOutcome {
+    if (g_keychron_pkexec_pid <= 0) return .none;
+    var status: c_int = 0;
+    const r = std.c.waitpid(g_keychron_pkexec_pid, &status, WNOHANG);
+    if (r == g_keychron_pkexec_pid) {
+        g_keychron_pkexec_pid = -1;
+        return .{ .exited = status };
+    }
+    if (r < 0) {
+        // ECHILD: someone else (e.g. GLib's SIGCHLD handling) reaped it.
+        g_keychron_pkexec_pid = -1;
+        return .none;
+    }
+    return .running;
+}
+
+fn keychronPkexecSucceeded(status: c_int) bool {
+    return (status & 0x7f) == 0 and ((status >> 8) & 0xff) == 0;
+}
+
 fn onKeychronSetupClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
     // Stage the rule content as the user first: the privileged half is then
     // a plain install(1) of a known file, with no shell quoting of the rule
@@ -867,10 +919,24 @@ fn onKeychronSetupClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
 
     var cmd_buf: [1024]u8 = undefined;
     if (commandExists("pkexec")) {
+        switch (keychronPkexecOutcome()) {
+            .running => {
+                // A prompt is still up from the previous click — don't stack
+                // a second pkexec (and a second password dialog) on top.
+                logging.step("keychron: already waiting on the polkit prompt", .{});
+                if (!g_keychron_polling) {
+                    g_keychron_polling = true;
+                    g_keychron_poll_ticks = 0;
+                    _ = gtk.g_timeout_add(1000, &onKeychronPoll, null);
+                }
+                return;
+            },
+            else => {},
+        }
         // One graphical polkit prompt (polkit-gnome/mate-polkit ship with
         // every simpbar install) — no terminal window for a two-line write.
         const cmd = keychronRunScript(&cmd_buf, staged, true) orelse return;
-        launchArgv(&[_][:0]const u8{ "pkexec", "/usr/bin/sh", "-c", cmd });
+        if (!keychronSpawnPkexec(&[_][:0]const u8{ "pkexec", "/usr/bin/sh", "-c", cmd })) return;
         logging.step("keychron: staged rules, pkexec prompt launched", .{});
     } else {
         // Systems stripped of polkit: same work, but sudo in a terminal so
@@ -891,20 +957,54 @@ fn onKeychronSetupClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
 
 fn onKeychronPoll(_: ?*anyopaque) callconv(.c) c_int {
     g_keychron_poll_ticks += 1;
-    if (keychronRulesCurrent()) {
-        g_keychron_polling = false;
-        if (g_keychron_button) |button| gtk.gtk_button_set_label(button, "Reinstall");
-        if (g_keychron_row) |row| {
-            var buf: [512]u8 = undefined;
-            gtk.adw_action_row_set_subtitle(row, keychronSetupSubtitle(&buf));
-        }
+
+    // pkexec is a direct child of this process (see keychronSpawnPkexec), so
+    // it can be reaped here: its exit distinguishes "prompt cancelled" from
+    // "still waiting for the password".
+    const outcome = keychronPkexecOutcome();
+    const running = switch (outcome) {
+        .running => true,
+        else => false,
+    };
+
+    // Success: the rule is in place and pkexec has finished its udevadm
+    // trigger calls (so the ACL is already applied on replug).
+    if (!running and keychronRulesCurrent()) {
+        keychronShowInstalled();
         return 0; // G_SOURCE_REMOVE
     }
-    if (g_keychron_poll_ticks >= 180) {
+
+    switch (outcome) {
+        .exited => |status| {
+            // pkexec returned before the rule appeared: the polkit prompt was
+            // dismissed, or the install failed. Stop polling so the next
+            // click starts a fresh attempt.
+            g_keychron_polling = false;
+            if (keychronPkexecSucceeded(status)) {
+                logging.warn("keychron: pkexec finished but the udev rule is missing", .{});
+            } else {
+                logging.warn("keychron: pkexec exited with status {d}; rule not installed", .{status});
+            }
+            if (g_keychron_row) |row| gtk.adw_action_row_set_subtitle(row, "Setup didn't complete — the password prompt was cancelled or failed. Try again.");
+            return 0;
+        },
+        else => {},
+    }
+
+    if (g_keychron_poll_ticks >= 900) {
         g_keychron_polling = false;
         return 0;
     }
     return 1; // G_SOURCE_CONTINUE
+}
+
+fn keychronShowInstalled() void {
+    g_keychron_polling = false;
+    if (g_keychron_button) |button| gtk.gtk_button_set_label(button, "Reinstall");
+    if (g_keychron_row) |row| {
+        var buf: [512]u8 = undefined;
+        gtk.adw_action_row_set_subtitle(row, keychronSetupSubtitle(&buf));
+    }
 }
 
 fn onKeychronOpenClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
