@@ -11,26 +11,53 @@ import Quickshell.Io
 // libQt6QuickControls2Impl but exposes no fromTheme, and Quickshell's
 // IconImage is only a thin Image wrapper). So we resolve names ourselves with
 // a single one-shot `find` over the app-icon directories, then pick the best
-// candidate per name. One subprocess at startup, ~4k lines, no cache file to go
-// stale.
+// candidate per name. One subprocess per scan (~4k lines), no cache file to go
+// stale: once at startup, then again whenever the drawer opens so icons
+// installed alongside new apps resolve on their first appearance.
 Singleton {
     id: root
 
+    // Roots are walked at runtime (see AppModel's rescan note). HOME paths are
+    // built with Quickshell.env("HOME") because plain QML strings do NOT
+    // interpolate `${...}`: the ${HOME} roots used to sit here as literal
+    // strings, `find` skipped the nonexistent paths, and every icon that only
+    // exists in a user directory -- Lutris game art, user flatpak exports --
+    // silently resolved to nothing and drew a text glyph instead.
     readonly property var roots: [
         "/usr/share/icons",
         "/usr/share/pixmaps",
-        "${HOME}/.local/share/icons",
-        "${HOME}/.icons",
+        (Quickshell.env("HOME") || "") + "/.local/share/icons",
+        (Quickshell.env("HOME") || "") + "/.icons",
         // Flatpaks do NOT install into /usr/share/icons. Their desktop entries
         // declare icon names like `io.github.shiftey.Desktop` that only exist
         // in flatpak's own appstream store, under a per-app hash directory.
         "/var/lib/flatpak/appstream",
         "/var/lib/flatpak/exports/share/icons",
-        "${HOME}/.local/share/flatpak/exports/share/icons"
+        (Quickshell.env("HOME") || "") + "/.local/share/flatpak/exports/share/icons"
     ]
 
     property var best: ({})     // basename -> { path: ..., rank: ... }
     property bool ready: false
+
+    // Mirrors the scan process so a consumer can tell a finished walk from one
+    // that is still running: a snapshot taken mid-scan would bake in empty
+    // icon strings for apps whose art only exists in the fresh pass.
+    property bool scanning: true
+
+    // A lookup made now is guaranteed to see every icon on disk: the last
+    // scan finished and no rescan is in flight.
+    readonly property bool settled: ready && !scanning
+
+    // Re-run the directory walk so icons installed after startup resolve too
+    // (drawn from the same story as AppModel.refresh()). The collector merges
+    // into the existing map -- offer() keeps the higher-ranked candidate -- so
+    // stale entries linger harmlessly and new files simply show up.
+    function rescan() {
+        if (scan.running)
+            return;
+        scanning = true;
+        scan.running = true;
+    }
 
     // Rank candidates so the closest-to-native-size icon wins. Higher is better.
     function rankOf(path) {
@@ -127,6 +154,7 @@ Singleton {
                         root.offer(l);
                 }
                 root.ready = true;
+                root.scanning = false;
                 console.log("ICONS ready entries=" + Object.keys(root.best).length);
             }
         }

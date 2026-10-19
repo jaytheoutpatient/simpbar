@@ -75,14 +75,19 @@ Singleton {
     // Snapshot the singleton's entries into plain objects. Keeping the
     // DesktopEntry handle lets us launch with entry.execute(), which applies
     // the desktop file's own Exec rules (field codes, terminal flag, cwd).
-    function load() {
-        if (root.ready)
+    //
+    // `force` re-snapshots even after the start-up load: every open of the
+    // drawer goes through this so apps installed in the meantime appear.
+    // Without the flag the early return would keep showing the snapshot taken
+    // when the daemon started, no matter what got installed later.
+    function load(force) {
+        if (root.ready && !force)
             return true;
 
-        // Icon paths are resolved by a separate one-shot scan. Snapshotting
-        // before it finishes would permanently bake in empty icon strings,
-        // since `apps` is only assigned once.
-        if (!Icons.ready)
+        // Icon paths are resolved by a separate scan. Snapshotting before it
+        // settles would bake in empty icon strings for anything whose art
+        // only exists in the fresh pass.
+        if (!Icons.settled)
             return false;
 
         var vals = DesktopEntries.applications.values;
@@ -136,6 +141,40 @@ Singleton {
                 return;
             }
             root.load();
+        }
+    }
+
+    property int refreshTries: 0
+
+    // Rebuild the catalogue on demand -- called by the drawer's openDrawer(),
+    // so anything installed since the last open shows up without restarting
+    // the daemon. The flow mirrors start-up: kick an icon rescan, then poll
+    // until the scan settles (Icons.settled gates load()) and snapshot. The
+    // extra re-reads after that cover the lag between a desktop file landing
+    // on disk and quickshell's entries watcher ingesting it.
+    function refresh() {
+        Icons.rescan();
+        refreshTries = 0;
+        refreshPoll.restart();
+    }
+
+    Timer {
+        id: refreshPoll
+        interval: 150
+        repeat: false
+        onTriggered: {
+            root.refreshTries++;
+            var settled = root.load(true);
+            if (settled && root.refreshTries >= 3) {
+                root.refreshTries = 0;
+                return;
+            }
+            if (root.refreshTries > 20) {
+                console.log("APPS refresh timeout: catalogue never settled");
+                root.refreshTries = 0;
+                return;
+            }
+            refreshPoll.restart();
         }
     }
 

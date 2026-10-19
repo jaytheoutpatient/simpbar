@@ -145,6 +145,10 @@ PanelWindow {
     }
 
     function openDrawer() {
+        // Rebuild the catalogue on every open so apps installed since the
+        // last one show up (DesktopEntries itself is live, but the grid only
+        // ever re-read it through AppModel.load()).
+        AppModel.refresh()
         resetSearch()
         win.open = true
         win.visible = true
