@@ -1,3 +1,5 @@
+Neon Feather Circle Emblem.png
+
 # Simpbar
 
 A native Zig/Wayland status bar for **Hyprland and MangoWM** — simple, clean, out of the way — plus an installer that sets up a ricing-friendly Arch desktop around it.
