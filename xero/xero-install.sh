@@ -1612,8 +1612,8 @@ select_graphics_driver() {
     drivers+=(
         "intel                │ Intel Graphics"
         "amd                  │ AMD Graphics"
-        "nvidia-turing        │ NVIDIA Turing+ (RTX 20/30/40, GTX 1650+)"
-        "nvidia-legacy        │ NVIDIA Legacy (GTX 900/1000 series)"
+        "nvidia-turing        │ NVIDIA Turing+ (GTX 16 / RTX 20–50 series)"
+        "nvidia-legacy        │ NVIDIA Maxwell–Volta (GTX 750–10, Titan V)"
         "intel-amd            │ Intel + AMD (Hybrid)"
         "intel-nvidia-turing  │ Intel + NVIDIA Turing+ (Optimus)"
         "intel-nvidia-legacy  │ Intel + NVIDIA Legacy (Optimus)"
@@ -3698,7 +3698,10 @@ install_graphics() {
     local packages=""
     local needs_nvidia_config="no"
 
-    # Base mesa/VM drivers (installed for all configurations)
+    # Base mesa/VM drivers (installed for all configurations).
+    # libva-nvidia-driver: VA-API/NVDEC backend — browsers do hardware video
+    # decode through VA-API, not VDPAU; works on both the open (Turing+) and
+    # 580xx (Maxwell–Volta) branches.
     local base_drivers="mesa autorandr mesa-utils lib32-mesa xf86-video-qxl xf86-video-fbdev lib32-mesa-utils"
 
     case "${CONFIG[gfx_driver]}" in
@@ -3709,30 +3712,30 @@ install_graphics() {
             packages="amd-drv $base_drivers"
             ;;
         "nvidia-turing")
-            packages="libvdpau nvidia-utils opencl-nvidia libvdpau-va-gl nvidia-settings nvidia-open-dkms vulkan-icd-loader lib32-nvidia-utils lib32-opencl-nvidia linux-firmware-nvidia lib32-vulkan-icd-loader $base_drivers"
+            packages="libvdpau nvidia-utils opencl-nvidia libvdpau-va-gl nvidia-settings nvidia-open-dkms vulkan-icd-loader lib32-nvidia-utils lib32-opencl-nvidia linux-firmware-nvidia libva-nvidia-driver lib32-vulkan-icd-loader $base_drivers"
             needs_nvidia_config="yes"
             ;;
         "nvidia-legacy")
-            packages="nvidia-580xx-dkms nvidia-580xx-utils opencl-nvidia-580xx lib32-opencl-nvidia-580xx lib32-nvidia-580xx-utils $base_drivers"
+            packages="nvidia-580xx-dkms nvidia-580xx-utils nvidia-580xx-settings opencl-nvidia-580xx lib32-opencl-nvidia-580xx lib32-nvidia-580xx-utils libva-nvidia-driver $base_drivers"
             needs_nvidia_config="yes"
             ;;
         "intel-amd")
             packages="intel-drv amd-drv $base_drivers"
             ;;
         "intel-nvidia-turing")
-            packages="intel-drv libvdpau nvidia-utils opencl-nvidia libvdpau-va-gl nvidia-settings nvidia-open-dkms vulkan-icd-loader lib32-nvidia-utils lib32-opencl-nvidia linux-firmware-nvidia lib32-vulkan-icd-loader $base_drivers"
+            packages="intel-drv libvdpau nvidia-utils opencl-nvidia libvdpau-va-gl nvidia-settings nvidia-open-dkms vulkan-icd-loader lib32-nvidia-utils lib32-opencl-nvidia linux-firmware-nvidia libva-nvidia-driver lib32-vulkan-icd-loader $base_drivers"
             needs_nvidia_config="yes"
             ;;
         "intel-nvidia-legacy")
-            packages="intel-drv nvidia-580xx-dkms nvidia-580xx-utils opencl-nvidia-580xx lib32-opencl-nvidia-580xx lib32-nvidia-580xx-utils $base_drivers"
+            packages="intel-drv nvidia-580xx-dkms nvidia-580xx-utils nvidia-580xx-settings opencl-nvidia-580xx lib32-opencl-nvidia-580xx lib32-nvidia-580xx-utils libva-nvidia-driver $base_drivers"
             needs_nvidia_config="yes"
             ;;
         "amd-nvidia-turing")
-            packages="amd-drv libvdpau nvidia-utils opencl-nvidia libvdpau-va-gl nvidia-settings nvidia-open-dkms vulkan-icd-loader lib32-nvidia-utils lib32-opencl-nvidia linux-firmware-nvidia lib32-vulkan-icd-loader $base_drivers"
+            packages="amd-drv libvdpau nvidia-utils opencl-nvidia libvdpau-va-gl nvidia-settings nvidia-open-dkms vulkan-icd-loader lib32-nvidia-utils lib32-opencl-nvidia linux-firmware-nvidia libva-nvidia-driver lib32-vulkan-icd-loader $base_drivers"
             needs_nvidia_config="yes"
             ;;
         "amd-nvidia-legacy")
-            packages="amd-drv nvidia-580xx-dkms nvidia-580xx-utils opencl-nvidia-580xx lib32-opencl-nvidia-580xx lib32-nvidia-580xx-utils $base_drivers"
+            packages="amd-drv nvidia-580xx-dkms nvidia-580xx-utils nvidia-580xx-settings opencl-nvidia-580xx lib32-opencl-nvidia-580xx lib32-nvidia-580xx-utils libva-nvidia-driver $base_drivers"
             needs_nvidia_config="yes"
             ;;
         "vm")
