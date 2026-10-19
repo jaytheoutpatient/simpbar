@@ -1520,30 +1520,69 @@ var running_state: RunningApps = RunningApps.empty();
 /// greppable: BROWSER_APPIDS ↔ simpbar-launch-browser's probe loop.
 const BROWSER_APPIDS = [_][]const u8{ "brave", "brave-browser", "zen", "zen-browser", "vivaldi", "vivaldi-stable", "edge", "microsoft-edge", "librewolf", "firefox", "firefox-esr", "chromium", "google-chrome", "chrome" };
 /// DISCORD_APPIDS ↔ simpbar-launch-discord's probe loop ("fluxer" covers
-/// app.fluxer.FluxerDesktop via substring, same as the other entries).
+/// app.fluxer.FluxerDesktop as a whole-word run, same as the other entries).
 const DISCORD_APPIDS = [_][]const u8{ "vesktop", "equibop", "discord", "fluxer" };
 
-/// True when `appid_norm` (already lowercased) names the app `key`
-/// (lowercase): exact hit, reverse-DNS component hit
-/// ("org.gnome.nautilus" ↔ "nautilus"), or substring either way (covers
-/// "zen-browser" ↔ "zen" and wrapper families without enumerating builds).
-fn appidMatchesKey(appid_norm: []const u8, key: []const u8) bool {
-    if (key.len == 0 or appid_norm.len == 0) return false;
-    if (std.mem.eql(u8, appid_norm, key)) return true;
-    var parts = std.mem.splitScalar(u8, appid_norm, '.');
-    while (parts.next()) |part| {
-        if (part.len == 0) continue;
-        if (std.mem.eql(u8, part, key)) return true;
-        if (std.mem.indexOf(u8, part, key) != null) return true;
-        if (std.mem.indexOf(u8, key, part) != null) return true;
+/// Word separators inside an app id or a match key: reverse-DNS dots plus
+/// the dash/underscore/space variants distro ids and desktop classes use
+/// ("org.gnome.Nautilus", "zen-browser", "steam_app_440").
+fn isWordSep(c: u8) bool {
+    return c == '.' or c == '-' or c == '_' or c == ' ';
+}
+
+/// True when `needle`'s words appear as one contiguous run of `hay`'s
+/// words: case is ignored and separators *between* words are skipped while
+/// walking, but the run has to start and end on a whole word of `hay`
+/// (index 0 / a separator on each side). So "simpbar-config" hits
+/// "dev.jaytheoutpatient.simpbar.Config", "gnome-text-editor" hits
+/// "org.gnome.TextEditor" and "chrome" hits "google-chrome" — while "edge"
+/// never lands inside "ledger", "zen" never inside "zenity", and one
+/// shared word ("simpbar", "com", "org") can never stand in for a whole
+/// sibling key.
+fn wordRunIn(hay: []const u8, needle: []const u8) bool {
+    if (hay.len == 0 or needle.len == 0) return false;
+    var needle_words: usize = 0;
+    for (needle) |c| {
+        if (!isWordSep(c)) needle_words += 1;
     }
-    // Flat (non-DNS) appids skip the loop above meaningfully only on exact
-    // hits, so give them the same substring chance ("Alacritty" is flat).
-    if (std.mem.indexOfScalar(u8, appid_norm, '.') == null) {
-        if (std.mem.indexOf(u8, appid_norm, key) != null) return true;
-        if (std.mem.indexOf(u8, key, appid_norm) != null) return true;
+    if (needle_words == 0) return false; // separators-only key matches nothing
+    var start: usize = 0;
+    while (start < hay.len) : (start += 1) {
+        // A run may only begin at a word edge: index 0 or just past a sep.
+        if (start > 0 and !isWordSep(hay[start - 1])) continue;
+        var hi = start;
+        var ni: usize = 0;
+        while (true) {
+            while (ni < needle.len and isWordSep(needle[ni])) ni += 1;
+            if (ni == needle.len) break;
+            while (hi < hay.len and isWordSep(hay[hi])) hi += 1;
+            if (hi == hay.len or std.ascii.toLower(hay[hi]) != std.ascii.toLower(needle[ni])) break;
+            hi += 1;
+            ni += 1;
+        }
+        // Needle fully consumed, and the run stopped on a whole word: hit.
+        var done = ni;
+        while (done < needle.len and isWordSep(needle[done])) done += 1;
+        if (done == needle.len and (hi == hay.len or isWordSep(hay[hi]))) return true;
     }
     return false;
+}
+
+/// True when `appid_norm` (already lowercased) names the app `key`
+/// (lowercase): the two are compared as word runs in both directions, so
+/// "org.gnome.nautilus" ↔ "nautilus", "zen-browser" ↔ "zen" and
+/// "…simpbar.Config" ↔ "simpbar-config" all hit, and a flatpak pin
+/// ("com.spotify.Client") still finds a window reporting plain "spotify".
+///
+/// Both directions, whole words only: the old per-component substring test
+/// matched any single dot component either way, which made every window of
+/// one family light every pin of that family — `…simpbar.Config` satisfied
+/// the `simpbar-welcome` pin through their shared "simpbar" component (and
+/// "com" satisfied every flatpak-style pin at once), so starting
+/// simpbar-config lit the welcome dot too.
+fn appidMatchesKey(appid_norm: []const u8, key: []const u8) bool {
+    if (key.len == 0 or appid_norm.len == 0) return false;
+    return wordRunIn(appid_norm, key) or wordRunIn(key, appid_norm);
 }
 
 /// Command → match key: first shell word's basename, lowercased
@@ -11109,7 +11148,7 @@ test "volume poll and slider math" {
 
 test "running app matching and taskbar tail" {
     const t = std.testing;
-    // appid keys: exact, reverse-DNS component, substring both ways.
+    // appid keys: exact, reverse-DNS tail, word runs both ways.
     try t.expect(appidMatchesKey("nautilus", "nautilus"));
     try t.expect(appidMatchesKey("org.gnome.nautilus", "nautilus"));
     try t.expect(appidMatchesKey("app.fluxer.fluxerdesktop", "fluxer"));
@@ -11119,6 +11158,28 @@ test "running app matching and taskbar tail" {
     try t.expect(!appidMatchesKey("alacritty", "foot"));
     try t.expect(!appidMatchesKey("org.gnome.nautilus", ""));
     try t.expect(!appidMatchesKey("", "foot"));
+    // Two pins from one app family: their shared "simpbar" word must not
+    // light a sibling's dot — config and welcome are separate GTK apps
+    // (dev.jaytheoutpatient.simpbar.{Config,Welcome}), and before this the
+    // shared component matched both pins, so launching simpbar-config
+    // marked simpbar-welcome running too.
+    try t.expect(appidMatchesKey("dev.jaytheoutpatient.simpbar.config", "simpbar-config"));
+    try t.expect(!appidMatchesKey("dev.jaytheoutpatient.simpbar.config", "simpbar-welcome"));
+    try t.expect(appidMatchesKey("dev.jaytheoutpatient.simpbar.welcome", "simpbar-welcome"));
+    try t.expect(!appidMatchesKey("dev.jaytheoutpatient.simpbar.welcome", "simpbar-config"));
+    try t.expect(!clientMatchesLauncher("simpbar-welcome", "dev.jaytheoutpatient.simpbar.config", "simpbar config"));
+    try t.expect(!clientMatchesLauncher("simpbar-config", "dev.jaytheoutpatient.simpbar.welcome", "simpbar welcome"));
+    try t.expect(clientMatchesLauncher("simpbar-welcome", "dev.jaytheoutpatient.simpbar.welcome", "simpbar welcome"));
+    // Whole words only: one short component can't vouch for an unrelated
+    // key ("edge" sits inside "ledger", "zen" inside "zenity", and "com"
+    // inside every flatpak id), while word-split ids still line up with
+    // their binary names and classes.
+    try t.expect(!appidMatchesKey("ledger", "edge"));
+    try t.expect(!appidMatchesKey("zenity", "zen"));
+    try t.expect(!appidMatchesKey("com.discordapp.discord", "com.spotify.client"));
+    try t.expect(appidMatchesKey("org.gnome.texteditor", "gnome-text-editor"));
+    try t.expect(appidMatchesKey("steam_app_440", "steam"));
+    try t.expect(appidMatchesKey("com.vivaldi.vivaldi", "vivaldi"));
     // Command keys: basename, argv, desktop suffix.
     var kb: [64]u8 = undefined;
     try t.expectEqualStrings("nautilus", launcherMatchKey("nautilus", &kb));
