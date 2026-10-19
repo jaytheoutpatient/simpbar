@@ -1,4 +1,5 @@
-Neon Feather Circle Emblem.png
+
+<img width="1254" height="1254" alt="Neon Gradient Feather Emblem" src="https://github.com/user-attachments/assets/a04835bf-6f32-4dc9-8dc7-68c03ae6553a" />
 
 # Simpbar
 
@@ -48,6 +49,20 @@ Hyprland set (MangoWM in `~/.config/mango/cfg/keybinds.conf`, same spirit):
 | `SUPER + E` | Files |
 | `SUPER + Q` | Close window |
 | `SUPER + 1–0` | Workspaces |
+
+
+## Images
+
+<img width="1920" height="1080" alt="screenshot-2026-10-19_11-47-27" src="https://github.com/user-attachments/assets/b220c3cb-e8b4-43aa-8b16-ec077d18ae85" />
+<img width="1920" height="1080" alt="screenshot-2026-10-19_11-48-40" src="https://github.com/user-attachments/assets/cdabfa9e-d839-43d6-9a3d-d0ad3a2809fe" />
+<img width="1920" height="1080" alt="screenshot-2026-10-19_11-48-18" src="https://github.com/user-attachments/assets/a72ed3a5-118b-4d20-b88a-47dfa004dd5e" />
+<img width="1919" height="1080" alt="screenshot-2026-10-19_11-48-00" src="https://github.com/user-attachments/assets/94a141d8-cf41-43c7-8448-b72c604dbd89" />
+<img width="1919" height="1080" alt="screenshot-2026-10-19_11-47-43" src="https://github.com/user-attachments/assets/f005fcda-d05b-43d4-a554-895af6de5eda" />
+
+
+
+
+
 
 ## Credits
 
