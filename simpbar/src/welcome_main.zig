@@ -838,21 +838,17 @@ fn keychronRunScript(buf: []u8, staged_path: [:0]const u8, pkexec_style: bool) ?
     // string shape works for the sudo terminal fallback. bufPrintZ() wants
     // a comptime format string, hence one literal per branch.
     if (pkexec_style) {
-        return std.fmt.bufPrintZ(buf,
-            "/usr/bin/install -Dm644 '{s}' /etc/udev/rules.d/70-keychron.rules && " ++
-                "/usr/bin/udevadm control --reload-rules && " ++
-                "/usr/bin/udevadm trigger --subsystem-match=hidraw && " ++
-                "/usr/bin/udevadm trigger --subsystem-match=usb && " ++
-                "/usr/bin/rm -f '{s}'",
-            .{ staged_path, staged_path }) catch null;
+        return std.fmt.bufPrintZ(buf, "/usr/bin/install -Dm644 '{s}' /etc/udev/rules.d/70-keychron.rules && " ++
+            "/usr/bin/udevadm control --reload-rules && " ++
+            "/usr/bin/udevadm trigger --subsystem-match=hidraw && " ++
+            "/usr/bin/udevadm trigger --subsystem-match=usb && " ++
+            "/usr/bin/rm -f '{s}'", .{ staged_path, staged_path }) catch null;
     }
-    return std.fmt.bufPrintZ(buf,
-        "sudo /usr/bin/install -Dm644 '{s}' /etc/udev/rules.d/70-keychron.rules && " ++
-            "sudo /usr/bin/udevadm control --reload-rules && " ++
-            "sudo /usr/bin/udevadm trigger --subsystem-match=hidraw && " ++
-            "sudo /usr/bin/udevadm trigger --subsystem-match=usb; " ++
-            "rm -f '{s}'; echo; read -p 'Press Enter to close...'",
-        .{ staged_path, staged_path }) catch null;
+    return std.fmt.bufPrintZ(buf, "sudo /usr/bin/install -Dm644 '{s}' /etc/udev/rules.d/70-keychron.rules && " ++
+        "sudo /usr/bin/udevadm control --reload-rules && " ++
+        "sudo /usr/bin/udevadm trigger --subsystem-match=hidraw && " ++
+        "sudo /usr/bin/udevadm trigger --subsystem-match=usb; " ++
+        "rm -f '{s}'; echo; read -p 'Press Enter to close...'", .{ staged_path, staged_path }) catch null;
 }
 
 const KeychronPkexecOutcome = union(enum) {
@@ -1018,9 +1014,8 @@ fn onKeychronOpenClicked(_: *gtk.GtkButton, _: ?*anyopaque) callconv(.c) void {
 fn buildKeychronGroup() *gtk.AdwPreferencesGroup {
     const group = gtk.adw_preferences_group_new();
     gtk.adw_preferences_group_set_title(group, "Keychron keyboards");
-    gtk.adw_preferences_group_set_description(group,
-        "WebHID access for the Keychron Launcher and VIA. Browser-based " ++
-            "configurators cannot see the keyboard without these rules.");
+    gtk.adw_preferences_group_set_description(group, "WebHID access for the Keychron Launcher and VIA. Browser-based " ++
+        "configurators cannot see the keyboard without these rules.");
 
     {
         const row = gtk.adw_action_row_new();
@@ -1054,8 +1049,7 @@ fn buildKeychronGroup() *gtk.AdwPreferencesGroup {
                 "Opens launcher.keychron.com in a Chromium-based browser.";
             gtk.adw_action_row_set_subtitle(row, sub);
         } else {
-            gtk.adw_action_row_set_subtitle(row,
-                "Chromium isn't installed. Firefox cannot use WebHID, so this installs Chromium first.");
+            gtk.adw_action_row_set_subtitle(row, "Chromium isn't installed. Firefox cannot use WebHID, so this installs Chromium first.");
         }
         gtk.adw_action_row_set_icon_name(row, "web-browser-symbolic");
         const label: [:0]const u8 = if (keychronBrowser() != null) "Open" else "Install Chromium";
@@ -1276,7 +1270,7 @@ fn buildSetupPage() *gtk.GtkBox {
         const button = gtk.gtk_button_new_with_label("Launch");
         gtk.gtk_widget_add_css_class(@ptrCast(button), "flat");
         gtk.gtk_widget_set_valign(@ptrCast(button), gtk.ALIGN_CENTER);
-        _ = gtk.g_signal_connect_data(@ptrCast(button), "clicked", @ptrCast(&onSetupActionClicked), @constCast(@ptrCast(action)), null, 0);
+        _ = gtk.g_signal_connect_data(@ptrCast(button), "clicked", @ptrCast(&onSetupActionClicked), @ptrCast(@constCast(action)), null, 0);
         gtk.adw_action_row_add_suffix(row, @ptrCast(button));
         gtk.adw_action_row_set_activatable_widget(row, @ptrCast(button));
         gtk.adw_preferences_group_add(group, @ptrCast(row));
@@ -1468,7 +1462,7 @@ fn buildAboutPage() *gtk.GtkBox {
         gtk.adw_action_row_set_subtitle(row, link.subtitle);
         gtk.adw_action_row_set_icon_name(row, link.icon);
         gtk.gtk_list_box_row_set_activatable(@ptrCast(row), 1);
-        _ = gtk.g_signal_connect_data(@ptrCast(row), "activated", @ptrCast(&onAboutRowActivated), @constCast(@ptrCast(link.url)), null, 0);
+        _ = gtk.g_signal_connect_data(@ptrCast(row), "activated", @ptrCast(&onAboutRowActivated), @ptrCast(@constCast(link.url)), null, 0);
         gtk.adw_preferences_group_add(group, @ptrCast(row));
     }
     gtk.gtk_box_append(box, @ptrCast(group));
