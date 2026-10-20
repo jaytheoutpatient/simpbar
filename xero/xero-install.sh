@@ -3667,7 +3667,11 @@ write_limine_conf() {
             [[ "$k" == *-headers ]] && continue
             stem="$k"
             if [[ ! -f "$boot_mnt/vmlinuz-$stem" ]]; then
-                echo "WARNING: $boot_mnt/vmlinuz-$stem missing — skipping entry"
+                # Keep diagnostics out of limine.conf: this loop's stdout is
+                # redirected to the config file, so a plain echo here used to
+                # put WARNING text *inside* limine.conf and hide it from the
+                # installer log.
+                echo "WARNING: $boot_mnt/vmlinuz-$stem missing — skipping entry" >&2
                 continue
             fi
             entries=$((entries + 1))
@@ -3693,6 +3697,10 @@ write_limine_conf() {
     } > "$boot_mnt/limine.conf"
     if [[ "$entries" -eq 0 ]]; then
         echo "ERROR: no kernel entries written to $boot_mnt/limine.conf"
+        echo "  $boot_mnt contents:" >&2
+        ls -la "$boot_mnt" >&2 2>/dev/null || true
+        echo "  installed kernel modules:" >&2
+        ls -1 "$MOUNTPOINT/usr/lib/modules" >&2 2>/dev/null || true
         return 1
     fi
     # Limine probes several standard paths; the ESP copy covers UEFI
@@ -3710,6 +3718,22 @@ install_bootloader() {
     # limine-snapper-sync keeps snapshot entries current.
     local boot_mnt="$MOUNTPOINT/boot"
     [[ -d "$boot_mnt" ]] || { echo "ERROR: $boot_mnt missing"; return 1; }
+    if [[ -n "${CONFIG[boot_part]}" ]] && ! mountpoint -q "$boot_mnt"; then
+        echo "ERROR: $boot_mnt is not a mountpoint — the boot/EFI partition is not mounted"
+        return 1
+    fi
+
+    # Do not rely solely on the linux package's pacman hook to populate /boot:
+    # in a pacstrap transaction the mkinitcpio hook can be skipped or fail
+    # while pacstrap still reports success. Without /boot/vmlinuz-linux and
+    # initramfs-linux.img write_limine_conf has nothing to write entries for.
+    # Running the target's generator here also covers extra kernels and makes
+    # the initramfs match the mkinitcpio.conf changes made by configure_system.
+    echo "Generating initramfs for installed kernels..."
+    arch-chroot "$MOUNTPOINT" mkinitcpio -P || {
+        echo "ERROR: mkinitcpio -P failed — no kernel/initramfs in $boot_mnt"
+        return 1
+    }
 
     write_limine_conf || return 1
 
