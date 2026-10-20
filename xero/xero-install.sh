@@ -3243,7 +3243,11 @@ install_base_system() {
     optional+=" xf86-input-elographics"
 
     # Firmware (some may not apply to all hardware)
-    optional+=" fwupd sof-firmware linux-firmware-intel"
+    # Realtek firmware matters for the common TP-Link/Realtek USB Bluetooth
+    # dongles: without linux-firmware-realtek the adapter enumerates but
+    # rtl8761bu/rtl8761b firmware never loads, so bluetoothctl sees no
+    # controller. The Intel package is here for the same reason.
+    optional+=" fwupd sof-firmware linux-firmware-intel linux-firmware-realtek"
 
     # Secrets service — file managers (nautilus/nemo remote shares, dolphin
     # via kio) and anything using the secret-service D-Bus API want it; the
@@ -3402,6 +3406,13 @@ LOGO=archlinux
 FEATHEROS
 
     arch-chroot "$MOUNTPOINT" systemctl enable NetworkManager
+
+    # bluez is already in the critical base set, but Arch ships
+    # bluetooth.service disabled. Enable it so the adapter is ready at login:
+    # the simpbar drawer's Bluetooth tab talks to bluez over D-Bus and would
+    # otherwise show "No adapter" until the service is started by hand.
+    arch-chroot "$MOUNTPOINT" systemctl enable bluetooth.service \
+        || show_warning "Could not enable bluetooth.service — enable it manually after reboot: systemctl enable --now bluetooth"
 
     # ly owns tty1 after install: the package ships only the template
     # ly@.service, so it is enabled as an instance (ly@tty1) — a plain

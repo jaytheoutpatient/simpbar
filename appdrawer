@@ -12,6 +12,7 @@
 #   appdrawer open       open the drawer on the Apps tab
 #   appdrawer close      close the drawer
 #   appdrawer wallpapers open the drawer straight on the Wallpapers tab
+#   appdrawer bluetooth  open the drawer straight on the Bluetooth tab
 #   appdrawer apps       open the drawer straight on the Apps tab
 #   appdrawer power      open the drawer straight on the Power menu
 #                       (lock / log out / reboot / power off)
@@ -37,11 +38,11 @@ if [ "$#" -gt 0 ]; then
             "$QS" -c "$CFG" -d >/dev/null 2>&1
             exit $?
             ;;
-        open|close|toggle|wallpapers|apps|power)
+        open|close|toggle|wallpapers|apps|bluetooth|power)
             ACTION="$1"
             ;;
         *)
-            printf 'usage: %s [toggle|open|close|start|wallpapers|apps|power]\n' "$0" >&2
+            printf 'usage: %s [toggle|open|close|start|wallpapers|apps|bluetooth|power]\n' "$0" >&2
             exit 2
             ;;
     esac

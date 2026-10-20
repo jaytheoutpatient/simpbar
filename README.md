@@ -15,7 +15,7 @@ curl -sSL https://raw.githubusercontent.com/jaytheoutpatient/simpbar/main/instal
 
 Interactive — answers a few questions, asks for sudo **once**, then installs everything. Reboot when done (`systemctl reboot`).
 
-What you get: bar + desktop widgets + app drawer, wallpaper picker with matugen auto-theming, foot, rofi, swaync, fish, Neovim, browser/Discord of your choice, OBS/video tools optional. Gaming launchers (Steam/Lutris/Heroic) come from the Xero installer's GAMING picks.
+What you get: bar + desktop widgets + app drawer with Bluetooth, wallpaper picker with matugen auto-theming, foot, rofi, swaync, fish, Neovim, browser/Discord of your choice, OBS/video tools optional. Gaming launchers (Steam/Lutris/Heroic) come from the Xero installer's GAMING picks.
 
 ## Desktop widgets
 

@@ -53,9 +53,13 @@ PanelWindow {
     property string tab: "apps"
     readonly property var tabs: [
         { id: "apps", label: "Apps" },
-        { id: "wallpapers", label: "Wallpapers" }
+        { id: "wallpapers", label: "Wallpapers" },
+        { id: "bluetooth", label: "Bluetooth" }
     ]
     readonly property bool showingWallpapers: win.tab === "wallpapers"
+    // Bluetooth is a full-width module like wallpapers: no category column,
+    // no app grid, and its own two-column device panel instead.
+    readonly property bool showingBluetooth: win.tab === "bluetooth"
     // Any wallpaper process in flight (apply, local random, fetch, or an
     // online preview search/apply). The footer's action buttons share one busy
     // state and one "Working…" label so they can never race each other for the
@@ -169,6 +173,21 @@ PanelWindow {
             WallpaperModel.refresh()
             WallpaperModel.refreshCurrent()
         }
+    }
+
+    // Start a Bluetooth scan without clicking the panel's button. Used by the
+    // `appdrawer bluetoothScan` IPC action so a bar button or a test can kick
+    // one off. Opening the tab already starts a scan, so when the drawer is
+    // closed or on another tab this only opens Bluetooth; calling startScan
+    // immediately afterwards would race that first StartDiscovery and log
+    // "Operation already in progress". On an already-open Bluetooth tab it is
+    // the way to resume after pressing Stop.
+    function bluetoothScan() {
+        if (!win.open || !win.showingBluetooth) {
+            win.openTab("bluetooth")
+            return
+        }
+        bt.startScan()
     }
 
     // Land straight on the Power menu (lock / log out / reboot / power off).
@@ -290,15 +309,24 @@ PanelWindow {
                     onTextChanged: {
                         if (win.showingWallpapers && win.whOnline)
                             return;
+                        if (win.showingBluetooth) {
+                            bt.query = text
+                            return;
+                        }
                         win.activeModel.query = text
                     }
                     Keys.onEscapePressed: win.closeDrawer()
                     Keys.onReturnPressed: {
                         // Enter acts on whatever the visible tab is: launch the
-                        // first app, or apply the first wallpaper match. The
+                        // first app, apply the first wallpaper match, or
+                        // connect/pair the first idle Bluetooth device. The
                         // drawer stays open for the wallpaper case so the
                         // recolour is visible. In wallhaven mode it runs the
                         // online search instead.
+                        if (win.showingBluetooth) {
+                            bt.activateFirst();
+                            return;
+                        }
                         if (win.showingWallpapers && win.whOnline) {
                             if (search.text.trim().length > 0)
                                 WallhavenSearch.search(search.text.trim());
@@ -320,10 +348,11 @@ PanelWindow {
                     verticalAlignment: Text.AlignVCenter
                     leftPadding: 44
                     visible: search.text.length === 0
-                    text: win.whOnline
-                          ? "search wallhaven.cc…"
-                          : (win.showingWallpapers ? "Search wallpapers"
-                                                   : "Search apps")
+                    text: win.showingBluetooth ? "Search Bluetooth devices"
+                          : win.whOnline
+                            ? "search wallhaven.cc…"
+                            : (win.showingWallpapers ? "Search wallpapers"
+                                                     : "Search apps")
                     color: Theme.dim
                     font.pixelSize: 16
                     elide: Text.ElideRight
@@ -349,10 +378,14 @@ PanelWindow {
                     width: tabLabel.implicitWidth + 26
                     height: 28
                     radius: 9
-                    color: win.tab === modelData.id ? Theme.accent
-                                                    : (tabHover.hovered ? Theme.hover
-                                                                        : "transparent")
-                    opacity: win.tab === modelData.id ? 0.22 : 1.0
+                    // Tint only the fill: dropping opacity on the whole
+                    // delegate (as this used to) also faded the label, so the
+                    // selected tab read as disabled next to the others. The
+                    // wallpaper mini-tabs already use this fill-behind-text
+                    // pattern.
+                    color: win.tab === modelData.id
+                           ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.22)
+                           : (tabHover.hovered ? Theme.hover : "transparent")
                     border.width: 1
                     border.color: win.tab === modelData.id ? Theme.accent
                                                             : Theme.separator
@@ -610,10 +643,11 @@ PanelWindow {
             // category sidebar
             Item {
                 id: side
-                // No categories apply to wallpapers, so the whole column is
-                // dropped and the grid below takes the full width.
-                visible: !win.showingWallpapers
-                width: win.showingWallpapers ? 0 : win.sidebarW
+                // No categories apply to wallpapers or Bluetooth, so the whole
+                // column is dropped and the grid/panel below takes the width.
+                visible: !win.showingWallpapers && !win.showingBluetooth
+                width: (win.showingWallpapers || win.showingBluetooth)
+                       ? 0 : win.sidebarW
                 anchors.top: parent.top
                 anchors.bottom: parent.bottom
 
@@ -686,8 +720,10 @@ PanelWindow {
             // app grid
             GridView {
                 id: grid
-                anchors.left: win.showingWallpapers ? parent.left : side.right
-                anchors.leftMargin: win.showingWallpapers ? 0 : 18
+                anchors.left: (win.showingWallpapers || win.showingBluetooth)
+                              ? parent.left : side.right
+                anchors.leftMargin: (win.showingWallpapers || win.showingBluetooth)
+                                    ? 0 : 18
                 anchors.right: parent.right
                 anchors.top: parent.top
                 anchors.bottom: parent.bottom
@@ -697,7 +733,7 @@ PanelWindow {
                 // one keeps its scroll position and delegates alive. Without
                 // this the app grid stayed painted underneath the wallpaper grid
                 // and the two interleaved, since their cell sizes differ.
-                visible: !win.showingWallpapers
+                visible: !win.showingWallpapers && !win.showingBluetooth
 
                 clip: true
                 interactive: win.open
@@ -912,6 +948,19 @@ PanelWindow {
                     font.pixelSize: 15
                 }
             }
+
+            // ---- bluetooth panel -------------------------------------------
+            // A sibling of the grids, hidden the same way they are. It owns its
+            // own adapter state and scanning: `active` only turns discovery on
+            // while the tab is both selected and the drawer is open, so closing
+            // the drawer stops the radio instead of scanning until the daemon
+            // exits.
+            BluetoothPanel {
+                id: bt
+                anchors.fill: parent
+                visible: win.showingBluetooth
+                active: win.showingBluetooth && win.open
+            }
         }
 
         // ---- footer --------------------------------------------------------
@@ -929,7 +978,9 @@ PanelWindow {
                 // Status takes precedence: while a wallpaper is being applied
                 // the busy text is the only thing worth reading. In wallhaven
                 // mode the online search's chatter wins over the folder's.
-                text: win.showingWallpapers
+                text: win.showingBluetooth
+                      ? bt.footerText
+                      : win.showingWallpapers
                       ? (WallhavenSearch.status.length > 0
                          ? WallhavenSearch.status
                          : (WallpaperModel.status.length > 0
@@ -1785,7 +1836,17 @@ PanelWindow {
             // something looking untidy. Worth asserting rather than eyeballing.
             + " appGridVisible=" + grid.visible
             + " wpGridVisible=" + wpGrid.visible
-            + " sidebarVisible=" + side.visible);
+            + " sidebarVisible=" + side.visible
+            // Bluetooth: adapter presence and power are what explain an empty
+            // panel, and discovery is the one piece of hidden radio state.
+            + " btTab=" + win.showingBluetooth
+            + " btAvailable=" + bt.available
+            + " btPowered=" + bt.powered
+            + " btState='" + bt.adapterState + "'"
+            + " btDiscovering=" + bt.discovering
+            + " btKnown=" + bt.mine.length
+            + " btNearby=" + bt.nearby.length
+            + " btQuery='" + bt.query + "'");
     }
 
     Process {

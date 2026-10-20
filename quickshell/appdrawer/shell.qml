@@ -7,6 +7,7 @@ import Quickshell.Io
 //   Run the daemon:      qs -c appdrawer
 //   Toggle the drawer:   qs -c appdrawer ipc call drawer toggle
 //   Open wallpapers:     qs -c appdrawer ipc call drawer wallpapers
+//   Open Bluetooth:      qs -c appdrawer ipc call drawer bluetooth
 //
 // The toggle goes through IPC rather than Quickshell.GlobalShortcut because
 // GlobalShortcut needs a Hyprland `global` bind, and that dispatcher does not
@@ -37,6 +38,18 @@ ShellRoot {
 
         function apps() {
             drawer.openTab("apps")
+        }
+
+        // Open straight onto the Bluetooth module. The tab starts scanning by
+        // itself on entry; the separate scan action is for a bar button or a
+        // keybind that wants to kick one off, and for tests that cannot click
+        // the panel's Scan control.
+        function bluetooth() {
+            drawer.openTab("bluetooth")
+        }
+
+        function bluetoothScan() {
+            drawer.bluetoothScan()
         }
 
         // Open straight onto the Power menu (lock / log out / reboot / power
