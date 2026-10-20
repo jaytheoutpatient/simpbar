@@ -24,7 +24,7 @@ set -Eeuo pipefail
 
 VERSION="2.0.0"
 SCRIPT_NAME="Featherlite Installer"
-PART_LABEL="Part 1 - Pacstrap"
+PART_LABEL="Featherlite Linux - Part 1: Pacstrap"
 
 # Mountpoint for installation
 MOUNTPOINT="/mnt"
@@ -880,11 +880,11 @@ invaders_play() {
         # characters, and the wrapped "op" landed on the first alien row
         # (where the field clear, which starts at $left, never erased it).
         # Keep the whole banner on one row at every width.
-        local beta_tag="" title="SPACE INVADERS" help=""
+        local beta_tag="" title="FEATHERLITE INVADERS" help=""
         if (( cols >= 80 )); then beta_tag=" (beta)"; fi
         title+="$beta_tag"
         local help_full="  · ◀ ▶ a/d move · space shoot · q stop"
-        local help_short="  · a/d move · space shoot · q stop"
+        local help_short="  · a/d move · space shoot · q"
         local help_tiny="  · a/d · space · q"
         local avail=$(( cols - left + 1 ))
         if (( ${#title} + ${#help_full} + 2 <= avail )); then
