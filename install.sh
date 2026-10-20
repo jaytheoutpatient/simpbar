@@ -922,10 +922,12 @@ if ! grep -Pzoq '(?m)^\[multilib\]\nInclude' /etc/pacman.conf 2>/dev/null; then
         || die "Failed to sync package databases after enabling multilib."
 fi
 
-# zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl are
+# freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl are
 # simpbar's build/runtime deps (Wayland client + layer-shell, FreeType glyph
 # rendering, gdk-pixbuf for tray icon-name decode, and the mpris source it
-# shells out to) — all official-repo, no AUR needed. pacman-contrib
+# shells out to) — all official-repo, no AUR needed. Zig itself is handled by
+# ensure_zig_016 below, which pins the 0.16 API this tree builds against
+# instead of trusting whatever version the distro currently ships. pacman-contrib
 # (checkupdates) and wireplumber (wpctl) were already here for other
 # reasons but simpbar's pacman-update-count and volume widgets need them too.
 # grim + slurp + wl-clipboard + libnotify + gawk cover the screenshot binds
@@ -944,7 +946,7 @@ fi
 # network mounts, dolphin via kio's credentials dialogue) and anything
 # storing secrets (secret-service D-Bus API); the PAM auto-unlock lines go
 # in at Step 8.
-PACMAN_PKGS=(zig freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji fastfetch neovim swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility polkit-gnome gnome-keyring grim slurp wlr-randr cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
+PACMAN_PKGS=(freetype2 gdk-pixbuf2 wayland wayland-protocols playerctl mate-polkit swaybg ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji fastfetch neovim swaync rofi flatpak bazaar nwg-look pavucontrol cava pipewire pipewire-pulse wireplumber gnome-disk-utility polkit-gnome gnome-keyring grim slurp wlr-randr cliphist wl-clipboard python-gobject gtk4 libadwaita pacman-contrib libnotify nwg-drawer qt6ct breeze gawk kdeconnect quickshell brightnessctl)
 
 # Official Mesa Vulkan stack — see the Step 6 header: pinning these keeps
 # pacman from resolving the vulkan-driver virtuals to a conflicting mesa-git.
@@ -1136,6 +1138,79 @@ fi
 
 run_spinner "Refreshing font cache" fc-cache -f \
     || warn "Could not refresh the font cache — run 'fc-cache -f' manually if icons look missing"
+
+# The source tree targets Zig 0.16 (build.zig.zon's minimum_zig_version).
+# Do not trust the distro's current package: it may be a different API level
+# and lack std.fmt.bufPrintZ, which this tree and its wayland scanner still
+# use, while older ones lack other 0.16 APIs. Use a cached/system 0.16.0 when
+# present, otherwise fetch the official 0.16.0 tarball into the user's
+# simpbar data dir and put it first on PATH for both build steps. Pin the
+# exact release: a 0.16.0-dev snapshot can predate bufPrintZ being restored.
+ensure_zig_016() {
+    local want="0.16.0"
+    local zigdir="$HOME/.local/share/simpbar/zig-$want"
+    local parent="$HOME/.local/share/simpbar"
+    local arch url tarball extracted
+
+    if [ -x "$zigdir/zig" ] \
+       && [ "$("$zigdir/zig" version 2>/dev/null || true)" = "$want" ]; then
+        export PATH="$zigdir:$PATH"
+        ok "Using cached Zig $("$zigdir/zig" version)"
+        return 0
+    fi
+
+    if command -v zig >/dev/null 2>&1; then
+        local system_version system_std
+        system_version=$(zig version 2>/dev/null || true)
+        system_std=$(zig env 2>/dev/null \
+            | sed -n 's/^[[:space:]]*\.std_dir = "\(.*\)",$/\1/p' \
+            | head -n1) || system_std=""
+        # Version alone is not enough: a broken/partial install can report
+        # 0.16.0 while its stdlib no longer has the API this tree needs.
+        if [ "$system_version" = "$want" ] \
+           && [ -n "$system_std" ] \
+           && grep -q 'pub fn bufPrintZ' "$system_std/fmt.zig" 2>/dev/null; then
+            ok "Using system Zig $system_version"
+            return 0
+        fi
+        warn "System Zig is ${system_version:-unknown} without the 0.16 std.fmt API; installing pinned Zig $want for the build"
+    fi
+
+    case "$(uname -m)" in
+        x86_64) arch=x86_64 ;;
+        aarch64|arm64) arch=aarch64 ;;
+        *) die "Unsupported architecture for Zig $want: $(uname -m)" ;;
+    esac
+
+    mkdir -p "$parent" \
+        || die "Could not create $parent"
+    tarball="$parent/zig-$want.tar.xz"
+    url="https://ziglang.org/download/$want/zig-$arch-linux-$want.tar.xz"
+    extracted="$parent/zig-$arch-linux-$want"
+
+    run_spinner "Downloading Zig $want" \
+        curl -fL --retry 3 -o "$tarball" "$url" \
+        || { rm -f "$tarball"; die "Could not download Zig $want from $url"; }
+
+    rm -rf "$extracted" "$zigdir"
+    run_spinner "Extracting Zig $want" \
+        tar -xJf "$tarball" -C "$parent" \
+        || { rm -f "$tarball"; die "Could not extract Zig $want"; }
+    rm -f "$tarball"
+
+    if [ ! -x "$extracted/zig" ]; then
+        die "Zig archive did not contain $extracted/zig"
+    fi
+    mv "$extracted" "$zigdir" \
+        || die "Could not move Zig $want into $zigdir"
+    if [ "$("$zigdir/zig" version 2>/dev/null || true)" != "$want" ]; then
+        die "Downloaded Zig at $zigdir is not version $want"
+    fi
+    export PATH="$zigdir:$PATH"
+    ok "Using pinned Zig $("$zigdir/zig" version) from $zigdir"
+}
+
+ensure_zig_016
 
 # Build simpbar (the bar) and simpbar-welcome (the GTK4 + libadwaita
 # companion app) from the source placed in ~/.local/share/simpbar/simpbar
@@ -2006,7 +2081,8 @@ run_spinner "Updating the full system (pacman -Syu)" sudo pacman -Syu --noconfir
 # ── Step 9: done ────────────────────────────────────────────────────
 step "Done"
 ok "Full system updated (pacman -Syu)"
-ok "zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, ${TERMINAL_PKG}, fastfetch, neovim, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, cava, pipewire, gnome-disk-utility, nwg-drawer, kdeconnect, brightnessctl, wlr-randr installed (pacman)"
+ok "Zig 0.16.0 build tool ready"
+ok "freetype2, gdk-pixbuf2, wayland, wayland-protocols, playerctl, mate-polkit, swaybg, JetBrainsMono Nerd Font, Noto Fonts, Noto Emoji, ${TERMINAL_PKG}, fastfetch, neovim, swaync, rofi, flatpak, bazaar, nwg-look, pavucontrol, cava, pipewire, gnome-disk-utility, nwg-drawer, kdeconnect, brightnessctl, wlr-randr installed (pacman)"
 
 # gnome-keyring auto-unlock at login: two `optional` PAM lines (optional =
 # they can never block login, even if the module ever disappears) appended
