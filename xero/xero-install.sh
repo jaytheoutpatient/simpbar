@@ -433,16 +433,17 @@ confirm_action() {
     fi
 }
 
-# Big block-letter "FEATHERLITE" wordmark, 54 cols wide — drawn with the same
-# U+2588 FULL BLOCK used by the progress bar itself, so it's exactly as
+# Big block-letter "FEATHERLITE" wordmark, 54 cols wide — 11 letters at
+# 4 columns each plus one space between them. Drawn with the same U+2588
+# FULL BLOCK used by the progress bar itself, so it's exactly as
 # console-safe as the bar already proven to render correctly here. Skipped
 # entirely on a narrow terminal (see draw_progress_bar) rather than wrapped.
 FEATHERLITELOGO=(
-    "████ ████ ████ █  █ ████ ████ █    ████ ████ ████ ████"
-    "█    █    █  █  █   █  █ █    █  █ █     █    █   █   "
-    "███  ███  ████  █   ████ ███  ███  █     █    █   ███ "
-    "█    █    █  █  █   █  █ █    █ █  █     █    █   █   "
-    "█    ████ █  █  █   █  █ ████ █  █ ████ ████  █   ████"
+    "████ ████ ████ ████ █  █ ████ ████ █    ████ ████ ████"
+    "█    █    █  █  ██  █  █ █    █  █ █     ██   ██  █   "
+    "███  ███  ████  ██  ████ ███  ███  █     ██   ██  ███ "
+    "█    █    █  █  ██  █  █ █    █ █  █     ██   ██  █   "
+    "█    ████ █  █  ██  █  █ ████ █  █ ████ ████  ██  ████"
 )
 
 # Pure bash/tput/printf, no gum — redrawn many times a second from
