@@ -192,19 +192,41 @@ on_err() {
     DISPLAY_PID=""
     clear 2>/dev/null || true
     tput cnorm 2>/dev/null || true
+    # run_step_visual turns autowrap off while the progress frame/game share
+    # the terminal; restore it before any normal error UI is printed.
+    printf '\033[?7h' 2>/dev/null || true
 
     if have_gum; then
         gum style --foreground 196 --bold --margin "1 2" \
             "❌ ERROR (exit=$exit_code) at line $line_no" \
             "$cmd"
-        echo ""
-        gum style --foreground 245 --margin "0 2" \
-            "Tip: If this was during formatting, it's often missing partitions (udev timing) or empty device paths."
-        echo ""
-        gum input --placeholder "Press Enter to exit..." --width 50
     else
         echo -e "${RED}ERROR (exit=$exit_code) at line $line_no${NC}"
         echo -e "${RED}$cmd${NC}"
+    fi
+
+    # The failing command's own output is usually the only useful diagnostic
+    # (pacman's "target not found", a mirror timeout, "not enough free space",
+    # etc.). Show the tail even when the global ERR trap fires outside
+    # run_step_visual's status block.
+    if [[ -n "${STEP_LOG:-}" && -s "$STEP_LOG" ]]; then
+        echo ""
+        echo "Last output from the failed step:"
+        tail -n 30 "$STEP_LOG" 2>/dev/null || true
+        echo ""
+        echo "Full step log: $STEP_LOG"
+    fi
+
+    echo ""
+    if have_gum; then
+        gum style --foreground 245 --margin "0 2" \
+            "Tip: Check the last output above. Common causes are no network/mirror, an unavailable package/repo, or too little free space in the target. If this was during formatting, also check partitions/udev timing."
+        echo ""
+        gum input --placeholder "Press Enter to exit..." --width 50
+    else
+        echo "Tip: Check the last output above. Common causes are no network/mirror, an unavailable package/repo, or too little free space in the target."
+        echo ""
+        read -r -p "Press Enter to exit..." _ < /dev/tty || true
     fi
 
     exit "$exit_code"
@@ -215,7 +237,12 @@ trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
 # loop (a forked process, not a child that dies on its own) on any exit.
 DISPLAY_PID=""
 INVADERS_PID=""
-trap 'kill "$DISPLAY_PID" 2>/dev/null || true; invaders_stop; tput cnorm 2>/dev/null || true' EXIT
+# Path to the current visual step's captured output, if any. on_err uses it
+# when a failure happens outside run_step_visual's own status handling (for
+# example inside the redraw/game cleanup) so the real command error is visible
+# instead of only the failing shell line.
+STEP_LOG=""
+trap 'kill "$DISPLAY_PID" 2>/dev/null || true; invaders_stop; tput cnorm 2>/dev/null || true; printf "\033[?7h" 2>/dev/null || true' EXIT
 
 # ────────────────────────────────────────────────────────────────────────────────
 # UTILITY FUNCTIONS
@@ -443,17 +470,27 @@ draw_progress_bar() {
     [[ $filled -gt 0 ]] && bar+=$(printf '█%.0s' $(seq 1 "$filled"))
     [[ $empty -gt 0 ]] && bar+=$(printf '░%.0s' $(seq 1 "$empty"))
 
-    local out="" row=0 t
+    local out="" row=0 t patience
     # _pl <sgr-or-empty> <text>: append one frame line to $out.
     _pl() {
         local pre="" post='\n'
+        local text="$2"
         if [[ -n "$top" ]]; then
             printf -v pre '\033[%d;1H' $(( top + 1 + row ))
             post=''
         fi
         row=$(( row + 1 ))
-        if [[ -n "$2" ]]; then
-            printf -v t '%s%b%s\033[0m\033[K%b' "$pre" "$1" "$(center_pad "$2" "$cols")" "$post"
+        # Clear each row BEFORE writing it rather than after. A line that
+        # fills the last column leaves the cursor at the margin with a wrap
+        # pending, so a trailing \033[K erased the line's last character --
+        # and with autowrap on it ran on the NEXT row and erased whatever
+        # lives there (the game header at the minimum height). Pre-clearing
+        # cannot touch another row. Clip only text that would overflow.
+        if (( ${#text} > cols )); then
+            text="${text:0:cols}"
+        fi
+        if [[ -n "$text" ]]; then
+            printf -v t '%s\033[K%b%s\033[0m%b' "$pre" "$1" "$(center_pad "$text" "$cols")" "$post"
         else
             printf -v t '%s\033[K%b' "$pre" "$post"
         fi
@@ -474,7 +511,17 @@ draw_progress_bar() {
     _pl '\033[38;5;45m\033[1m' "$PART_LABEL"
     _pl '\033[38;5;212m\033[1m' "Step $step_num of $total: $title"
     _pl '' ''
-    _pl '\033[38;5;245m' "(Be patient while system installs. If it looks stuck it's normal.)"
+    # The full sentence is 66 columns. At narrower widths it used to wrap,
+    # and its trailing \033[K then erased the first cells of the game's
+    # header on the next row. Pick a sentence that fits instead of wrapping.
+    patience="(Be patient while system installs. If it looks stuck it's normal.)"
+    if (( ${#patience} > cols )); then
+        patience="(Be patient - this can take a while.)"
+    fi
+    if (( ${#patience} > cols )); then
+        patience="(Please wait...)"
+    fi
+    _pl '\033[38;5;245m' "$patience"
     printf '%s' "$out"
 }
 
@@ -515,7 +562,6 @@ INVADERS_OPTOUT="/tmp/featherlite-invaders.optout"
 invaders_play() {
     local stopfile="$1"
     local FW=33 SHIP_R=8 BOTTOM_PAD=2   # field width; ship row (0..8); rows kept clear at the bottom
-    local bottom=$(( 24 - BOTTOM_PAD )) # last usable screen row (BOTTOM_PAD above the claimed bottom)
     # Real parent pid for the orphan check: in a subshell $PPID is only a
     # preserved copy of the parent's own parent, so read /proc/<BASHPID>/stat
     # (field 4) once — no fork; $PPID stays as the fallback.
@@ -545,7 +591,17 @@ invaders_play() {
     emit() { local _t; printf -v _t "$@"; OUT+="$_t"; }
     : > "$INVADERS_LOG" 2>/dev/null || true
     ilog "start pid=$BASHPID parent=$myppid tty_saved=$([[ -n "$tty_saved" ]] && echo yes || echo no)"
-    local rows_base=0 lines=24 cols=80 left=1
+    # Seed geometry from the real terminal instead of the old 24x80 placeholder:
+    # if the stop file vanishes before the first geometry poll, cleanup still
+    # has to clear the real strip. The placeholder's bottom (22) made an early
+    # farewell clear rows 10-22, which is exactly where the logo lives on a
+    # taller console.
+    local lines cols bottom rows_base left
+    lines=$(term_lines) 2>/dev/null || lines=24
+    cols=$(term_cols) 2>/dev/null || cols=80
+    (( cols < 40 )) && cols=40
+    bottom=$(( lines - BOTTOM_PAD ))
+    rows_base=$(( bottom - 11 ))
     local frame=0 cleaned=0 painted=0 geo_dirty=1 refuse_last=""
     local score=0 wave=1 lives=3
     local origin=2 dirn=1 drop=0 step=0 step_every=6
@@ -570,16 +626,28 @@ invaders_play() {
     reseed
 
     quiet_exit() {
-        # farewell row + the 12 strip rows (bottom-11 .. bottom)
+        # Clear only the 12 rows the game owns (rows_base..bottom). The old
+        # version started one row above the strip for the farewell message;
+        # at the minimum height that extra row is the progress frame's last
+        # line, so stopping the game erased part of the loading screen.
+        (( painted != 0 )) || return 0
         local i
-        for (( i = 0; i < 13; i++ )); do
-            printf '\033[%d;1H\033[K' "$(( bottom - 12 + i ))" 2>/dev/null || true
+        for (( i = 0; i < 12; i++ )); do
+            printf '\033[%d;1H\033[K' "$(( rows_base + i ))" 2>/dev/null || true
         done
+        painted=0
     }
     farewell() {
+        # If the terminal was too small to ever paint a frame, there is no
+        # strip to write over -- and rows_base may be inside the progress
+        # frame. Stay silent rather than damage the loading screen.
+        (( painted != 0 )) || return 0
+        local msg="${1:-arcade closed}"
         quiet_exit
+        # rows_base is inside the strip, below the progress frame at every
+        # size where the game was allowed to run.
         printf '\033[%d;1H\033[K\033[38;5;245m        %s\033[0m' \
-            "$(( bottom - 12 ))" "${1:-(arcade closed — install continues)}"
+            "$rows_base" "$msg"
     }
     finish() {
         if [[ -n "$tty_saved" ]]; then
@@ -653,7 +721,7 @@ invaders_play() {
             # remaining step (invaders_start checks INVADERS_OPTOUT).
             : > "$INVADERS_OPTOUT" 2>/dev/null || true
             ilog "exit q — arcade opted out for the session geo=${lines}x${cols}"
-            farewell "(arcade off — no more this session)"
+            farewell "arcade off for this session"
             tput cnorm 2>/dev/null || true
             break
         fi
@@ -806,12 +874,28 @@ invaders_play() {
         # ── render: 12 rows, top to bottom, everything erased each pass ──
         painted=1
         OUT=""
-        # header: rows_base. "(beta)" rides along only on wide consoles so the
-        # line can never wrap on small ones.
-        local beta_tag=""
+        # header: rows_base. Build the widest help text that actually fits,
+        # keeping the banner aligned with the field's left edge. The old line
+        # was 60 cols wide with "(beta)"; at 80 cols it overflowed by two
+        # characters, and the wrapped "op" landed on the first alien row
+        # (where the field clear, which starts at $left, never erased it).
+        # Keep the whole banner on one row at every width.
+        local beta_tag="" title="SPACE INVADERS" help=""
         if (( cols >= 80 )); then beta_tag=" (beta)"; fi
-        emit '\033[%d;1H\033[K\033[%d;%dH\033[38;5;198mSPACE INVADERS%s\033[38;5;245m  · ◀ ▶ a/d move · space shoot · q stop\033[0m' \
-            "$rows_base" "$rows_base" "$left" "$beta_tag" 2>/dev/null || true
+        title+="$beta_tag"
+        local help_full="  · ◀ ▶ a/d move · space shoot · q stop"
+        local help_short="  · a/d move · space shoot · q stop"
+        local help_tiny="  · a/d · space · q"
+        local avail=$(( cols - left + 1 ))
+        if (( ${#title} + ${#help_full} + 2 <= avail )); then
+            help="$help_full"   # +2: the two arrow glyphs can be wide
+        elif (( ${#title} + ${#help_short} <= avail )); then
+            help="$help_short"
+        elif (( ${#title} + ${#help_tiny} <= avail )); then
+            help="$help_tiny"
+        fi
+        emit '\033[%d;1H\033[K\033[%d;%dH\033[38;5;198m%s\033[38;5;245m%s\033[0m' \
+            "$rows_base" "$rows_base" "$left" "$title" "$help" 2>/dev/null || true
         # alien field rows 0..SHIP_R: rows_base+1..rows_base+9
         for (( i = 0; i <= SHIP_R; i++ )); do
             emit '\033[%d;%dH\033[K' "$(( rows_base + 1 + i ))" "$left" 2>/dev/null || true
@@ -857,8 +941,14 @@ invaders_play() {
         fi
         # ship (red + BREACH! while flashing)
         if (( flash > 0 )); then
-            emit '\033[%d;%dH\033[1m\033[38;5;196m┬▲┬\033[0m \033[38;5;196mBREACH!\033[0m' \
-                "$(( rows_base + 1 + SHIP_R ))" "$(( left + ship_x - 1 ))" 2>/dev/null || true
+            local ship_txt="┬▲┬ BREACH!"
+            # A ship at the right edge would otherwise wrap "BREACH!" onto
+            # the HUD row; drop the word rather than let it escape the field.
+            if (( left + ship_x - 1 + ${#ship_txt} - 1 > cols )); then
+                ship_txt="┬▲┬"
+            fi
+            emit '\033[%d;%dH\033[1m\033[38;5;196m%s\033[0m' \
+                "$(( rows_base + 1 + SHIP_R ))" "$(( left + ship_x - 1 ))" "$ship_txt" 2>/dev/null || true
         else
             emit '\033[%d;%dH\033[38;5;45m┬▲┬\033[0m' \
                 "$(( rows_base + 1 + SHIP_R ))" "$(( left + ship_x - 1 ))" 2>/dev/null || true
@@ -951,6 +1041,7 @@ run_step_visual() {
 
     local logfile
     logfile=$(mktemp)
+    STEP_LOG="$logfile"
 
     # Percent range this step owns, from where the previous step left off to
     # where the next starts. Progress within it is approximated from how
@@ -972,6 +1063,13 @@ run_step_visual() {
 
     clear
     tput civis
+    # The progress frame and the game are independent writers sharing one
+    # terminal. Turn autowrap off for the duration so a line that is one cell
+    # too wide (a long title, a font that measures a glyph differently) clips
+    # at the right edge instead of wrapping and scrolling the screen. The
+    # explicit clipping in both renderers is the primary fix; this is the
+    # belt-and-suspenders guard. Restored before any normal UI/error output.
+    printf '\033[?7l' 2>/dev/null || true
     (
         # Geometry is re-checked every frame, not pinned: a mid-step
         # terminal resize otherwise leaves cup repositioning stale
@@ -989,7 +1087,21 @@ run_step_visual() {
                 clear
                 content_height=8
                 [[ $cols -ge 58 ]] && content_height=$(( content_height + 6 ))
-                top_row=$(vpad_for "$content_height")
+                # Anchor the banner across resizes instead of re-centering it
+                # on every size change (which made it visibly jump while the
+                # game was running). Keep the current top row unless the new
+                # height can no longer fit both the frame and the game strip.
+                local reserve=0
+                if [[ "${CONFIG[play_invaders]:-off}" == "on" \
+                      && ! -e "$INVADERS_OPTOUT" ]] \
+                   && (( rows_now >= content_height + 28 )); then
+                    reserve=14   # frame must end above rows_base (rows-13)
+                fi
+                local max_top=$(( rows_now - content_height - reserve ))
+                if (( max_top < 0 )); then max_top=0; fi
+                if (( top_row > max_top )); then
+                    top_row=$max_top
+                fi
                 last_cols=$cols
                 last_rows=$rows_now
             fi
@@ -1014,8 +1126,12 @@ run_step_visual() {
     # Stopped right after the step function returns, below.
     invaders_start
 
-    "$func" "$@" > "$logfile" 2>&1
-    local status=$?
+    # Capture the status instead of letting `set -e`/the global ERR trap abort
+    # before we can show the step's actual output. This is what turns a bare
+    # "ERROR at line N" into pacman's real diagnostic ("target not found",
+    # mirror timeout, not enough space, signature failure, ...).
+    local status=0
+    "$func" "$@" > "$logfile" 2>&1 || status=$?
 
     invaders_stop
 
@@ -1027,24 +1143,51 @@ run_step_visual() {
     wait "$display_pid" 2>/dev/null || true
     DISPLAY_PID=""
     tput cnorm
+    printf '\033[?7h' 2>/dev/null || true
 
     if [[ $status -ne 0 ]]; then
         clear
-        print_vpad "$top_row"
-        draw_progress_bar "$base_pct" "$step_num" "$total" "$title" "$cols"
-        show_error "Step failed: $title"
+        if have_gum; then
+            gum style --foreground 196 --bold --margin "1 2" \
+                "❌ Step failed: $title" \
+                "Exit status: $status"
+        else
+            echo -e "${RED}ERROR: Step failed: $title (exit $status)${NC}"
+        fi
         # The live output box is gone by design, but on an actual failure
         # "Step failed: X" with no detail at all is worse than the box —
-        # show the tail of what the step actually printed before it died.
+        # show what the step actually printed before it died.
         if [[ -s "$logfile" ]]; then
             echo ""
-            echo "Last output before failure:"
-            tail -n 15 "$logfile"
+            echo "Last 30 lines of output:"
+            tail -n 30 "$logfile" 2>/dev/null || true
+        else
+            echo ""
+            echo "The step produced no output."
+        fi
+        # Keep the complete log: the tail above is often enough, but a long
+        # pacman/transaction error can have the useful line farther back.
+        local failed_log="/tmp/featherlite-install-failed.log"
+        if cp "$logfile" "$failed_log" 2>/dev/null; then
+            echo ""
+            echo "Full step log saved to: $failed_log"
         fi
         rm -f "$logfile"
-        return $status
+        STEP_LOG=""
+        echo ""
+        if have_gum; then
+            gum input --placeholder "Press Enter to exit..." --width 50
+        else
+            read -r -p "Press Enter to exit..." _ < /dev/tty || true
+        fi
+        # Exit explicitly. Returning nonzero here would go through the global
+        # ERR trap, clear the screen, and replace the useful output above with
+        # the generic "ERROR at line N" box.
+        exit "$status"
     fi
+
     rm -f "$logfile"
+    STEP_LOG=""
     return 0
 }
 
@@ -3179,6 +3322,26 @@ add_temp_repo() {
 }
 
 install_base_system() {
+    # The generic ERR box used to say "check partitions" even when pacstrap
+    # failed for a completely different reason. Check the two things that make
+    # pacstrap fail before it downloads anything, and leave enough context in
+    # the step log to diagnose them.
+    if ! mountpoint -q "$MOUNTPOINT"; then
+        show_error "$MOUNTPOINT is not a mountpoint — the target filesystems were not mounted."
+        lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS 2>/dev/null || true
+        return 1
+    fi
+
+    # The critical package set is ~4.5 GiB installed plus ~1.6 GiB of pacman
+    # cache; require 8 GiB free so a small VM/root doesn't die mid-download.
+    local avail_kb
+    avail_kb=$(df -Pk "$MOUNTPOINT" 2>/dev/null | awk 'NR == 2 { print $4 }')
+    if [[ "$avail_kb" =~ ^[0-9]+$ ]] && (( avail_kb < 8 * 1024 * 1024 )); then
+        show_error "Only $(( avail_kb / 1024 / 1024 )) GiB free on $MOUNTPOINT; the base package set needs about 8 GiB."
+        df -h "$MOUNTPOINT" 2>/dev/null || true
+        return 1
+    fi
+
     add_temp_repo
 
     # ── Critical base (pacstrap aborts if these fail) ─────────────────────────
