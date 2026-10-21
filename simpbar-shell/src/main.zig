@@ -12,6 +12,7 @@
 //! rest of the desktop passes clicks straight through to windows.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
@@ -1901,9 +1902,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
         posix.sigaction(.USR1, &act, null);
     }
+    // DebugAllocator does leak tracking and guard work on every allocation;
+    // keep it for Debug builds, but use libc's release allocator for the
+    // shipping builds. Both choices stay paired with every free below.
     var gpa_state = std.heap.DebugAllocator(.{}){};
     defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+    const gpa: std.mem.Allocator = if (builtin.mode == .Debug)
+        gpa_state.allocator()
+    else
+        std.heap.c_allocator;
 
     resolveConfigPaths();
     var cfg = loadConfig(gpa);

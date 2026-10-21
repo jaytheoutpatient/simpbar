@@ -130,6 +130,11 @@ pub fn build(b: *Build) !void {
         .name = "simpbar-shell",
         .root_module = exe_mod,
     });
+    // Same toolchain pins as the bar (../simpbar/build.zig): Zig 0.16's
+    // Debug defaults fall over on this project, and ReleaseFast's LLVM/LLD
+    // defaults are what we want in every optimize mode anyway.
+    exe.use_llvm = true;
+    exe.use_lld = true;
 
     _ = wayland_dep;
 

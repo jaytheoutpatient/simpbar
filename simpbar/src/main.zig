@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 
 // ligma
@@ -3205,7 +3206,7 @@ const Tray = struct {
     /// everything else (signals we didn't ask for, e.g.) is dropped.
     fn onReadable(self: *Tray) void {
         const c: *dbus.Connection = if (self.conn) |*conn| conn else return;
-        const msg = c.readMessage(std.heap.page_allocator) catch |err| {
+        const msg = c.readMessage(std.heap.c_allocator) catch |err| {
             logging.warn("tray: dbus connection lost: {}", .{err});
             c.close();
             self.conn = null;
@@ -4962,9 +4963,15 @@ fn realMain() !void {
     logging.step("config loaded from {s}", .{config_json_path});
     icontheme.refreshConfiguredTheme();
 
+    // DebugAllocator does leak tracking and guard work on every allocation;
+    // keep it for Debug builds, but use libc's release allocator for the
+    // shipping builds. Both choices stay paired with every free below.
     var gpa_state = std.heap.DebugAllocator(.{}){};
     defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+    const gpa: std.mem.Allocator = if (builtin.mode == .Debug)
+        gpa_state.allocator()
+    else
+        std.heap.c_allocator;
 
     var app_font = init_font: {
         var buf: [512]u8 = undefined;
@@ -10449,7 +10456,8 @@ fn paintMorph(bar: *Bar, pixels: [*]u32, e: f32, time_text: []const u8, mpris_te
 }
 
 fn paintFrame(bar: *Bar, pixels: [*]u32) void {
-    const pixel_count: usize = @as(usize, bar.width) * bar.height;
+    const width: usize = bar.width;
+    const pixel_count: usize = width * bar.height;
     // Only the background fill and borders follow bg_opacity_percent — every
     // module (pills, text, icons, hover, bezels) stays fully opaque, so at 0
     // the bar body is gone but the modules float over the wallpaper.
@@ -10458,18 +10466,18 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     // Eased taskbar↔dock blend (see mode_blend): endpoints render through
     // the exact legacy paths so both modes stay pixel-identical at rest.
     const e = bar.mode_blend;
-    var i: usize = 0;
     // Transparent base unless fully taskbar (the dock pill and morph pill
     // paint their own background; taskbar fills edge to edge as before).
-    while (i < pixel_count) : (i += 1) pixels[i] = if (e <= 0.0) bg_fill else 0;
+    // @memset keeps this full-surface clear out of the scalar loop and lets
+    // LLVM emit wide stores for both the fill and transparent cases.
+    @memset(pixels[0..pixel_count], if (e <= 0.0) bg_fill else 0);
 
     // Auto-hide collapsed state: transparent surface with just the 2px hint
     // strip at the screen edge. No modules, no regions (autohideHide already
     // cleared them and narrowed input to the strip); strip clicks reach the
     // button handler, which shows the bar instead of hit-testing.
     if (bar.autohide_hidden) {
-        var j: usize = 0;
-        while (j < pixel_count) : (j += 1) pixels[j] = 0;
+        @memset(pixels[0..pixel_count], 0);
         const strip = autohideStripRect(bar);
         const strip_u: u32 = @intCast(AUTOHIDE_STRIP_PX);
         const sy: u32 = if (std.mem.eql(u8, current_config.appearance.position, "top")) 0 else bar.height - strip_u;
@@ -10478,9 +10486,12 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
         const strip_col: u32 = ((@as(u32, current_config.appearance.bg_opacity_percent) * 255 / 100) << 24) | (current_config.appearance.border_color & 0x00FFFFFF);
         var yy: u32 = sy;
         while (yy < sy + strip_u and yy < bar.height) : (yy += 1) {
-            var xx: i64 = @max(0, strip.x);
+            const xx: i64 = @max(0, strip.x);
             const xe: i64 = @min(@as(i64, @intCast(bar.width)), strip.x + strip.w);
-            while (xx < xe) : (xx += 1) pixels[yy * bar.width + @as(usize, @intCast(xx))] = strip_col;
+            if (xe > xx) {
+                const start: usize = @as(usize, yy) * width + @as(usize, @intCast(xx));
+                @memset(pixels[start..][0..@intCast(xe - xx)], strip_col);
+            }
         }
         return;
     }
@@ -10507,22 +10518,21 @@ fn paintFrame(bar: *Bar, pixels: [*]u32) void {
     const left_px = if (e <= 0.0) @min(current_config.appearance.border_left_px, bar.width) else 0;
     const right_px = if (e <= 0.0) @min(current_config.appearance.border_right_px, bar.width - left_px) else 0;
 
+    const left_n: usize = left_px;
+    const right_n: usize = right_px;
     var row: u32 = 0;
     while (row < top_px) : (row += 1) {
-        var col: u32 = 0;
-        while (col < bar.width) : (col += 1) pixels[row * bar.width + col] = bc;
+        @memset(pixels[@as(usize, row) * width ..][0..width], bc);
     }
     row = bar.height - bottom_px;
     while (row < bar.height) : (row += 1) {
-        var col: u32 = 0;
-        while (col < bar.width) : (col += 1) pixels[row * bar.width + col] = bc;
+        @memset(pixels[@as(usize, row) * width ..][0..width], bc);
     }
     row = 0;
     while (row < bar.height) : (row += 1) {
-        var col: u32 = 0;
-        while (col < left_px) : (col += 1) pixels[row * bar.width + col] = bc;
-        col = bar.width - right_px;
-        while (col < bar.width) : (col += 1) pixels[row * bar.width + col] = bc;
+        const row_start: usize = @as(usize, row) * width;
+        if (left_n > 0) @memset(pixels[row_start..][0..left_n], bc);
+        if (right_n > 0) @memset(pixels[row_start + width - right_n ..][0..right_n], bc);
     }
 
     // Background effect inside the border bands (taskbar endpoint only —

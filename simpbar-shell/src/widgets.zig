@@ -199,9 +199,20 @@ pub const Canvas = struct {
         const x_end = @min(x0 + @as(i64, @intCast(w)), @as(i64, @intCast(self.width)));
         const y_end = @min(y0 + @as(i64, @intCast(h)), @as(i64, @intCast(self.height)));
         if (x_end <= x_start or y_end <= y_start) return;
+        const sa = (color >> 24) & 0xFF;
+        if (sa == 0) return; // fully transparent: blendOver is the identity
+        const x0u: usize = @intCast(x_start);
+        const x1u: usize = @intCast(x_end);
         var y = y_start;
         while (y < y_end) : (y += 1) {
             const row = self.pixels[@as(usize, @intCast(y)) * self.width ..][0..self.width];
+            // Opaque primitives (watch case plates, bars, day/date windows)
+            // are most of the fillRect calls; write them row-wise instead of
+            // running the per-pixel alpha blend.
+            if (sa == 255) {
+                @memset(row[x0u..x1u], color);
+                continue;
+            }
             var x = x_start;
             while (x < x_end) : (x += 1) {
                 row[@intCast(x)] = blendOver(row[@intCast(x)], color);

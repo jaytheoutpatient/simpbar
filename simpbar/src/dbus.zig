@@ -150,18 +150,18 @@ pub const Connection = struct {
     /// by the caller if it wants the error name/text (not currently used).
     pub fn call(self: *Connection, target: CallTarget, body: Body) !Message {
         const serial = self.nextSerial();
-        const raw = try buildMessage(std.heap.page_allocator, .method_call, serial, .{
+        const raw = try buildMessage(std.heap.c_allocator, .method_call, serial, .{
             .path = target.path,
             .interface = target.interface,
             .member = target.member,
             .destination = target.destination,
             .signature = if (body.signature.len > 0) body.signature else null,
         }, body.bytes);
-        defer std.heap.page_allocator.free(raw);
+        defer std.heap.c_allocator.free(raw);
         try writeAll(self.fd, raw);
 
         while (true) {
-            const msg = try self.readMessage(std.heap.page_allocator);
+            const msg = try self.readMessage(std.heap.c_allocator);
             if (msg.reply_serial == serial) {
                 if (msg.msg_type == .error_reply) return error.DbusError;
                 return msg;
@@ -182,8 +182,8 @@ pub const Connection = struct {
         const serial = self.nextSerial();
         var f = fields;
         if (body.signature.len > 0) f.signature = body.signature;
-        const raw = try buildMessage(std.heap.page_allocator, msg_type, serial, f, body.bytes);
-        defer std.heap.page_allocator.free(raw);
+        const raw = try buildMessage(std.heap.c_allocator, msg_type, serial, f, body.bytes);
+        defer std.heap.c_allocator.free(raw);
         try writeAll(self.fd, raw);
     }
 
