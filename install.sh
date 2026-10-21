@@ -1212,6 +1212,35 @@ ensure_zig_016() {
 
 ensure_zig_016
 
+# Optional CPU floor for the two builds below. Leave unset for Zig's normal
+# native target, which already uses every instruction the build machine
+# supports (on an AVX2/v3 machine that includes the v3 feature set). Set
+# SIMPBAR_ZIG_CPU=x86_64_v3 for a portable v3 floor, or x86_64_v4 for
+# AVX-512/v4-only machines. A v4 binary will SIGILL on a v3 machine.
+# `build.zig` uses standardTargetOptions, so -Dcpu is supported.
+ZIG_CPU_ARGS=()
+if [ -n "${SIMPBAR_ZIG_CPU:-}" ]; then
+    ZIG_CPU_ARGS+=("-Dcpu=$SIMPBAR_ZIG_CPU")
+fi
+if [ "${SIMPBAR_ZIG_CPU:-}" = "x86_64_v3" ] \
+   && ! grep -qw avx2 /proc/cpuinfo 2>/dev/null; then
+    warn "SIMPBAR_ZIG_CPU=x86_64_v3 requested on a host without AVX2; the installed binaries will only run on v3+ machines."
+fi
+if [ "${SIMPBAR_ZIG_CPU:-}" = "x86_64_v4" ] \
+   && ! grep -qw avx512f /proc/cpuinfo 2>/dev/null; then
+    warn "SIMPBAR_ZIG_CPU=x86_64_v4 requested on a host without AVX-512; the installed binaries will only run on v4 machines."
+fi
+
+build_simpbar() {
+    cd "$HOME/.local/share/simpbar/simpbar" || return 1
+    zig build -Doptimize=ReleaseFast "${ZIG_CPU_ARGS[@]}"
+}
+
+build_simpbar_shell() {
+    cd "$HOME/.local/share/simpbar/simpbar-shell" || return 1
+    zig build -Doptimize=ReleaseFast "${ZIG_CPU_ARGS[@]}"
+}
+
 # Build simpbar (the bar) and simpbar-welcome (the GTK4 + libadwaita
 # companion app) from the source placed in ~/.local/share/simpbar/simpbar
 # back in Step 2, now that zig/freetype2/gdk-pixbuf2/wayland-protocols/gtk4/
@@ -1219,7 +1248,7 @@ ensure_zig_016
 # under the default install step, so this one invocation builds both. A
 # release build (not the plain debug build simpbar's own dev workflow
 # uses) — this is what ends up running on every login.
-run_spinner "Building simpbar" bash -c 'cd ~/.local/share/simpbar/simpbar && zig build -Doptimize=ReleaseFast' \
+run_spinner "Building simpbar" build_simpbar \
     || die "Failed to build simpbar — check zig, freetype2, gdk-pixbuf2, wayland, wayland-protocols, gtk4, and libadwaita installed correctly."
 
 run_spinner "Installing simpbar to /usr/bin" \
@@ -1240,7 +1269,7 @@ ok "simpbar-config built and installed to /usr/bin/simpbar-config"
 # Build simpbar-shell (the desktop widgets) too — same zig, against the bar's
 # source layout it was staged next to above. Autostarted on login by whichever
 # WM was chosen (hyprland.lua or the mango autostart.conf).
-run_spinner "Building simpbar-shell" bash -c 'cd ~/.local/share/simpbar/simpbar-shell && zig build -Doptimize=ReleaseFast' \
+run_spinner "Building simpbar-shell" build_simpbar_shell \
     || die "Failed to build simpbar-shell — check zig, freetype2, gdk-pixbuf2, wayland, and wayland-protocols installed correctly."
 
 run_spinner "Installing simpbar-shell to /usr/bin" \
